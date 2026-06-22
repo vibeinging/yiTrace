@@ -60,6 +60,58 @@ pub enum SegLifecycle {
 
 // ───────────────────────── 外部件接口边界 ─────────────────────────
 
+/// **折叠列投影**：聚合/列表类查询声明它要读哪些**可折叠值列**。
+///
+/// 身份与分组列（trace_id/span_id/ts/seq/event_type/ext_span_id）**恒读**——折叠去重、组内定序、
+/// 分组都要用，不在投影里。投影只挑可折叠值列，主要价值是让**列式段（Vortex）跳过不读的列**，
+/// 尤其两个大文本列 `input_text`/`output_text`（多数聚合/成本/会话查询根本不碰原文）。
+///
+/// 行式/内存源忽略投影（数据本就全在手边、没有列 I/O 可省）；只有列式段从中受益。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Projection(u16);
+
+impl Projection {
+    pub const STATUS: u16 = 1 << 0;
+    pub const DURATION_NS: u16 = 1 << 1;
+    pub const PARENT_SPAN_ID: u16 = 1 << 2;
+    pub const INPUT_TOKENS: u16 = 1 << 3;
+    pub const OUTPUT_TOKENS: u16 = 1 << 4;
+    pub const SESSION_ID: u16 = 1 << 5;
+    pub const AGENT_NAME: u16 = 1 << 6;
+    pub const TOOL_NAME: u16 = 1 << 7;
+    pub const MODEL: u16 = 1 << 8;
+    pub const INPUT_TEXT: u16 = 1 << 9;
+    pub const OUTPUT_TEXT: u16 = 1 << 10;
+    pub const EVAL_SCORE: u16 = 1 << 11;
+    pub const EVAL_LABEL: u16 = 1 << 12;
+    pub const LOGS: u16 = 1 << 13;
+
+    const MASK: u16 = (1 << 14) - 1;
+
+    /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
+    pub const ALL: Projection = Projection(Self::MASK);
+
+    /// 选定若干列（位或）。如 `Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS)`。
+    pub const fn of(cols: u16) -> Self {
+        Projection(cols & Self::MASK)
+    }
+
+    /// 该投影是否要某列（传列常量）。
+    pub const fn has(self, col: u16) -> bool {
+        self.0 & col != 0
+    }
+
+    /// 是否要全部列——存储据此走"读全列"快路（与历史行为完全一致），不必逐列裁剪。
+    pub const fn is_all(self) -> bool {
+        self.0 == Self::MASK
+    }
+
+    /// 原始位（列式存储据此判断每列读不读）。
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
 /// 列式不可变段存储。真实实现接 **Vortex**（layouts + zone-map + 统计）；
 /// 删除/manifest/版本不归它管（那是本引擎自己的事，见 yt-core::manifest）。
 pub trait SegmentStore: Send + Sync {
@@ -74,11 +126,19 @@ pub trait SegmentStore: Send + Sync {
     /// 物理删除一个 dead 段文件（仅在 §D1.4 三条水位放行后调用）。
     fn unlink_segment(&self, seg: SegmentId);
 
-    /// 可选：**按时间范围下推扫描**，返回 `ts ∈ [from, to]` 命中行的 `FoldInput`（不带物理行号）。
-    /// 默认 `None` = 不支持下推，引擎回退到 `scan_fold_inputs` 全扫。列式存储（Vortex）覆盖它，把时间
-    /// 过滤推进文件扫描、只解码命中行。
+    /// 可选：**投影扫描**，只解码 `proj` 选中的可折叠值列（身份/分组列恒读），返回**带物理行号**的
+    /// `FoldInput`。投影只裁列、不丢行，故行号完整、与删除位图共存安全——**任何查询都能用**。
+    /// 默认 `None` = 不支持，引擎回退 `scan_fold_inputs` 读全列。列式存储（Vortex）覆盖它，让聚合/列表
+    /// 查询跳过不读的大文本列（上列式最大的单点收益）。
+    fn scan_fold_inputs_projected(&self, _seg: SegmentId, _proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
+        None
+    }
+
+    /// 可选：**按时间范围下推扫描 + 投影**，返回 `ts ∈ [from, to]` 命中行的 `FoldInput`（不带物理行号），
+    /// 只解码 `proj` 选中的列。默认 `None` = 不支持下推，引擎回退全扫。列式存储（Vortex）覆盖它，把时间
+    /// 过滤推进文件扫描、只解码命中行的命中列。
     /// **注意**：下推丢了物理行号，而删除按物理行号定位，二者不能共存——引擎只在「段无删除」时用它。
-    fn scan_fold_inputs_in_time(&self, _seg: SegmentId, _from: i64, _to: i64) -> Option<Vec<FoldInput>> {
+    fn scan_fold_inputs_in_time(&self, _seg: SegmentId, _from: i64, _to: i64, _proj: Projection) -> Option<Vec<FoldInput>> {
         None
     }
 }
@@ -874,17 +934,20 @@ impl WriteCoordinator {
     /// 带剪枝的读路径。按时间窗（段 zone-map）+ trace_id 剪枝，减少触及的段数（活 trace 读扇出上界）。
     /// 返回 (折叠出的 span, 实际扫描的段数)。所有判定只用快照里钉死的版本。
     pub fn read_spans_query(&self, snap: &Snapshot, q: &TraceQuery) -> (Vec<FoldedSpan>, usize) {
-        self.fold_query(snap, q, None)
+        // 普通读 / trace 详情要原文,读全列。
+        self.fold_query(snap, q, None, Projection::ALL)
     }
 
     /// 折叠核心。`keys=Some(集合)` 时**只折叠命中这些 (trace,span) 的行**（检索用：先由索引拿到命中 key,
-    /// 只折叠它们,不折叠全库）；`None` = 折叠全部（普通读）。段扫描仍是全段（行级行指针待真实索引），
-    /// 但折叠/克隆只发生在候选行上。
+    /// 只折叠它们,不折叠全库）；`None` = 折叠全部（普通读）。`proj` 声明要读哪些可折叠值列——列式段据此
+    /// 跳过不读的列（尤其大文本列），行式/内存源忽略它（无列 I/O 可省）。段扫描仍是全段（行级行指针待真实
+    /// 索引），但折叠/克隆只发生在候选行上。
     fn fold_query(
         &self,
         snap: &Snapshot,
         q: &TraceQuery,
         keys: Option<&std::collections::HashSet<(u64, u64)>>,
+        proj: Projection,
     ) -> (Vec<FoldedSpan>, usize) {
         let mut inputs: Vec<FoldInput> = Vec::new();
         let mut scanned = 0usize;
@@ -897,14 +960,17 @@ impl WriteCoordinator {
                 continue; // 时间窗外，整段剪掉
             }
             scanned += 1;
-            // 行源：段无删除 + 有真实时间窗 → 尝试**谓词下推**（把时间过滤推进段扫描、只解码命中行）；
-            // 否则回退全扫（下推丢物理行号，而删除按物理行号，不能共存）。
-            let pushed = if entry.deletion_seq == 0 && (q.time_from != i64::MIN || q.time_to != i64::MAX) {
-                self.segments.scan_fold_inputs_in_time(entry.segment_id, q.time_from, q.time_to)
+            // 行源,三条路（投影 `proj` 贯穿全部——列式段据此只解码命中列）：
+            //   ① 段无删除 + 有真实时间窗 → **时间下推 + 投影**：时间过滤推进段扫描、只解码命中行的命中列
+            //      （下推丢物理行号，但段无删除、用不到行号）。
+            //   ② 否则尝试**纯投影下推**：只裁列、不丢行 → 行号完整，删除位图照常按行号生效（任何查询都能用）。
+            //   ③ 都不支持（None）→ 回退 `scan_fold_inputs` 读全列。
+            let time_pushed = if entry.deletion_seq == 0 && (q.time_from != i64::MIN || q.time_to != i64::MAX) {
+                self.segments.scan_fold_inputs_in_time(entry.segment_id, q.time_from, q.time_to, proj)
             } else {
                 None
             };
-            match pushed {
+            match time_pushed {
                 Some(folds) => {
                     // 行已被下推按时间过滤、段又无删除；只补 trace_id + keys 过滤。
                     for fi in folds {
@@ -918,7 +984,12 @@ impl WriteCoordinator {
                     }
                 }
                 None => {
-                    for (row, fi) in self.segments.scan_fold_inputs(entry.segment_id) {
+                    // 投影下推带回物理行号 → 删除检查照旧；不支持则全列扫描。两路下游过滤完全一致。
+                    let rows = self
+                        .segments
+                        .scan_fold_inputs_projected(entry.segment_id, proj)
+                        .unwrap_or_else(|| self.segments.scan_fold_inputs(entry.segment_id));
+                    for (row, fi) in rows {
                         if entry.deletion_vec.is_deleted(row) {
                             continue;
                         }
@@ -982,7 +1053,11 @@ impl WriteCoordinator {
     /// 列出 trace 摘要（web 控制台列表视图）。按 trace_id 把折叠出的 span 聚合：span 数、总/最大耗时、报错数。
     /// 输出按 trace_id 升序，确定可复算。
     pub fn list_traces(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<TraceSummary> {
-        let (spans, _) = self.read_spans_query(snap, q);
+        // 只读 status/耗时/token —— 不碰大文本列。
+        let proj = Projection::of(
+            Projection::STATUS | Projection::DURATION_NS | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+        );
+        let (spans, _) = self.fold_query(snap, q, None, proj);
         let mut by_trace: BTreeMap<u64, TraceSummary> = BTreeMap::new();
         for s in spans {
             let e = by_trace.entry(s.trace_id).or_insert(TraceSummary {
@@ -1010,7 +1085,9 @@ impl WriteCoordinator {
 
     /// 列出会话摘要（多轮会话视图）：按 session_id 聚合,数 trace 数/span 数/token 汇总。升序。
     pub fn list_sessions(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<SessionSummary> {
-        let (spans, _) = self.read_spans_query(snap, q);
+        // 按 session 聚合 token —— 只读 session_id + token,跳过文本。
+        let proj = Projection::of(Projection::SESSION_ID | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let (spans, _) = self.fold_query(snap, q, None, proj);
         // session_id -> (distinct traces, span_count, in_tok, out_tok)
         let mut acc: BTreeMap<u64, (std::collections::HashSet<u64>, usize, u64, u64)> = BTreeMap::new();
         for s in spans {
@@ -1035,7 +1112,9 @@ impl WriteCoordinator {
 
     /// 按 agent 的成本归因（per-agent 成本下钻）：按 agent_name 聚合 token。按 agent 名升序。
     pub fn cost_by_agent(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<AgentCost> {
-        let (spans, _) = self.read_spans_query(snap, q);
+        // 按 agent 归因 token —— 只读 agent_name + token,跳过文本（成本下钻是典型的"只数不读原文"）。
+        let proj = Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let (spans, _) = self.fold_query(snap, q, None, proj);
         let mut acc: BTreeMap<String, (usize, u64, u64)> = BTreeMap::new();
         for s in spans {
             if let Some(a) = &s.agent_name {
@@ -1112,7 +1191,9 @@ impl WriteCoordinator {
     /// `pass_threshold` 千分制，分数 ≥ 它算通过。这是 eval 的产品出口:回归视图("哪个 agent 退步了")。
     /// 输出第 0 行恒为整体(agent_name=None),其后按 agent 名升序。
     pub fn eval_summary(&self, snap: &Snapshot, q: &TraceQuery, pass_threshold: u32) -> Vec<EvalSummary> {
-        let (spans, _) = self.read_spans_query(snap, q);
+        // 看板只看分数 + agent 名 —— 不读被评的原文（原文在打分时已用过、写回成了分数）。
+        let proj = Projection::of(Projection::EVAL_SCORE | Projection::EVAL_LABEL | Projection::AGENT_NAME);
+        let (spans, _) = self.fold_query(snap, q, None, proj);
         // 只取已打分的 span（无 eval_score 的不计），喂进共用聚合口径。
         let scored = spans.into_iter().filter_map(|s| s.eval_score.map(|sc| (s.agent_name, sc)));
         aggregate_eval(scored, pass_threshold)
@@ -1213,7 +1294,15 @@ impl WriteCoordinator {
     /// 边 = 父 span 的角色 → 子 span 的角色(同角色自环剔除,只留跨角色调用/移交),按出现次数聚合。
     /// 节点带聚合统计(span 数、token)。节点/边都确定排序,可复算。
     pub fn agent_graph(&self, snap: &Snapshot, trace_id: u64) -> AgentGraph {
-        let (spans, _) = self.read_spans_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX));
+        // 执行图按 agent/工具/父子连边 + 聚合 token —— 只读这些维度,不读原文。
+        let proj = Projection::of(
+            Projection::AGENT_NAME
+                | Projection::TOOL_NAME
+                | Projection::PARENT_SPAN_ID
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS,
+        );
+        let (spans, _) = self.fold_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX), None, proj);
 
         // 角色判定（返回 (名字, 类型)）。
         let actor_of = |s: &FoldedSpan| -> (String, ActorKind) {
@@ -1389,7 +1478,8 @@ impl WriteCoordinator {
     /// **只折叠命中行**：把候选 key 集喂给 `fold_query`，不折叠全库（大数据下检索不再为几条命中折叠整库）。
     fn join_folded(&self, snap: &Snapshot, cands: Vec<(u64, u64, f32)>) -> Vec<(FoldedSpan, f32)> {
         let keys: std::collections::HashSet<(u64, u64)> = cands.iter().map(|&(t, s, _)| (t, s)).collect();
-        let (hits, _) = self.fold_query(snap, &TraceQuery::all(), Some(&keys));
+        // 检索结果要展示原文（命中片段），读全列。
+        let (hits, _) = self.fold_query(snap, &TraceQuery::all(), Some(&keys), Projection::ALL);
         let map: HashMap<(u64, u64), FoldedSpan> =
             hits.into_iter().map(|s| ((s.trace_id, s.span_id), s)).collect();
         cands
@@ -1682,12 +1772,19 @@ mod tests {
         }
     }
 
-    /// 支持时间下推的 mock 段存储：`scan_fold_inputs_in_time` 真按 ts 过滤并计数被调几次。
-    /// 用来验证引擎读路径在「有时间窗 + 段无删除」时确实走下推、且下推做了段内行级时间过滤。
+    /// 支持下推的 mock 段存储：时间下推 / 投影下推都真做，并把「最近一次收到的投影」与「时间下推次数」
+    /// 记下来，供测试断言引擎确实走了下推、且传下来的投影是窄的（聚合不带文本列）。
     #[derive(Default)]
     struct PushdownStore {
         rows: Mutex<std::collections::HashMap<u64, Vec<WalRecord>>>,
         pushdowns: std::sync::atomic::AtomicUsize,
+        /// 最近一次任意下推（时间/投影）收到的投影位，供断言"聚合查询不要文本列"。
+        last_proj: std::sync::atomic::AtomicU16,
+    }
+    impl PushdownStore {
+        fn last_proj(&self) -> Projection {
+            Projection::of(self.last_proj.load(std::sync::atomic::Ordering::Relaxed))
+        }
     }
     impl SegmentStore for PushdownStore {
         fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) {
@@ -1707,8 +1804,13 @@ mod tests {
         fn unlink_segment(&self, seg: SegmentId) {
             self.rows.lock().unwrap().remove(&seg.get());
         }
-        fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64) -> Option<Vec<FoldInput>> {
+        fn scan_fold_inputs_projected(&self, seg: SegmentId, proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
+            self.last_proj.store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
+            Some(self.scan_fold_inputs(seg))
+        }
+        fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Option<Vec<FoldInput>> {
             self.pushdowns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_proj.store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
             let g = self.rows.lock().unwrap();
             Some(
                 g.get(&seg.get())
@@ -2064,6 +2166,41 @@ mod tests {
         assert!(store.pushdowns.load(Ordering::Relaxed) > n0, "有时间窗 → 走下推");
         assert_eq!(hit.len(), 1, "下推做了段内行级时间过滤");
         assert_eq!(hit[0].span_id, 20);
+    }
+
+    #[test]
+    fn aggregation_pushes_narrow_projection_detail_reads_all() {
+        // 投影下推:聚合类查询(cost_by_agent)把「不含大文本列」的窄投影下推给段存储;trace 详情读全列。
+        use std::sync::atomic::Ordering;
+        let store = Arc::new(PushdownStore::default());
+        let wc = WriteCoordinator::new(store.clone());
+
+        // 一条带 agent + token + 原文 的 span,flush 进段(无删除)。
+        let mut r = ev_at(1, 10, 1, 100, Some(0), Some(5), &[]);
+        r.fields.agent_name = Some("风控".into());
+        r.fields.input_tokens = Some(100);
+        r.fields.output_tokens = Some(20);
+        r.fields.output_text = Some("一大段研判正文……".into());
+        wc.ingest(vec![r.clone()]);
+        wc.commit_flush(&[r], WalLsn::new(1));
+        let snap = wc.pin_snapshot();
+
+        // 成本下钻:走投影下推,投影应只含 agent + token,**不含两个文本列**。
+        let cost = wc.cost_by_agent(&snap, &TraceQuery::all());
+        assert_eq!(cost.len(), 1);
+        assert_eq!(cost[0].input_tokens, 100);
+        let p = store.last_proj();
+        assert!(p.has(Projection::AGENT_NAME) && p.has(Projection::INPUT_TOKENS), "聚合要的列在投影里");
+        assert!(
+            !p.has(Projection::INPUT_TEXT) && !p.has(Projection::OUTPUT_TEXT),
+            "聚合不读原文 → 投影不含大文本列(列式段据此跳过解码)"
+        );
+
+        // trace 详情:读全列,原文必须读得到。
+        let detail = &wc.read_spans(&snap)[0];
+        assert_eq!(detail.output_text.as_deref(), Some("一大段研判正文……"), "详情读全列、原文在");
+        assert!(store.last_proj().is_all(), "详情下推的是全列投影");
+        let _ = store.pushdowns.load(Ordering::Relaxed); // 触达字段,消除未读告警
     }
 
     #[test]

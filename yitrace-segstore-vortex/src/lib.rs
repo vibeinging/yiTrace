@@ -19,7 +19,7 @@ use vortex::array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
 use vortex::array::arrow::IntoArrowArray;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::array::{ArrayRef, IntoArray};
-use vortex::expr::{and, col, gt_eq, lit, lt_eq, Expression};
+use vortex::expr::{and, col, gt_eq, lit, lt_eq, root, select, Expression};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -31,12 +31,43 @@ use arrow::array::{
 use yt_core::event::{EventIdentity, EventType};
 use yt_core::fold::{FoldInput, SpanFields};
 use yt_core::ids::SegmentId;
-use yt_engine::SegmentStore;
+use yt_engine::{Projection, SegmentStore};
 use yt_wal::WalRecord;
 
 /// logs（Vec<String>）压成单列：用 NUL 连接，空 logs → None。日志文本里出现 NUL 概率极低（v1 简化，
 /// 后续换真正的 list<utf8> 列）。
 const LOG_SEP: char = '\u{0}';
+
+/// 投影 → 要 `select` 的列名。身份/分组列（trace_id/span_id/ts/seq/event_type/ext_span_id）**恒选**
+/// （折叠去重/定序/分组要用）；可折叠值列按 `proj` 的位选。`proj.is_all()` → `None` = 不裁列、读全表
+/// （与历史行为字节一致）。**投影下推的省点全在这**：聚合不选 input_text/output_text，Vortex 连解码都不做。
+fn projected_field_names(proj: Projection) -> Option<Vec<&'static str>> {
+    if proj.is_all() {
+        return None;
+    }
+    let mut cols = vec!["trace_id", "span_id", "ts", "seq", "event_type", "ext_span_id"];
+    for (bit, name) in [
+        (Projection::STATUS, "status"),
+        (Projection::DURATION_NS, "duration_ns"),
+        (Projection::PARENT_SPAN_ID, "parent_span_id"),
+        (Projection::INPUT_TOKENS, "input_tokens"),
+        (Projection::OUTPUT_TOKENS, "output_tokens"),
+        (Projection::SESSION_ID, "session_id"),
+        (Projection::AGENT_NAME, "agent_name"),
+        (Projection::TOOL_NAME, "tool_name"),
+        (Projection::MODEL, "model"),
+        (Projection::INPUT_TEXT, "input_text"),
+        (Projection::OUTPUT_TEXT, "output_text"),
+        (Projection::EVAL_SCORE, "eval_score"),
+        (Projection::EVAL_LABEL, "eval_label"),
+        (Projection::LOGS, "logs"),
+    ] {
+        if proj.has(bit) {
+            cols.push(name);
+        }
+    }
+    Some(cols)
+}
 
 /// 列式段存储到一个目录，每段一个 `.vortex` 文件。
 pub struct VortexSegmentStore {
@@ -127,36 +158,43 @@ impl VortexSegmentStore {
         .expect("build struct array")
     }
 
-    /// 从读回的 Arrow StructArray 逐行重建 WalRecord。
+    /// 从读回的 Arrow StructArray 逐行重建 WalRecord。**投影感知**：身份/分组列恒在；可折叠值列可能因
+    /// 投影被裁掉（`column_by_name` 返回 None）→ 该字段整列当 None，不 panic。这样同一段读回路径既服务
+    /// 全列读、也服务投影读。
     fn rows_from_arrow(st: &arrow::array::StructArray) -> Vec<WalRecord> {
         let n = st.len();
-        let u64c = |name: &str| st.column_by_name(name).unwrap().as_any().downcast_ref::<UInt64Array>().unwrap().clone();
-        let opt_u64 = |a: &UInt64Array, i: usize| if a.is_null(i) { None } else { Some(a.value(i)) };
-
-        let trace_id = u64c("trace_id");
-        let span_id = u64c("span_id");
+        // 身份/分组列：任何投影都选了它们，恒在 → 直接取。
+        let u64req = |name: &str| st.column_by_name(name).unwrap().as_any().downcast_ref::<UInt64Array>().unwrap().clone();
+        let trace_id = u64req("trace_id");
+        let span_id = u64req("span_id");
         let ts = st.column_by_name("ts").unwrap().as_any().downcast_ref::<Int64Array>().unwrap().clone();
-        let seq = u64c("seq");
+        let seq = u64req("seq");
         let event_type = st.column_by_name("event_type").unwrap().as_any().downcast_ref::<UInt8Array>().unwrap().clone();
         let ext_span_id = st.column_by_name("ext_span_id").unwrap().as_string_view().clone();
-        let status = st.column_by_name("status").unwrap().as_any().downcast_ref::<UInt8Array>().unwrap().clone();
-        let duration_ns = u64c("duration_ns");
-        let parent_span_id = u64c("parent_span_id");
-        let input_tokens = u64c("input_tokens");
-        let output_tokens = u64c("output_tokens");
-        let session_id = u64c("session_id");
-        let eval_score = st.column_by_name("eval_score").unwrap().as_any().downcast_ref::<UInt32Array>().unwrap().clone();
 
-        let sv = |name: &str| st.column_by_name(name).unwrap().as_string_view().clone();
-        let agent_name = sv("agent_name");
-        let tool_name = sv("tool_name");
-        let model = sv("model");
-        let input_text = sv("input_text");
-        let output_text = sv("output_text");
-        let eval_label = sv("eval_label");
-        let logs = sv("logs");
+        // 可折叠值列：可能被投影裁掉 → Option<列>，缺列即全行 None。
+        let optu64 = |name: &str| st.column_by_name(name).map(|c| c.as_any().downcast_ref::<UInt64Array>().unwrap().clone());
+        let duration_ns = optu64("duration_ns");
+        let parent_span_id = optu64("parent_span_id");
+        let input_tokens = optu64("input_tokens");
+        let output_tokens = optu64("output_tokens");
+        let session_id = optu64("session_id");
+        let status = st.column_by_name("status").map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
+        let eval_score = st.column_by_name("eval_score").map(|c| c.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
+        let optsv = |name: &str| st.column_by_name(name).map(|c| c.as_string_view().clone());
+        let agent_name = optsv("agent_name");
+        let tool_name = optsv("tool_name");
+        let model = optsv("model");
+        let input_text = optsv("input_text");
+        let output_text = optsv("output_text");
+        let eval_label = optsv("eval_label");
+        let logs = optsv("logs");
 
-        let opt_str = |a: &StringViewArray, i: usize| if a.is_null(i) { None } else { Some(a.value(i).to_string()) };
+        // 缺列 → None；在列但该行为 null → None；否则取值。
+        let gu64 = |a: &Option<UInt64Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
+        let gu8 = |a: &Option<UInt8Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
+        let gu32 = |a: &Option<UInt32Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
+        let gstr = |a: &Option<StringViewArray>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i).to_string());
 
         (0..n)
             .map(|i| WalRecord {
@@ -169,20 +207,20 @@ impl VortexSegmentStore {
                     event_type: EventType::from_tag(event_type.value(i)),
                 },
                 fields: SpanFields {
-                    status: if status.is_null(i) { None } else { Some(status.value(i)) },
-                    duration_ns: opt_u64(&duration_ns, i),
-                    parent_span_id: opt_u64(&parent_span_id, i),
-                    input_tokens: opt_u64(&input_tokens, i),
-                    output_tokens: opt_u64(&output_tokens, i),
-                    session_id: opt_u64(&session_id, i),
-                    eval_score: if eval_score.is_null(i) { None } else { Some(eval_score.value(i)) },
-                    agent_name: opt_str(&agent_name, i),
-                    tool_name: opt_str(&tool_name, i),
-                    model: opt_str(&model, i),
-                    input_text: opt_str(&input_text, i),
-                    output_text: opt_str(&output_text, i),
-                    eval_label: opt_str(&eval_label, i),
-                    logs: match opt_str(&logs, i) {
+                    status: gu8(&status, i),
+                    duration_ns: gu64(&duration_ns, i),
+                    parent_span_id: gu64(&parent_span_id, i),
+                    input_tokens: gu64(&input_tokens, i),
+                    output_tokens: gu64(&output_tokens, i),
+                    session_id: gu64(&session_id, i),
+                    eval_score: gu32(&eval_score, i),
+                    agent_name: gstr(&agent_name, i),
+                    tool_name: gstr(&tool_name, i),
+                    model: gstr(&model, i),
+                    input_text: gstr(&input_text, i),
+                    output_text: gstr(&output_text, i),
+                    eval_label: gstr(&eval_label, i),
+                    logs: match gstr(&logs, i) {
                         None => Vec::new(),
                         Some(s) => s.split(LOG_SEP).map(|x| x.to_string()).collect(),
                     },
@@ -191,9 +229,10 @@ impl VortexSegmentStore {
             .collect()
     }
 
-    /// 读段（可选谓词下推）。`filter=Some(expr)` 时把过滤**推进 Vortex 文件扫描**（`scan().with_filter`），
-    /// 只解码命中的行/块，不在 Rust 后置全读再筛。
-    fn read_filtered(&self, seg: SegmentId, filter: Option<Expression>) -> Vec<WalRecord> {
+    /// 读段（可选谓词下推 + 投影下推）。`filter=Some(expr)` 把过滤**推进 Vortex 文件扫描**
+    /// （`scan().with_filter`），只解码命中行/块；`proj` 非全列时再 `with_projection(select(...))` 把列也裁掉，
+    /// 不读的列（尤其大文本列）连解码都不做。都不在 Rust 后置全读再筛。
+    fn read_filtered(&self, seg: SegmentId, filter: Option<Expression>, proj: Projection) -> Vec<WalRecord> {
         let path = self.seg_path(seg);
         let bytes = std::fs::read(&path).unwrap_or_default();
         if bytes.is_empty() {
@@ -205,6 +244,10 @@ impl VortexSegmentStore {
             let scan = match filter {
                 Some(f) => scan.with_filter(f),
                 None => scan,
+            };
+            let scan = match projected_field_names(proj) {
+                Some(cols) => scan.with_projection(select(cols, root())),
+                None => scan, // 全列读,不裁
             };
             scan.into_array_stream()?.read_all().await
         });
@@ -220,11 +263,11 @@ impl VortexSegmentStore {
         Self::rows_from_arrow(st)
     }
 
-    /// **按 ts 范围下推过滤**（谓词进文件扫描）：只返回 `ts ∈ [from, to]` 的行。
-    /// 这是列式剪枝的主路 —— 读路径按时间窗只碰相关行/块，大段里查一小段时间不全扫。
-    pub fn scan_in_time(&self, seg: SegmentId, from: i64, to: i64) -> Vec<WalRecord> {
+    /// **按 ts 范围下推过滤**（谓词进文件扫描）+ 可选投影：只返回 `ts ∈ [from, to]` 的行、只解码 `proj` 的列。
+    /// 这是列式剪枝的主路 —— 读路径按时间窗只碰相关行/块、按投影只碰相关列，大段里查一小段时间不全扫、不全解。
+    pub fn scan_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Vec<WalRecord> {
         let filter = and(gt_eq(col("ts"), lit(from)), lt_eq(col("ts"), lit(to)));
-        self.read_filtered(seg, Some(filter))
+        self.read_filtered(seg, Some(filter), proj)
     }
 }
 
@@ -256,7 +299,8 @@ impl SegmentStore for VortexSegmentStore {
     }
 
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
-        self.read_filtered(seg, None)
+        // compaction 重建新段要全字段 → 读全列。
+        self.read_filtered(seg, None, Projection::ALL)
     }
 
     fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)> {
@@ -271,10 +315,22 @@ impl SegmentStore for VortexSegmentStore {
         let _ = std::fs::remove_file(self.seg_path(seg));
     }
 
-    /// 覆盖默认（None）：把时间过滤**真下推**进 Vortex 文件扫描，返回命中行的 FoldInput。
+    /// 覆盖默认（None）：**投影下推**——只解码 `proj` 的列，不丢行 → 带物理行号返回（删除位图照常生效）。
+    /// 行号 = 段内顺序；投影只裁列、行顺序不变，所以 enumerate 出来的行号与全列读一致。
+    fn scan_fold_inputs_projected(&self, seg: SegmentId, proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
+        Some(
+            self.read_filtered(seg, None, proj)
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i as u32, r.to_fold_input()))
+                .collect(),
+        )
+    }
+
+    /// 覆盖默认（None）：把时间过滤 + 投影**真下推**进 Vortex 文件扫描，返回命中行的 FoldInput。
     /// 引擎只在「段无删除」时调它（见 trait 文档），故这里不管删除位图。
-    fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64) -> Option<Vec<FoldInput>> {
-        Some(self.scan_in_time(seg, from, to).iter().map(|r| r.to_fold_input()).collect())
+    fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Option<Vec<FoldInput>> {
+        Some(self.scan_in_time(seg, from, to, proj).iter().map(|r| r.to_fold_input()).collect())
     }
 }
 
@@ -366,16 +422,57 @@ mod tests {
         assert_eq!(store.scan_records(seg).len(), 5);
 
         // ts ∈ [200,400] → 只剩 3 行(ts=200,300,400)
-        let hit = store.scan_in_time(seg, 200, 400);
+        let hit = store.scan_in_time(seg, 200, 400, Projection::ALL);
         let ts: Vec<i64> = hit.iter().map(|r| r.ts).collect();
         assert_eq!(ts, vec![200, 300, 400], "下推过滤只返回时间窗内的行");
 
         // 窗口外 → 空
-        assert!(store.scan_in_time(seg, 1000, 2000).is_empty());
+        assert!(store.scan_in_time(seg, 1000, 2000, Projection::ALL).is_empty());
         // 单点窗口
-        let one = store.scan_in_time(seg, 300, 300);
+        let one = store.scan_in_time(seg, 300, 300, Projection::ALL);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].ts, 300);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projection_reads_only_selected_columns() {
+        // 投影下推:只 select 命中列,被裁掉的列(尤其大文本)读回即 None,身份/选中列照常。
+        let dir = temp_dir();
+        let store = VortexSegmentStore::open(&dir).unwrap();
+        let seg = SegmentId::new(7);
+
+        let mut a = rec(1, 10, 1);
+        a.fields.agent_name = Some("风控".into());
+        a.fields.input_tokens = Some(100);
+        a.fields.output_tokens = Some(20);
+        a.fields.input_text = Some("很长的提示词……".into());
+        a.fields.output_text = Some("很长的回答正文……".into());
+        a.fields.logs = vec!["开始".into()];
+        store.flush_to_segment(seg, &[a]);
+
+        // 窄投影:只要 agent + token(成本下钻的列)。
+        let proj = Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let folds = store.scan_fold_inputs_projected(seg, proj).unwrap();
+        assert_eq!(folds.len(), 1);
+        assert_eq!(folds[0].0, 0, "投影不丢行 → 物理行号完整");
+        let f = &folds[0].1;
+        // 身份恒在
+        assert_eq!(f.trace_id, 1);
+        assert_eq!(f.identity.ext_span_id, "1-10");
+        // 选中列读得到
+        assert_eq!(f.fields.agent_name.as_deref(), Some("风控"));
+        assert_eq!(f.fields.input_tokens, Some(100));
+        assert_eq!(f.fields.output_tokens, Some(20));
+        // 未选列(被裁掉)读回 None —— 大文本列连解码都没做
+        assert_eq!(f.fields.input_text, None, "投影外的大文本列不读 → None");
+        assert_eq!(f.fields.output_text, None, "投影外的大文本列不读 → None");
+        assert!(f.fields.logs.is_empty(), "投影外的 logs 列不读 → 空");
+
+        // 对照:全列读回原文都在。
+        let all = store.scan_records(seg);
+        assert_eq!(all[0].fields.output_text.as_deref(), Some("很长的回答正文……"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
