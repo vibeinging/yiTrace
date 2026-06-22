@@ -1,0 +1,8 @@
+[package]
+name = "yt-wal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+yt-core = { path = "../yt-core" }

@@ -1,0 +1,20 @@
+# yt-segstore-vortex —— 列式段存储（Vortex），实现引擎的 SegmentStore trait。
+#
+# 刻意建在 std-only 引擎工作区之外：vortex/datafusion 这套大依赖只在这里，引擎骨架保持零依赖、离线可编译。
+# 决策见 docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md。
+[package]
+name = "yt-segstore-vortex"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+rust-version = "1.91"
+
+[dependencies]
+vortex = { version = "0.75", features = ["tokio"] }
+arrow = "58"                                    # 读回:Vortex 数组 → Arrow 列,按 Arrow 熟悉的 API 取值
+tokio = { version = "1", features = ["rt", "fs", "io-util"] }
+
+# 引擎 crate 走 path 依赖（实现它的 SegmentStore trait + 复用类型）。
+yt-engine = { path = "../yitrace-engine/crates/yt-engine" }
+yt-core = { path = "../yitrace-engine/crates/yt-core" }
+yt-wal = { path = "../yitrace-engine/crates/yt-wal" }

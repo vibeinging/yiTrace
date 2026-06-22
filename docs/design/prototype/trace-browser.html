@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>yiTrace · Trace 浏览器（原型）</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#141b25; --panel2:#1a2230; --border:#232d3d;
+    --txt:#c9d4e3; --muted:#6b7a8f; --dim:#48566b;
+    --accent:#5b8def; --accent2:#7c5cff;
+    --ok:#3fb950; --warn:#d29922; --err:#f0584b; --run:#2dd4bf;
+    --llm:#7c5cff; --tool:#5b8def; --chain:#d29922; --retr:#3fb950; --agent:#e879c9;
+    --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font:13px/1.5 -apple-system,'PingFang SC','Microsoft YaHei',Segoe UI,sans-serif;
+    background:var(--bg);color:var(--txt);height:100vh;overflow:hidden}
+  .app{display:grid;grid-template-rows:48px 1fr;height:100vh}
+  /* top bar */
+  .topbar{display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--panel);
+    border-bottom:1px solid var(--border)}
+  .logo{font-weight:700;letter-spacing:.3px;font-size:15px}
+  .logo b{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .logo small{color:var(--dim);font-weight:400;font-size:11px;margin-left:6px}
+  .search{flex:1;max-width:560px;position:relative}
+  .search input{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+    padding:7px 12px 7px 34px;color:var(--txt);font-size:13px;outline:none}
+  .search input:focus{border-color:var(--accent)}
+  .search .ic{position:absolute;left:11px;top:8px;color:var(--muted)}
+  .search .badge{position:absolute;right:8px;top:6px;font-size:10px;color:var(--accent2);
+    background:rgba(124,92,255,.12);padding:2px 7px;border-radius:5px;border:1px solid rgba(124,92,255,.25)}
+  .ctx{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px}
+  .pill{background:var(--panel2);border:1px solid var(--border);padding:4px 10px;border-radius:6px}
+  /* main 3-pane */
+  .main{display:grid;grid-template-columns:312px 1fr 360px;height:100%;overflow:hidden}
+  .pane{overflow:auto;height:100%}
+  .pane.list{border-right:1px solid var(--border);background:var(--panel)}
+  .pane.detail{border-left:1px solid var(--border);background:var(--panel)}
+  .ph{padding:10px 14px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
+    position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border);z-index:2;display:flex;justify-content:space-between;align-items:center}
+  /* filters */
+  .filters{display:flex;gap:6px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--border)}
+  .filters .f{font-size:11px;color:var(--muted);background:var(--panel2);border:1px solid var(--border);
+    padding:3px 9px;border-radius:14px;cursor:pointer}
+  .filters .f.on{color:var(--accent);border-color:var(--accent)}
+  /* trace list item */
+  .titem{padding:11px 14px;border-bottom:1px solid var(--border);cursor:pointer;position:relative}
+  .titem:hover{background:var(--panel2)}
+  .titem.sel{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
+  .titem .tname{font-size:13px;color:var(--txt);margin-bottom:5px;display:flex;gap:6px;align-items:center}
+  .titem .tmeta{display:flex;gap:10px;font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.run{background:var(--run);box-shadow:0 0 0 0 var(--run);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(45,212,191,.5)}70%{box-shadow:0 0 0 6px rgba(45,212,191,0)}100%{box-shadow:0 0 0 0 rgba(45,212,191,0)}}
+  .runtag{font-size:10px;color:var(--run);border:1px solid rgba(45,212,191,.4);padding:1px 6px;border-radius:4px;margin-left:auto}
+  /* center: trace tree / waterfall */
+  .center{display:flex;flex-direction:column;height:100%;overflow:hidden}
+  .toolbar{display:flex;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);background:var(--panel2)}
+  .toolbar .tt{font-size:13px;color:var(--txt);font-weight:600}
+  .toolbar .sub{font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .seg{display:flex;background:var(--bg);border:1px solid var(--border);border-radius:7px;overflow:hidden;margin-left:auto}
+  .seg button{background:none;border:none;color:var(--muted);padding:5px 11px;font-size:12px;cursor:pointer}
+  .seg button.on{background:var(--accent);color:#fff}
+  .btn{background:var(--panel);border:1px solid var(--border);color:var(--txt);padding:5px 11px;border-radius:7px;font-size:12px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)}
+  .btn .k{color:var(--accent2)}
+  /* token 汇总条 */
+  .summary{display:flex;align-items:center;gap:20px;padding:9px 16px;border-bottom:1px solid var(--border);background:var(--bg);flex-wrap:wrap}
+  .summary .blk{display:flex;align-items:center;gap:8px}
+  .summary .lab{color:var(--muted);font-size:11px}
+  .summary .big{font-family:var(--mono);font-size:15px;color:var(--txt);font-weight:600}
+  .summary .big.cost{color:var(--ok)}
+  .summary .iobar{width:130px;height:9px;border-radius:5px;overflow:hidden;display:flex;background:var(--panel2)}
+  .summary .iobar i{background:#44557a}.summary .iobar o{background:var(--accent2)}
+  .summary .mdl{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .lgd{display:inline-flex;gap:3px;align-items:center;font-size:10px;color:var(--muted)}.lgd b{width:8px;height:8px;border-radius:2px;display:inline-block}
+  /* 行内 token 条 */
+  .tokcell{width:128px;flex:none;display:flex;align-items:center;gap:7px;justify-content:flex-end;font-family:var(--mono);font-size:11px}
+  .tbar{display:inline-flex;height:8px;width:56px;background:var(--bg);border-radius:3px;overflow:hidden;justify-content:flex-start}
+  .tbar i{background:#44557a}.tbar o{background:var(--accent2)}
+  .tnum{min-width:38px;text-align:right;color:var(--txt)}.tnum.dim{color:var(--dim)}
+  /* 步骤流卡片：每一步 输入→输出 */
+  .stream{padding:14px 20px}
+  .scard{position:relative;padding:0 0 16px 24px;border-left:2px solid var(--border);margin-left:6px}
+  .scard:last-child{border-left-color:transparent}
+  .scard .sdot{position:absolute;left:-7px;top:3px;width:12px;height:12px;border-radius:50%;border:2px solid var(--bg)}
+  .scard .shd{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+  .scard .snm{font-size:13px;color:var(--txt);font-weight:600}
+  .scard .smeta{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .iorow{display:grid;grid-template-columns:1fr 16px 1fr;gap:8px;align-items:stretch}
+  .iobox{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 11px;font-size:12px;line-height:1.6;white-space:pre-wrap;max-height:230px;overflow:auto}
+  .iobox .cap{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;position:sticky;top:0;background:var(--bg)}
+  .iobox.in{border-left:3px solid #44557a}.iobox.out{border-left:3px solid var(--accent2)}
+  .iobox.err{border-left:3px solid var(--err);color:#ff9b91;font-family:var(--mono);font-size:11px}
+  .ioarrow{display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:15px}
+  /* 线程重建 */
+  .thchip{cursor:pointer;color:var(--accent2);font-family:var(--mono)}.thchip:hover{text-decoration:underline}
+  .thlink{cursor:pointer;color:var(--accent2);text-decoration:underline dotted}.thlink:hover{color:#a98cff}
+  .thmodal{display:none;position:fixed;inset:0;background:rgba(5,8,12,.68);z-index:50;align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+  .thpanel{width:700px;max-width:92vw;max-height:84vh;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.55);display:flex;flex-direction:column}
+  .thhd{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:9px;font-size:14px;font-weight:600;flex-wrap:wrap}
+  .thhd button{margin-left:auto;background:none;border:none;color:var(--muted);font-size:17px;cursor:pointer}
+  .thsub{font-size:11px;color:var(--muted);font-weight:400;width:100%;margin-top:2px}
+  .thbody{padding:18px 20px 8px;overflow:auto}
+  .turn{position:relative;display:flex;gap:14px;padding:0 0 18px 2px;cursor:pointer}
+  .turn::before{content:'';position:absolute;left:7px;top:15px;bottom:-3px;width:2px;background:var(--border)}
+  .turn:last-child::before{display:none}
+  .turn:hover .tcol{border-color:var(--accent2);background:var(--panel2)}
+  .tdot{width:14px;height:14px;border-radius:50%;flex:none;margin-top:2px;z-index:1;border:3px solid var(--panel)}
+  .tdot.ok{background:var(--ok)}.tdot.err{background:var(--err)}.tdot.run{background:var(--run);animation:pulse 1.6s infinite}
+  .tcol{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:11px 13px;transition:.12s}
+  .trow1{font-size:12px;color:var(--muted);margin-bottom:7px;font-family:var(--mono)}.trow1 b{color:var(--txt);font-family:-apple-system,sans-serif}
+  .turn .q{font-size:13px;color:var(--txt);margin-bottom:6px}
+  .turn .a{font-size:12.5px;color:var(--muted);margin-bottom:7px;line-height:1.55}
+  .turn .tm{font-family:var(--mono);font-size:11px;color:var(--dim)}
+  /* 纯瀑布 = 火焰图（深度 × 时间，嵌套时间块） */
+  .flame{padding:10px 16px 18px}
+  .flevel{position:relative;height:23px;margin-bottom:3px}
+  .fblk{position:absolute;top:0;height:21px;border-radius:3px;overflow:hidden;cursor:pointer;display:flex;align-items:center;padding:0 6px;min-width:3px;opacity:.92;transition:opacity .1s}
+  .fblk:hover{opacity:1;box-shadow:0 0 0 1px var(--txt) inset}
+  .fblk.fsel{box-shadow:0 0 0 2px #fff inset}
+  .flbl{font-size:10.5px;color:#fff;white-space:nowrap;overflow:hidden;text-shadow:0 1px 2px rgba(0,0,0,.45);font-weight:500}
+  .fblk.b-chain .flbl,.fblk.b-retr .flbl{color:#0d1117;text-shadow:none}
+  .fhint{padding:2px 16px 10px;font-size:11px;color:var(--dim)}
+  .tree{flex:1;overflow:auto;padding:8px 0}
+  /* waterfall ruler */
+  .ruler{display:flex;font-size:10px;color:var(--dim);font-family:var(--mono);padding:2px 16px 6px 16px;border-bottom:1px solid var(--border);gap:0}
+  .ruler span{flex:1;text-align:left;border-left:1px solid var(--border);padding-left:4px}
+  .ruler span:first-child{border:none}
+  /* span row */
+  .srow{display:flex;align-items:center;height:30px;padding-right:14px;cursor:pointer;position:relative;font-size:12.5px}
+  .srow:hover{background:var(--panel2)}
+  .srow.sel{background:rgba(91,141,239,.12)}
+  .srow.crit::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--warn)}
+  .sname{display:flex;align-items:center;gap:7px;width:300px;flex:none;white-space:nowrap;overflow:hidden}
+  .twig{color:var(--dim);font-family:var(--mono);user-select:none}
+  .caret{width:12px;color:var(--muted);cursor:pointer;display:inline-block;text-align:center}
+  .kind{font-size:10px;padding:1px 6px;border-radius:4px;font-family:var(--mono);flex:none}
+  .k-llm{color:var(--llm);background:rgba(124,92,255,.13)} .k-tool{color:var(--tool);background:rgba(91,141,239,.13)}
+  .k-chain{color:var(--chain);background:rgba(210,153,34,.13)} .k-retr{color:var(--retr);background:rgba(63,185,80,.13)}
+  .k-agent{color:var(--agent);background:rgba(232,121,201,.13)}
+  .slabel{overflow:hidden;text-overflow:ellipsis}
+  /* waterfall bar */
+  .wf{flex:1;position:relative;height:100%;margin:0 12px}
+  .bar{position:absolute;top:9px;height:12px;border-radius:3px;min-width:3px}
+  .bar.b-llm{background:var(--llm)} .bar.b-tool{background:var(--tool)} .bar.b-chain{background:var(--chain)}
+  .bar.b-retr{background:var(--retr)} .bar.b-agent{background:linear-gradient(90deg,var(--agent),var(--accent2))}
+  .bar.b-err{background:var(--err)!important;animation:none}
+  .scost{width:64px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .scost b{color:var(--txt);font-weight:500}
+  .sdur{width:62px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .errchip{font-size:10px;color:var(--err);border:1px solid rgba(240,88,75,.4);padding:0 5px;border-radius:4px}
+  /* detail pane */
+  .dsec{padding:12px 16px;border-bottom:1px solid var(--border)}
+  .dsec h4{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:9px;font-weight:600}
+  .kv{display:flex;justify-content:space-between;font-size:12px;padding:3px 0}
+  .kv .k{color:var(--muted)} .kv .v{font-family:var(--mono);color:var(--txt)}
+  .io{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px;font-size:12.5px;
+    line-height:1.6;white-space:pre-wrap;color:var(--txt);max-height:200px;overflow:auto}
+  .io.lazy{color:var(--dim);font-style:italic;cursor:pointer;text-align:center;padding:14px}
+  .errbox{background:rgba(240,88,75,.08);border:1px solid rgba(240,88,75,.3);border-radius:7px;padding:10px;
+    font-family:var(--mono);font-size:11.5px;color:#ff9b91;white-space:pre-wrap}
+  /* similar panel */
+  .sim{padding:10px 16px}
+  .simitem{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:7px;cursor:pointer;background:var(--bg)}
+  .simitem:hover{border-color:var(--accent2)}
+  .score{font-family:var(--mono);font-size:11px;color:#fff;background:linear-gradient(90deg,var(--accent2),var(--accent));padding:2px 7px;border-radius:5px;flex:none}
+  .simn{font-size:12px;color:var(--txt);overflow:hidden}
+  .simn small{color:var(--muted);font-size:10px}
+  .tag{font-size:10px;color:var(--muted);background:var(--panel2);border:1px solid var(--border);padding:1px 6px;border-radius:4px}
+  .hl{color:var(--accent2);font-weight:600}
+  /* live banner */
+  .live{margin:10px 16px;padding:8px 12px;border:1px solid rgba(45,212,191,.35);background:rgba(45,212,191,.07);
+    border-radius:8px;font-size:12px;color:var(--run);display:flex;align-items:center;gap:8px}
+  .scroll::-webkit-scrollbar{width:9px;height:9px}.scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
+  *::-webkit-scrollbar{width:9px;height:9px}*::-webkit-scrollbar-thumb{background:#26303f;border-radius:5px}*::-webkit-scrollbar-track{background:transparent}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="logo"><b>yiTrace</b><small>Agent 可观测 · 原型</small></div>
+    <div class="search">
+      <span class="ic">🔍</span>
+      <input id="sq" placeholder='中文语义搜索：例如「理财顾问绕过合规检查」「保本话术」…' value="">
+      <span class="badge">语义召回</span>
+    </div>
+    <div class="ctx">
+      <span class="pill">租户 <b style="color:var(--txt)">招商银行·风控</b></span>
+      <span class="pill">项目 <b style="color:var(--txt)">data-agent</b></span>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- LEFT: trace list -->
+    <div class="pane list scroll">
+      <div class="ph">Trace 列表 <span id="lcnt" style="color:var(--dim)"></span></div>
+      <div class="filters">
+        <span class="f on">全部</span><span class="f">错误</span><span class="f">运行中</span>
+        <span class="f">耗时&gt;5s</span><span class="f">成本&gt;$0.1</span><span class="f">已标注</span>
+      </div>
+      <div id="tlist"></div>
+    </div>
+
+    <!-- CENTER: tree / waterfall -->
+    <div class="center">
+      <div class="toolbar">
+        <div>
+          <div class="tt" id="ctitle">—</div>
+          <div class="sub" id="csub"></div>
+        </div>
+        <button class="btn" onclick="alert('打开 SQL 面板：\\nSELECT * FROM spans WHERE semantic_match(\\'保本话术\\') AND NOT EXISTS(compliance_node) …\\n（原型占位）')">SQL 面板 <span class="k">⌘K</span></button>
+        <div class="seg"><button class="on" id="vtree" onclick="setView('tree')">树+瀑布</button><button id="vstream" onclick="setView('stream')">步骤流·输入→输出</button><button id="vwf" onclick="setView('wf')">纯瀑布</button></div>
+      </div>
+      <div class="summary" id="summary"></div>
+      <div class="ruler" id="ruler"></div>
+      <div class="tree scroll" id="tree"></div>
+    </div>
+
+    <!-- RIGHT: span detail + similar -->
+    <div class="pane detail scroll">
+      <div class="ph">Span 详情 <span style="color:var(--dim)">大字段晚物化</span></div>
+      <div id="detail"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 线程重建弹窗：同会话多条 trace 串成时间线 -->
+<div class="thmodal" id="thmodal" onclick="if(event.target===this)closeThread()">
+  <div class="thpanel">
+    <div class="thhd">🧵 线程重建 · <span id="thid" style="font-family:var(--mono);color:var(--accent2)"></span><span id="thmeta"></span><button onclick="closeThread()">✕</button>
+      <div class="thsub">同一会话（thread_id）跨多条 trace 的多轮对话 —— 引擎 <b>q.getThread(threadId)</b> 按时序串联。点某轮跳进该条 trace 的树。</div>
+    </div>
+    <div class="thbody" id="thbody"></div>
+  </div>
+</div>
+
+<script>
+/* ====== 假数据：AgenticData 风格的数据分析 agent trace ====== */
+const KIND={llm:['LLM','k-llm','b-llm'],tool:['TOOL','k-tool','b-tool'],chain:['CHAIN','k-chain','b-chain'],
+  retriever:['RETR','k-retr','b-retr'],agent:['AGENT','k-agent','b-agent']};
+// span: {id,kind,name,start,dur,in,out,model,itok,otok,cost,status,crit,children,error}
+const T1={
+  id:'4f9a-7e21', name:'销售异常分析', status:'ok', dur:8420, cost:0.142, spans:32, started:'2026-06-17 09:14:03', thread:'sess-8821',
+  root:{id:'sp01',kind:'agent',name:'agent.workflow · 销售异常分析',start:0,dur:8420,model:'',cost:0.142,status:'ok',crit:true,
+    in:'用户：分析 2026Q1 各区域销售额，找出环比异常的区域，并给出可能原因。',
+    out:'已完成。检出 2 个环比异常区域：华北（-23.4%，疑似渠道流失）、西南（+58.1%，疑似促销活动）。详见报告。',
+    children:[
+      {id:'sp02',kind:'chain',name:'Planner · 任务分解',start:120,dur:980,cost:0.011,status:'ok',crit:true,
+        in:'目标：找出 Q1 各区域销售额环比异常的区域并解释原因。',
+        out:'计划(3步)：①查询各区域 Q1 与 Q4 销售额；②计算环比并做 3σ 异常检测；③对异常区域做画像归因。',
+        children:[{id:'sp03',kind:'llm',name:'规划生成',start:140,dur:920,model:'Qwen2.5-72B',itok:512,otok:186,cost:0.011,status:'ok',crit:true,
+          in:'系统：你是数据分析规划器…\n用户：找出 Q1 各区域销售额环比异常的区域',out:'{"steps":["query_regional_sales","detect_anomaly_3sigma","profile_attribution"]}'}]},
+      {id:'sp10',kind:'agent',name:'SuperAgent · 执行编排',start:1140,dur:7240,cost:0.131,status:'ok',crit:true,
+        in:'执行 3 步计划',out:'3 步全部完成，2 个异常区域已归因。',
+        children:[
+          {id:'sp11',kind:'tool',name:'nl2sql · 查各区域季度销售额',start:1180,dur:1640,cost:0.024,status:'ok',crit:true,
+            in:'查 2026 Q1 与 Q4 各区域销售额',out:'返回 7 行（华北/华东/华南/西南/西北/东北/华中），列：region, q1_sales, q4_sales',
+            children:[
+              {id:'sp12',kind:'retriever',name:'schema 向量检索 · 相关表/列',start:1200,dur:240,cost:0.001,status:'ok',
+                in:'各区域 季度 销售额',out:'命中表 fact_sales(region,quarter,amount)、dim_region；相似度 top-3'},
+              {id:'sp13',kind:'llm',name:'NL2SQL 生成',start:1450,dur:760,model:'Qwen2.5-72B',itok:1840,otok:142,cost:0.022,status:'ok',crit:true,
+                in:'schema：fact_sales(region,quarter,amount)…\n问题：各区域 Q1/Q4 销售额',
+                out:"SELECT region, SUM(CASE WHEN quarter='2026Q1' THEN amount END) q1_sales,\n       SUM(CASE WHEN quarter='2025Q4' THEN amount END) q4_sales\nFROM fact_sales GROUP BY region;"},
+              {id:'sp14',kind:'tool',name:'执行 SQL',start:2220,dur:560,cost:0.001,status:'ok',crit:true,
+                in:'SELECT region, SUM(...) … GROUP BY region',out:'7 rows · 12ms · [华北 q1=8.2M q4=10.7M] [华东 …] …'}]},
+          {id:'sp20',kind:'tool',name:'python_executor · 环比 + 3σ 异常检测',start:2900,dur:2980,cost:0.038,status:'ok',crit:true,
+            in:'对 7 区域计算 (q1-q4)/q4 环比，做 3σ 异常检测',out:'异常区域：华北(-23.4%)、西南(+58.1%)',
+            children:[
+              {id:'sp21',kind:'tool',name:'代码执行（第1次）',start:2920,dur:340,cost:0,status:'error',crit:true,
+                in:"df['ratio']=(df.q1_sales-df.q4_sale)/df.q4_sale  # 列名拼写",
+                out:'',error:"KeyError: 'q4_sale'\n  File <cell>, line 1, in <module>\n    df['ratio']=(df.q1_sales-df.q4_sale)/df.q4_sale\nKeyError: 'q4_sale' — 列名应为 'q4_sales'"},
+              {id:'sp22',kind:'llm',name:'自纠 · 修正列名',start:3280,dur:680,model:'Qwen2.5-72B',itok:640,otok:88,cost:0.009,status:'ok',crit:true,
+                in:'上一步报错 KeyError: q4_sale。请修正。',out:"列名应为 'q4_sales'，已修正：df['ratio']=(df.q1_sales-df.q4_sales)/df.q4_sales"},
+              {id:'sp23',kind:'tool',name:'代码执行（重试）',start:3980,dur:1860,cost:0.029,status:'ok',crit:true,
+                in:"df['ratio']=(df.q1_sales-df.q4_sales)/df.q4_sales\nz=(df.ratio-df.ratio.mean())/df.ratio.std()\ndf[abs(z)>2]",
+                out:'2 rows · 华北 ratio=-0.234 z=-2.1 · 西南 ratio=+0.581 z=2.4'}]},
+          {id:'sp30',kind:'tool',name:'semantic_join · 异常区域 × 区域画像',start:5920,dur:980,cost:0.012,status:'ok',
+            in:'华北/西南 × 区域运营画像（渠道、促销、客群）',out:'华北：Q1 主力渠道商流失 2 家；西南：Q1 有「焕新季」促销'},
+          {id:'sp40',kind:'llm',name:'总结生成报告',start:6960,dur:1420,model:'Qwen2.5-72B',itok:2240,otok:512,cost:0.046,status:'ok',crit:true,
+            in:'异常：华北-23.4%(渠道流失)、西南+58.1%(促销)。生成分析报告。',
+            out:'## Q1 区域销售异常分析\n\n**华北 -23.4%**：环比显著下滑，3σ 检测为异常。归因：Q1 主力渠道商流失 2 家，建议核查渠道健康度。\n\n**西南 +58.1%**：环比大幅上升。归因：Q1 开展「焕新季」促销，属预期内增长，无需预警。'}
+        ]}
+    ]}
+};
+const T2={ id:'a1c8-3f70', name:'华东华南客户结构对比', status:'run', dur:3100, cost:0.031, spans:'9+', started:'刚刚', thread:'sess-9032', live:true,
+  root:{id:'r2',kind:'agent',name:'agent.workflow · 客户结构对比',start:0,dur:3100,cost:0.031,status:'run',crit:true,
+    in:'用户：帮我对比华东和华南的客户结构（年龄/客群/客单价）。',out:'（运行中…）',
+    children:[
+      {id:'r2a',kind:'chain',name:'Planner · 任务分解',start:90,dur:820,cost:0.009,status:'ok',crit:true,in:'对比华东/华南客户结构',out:'计划：①取两区客户维表；②分组聚合；③对比'},
+      {id:'r2b',kind:'tool',name:'nl2sql · 取客户维度数据',start:960,dur:2140,cost:0.022,status:'run',crit:true,in:'华东/华南 客户 年龄/客群/客单价',out:'（执行中… 已生成 SQL，等待结果）'}
+    ]}
+};
+const T3={ id:'90b2-11ea', name:'本月总GMV查询', status:'ok', dur:1240, cost:0.008, spans:4, started:'2026-06-17 08:51', thread:'sess-8810',
+  root:{id:'r3',kind:'agent',name:'agent.workflow · GMV 查询',start:0,dur:1240,cost:0.008,status:'ok',crit:true,
+    in:'用户：本月总 GMV 是多少？',out:'2026 年 6 月（截至今日）总 GMV：¥48,210,773。',
+    children:[
+      {id:'r3a',kind:'tool',name:'nl2sql · 本月 GMV',start:80,dur:1080,cost:0.008,status:'ok',crit:true,in:'本月总 GMV',out:'¥48,210,773',
+        children:[{id:'r3b',kind:'llm',name:'NL2SQL 生成',start:120,dur:560,model:'Qwen2.5-72B',itok:420,otok:64,cost:0.007,status:'ok',crit:true,in:'本月总 GMV',out:"SELECT SUM(amount) FROM orders WHERE month='2026-06';"},
+          {id:'r3c',kind:'tool',name:'执行 SQL',start:700,dur:400,cost:0.001,status:'ok',crit:true,in:'SELECT SUM(amount)…',out:'48210773'}]}
+    ]}
+};
+/* ===== 轨迹生成器：更真实更大的假数据（银行·风控域，深浅不一） ===== */
+const M='Qwen2.5-72B', M2='Qwen2.5-7B';
+let _gid=4096; const gid=()=>(_gid++).toString(16).padStart(4,'0');
+let _sid=2000; const sid=()=>'sp'+(_sid++).toString(36);
+let _seed=20260617; const R=()=>(_seed=(_seed*9301+49297)%233280)/233280; const ri=(a,b)=>a+Math.floor(R()*(b-a+1));
+const cst=(it,ot)=>Math.round((it*8e-7+ot*4e-6)*1000)/1000;
+function llm(name,inn,out,it,ot,o={}){return{kind:'llm',name,model:o.m||M,in:inn,out,itok:it,otok:ot,ownCost:cst(it,ot),status:o.st||'ok',crit:o.crit!==false,_dur:o.dur||ri(500,1600)};}
+function tool(name,inn,out,o={}){return{kind:'tool',name,in:inn,out,ownCost:o.cost!=null?o.cost:0.001,status:o.st||'ok',crit:o.crit!==false,_dur:o.dur||ri(300,1500),error:o.error,children:o.children};}
+function retr(name,inn,out){return{kind:'retriever',name,in:inn,out,ownCost:0.001,status:'ok',crit:false,_dur:ri(120,420)};}
+function nl2sql(title,q,sql,res){return tool('nl2sql · '+title,q,res,{cost:0.001,children:[
+  retr('schema 向量检索 · 相关表/列',q,'命中表/列 top-3（相似度 0.7~0.9）'),
+  llm('NL2SQL 生成','schema：…\n问题：'+q,sql,ri(1200,2300),ri(80,200)),
+  tool('执行 SQL',sql,res,{cost:0.001,dur:ri(15,640)})]});}
+function py(title,code,res,err){const k=[llm('代码生成','任务：'+title,code,ri(600,1500),ri(120,320))];
+  if(err){k.push(tool('代码执行（第1次）',code,'',{st:'error',cost:0,dur:ri(180,520),error:err}));
+    k.push(llm('自纠 · 修正错误','上一步报错：'+err.split('\n')[0]+'，请修正','已定位并修正：'+title,ri(420,820),ri(60,150)));
+    k.push(tool('代码执行（重试）',code+'  # fixed',res,{cost:0.001,dur:ri(800,2100)}));}
+  else k.push(tool('代码执行',code,res,{cost:0.001,dur:ri(500,1900)}));
+  return tool('python_executor · '+title,'执行：'+title,res,{cost:0,children:k});}
+function react(title,iters,thoughts){const k=[];for(let i=0;i<iters;i++){
+  k.push(llm('思考 #'+(i+1),'vex.thought 当前进展评估…',(thoughts&&thoughts[i])||('需要进一步获取数据，下一步调用工具 #'+(i+1)),ri(280,640),ri(40,130),{m:M2,crit:false}));
+  k.push(tool('工具调用 #'+(i+1),'vex.tool.intent：'+title,'返回观察结果 → 更新状态',{cost:0.001,crit:false,dur:ri(200,900)}));}
+  return{kind:'chain',name:'ReAct 推理循环 · '+title,in:title,out:iters+' 轮思考-行动-观察迭代完成',ownCost:0,status:'ok',crit:true,children:k};}
+function buildStep(s){
+  if(s.t==='nl2sql')return nl2sql(s.title,s.q||s.title,s.sql||'SELECT … FROM … WHERE …',s.res||'返回结果');
+  if(s.t==='py')return py(s.title,s.code||"df['x']=df.a/df.b",s.res||'计算完成',s.err);
+  if(s.t==='react')return react(s.title,s.iters||3,s.th);
+  if(s.t==='join')return tool('semantic_join · '+s.title,s.title,s.res||'关联完成',{cost:0.012,dur:ri(600,1300)});
+  if(s.t==='retr')return retr('知识库检索 · '+s.title,s.title,s.res||'命中 top-k');
+  if(s.t==='api')return tool('api_call · '+s.title,s.title,s.res||'200 OK',{cost:0.002});
+  if(s.t==='run')return tool('python_executor · '+s.title,'执行：'+s.title,'（执行中…）',{cost:0,st:'run',children:[llm('代码生成','任务：'+s.title,'…',ri(500,900),ri(100,200)),tool('代码执行',s.title,'（执行中…）',{st:'run',cost:0,dur:ri(900,1800)})]});
+  return tool(s.title,s.title,s.res||'完成',{});}
+function build(spec){
+  const steps=spec.steps;
+  const planner={kind:'chain',name:'Planner · 任务分解',in:'目标：'+spec.q,out:'计划('+steps.length+'步)：'+steps.map((s,i)=>(i+1)+'.'+s.title).join('；'),ownCost:0.002,status:'ok',crit:true,
+    children:[llm('规划生成','系统：你是数据分析规划器…\n用户：'+spec.q,'{"steps":'+JSON.stringify(steps.map(s=>s.title))+'}',ri(450,720),ri(120,240))]};
+  const sc=steps.map(buildStep);
+  if(spec.status!=='run')sc.push(llm('总结生成报告','汇总各步结果，生成分析报告','## '+spec.name+'\n\n'+(spec.summary||'分析完成。'),ri(1800,2900),ri(320,720)));
+  const superA={kind:'agent',name:'SuperAgent · 执行编排',in:'执行 '+steps.length+' 步计划',out:spec.status==='run'?'（运行中…）':'各步完成，结果已汇总。',ownCost:0,status:spec.status,crit:true,children:sc};
+  return{kind:'agent',name:'agent.workflow · '+spec.name,in:'用户：'+spec.q,out:spec.status==='run'?'（运行中…）':spec.summary,ownCost:0,status:spec.status,crit:true,children:[planner,superA]};}
+function L(n,t){n.start=t;if(n.children&&n.children.length){let c=t+ri(20,60);for(const ch of n.children){L(ch,c);c=ch.start+ch.dur+ri(15,50);}n.dur=c-t+ri(20,80);}else n.dur=n._dur||ri(200,1200);}
+function AC(n){let c=n.ownCost||0;if(n.children)n.children.forEach(ch=>c+=AC(ch));n.cost=Math.round(c*1000)/1000;return n.cost;}
+function ID(n){n.id=sid();if(n.children)n.children.forEach(ID);}
+function cnt(n){return 1+(n.children?n.children.reduce((s,c)=>s+cnt(c),0):0);}
+function mk(spec){const root=build(spec);L(root,0);AC(root);ID(root);
+  return{id:gid()+'-'+gid(),name:spec.name,status:spec.status,dur:root.dur,cost:root.cost,spans:cnt(root),started:spec.when,thread:spec.thread,live:spec.status==='run',root};}
+
+const SPECS=[
+ {name:'反洗钱可疑交易排查',q:'找出近30天交易金额异常的对公账户（疑似洗钱）',status:'ok',thread:'sess-7701',when:'2026-06-17 10:22',
+  summary:'检出 14 个可疑账户，3 个命中"快进快出"模式，已生成 SAR 建议清单。',
+  steps:[{t:'nl2sql',title:'拉取近30天对公大额交易',q:'近30天对公账户交易明细',sql:"SELECT acct_id,SUM(amount) amt,COUNT(*) cnt\nFROM fact_txn WHERE dt>=date_sub(curdate(),30) AND acct_type='corp'\nGROUP BY acct_id HAVING amt>5000000;",res:'返回 2,418 个账户'},
+   {t:'py',title:'快进快出 + 离群检测',err:"KeyError: 'in_amt'\n  特征列名应为 'inflow' — 已自纠",res:'14 个账户离群（z>3）'},
+   {t:'react',title:'逐可疑账户画像归因',iters:4,th:['先查账户开户与法人信息','关联资金对手方','检索是否命中黑名单/高风险地区','汇总判定可疑等级']},
+   {t:'join',title:'可疑账户 × 黑名单/关联图谱',res:'3 个命中关联交易方'}]},
+ {name:'信用卡逾期率风险分级',q:'统计各信用卡产品的逾期率并按风险分级',status:'ok',thread:'sess-7702',when:'2026-06-17 10:05',
+  summary:'8 款产品中 2 款逾期率>5% 列为高风险，建议收紧授信。',
+  steps:[{t:'nl2sql',title:'各产品逾期率',q:'各信用卡产品逾期率',sql:"SELECT product,SUM(overdue)/SUM(balance) rate FROM card_loan GROUP BY product;",res:'8 行'},
+   {t:'py',title:'风险分级 + 趋势',res:'2 高 / 3 中 / 3 低'}]},
+ {name:'信用卡盗刷共性特征分析',q:'分析近一周信用卡盗刷的共性特征',status:'ok',thread:'sess-7703',when:'2026-06-17 09:48',
+  summary:'盗刷集中在凌晨跨境小额测试交易 + 随后大额，已提炼 5 条规则。',
+  steps:[{t:'nl2sql',title:'拉取确认盗刷样本',q:'近一周标记盗刷的交易',sql:'SELECT * FROM fact_txn WHERE fraud_flag=1 …',res:'返回 312 笔'},
+   {t:'retr',title:'历史盗刷模式知识库',res:'命中 6 类已知模式'},
+   {t:'react',title:'特征挖掘与规则提炼',iters:5,th:['时间分布分析','金额分布分析','商户类目分析','地理位置分析','聚类共性提炼']},
+   {t:'py',title:'规则有效性回测',err:"TypeError: unsupported operand — 时间字段类型不一致，已自纠",res:'5 条规则，覆盖率 83%'},
+   {t:'join',title:'规则 × 存量交易命中',res:'命中 1,204 笔待复核'}]},
+ {name:'理财合规话术检查',q:"哪些理财顾问在'保本'相关咨询中绕过了合规话术检查",status:'ok',thread:'sess-7704',when:'2026-06-17 09:30',
+  summary:'7 名顾问在"保本/刚兑/零风险"咨询中缺失合规话术节点，已生成整改清单。',
+  steps:[{t:'nl2sql',title:'拉取理财咨询会话',q:'近30天理财咨询会话',sql:"SELECT advisor_id,session_id,content FROM advisor_chat WHERE topic LIKE '%理财%';",res:'返回 8,820 条会话'},
+   {t:'react',title:'语义识别"保本"类话术 + 合规节点缺失',iters:3,th:['用语义匹配召回"保本/刚兑/零风险"近义表达','检查每条是否含强制合规话术节点','按顾问聚合缺失率']},
+   {t:'py',title:'缺失率排名',res:'7 名顾问缺失率>30%'}]},
+ {name:'零售业务季度经营分析报告',q:'生成 2026Q1 零售业务经营分析报告',status:'ok',thread:'sess-7705',when:'2026-06-17 08:40',
+  summary:'报告含 AUM/获客/留存/中收 四维，AUM 环比 +6.2%，中收承压。',
+  steps:[{t:'nl2sql',title:'AUM 与客户数',q:'Q1 零售 AUM 与客户数',sql:'SELECT … FROM retail_kpi …',res:'AUM 1.2万亿'},
+   {t:'nl2sql',title:'获客与留存',q:'Q1 获客留存',sql:'SELECT … FROM cust_lifecycle …',res:'获客 38万 / 留存 91%'},
+   {t:'nl2sql',title:'中间业务收入',q:'Q1 中收',sql:'SELECT … FROM fee_income …',res:'中收 -3.1%'},
+   {t:'react',title:'多维归因与图表生成',iters:4},
+   {t:'py',title:'生成图表（matplotlib）',res:'6 张图表'}]},
+ {name:'对公客户主数据去重',q:'清洗并去重对公客户主数据中的重复开户记录',status:'ok',thread:'sess-7706',when:'2026-06-17 08:20',
+  summary:'识别 2,140 组疑似重复（统一社会信用代码+名称模糊匹配），合并建议已生成。',
+  steps:[{t:'nl2sql',title:'拉取对公客户主数据',q:'对公客户主数据',sql:'SELECT * FROM dim_corp_cust;',res:'返回 41万条'},
+   {t:'py',title:'模糊匹配 + 实体消歧',err:"MemoryError: 全量两两比对 OOM — 改为按信用代码分块，已自纠",res:'2,140 组疑似重复'}]},
+ {name:'分行现金需求预测',q:'预测下月各分行的现金需求',status:'ok',thread:'sess-7707',when:'2026-06-16 17:10',
+  summary:'用 7 日均值+季节因子预测，5 家分行需上调备付金。',
+  steps:[{t:'nl2sql',title:'历史现金收付',q:'各分行历史现金收付',sql:'SELECT … FROM cash_flow …',res:'返回 18 分行 × 365 天'},
+   {t:'py',title:'时序预测（Prophet）',res:'下月日均需求预测'},
+   {t:'react',title:'异常分行复核',iters:2}]},
+ {name:'客诉根因聚类',q:'对本月信用卡客诉做根因聚类',status:'ok',thread:'sess-7708',when:'2026-06-16 16:30',
+  summary:'客诉聚为 6 类，"分期费率不透明"占 31%，建议优化告知流程。',
+  steps:[{t:'nl2sql',title:'拉取客诉文本',q:'本月信用卡客诉',sql:'SELECT content FROM complaints …',res:'返回 5,610 条'},
+   {t:'retr',title:'历史客诉标签库',res:'命中已知标签'},
+   {t:'react',title:'embedding 聚类 + 主题命名',iters:3}]},
+ {name:'营销活动 ROI 归因',q:'分析上月"焕新季"营销活动的 ROI 与转化路径',status:'ok',thread:'sess-7709',when:'2026-06-16 15:05',
+  summary:'ROI 2.8，短信触达转化最高，APP push 成本过高建议缩减。',
+  steps:[{t:'nl2sql',title:'活动触达与转化',q:'焕新季触达转化',sql:'SELECT … FROM campaign_log …',res:'返回多渠道数据'},
+   {t:'py',title:'归因模型（首末触+马尔可夫）',err:"ValueError: 转化路径含空值 — 已过滤自纠",res:'各渠道贡献度'}]},
+ {name:'授信审批一致性核查',q:'核查近一周授信审批是否存在与模型评分不一致的人工干预',status:'ok',thread:'sess-7710',when:'2026-06-16 14:20',
+  summary:'发现 23 笔人工提额超模型上限，11 笔无审批备注，已标记复核。',
+  steps:[{t:'nl2sql',title:'拉取审批流水',q:'近一周授信审批',sql:'SELECT … FROM credit_approval …',res:'返回 1,840 笔'},
+   {t:'py',title:'模型分 vs 人工额度差异检测',res:'23 笔异常'},
+   {t:'join',title:'异常审批 × 审批人画像',res:'集中在 3 名审批人'}]},
+ {name:'对公存款流失预警',q:'识别下季度可能流失的对公存款大户',status:'run',thread:'sess-7711',when:'刚刚',
+  steps:[{t:'nl2sql',title:'拉取对公存款余额趋势',q:'对公存款余额趋势',sql:'SELECT … FROM corp_deposit …',res:'返回 6,200 户'},
+   {t:'run',title:'流失概率模型打分'}]},
+ {name:'反欺诈实时规则上线监控',q:'监控新上线 3 条反欺诈规则的实时命中',status:'run',thread:'sess-7703',when:'刚刚',
+  steps:[{t:'nl2sql',title:'拉取历史交易',q:'近90天交易',sql:'SELECT … FROM fact_txn …',res:'返回 4,100万笔'},
+   {t:'run',title:'规则命中率 + 误报率回测'}]},
+ {name:'本月总GMV查询',q:'本月对公结算总笔数和金额是多少',status:'ok',thread:'sess-7713',when:'2026-06-16 11:02',
+  summary:'本月对公结算 218 万笔，金额 ¥1,204 亿。',
+  steps:[{t:'nl2sql',title:'本月对公结算',q:'本月对公结算笔数金额',sql:"SELECT COUNT(*),SUM(amount) FROM settle WHERE month='2026-06' AND type='corp';",res:'218万笔 / ¥1204亿'}]},
+ {name:'高净值客户资产配置诊断',q:'诊断私行客户的资产配置是否过度集中',status:'ok',thread:'sess-7714',when:'2026-06-16 10:15',
+  summary:'127 名私行客户单一资产占比>70%，建议再平衡提示。',
+  steps:[{t:'nl2sql',title:'私行客户持仓',q:'私行客户持仓分布',sql:'SELECT … FROM wealth_holding …',res:'返回 3,400 客户'},
+   {t:'py',title:'集中度（HHI）计算',res:'127 客户过度集中'},
+   {t:'react',title:'再平衡建议生成',iters:2}]},
+ /* —— 同会话后续轮次（演示线程重建）—— */
+ {name:'可疑账户资金链路追踪',q:'对刚才14个可疑账户做资金链路追踪（上下游对手方）',status:'ok',thread:'sess-7701',when:'2026-06-17 10:34',
+  summary:'14 个账户向上追溯到 3 个资金归集户，疑似团伙作案。',
+  steps:[{t:'nl2sql',title:'拉取可疑账户对手方',q:'14个账户的交易对手方',sql:'SELECT counterparty,amount FROM fact_txn WHERE acct_id IN (…);',res:'对手方 86 个'},
+   {t:'react',title:'资金链路图谱遍历',iters:4,th:['构建一跳对手方图','向上追溯资金来源','识别资金归集节点','判定团伙关联']},
+   {t:'join',title:'归集户 × 工商关联图谱',res:'3 个归集户，法人交叉持股'}]},
+ {name:'生成SAR上报材料',q:'为3个高风险归集户生成可疑交易报告（SAR）',status:'ok',thread:'sess-7701',when:'2026-06-17 10:48',
+  summary:'已生成 3 份 SAR，含交易明细、资金链路图、判定依据，待合规复核。',
+  steps:[{t:'retr',title:'SAR 模板与监管要点知识库',res:'命中模板 + 反洗钱法条'},
+   {t:'react',title:'逐户生成报告',iters:3}]},
+ {name:'反欺诈规则历史回测',q:'用刚提炼的5条盗刷规则回测近90天交易',status:'ok',thread:'sess-7703',when:'2026-06-17 10:14',
+  summary:'5 条规则命中率 83%、误报率 1.2%，建议全部上线。',
+  steps:[{t:'nl2sql',title:'拉取近90天交易',q:'近90天交易',sql:'SELECT * FROM fact_txn WHERE dt>=date_sub(curdate(),90);',res:'4,100 万笔'},
+   {t:'py',title:'规则命中 + 误报统计',err:"MemoryError: 全量加载 OOM — 改为按天分批，已自纠",res:'命中率 83% / 误报 1.2%'}]},
+ {name:'盗刷复核工单生成',q:'对命中的1204笔可疑交易生成复核工单并分派',status:'ok',thread:'sess-7703',when:'2026-06-17 10:22',
+  summary:'生成 1,204 张工单，按风险分派至 3 个复核小组。',
+  steps:[{t:'py',title:'工单分派（按风险/区域）',res:'1,204 工单'},
+   {t:'api',title:'推送至工单系统',res:'200 OK · 已创建'}]},
+ {name:'零售季报·中收下滑下钻',q:'下钻分析 Q1 中收下滑 3.1% 的具体原因',status:'ok',thread:'sess-7705',when:'2026-06-17 08:58',
+  summary:'中收下滑主要来自代销基金费率下调（-1.8%）+ 理财规模缩水（-1.1%）。',
+  steps:[{t:'nl2sql',title:'中收分项拆解',q:'Q1 中收分项',sql:'SELECT item,fee FROM fee_income WHERE quarter="2026Q1";',res:'分项数据'},
+   {t:'react',title:'逐项归因',iters:2}]}
+];
+const GEN=SPECS.map(mk);
+const TRACES=[T1,T2,T3,...GEN];
+const SIMILAR=[ // 语义召回结果（选中 T1 时）
+  {score:'0.92',name:'Q4 各区域销售异常排查',meta:'2026-04-02 · ok · $0.118',tag:'同类根因'},
+  {score:'0.87',name:'各区域 GMV 环比下滑分析',meta:'2026-03-15 · ok · $0.094',tag:'高奖励正例'},
+  {score:'0.81',name:'渠道流失导致销量下降归因',meta:'2026-02-28 · ⚠人工接管 · $0.21',tag:'失败案例'},
+];
+
+/* ====== 渲染 ====== */
+let curTrace=T1, curSpan=null, view='tree', maxEnd=8420;
+function flat(node,depth,arr,lastFlags){ // DFS 展平 + 维护树枝
+  node._depth=depth; node._last=lastFlags; arr.push(node);
+  if(node.children&&node._open!==false){ node.children.forEach((c,i)=>flat(c,depth+1,arr,[...lastFlags,i===node.children.length-1])); }
+  return arr;
+}
+function fmt(ms){return ms>=1000?(ms/1000).toFixed(2)+'s':ms+'ms';}
+function tk(n){return n>=1000?(n/1000).toFixed(1)+'k':n;}
+function stats(n,a){a.itok+=n.itok||0;a.otok+=n.otok||0;a.cost+=n.cost||0;a.n++;if(n.model){a.models[n.model]=(a.models[n.model]||0)+1;a.mtok[n.model]=(a.mtok[n.model]||0)+(n.itok||0)+(n.otok||0);}if(n.children)n.children.forEach(c=>stats(c,a));return a;}
+function renderSummary(){
+  const a=stats(curTrace.root,{itok:0,otok:0,cost:0,n:0,models:{},mtok:{}}); const tot=a.itok+a.otok||1;
+  const mdl=Object.keys(a.models).map(m=>`${m} ×${a.models[m]} · ${tk(a.mtok[m])} tok`).join('　|　')||'—';
+  document.getElementById('summary').innerHTML=`
+   <div class="blk"><span class="lab">总 Token</span><span class="big">${(a.itok+a.otok).toLocaleString()}</span></div>
+   <div class="blk"><span class="iobar"><i style="width:${a.itok/tot*130}px"></i><o style="width:${a.otok/tot*130}px"></o></span>
+     <span class="mdl">输入 ${a.itok.toLocaleString()} · 输出 ${a.otok.toLocaleString()}</span>
+     <span class="lgd"><b style="background:#44557a"></b>输入<b style="background:var(--accent2);margin-left:6px"></b>输出</span></div>
+   <div class="blk"><span class="lab">成本</span><span class="big cost">$${(curTrace.cost||a.cost).toFixed(3)}</span></div>
+   <div class="blk"><span class="lab">模型</span><span class="mdl">${mdl}</span></div>`;
+}
+function renderStream(){
+  const all=[]; (function w(n){all.push(n);if(n.children)n.children.forEach(w);})(curTrace.root);
+  const dotc={llm:'var(--llm)',tool:'var(--tool)',chain:'var(--chain)',retriever:'var(--retr)',agent:'var(--agent)'};
+  document.getElementById('tree').innerHTML='<div class="stream">'+all.map(s=>{
+    const k=KIND[s.kind]; const tot=(s.itok||0)+(s.otok||0);
+    const dc=s.status==='error'?'var(--err)':s.status==='run'?'var(--run)':dotc[s.kind];
+    const out=s.status==='error'
+      ?`<div class="iobox err"><div class="cap">错误 ✕ · 触发自纠重试</div>${esc(s.error)}</div>`
+      :`<div class="iobox out"><div class="cap"><span>输出${s.kind==='llm'?' · 思考/生成':''}</span><span>${s.otok?tk(s.otok)+' tok':''}</span></div>${esc(s.out)||'<span style="color:var(--dim)">（运行中…）</span>'}</div>`;
+    return `<div class="scard"><span class="sdot" style="background:${dc}"></span>
+      <div class="shd"><span class="kind ${k[1]}">${k[0]}</span><span class="snm">${s.name}</span>
+        <span class="smeta">${fmt(s.dur)}${tot?' · '+tk(tot)+' tok':''}${s.cost?' · $'+s.cost.toFixed(3):''}${s.model?' · '+s.model:''}</span></div>
+      <div class="iorow">
+        <div class="iobox in"><div class="cap"><span>输入${s.kind==='tool'?' · 入参/意图':''}</span><span>${s.itok?tk(s.itok)+' tok':''}</span></div>${esc(s.in)||'—'}</div>
+        <div class="ioarrow">→</div>${out}
+      </div></div>`;
+  }).join('')+'</div>';
+}
+function renderCenter(){renderRuler();const r=document.getElementById('ruler');
+  if(view==='stream'){r.style.display='none';renderStream();}
+  else if(view==='wf'){r.style.display='flex';renderFlame();}
+  else{r.style.display='flex';renderTree();}}
+function renderFlame(){
+  const all=[]; (function w(n,d){n._d=d;all.push(n);if(n.children)n.children.forEach(c=>w(c,d+1));})(curTrace.root,0);
+  maxEnd=Math.max(curTrace.root.dur||1,1);
+  const maxD=Math.max(0,...all.map(s=>s._d));
+  let html='<div class="fhint">深度 × 时间的嵌套时间块（火焰图）：横=时间轴，纵=调用深度。一眼看时间花在哪条子树、关键路径多深。点块选中。</div><div class="flame">';
+  for(let d=0;d<=maxD;d++){
+    html+='<div class="flevel">';
+    all.filter(s=>s._d===d).forEach(s=>{
+      const left=s.start/maxEnd*100, w=Math.max(s.dur/maxEnd*100,0.3);
+      const k=KIND[s.kind], bc=s.status==='error'?'b-err':k[2], tot=(s.itok||0)+(s.otok||0);
+      html+=`<div class="fblk ${bc} ${curSpan&&curSpan.id===s.id?'fsel':''}" style="left:${left}%;width:${w}%" title="${esc(s.name)} · ${fmt(s.dur)}${tot?' · '+tot+' tok':''}${s.cost?' · $'+s.cost.toFixed(3):''}" onclick="selSpan('${s.id}')"><span class="flbl">${s.name}</span></div>`;
+    });
+    html+='</div>';
+  }
+  document.getElementById('tree').innerHTML=html+'</div>';
+}
+function renderList(){
+  document.getElementById('lcnt').textContent='('+TRACES.length+')';
+  document.getElementById('tlist').innerHTML=TRACES.map(t=>{
+    const cls=t.status==='run'?'run':(t.status==='err'?'err':'ok');
+    return `<div class="titem ${t===curTrace?'sel':''}" onclick="selTrace('${t.id}')">
+      <div class="tname"><span class="dot ${cls}"></span>${t.name}${t.live?'<span class="runtag">● 运行中</span>':''}</div>
+      <div class="tmeta"><span class="thchip" onclick="event.stopPropagation();openThread('${t.thread}')" title="线程重建：串起本会话所有 trace">🧵${t.thread}</span><span>${fmt(t.dur)}</span><span>$${t.cost}</span><span>${t.spans} spans</span></div>
+    </div>`;}).join('');
+}
+function renderRuler(){
+  maxEnd=Math.max(curTrace.root.dur||curTrace.dur||1,1);
+  const r=document.getElementById('ruler');
+  if(view==='wf'){ let h='<span style="flex:0 0 6px;border:none"></span>'; for(let i=0;i<=6;i++){h+=`<span style="flex:1">${fmt(Math.round(maxEnd*i/6))}</span>`;} r.innerHTML=h; return; }
+  let h='<span style="flex:0 0 374px">span</span>';
+  for(let i=0;i<5;i++){ h+=`<span>${fmt(Math.round(maxEnd*i/5))}</span>`; }
+  h+='<span style="flex:0 0 250px;text-align:right;border:none;padding-right:14px">输入▕输出 token · 成本 · 耗时</span>';
+  r.innerHTML=h;
+}
+function renderTree(){
+  maxEnd=Math.max(curTrace.root.dur, curTrace.root.start+curTrace.root.dur);
+  const rows=flat(curTrace.root,0,[],[]);
+  const maxTok=Math.max(1,...rows.map(s=>(s.itok||0)+(s.otok||0)));
+  document.getElementById('tree').innerHTML=rows.map(s=>{
+    const k=KIND[s.kind]; const hasKids=s.children&&s.children.length;
+    let twig=''; for(let d=0;d<s._depth;d++){ twig+= (d===s._depth-1)?(s._last[d]?'└ ':'├ '):(s._last[d]?'　':'│ ');}
+    const caret=hasKids?`<span class="caret" onclick="event.stopPropagation();toggle('${s.id}')">${s._open===false?'▸':'▾'}</span>`:'<span class="caret"></span>';
+    const left=(s.start/maxEnd*100), w=Math.max(s.dur/maxEnd*100,0.4);
+    const barcls=s.status==='error'?'b-err':k[2];
+    const _tot=(s.itok||0)+(s.otok||0);
+    const tcell=_tot?`<span class="tbar" title="输入 ${s.itok||0} / 输出 ${s.otok||0}"><i style="width:${(s.itok||0)/maxTok*56}px"></i><o style="width:${(s.otok||0)/maxTok*56}px"></o></span><span class="tnum">${tk(_tot)}</span>`:`<span class="tbar"></span><span class="tnum dim">·</span>`;
+    return `<div class="srow ${s.crit?'crit':''} ${curSpan&&curSpan.id===s.id?'sel':''}" onclick="selSpan('${s.id}')">
+      <div class="sname">${caret}<span class="twig">${twig}</span><span class="kind ${k[1]}">${k[0]}</span><span class="slabel">${s.name}${s.status==='error'?' <span class="errchip">ERROR</span>':''}${s.status==='run'?' <span class="dot run" style="display:inline-block"></span>':''}</span></div>
+      <div class="wf"><div class="bar ${barcls}" style="left:${left}%;width:${w}%"></div></div>
+      <div class="tokcell">${tcell}</div>
+      <div class="scost">$${(s.cost||0).toFixed(3)}</div>
+      <div class="sdur">${fmt(s.dur)}</div>
+    </div>`;}).join('');
+}
+function findSpan(node,id){ if(node.id===id)return node; if(node.children)for(const c of node.children){const r=findSpan(c,id);if(r)return r;} return null;}
+function toggle(id){const s=findSpan(curTrace.root,id);s._open=s._open===false?true:false;renderTree();}
+function setView(v){view=v;['tree','stream','wf'].forEach(x=>document.getElementById('v'+x).classList.toggle('on',v===x));renderCenter();}
+function selTrace(id){curTrace=TRACES.find(t=>t.id===id);curSpan=null;renderList();
+  document.getElementById('ctitle').textContent=curTrace.name;
+  document.getElementById('csub').innerHTML=`trace ${curTrace.id} · ${curTrace.spans} spans · ${fmt(curTrace.dur)} · $${curTrace.cost} · <span class="thlink" onclick="openThread('${curTrace.thread}')" title="线程重建">🧵 ${curTrace.thread}</span> · ${curTrace.started}`;
+  renderRuler();renderSummary();renderCenter();selSpan(curTrace.root.id);}
+function selSpan(id){curSpan=findSpan(curTrace.root,id);renderCenter();renderDetail();}
+function loadBig(which){curSpan['_show_'+which]=true;renderDetail();}
+function renderDetail(){
+  const s=curSpan; if(!s){document.getElementById('detail').innerHTML='';return;}
+  const k=KIND[s.kind];
+  let live=curTrace.live?`<div class="live"><span class="dot run" style="display:inline-block"></span> 活 trace · 运行中，瀑布每秒自动刷新（span_live() 实时折叠）</div>`:'';
+  let io=(field,label,big)=>{
+    const val=s[field]; if(val===undefined||val==='')return '';
+    if(big&&!s['_show_'+field]) return `<h4>${label}</h4><div class="io lazy" onclick="loadBig('${field}')">⤓ 点击加载大字段（payload CAS · 晚物化，${ (val.length*1.6|0)} bytes）</div>`;
+    return `<h4>${label}</h4><div class="io">${esc(val)}</div>`;
+  };
+  document.getElementById('detail').innerHTML=`
+   ${live}
+   <div class="dsec">
+     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><span class="kind ${k[1]}">${k[0]}</span><b style="font-size:13px">${s.name}</b></div>
+     <div class="kv"><span class="k">span_id</span><span class="v">${s.id}</span></div>
+     ${s.model?`<div class="kv"><span class="k">model</span><span class="v">${s.model}</span></div>`:''}
+     <div class="kv"><span class="k">status</span><span class="v" style="color:${s.status==='error'?'var(--err)':s.status==='run'?'var(--run)':'var(--ok)'}">${s.status}</span></div>
+     <div class="kv"><span class="k">耗时</span><span class="v">${fmt(s.dur)}</span></div>
+     ${s.itok?`<div class="kv"><span class="k">tokens</span><span class="v">${s.itok} in / ${s.otok} out</span></div>`:''}
+     <div class="kv"><span class="k">成本</span><span class="v">$${(s.cost||0).toFixed(4)}</span></div>
+   </div>
+   <div class="dsec">${io('in','输入',(s.in||'').length>600)}</div>
+   <div class="dsec">${s.status==='error'?`<h4>错误</h4><div class="errbox">${esc(s.error)}</div>`:io('out','输出',(s.out||'').length>600)}</div>
+   ${s.id===curTrace.root.id?renderSimilar():''}
+  `;
+}
+function renderSimilar(){
+  return `<div class="dsec"><h4>🧭 语义找相似 trace（招牌·带过滤召回）</h4>
+   <div style="font-size:11px;color:var(--muted);margin-bottom:8px">在 <span class="tag">本租户</span> <span class="tag">近90天</span> <span class="tag">cost&gt;$0.05</span> 内，语义最接近本 trace 的历史轨迹</div>
+   <div class="sim" style="padding:0">${SIMILAR.map(s=>`<div class="simitem"><span class="score">${s.score}</span><div class="simn">${s.name}<br><small>${s.meta}</small></div><span class="tag" style="margin-left:auto;flex:none">${s.tag}</span></div>`).join('')}</div>
+   <div style="font-size:11px;color:var(--dim);margin-top:6px">SmithDB/Langfuse 给不了这个：对象存储+无状态架构与 ANN 哲学冲突。本地 NVMe DiskANN 带过滤召回 → 毫秒级。</div></div>`;
+}
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+/* ===== 线程重建：点 thread → 同会话多条 trace 串成时间线 ===== */
+function tkey(w){if(!w||w==='刚刚')return 1e15;const d=(''+w).match(/(\d{2})-(\d{2})/),m=(''+w).match(/(\d{2}):(\d{2})/);let v=0;if(d)v=(+d[1])*1e6+(+d[2])*1e4;if(m)v+=(+m[1])*100+(+m[2]);return v;}
+function openThread(tid){if(!tid)return;
+  const turns=TRACES.filter(t=>t.thread===tid).sort((a,b)=>tkey(a.started)-tkey(b.started));
+  let totC=0,totS=0,totT=0;turns.forEach(t=>{totC+=t.cost;totS+=(typeof t.spans==='number'?t.spans:parseInt(t.spans)||0);totT+=stats(t.root,{itok:0,otok:0,cost:0,n:0,models:{},mtok:{}}).itok;});
+  document.getElementById('thid').textContent=tid;
+  document.getElementById('thmeta').innerHTML=`<span class="tag">${turns.length} 轮对话</span><span class="tag">合计 $${totC.toFixed(3)}</span><span class="tag">${totS}+ spans</span>`;
+  document.getElementById('thbody').innerHTML=turns.map((t,i)=>{
+    const cls=t.status==='run'?'run':t.status==='err'?'err':'ok';const o=(t.root.out||'');
+    return `<div class="turn" onclick="closeThread();selTrace('${t.id}')">
+      <span class="tdot ${cls}"></span>
+      <div class="tcol">
+        <div class="trow1"><b>第 ${i+1} 轮</b> · ${t.started}${t.live?' · <span style="color:var(--run)">● 运行中</span>':''} · ${t.id} · ${t.name}</div>
+        <div class="q">🧑 ${esc(t.root.in.replace('用户：',''))}</div>
+        <div class="a">🤖 ${esc(o.slice(0,140))}${o.length>140?'…':''}</div>
+        <div class="tm">${t.spans} spans · ${fmt(t.dur)} · $${t.cost}</div>
+      </div></div>`;}).join('');
+  document.getElementById('thmodal').style.display='flex';
+}
+function closeThread(){document.getElementById('thmodal').style.display='none';}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeThread();});
+/* 语义搜索框：演示高亮 */
+document.getElementById('sq').addEventListener('input',e=>{ /* 原型：仅占位 */ });
+/* 活 trace 模拟刷新 */
+setInterval(()=>{ if(curTrace.live){ const b=T2.root.children[1]; if(b.dur<3000){b.dur+=120;T2.dur=b.start+b.dur;if(curTrace===T2){renderCenter();}} } },1200);
+
+renderList();selTrace('4f9a-7e21');
+</script>
+</body>
+</html>

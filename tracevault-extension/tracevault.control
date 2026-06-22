@@ -1,0 +1,9 @@
+# yiTrace 扩展(产物③):Agent trace 专用存储
+# 装进 yiTrace(openGauss 内核家族)实例:CREATE EXTENSION tracevault;
+comment = 'yiTrace: Agent trace 专用存储(表/分区/索引/中文词典/trace 函数/后台维护)'
+default_version = '1.0'
+relocatable = false
+superuser = true
+# 注:yiTrace 的向量(floatvector/diskann/hnsw)与 BM25(fulltext/vex_jieba)是内核内置,
+#     不是扩展,故此处无 requires;本扩展直接使用这些内核能力。
+# module_pathname = '$libdir/tracevault'   # 仅当后台维护用库内 bgworker(需 .so)时启用;v1 默认用外部守护进程,可不带 .so

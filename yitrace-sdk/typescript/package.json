@@ -1,0 +1,13 @@
+{
+  "name": "@yitrace/trace-sdk",
+  "version": "0.0.1",
+  "description": "yiTrace 打点 SDK (TypeScript)",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node test/test_sdk.ts"
+  }
+}

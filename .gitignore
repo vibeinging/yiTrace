@@ -1,0 +1,34 @@
+# Rust 构建产物（巨大，绝不入库）
+target/
+**/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# C / 扩展构建产物（tracevault-extension）
+*.o
+*.so
+*.a
+
+# 运行时/测试落盘产物（WAL / 段 / manifest / 向量文件，正常写在 temp_dir，这里兜底）
+*.wal
+*.vortex
+manifest.dat
+vectors.dat
+
+# 编辑器 / 操作系统
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

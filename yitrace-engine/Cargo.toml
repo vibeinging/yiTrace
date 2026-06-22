@@ -1,0 +1,25 @@
+# yiTrace 自研单机引擎 —— Rust 工作区
+#
+# 这是把以下设计文档落成代码的起点（不是成品，是能编译的骨架）：
+#   docs/design/2026-06-17_yitrace-engine-decision.md          （选型与人月）
+#   docs/design/2026-06-17_yitrace-segment-snapshot-hardened.md（并发/快照/崩溃，本工作区的正确性脊梁）
+#   docs/design/2026-06-18_yitrace-phase0-poc-plan.md          （动手前先验什么）
+#
+# 刻意只用标准库、零外部依赖：保证 `cargo check` 离线可过。
+# 真实实现里该换的外部件已在各处注释标出（arc-swap / crossbeam-epoch / roaring /
+# crc32fast / vortex / datafusion / 团队 BM25·graph_index 的 FFI）。
+[workspace]
+resolver = "2"
+members = [
+    "crates/yt-core",
+    "crates/yt-manifest",
+    "crates/yt-wal",
+    "crates/yt-memtable",
+    "crates/yt-engine",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT"
+rust-version = "1.80"
