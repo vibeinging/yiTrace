@@ -241,6 +241,7 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_opt_u64(b, f.input_tokens);
     put_opt_u64(b, f.output_tokens);
     put_opt_u64(b, f.session_id);
+    put_opt_u64(b, f.tenant_id);
     put_opt_str(b, &f.agent_name);
     put_opt_str(b, &f.tool_name);
     put_opt_str(b, &f.model);
@@ -261,6 +262,7 @@ fn decode_span_fields_from(c: &mut Cur) -> Option<SpanFields> {
     let input_tokens = c.opt_u64()?;
     let output_tokens = c.opt_u64()?;
     let session_id = c.opt_u64()?;
+    let tenant_id = c.opt_u64()?;
     let agent_name = c.opt_str()?;
     let tool_name = c.opt_str()?;
     let model = c.opt_str()?;
@@ -280,6 +282,7 @@ fn decode_span_fields_from(c: &mut Cur) -> Option<SpanFields> {
         input_tokens,
         output_tokens,
         session_id,
+        tenant_id,
         agent_name,
         tool_name,
         model,

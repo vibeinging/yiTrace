@@ -360,6 +360,9 @@ pub mod fold {
         pub output_tokens: Option<u64>,
         /// 会话 id（多轮对话/agent 会话；同一 session 串起多条 trace）。last-non-null。
         pub session_id: Option<u64>,
+        /// 租户 id（**逻辑隔离维度**）：多租户共享一套索引，靠每个查询强制带 tenant 过滤隔离。
+        /// span 创建时定，folded 取 last-non-null。服务层须按鉴权身份给每个查询注入它（见检索路径）。
+        pub tenant_id: Option<u64>,
         /// agent 名（成本/可观测按 agent 下钻）。last-non-null。
         pub agent_name: Option<String>,
         /// 工具名（tool/function call span）。last-non-null。
@@ -401,6 +404,9 @@ pub mod fold {
             }
             if other.session_id.is_some() {
                 self.session_id = other.session_id;
+            }
+            if other.tenant_id.is_some() {
+                self.tenant_id = other.tenant_id;
             }
             if other.agent_name.is_some() {
                 self.agent_name = other.agent_name.clone();
@@ -452,6 +458,7 @@ pub mod fold {
         pub input_tokens: Option<u64>,
         pub output_tokens: Option<u64>,
         pub session_id: Option<u64>,
+        pub tenant_id: Option<u64>,
         pub agent_name: Option<String>,
         pub tool_name: Option<String>,
         pub model: Option<String>,
@@ -485,6 +492,9 @@ pub mod fold {
             }
             if p.session_id.is_some() {
                 self.session_id = p.session_id;
+            }
+            if p.tenant_id.is_some() {
+                self.tenant_id = p.tenant_id;
             }
             if p.agent_name.is_some() {
                 self.agent_name = p.agent_name.clone();
@@ -540,6 +550,7 @@ pub mod fold {
             let mut input_tokens = None;
             let mut output_tokens = None;
             let mut session_id = None;
+            let mut tenant_id = None;
             let mut agent_name: Option<String> = None;
             let mut tool_name: Option<String> = None;
             let mut model: Option<String> = None;
@@ -567,6 +578,9 @@ pub mod fold {
                 }
                 if e.fields.session_id.is_some() {
                     session_id = e.fields.session_id;
+                }
+                if e.fields.tenant_id.is_some() {
+                    tenant_id = e.fields.tenant_id;
                 }
                 if e.fields.agent_name.is_some() {
                     agent_name = e.fields.agent_name.clone();
@@ -604,6 +618,7 @@ pub mod fold {
                 input_tokens,
                 output_tokens,
                 session_id,
+                tenant_id,
                 agent_name,
                 tool_name,
                 model,
