@@ -239,56 +239,116 @@ mod tests {
         hit as f32 / truth.len() as f32
     }
 
-    #[test]
-    fn in_graph_filter_recovers_recall_that_post_filter_loses() {
-        // 红队最大翻车点的实证:选择性谓词下,进图过滤的召回 ≫ 事后过滤。
-        let idx = GraphAnnIndex::new(12, 48);
-        let mut rng = Lcg(0x1234_5678);
-        let dim = 12;
-        let n = 800u64;
+    /// 一组选择性下的召回测量结果（多查询点平均 + 最差）。
+    struct RecallStat {
+        selectivity: f64,
+        match_count: usize,
+        post_mean: f32,
+        in_mean: f32,
+        in_worst: f32,
+    }
 
-        // 800 个点;约 8% 打上 label=1（稀疏谓词:只搜这部分）。label 用 span_id 的奇偶编码:
-        // 这里直接把"命中"编进 trace_id：trace_id=1 表示命中、=0 表示不命中。
+    /// 建一张 n 点的图,约 1/`one_in` 的点打 label（trace_id==1）；在多个命中点上各跑一次召回,
+    /// 返回 post-filter / in-graph 的均值与 in-graph 最差值。`seed` 让每组选择性用不同随机流。
+    fn measure_recall(n: u64, one_in: u64, seed: u64) -> RecallStat {
+        let idx = GraphAnnIndex::new(12, 48);
+        let mut rng = Lcg(seed);
+        let dim = 12;
         let mut matching: Vec<(u64, u64)> = Vec::new();
         for i in 0..n {
             let v = rng.vec(dim);
-            let is_match = i % 12 == 0; // ~8.3% 命中
+            let is_match = i % one_in == 0;
             let trace_id = if is_match { 1 } else { 0 };
-            idx.index_embedding(trace_id, i, v.clone());
+            idx.index_embedding(trace_id, i, v);
             if is_match {
                 matching.push((trace_id, i));
             }
         }
-        assert!(matching.len() > 30, "命中集要够大才有统计意义");
-
-        // 谓词:只要命中的点（trace_id==1）。
         let filter = |t: u64, _s: u64| t == 1;
-
-        // 查询点取某个命中点附近（加点扰动），这样它的图邻域里多是不命中的点 —— 正是 post-filter 崩的场景。
-        let probe_key = matching[matching.len() / 2];
-        let probe_vec = {
-            let st = idx.state.lock().unwrap();
-            let base = st.nodes.iter().find(|node| node.key == probe_key).unwrap().vec.clone();
-            base
-        };
-
         let k = 10;
-        let truth = idx.exact_filtered_topk(&probe_vec, k, &filter);
-        let post = idx.search_postfilter(&probe_vec, k, 48, &filter);
-        let ingraph = idx.search_ingraph(&probe_vec, k, 48, &filter);
 
-        let r_post = recall(&post, &truth);
-        let r_in = recall(&ingraph, &truth);
-        eprintln!("[带过滤ANN召回] post-filter={r_post:.2}  in-graph={r_in:.2}  (命中集={})", matching.len());
+        // 多个查询点：沿命中集均匀取 8 个（不同密度的邻域），各自的向量当查询。避免"挑一个好点"。
+        let probes = 8usize.min(matching.len());
+        let mut post_sum = 0.0f32;
+        let mut in_sum = 0.0f32;
+        let mut in_worst = 1.0f32;
+        for p in 0..probes {
+            let probe_key = matching[(matching.len() - 1) * p / probes.max(1)];
+            let probe_vec = {
+                let st = idx.state.lock().unwrap();
+                st.nodes.iter().find(|node| node.key == probe_key).unwrap().vec.clone()
+            };
+            let truth = idx.exact_filtered_topk(&probe_vec, k, &filter);
+            let r_post = recall(&idx.search_postfilter(&probe_vec, k, 48, &filter), &truth);
+            let r_in = recall(&idx.search_ingraph(&probe_vec, k, 48, &filter), &truth);
+            post_sum += r_post;
+            in_sum += r_in;
+            in_worst = in_worst.min(r_in);
+        }
+        let d = probes.max(1) as f32;
+        RecallStat {
+            selectivity: 1.0 / one_in as f64,
+            match_count: matching.len(),
+            post_mean: post_sum / d,
+            in_mean: in_sum / d,
+            in_worst,
+        }
+    }
 
-        // 实测结论:进图过滤召回明显高于事后过滤,且自身召回够用。
-        assert!(r_in > r_post, "in-graph({r_in}) 必须高于 post-filter({r_post})");
-        assert!(r_in >= 0.8, "in-graph 召回应 ≥0.8,实测 {r_in}");
-        // post-filter 在这个稀疏谓词下明显偏低（留余量,不卡死具体值）。
-        assert!(r_post <= 0.6, "post-filter 在稀疏谓词下召回应明显偏低,实测 {r_post}");
+    #[test]
+    fn in_graph_filter_recovers_recall_across_selectivities() {
+        // 红队最大翻车点的实证,**表驱动**:多组选择性 × 每组多查询点平均,报均值+最差,不靠单点。
+        // 结论要稳:每组里 in-graph 召回 ≥ post-filter,且越稀疏（谓词选择性越高）post-filter 崩得越狠。
+        // one_in: 100→1%、20→5%、10→10%、5→20%。每组换一个随机种子。
+        let cases = [(100u64, 0xA11Cu64), (20, 0xB22D), (10, 0xC33E), (5, 0xD44F)];
+        let n = 800u64;
+        let mut stats: Vec<RecallStat> = Vec::new();
+        for (one_in, seed) in cases {
+            let s = measure_recall(n, one_in, seed);
+            eprintln!(
+                "[带过滤ANN召回] 选择性≈{:.0}%  命中集={:>3}  post-filter 均值={:.2}  in-graph 均值={:.2} 最差={:.2}",
+                s.selectivity * 100.0,
+                s.match_count,
+                s.post_mean,
+                s.in_mean,
+                s.in_worst
+            );
+            // 每组：in-graph 均值不低于 post-filter（进图过滤至少不输事后过滤）。
+            assert!(
+                s.in_mean >= s.post_mean,
+                "选择性 {:.0}%: in-graph 均值({:.2}) 应 ≥ post-filter 均值({:.2})",
+                s.selectivity * 100.0,
+                s.in_mean,
+                s.post_mean
+            );
+            // 每组：in-graph 均值够用（留余量,不卡死单点）。
+            assert!(s.in_mean >= 0.75, "选择性 {:.0}%: in-graph 均值应 ≥0.75,实测 {:.2}", s.selectivity * 100.0, s.in_mean);
+            stats.push(s);
+        }
+        // 招牌结论的可复现版:在最稀疏那组（1%）,post-filter 明显崩,in-graph 明显高。
+        let sparsest = &stats[0];
+        assert!(
+            sparsest.in_mean - sparsest.post_mean >= 0.2,
+            "最稀疏组 in-graph 应显著高于 post-filter,差值实测 {:.2}",
+            sparsest.in_mean - sparsest.post_mean
+        );
+    }
 
-        // 返回的确实都满足谓词、且按距离升序。
-        assert!(ingraph.iter().all(|&(t, _, _)| t == 1), "in-graph 结果都满足谓词");
+    #[test]
+    fn in_graph_results_satisfy_predicate_and_sorted() {
+        // 进图过滤的结果都满足谓词、且按距离升序（结构正确性,与召回数值无关）。
+        let s = GraphAnnIndex::new(12, 48);
+        let mut rng = Lcg(0x1234_5678);
+        let mut matching = 0;
+        for i in 0..400u64 {
+            let is_match = i % 10 == 0;
+            s.index_embedding(if is_match { 1 } else { 0 }, i, rng.vec(12));
+            matching += is_match as i32;
+        }
+        assert!(matching > 0);
+        let probe = { s.state.lock().unwrap().nodes[10].vec.clone() };
+        let ingraph = s.search_ingraph(&probe, 10, 48, &|t, _| t == 1);
+        assert!(ingraph.iter().all(|&(t, _, _)| t == 1), "结果都满足谓词");
         assert!(ingraph.windows(2).all(|w| w[0].2 <= w[1].2), "按距离升序");
     }
 

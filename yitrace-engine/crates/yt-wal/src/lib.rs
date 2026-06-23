@@ -387,15 +387,34 @@ fn decode_batch(payload: &[u8]) -> Option<Vec<WalRecord>> {
     Some(out)
 }
 
-/// 无表 CRC32（IEEE）。真实实现可换 crc32fast。
+/// CRC32（IEEE，反射多项式 0xEDB8_8320）查表实现：256 项表在首用时一次性算好（`OnceLock`，零外部依赖、
+/// 不破 std-only），之后每字节一次查表，去掉了原来每字节 8 次内层位运算。WAL fsync 前对每批都算一次，
+/// 大批量写是热点，查表是稳妥的常数级加速（保持零依赖，不引 crc32fast）。
+fn crc32_table() -> &'static [u32; 256] {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        let mut i = 0usize;
+        while i < 256 {
+            let mut crc = i as u32;
+            let mut j = 0;
+            while j < 8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                j += 1;
+            }
+            t[i] = crc;
+            i += 1;
+        }
+        t
+    })
+}
+
 fn crc32_bytes(data: &[u8]) -> u32 {
+    let table = crc32_table();
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ table[((crc ^ b as u32) & 0xFF) as usize];
     }
     !crc
 }
@@ -419,6 +438,14 @@ mod tests {
     fn temp_path() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!("yt_wal_{}_{}.wal", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    #[test]
+    fn crc32_matches_ieee_known_vectors() {
+        // 查表实现必须与 IEEE CRC32 标准逐字节一致（换实现不能改校验和,否则老 WAL/段 全部读不回）。
+        assert_eq!(crc32_bytes(b""), 0x0000_0000);
+        assert_eq!(crc32_bytes(b"123456789"), 0xCBF4_3926, "标准测试向量");
+        assert_eq!(crc32_bytes(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
     }
 
     #[test]

@@ -791,9 +791,21 @@ impl WriteCoordinator {
     /// 把一条记录喂进**派生检索索引**：BM25 中文倒排 + 过滤属性边车。
     /// ingest、WAL 重放、从段重建索引三处共用 —— 派生索引的喂法只此一份。
     fn index_record(&self, r: &WalRecord) {
-        // 中文倒排：把该 span 的文本（这里用 logs）喂进 BM25。真实实现用 span name/input/output。
-        if !r.fields.logs.is_empty() {
-            self.bm25.index_text(r.trace_id, r.span_id, &r.fields.logs.join(" "));
+        // 中文倒排：把该 span 的**可检索文本**喂进 BM25。检索的主对象是 LLM 的输入/输出原文
+        // （input_text/output_text），logs（含 span name）作补充。三者拼起来索引——真实 SDK 灌进来的
+        // input/output 文本会被索引，而不是只索引 logs（否则真实数据上"中文检索"会突然失效）。
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(t) = r.fields.input_text.as_deref() {
+            parts.push(t);
+        }
+        if let Some(t) = r.fields.output_text.as_deref() {
+            parts.push(t);
+        }
+        for l in &r.fields.logs {
+            parts.push(l);
+        }
+        if !parts.is_empty() {
+            self.bm25.index_text(r.trace_id, r.span_id, &parts.join(" "));
         }
         // 过滤属性边车：last-non-null 累积 status/agent，ts 取范围（带过滤 ANN 的 payload）。
         let mut fa = self.filter_attrs.lock().unwrap();
@@ -1703,8 +1715,17 @@ impl WriteCoordinator {
     /// 段回收线程的一轮（草案 1 §D1.4）。对 dead_set 里每个资源，三条同真才物理删除：
     ///   (1) v_dead ≤ safe_version   (没有读者还 pin 在它 dead 之前的版本)
     ///   (2) ∧ 无未释放的 buffer pin  (字节级最后保险)
-    ///   (3) ∧ 不被当前 manifest 引用 (防崩溃竞态；骨架用当前版本近似 metastore)
+    ///   (3) ∧ 不被当前 manifest 引用 (防崩溃竞态)
     /// 返回这一轮回收了多少个段。真实实现是后台线程 + IO 限速。
+    ///
+    /// ⚠️ **骨架近似，未达文档承诺的崩溃安全（上量必换，见 docs/CURRENT_STATE.md §6）**：
+    /// - 条件 (3) 的"已提交 manifest 不再引用"用**当前内存版本** `contains_segment` 近似，不是查持久
+    ///   metastore；且 `safe_version()` 与 `dead_set.lock()` 之间**无联合原子性**，retain 内每条 dead
+    ///   段单独读版本。
+    /// - 当前安全**只因为**：段 id 永不复用 + compaction 只产新段、绝不复活旧段 id（所以判定 false 之后
+    ///   不会有写者重新引用同一 seg）。这是个**不变量依赖**，不是真正的崩溃竞态防护。
+    /// - 真实实现：持久化 **GC 日志**——写「即将删 seg X」→ fsync → 删文件 → 标记完成。崩溃在中途，重启
+    ///   据日志要么补完删除、要么回滚，绝不留"删一半 + manifest 没更新"的不一致。这是必须补的工程债。
     pub fn reclaim(&self) -> usize {
         let safe = self.current.safe_version();
         let mut freed = 0;
@@ -2048,6 +2069,49 @@ mod tests {
         let after = wc.read_spans(&snap1);
         assert_eq!(after, before, "崩溃恢复前后折叠结果逐字段一致（重放幂等）");
         assert_eq!(after[0].event_count, 2, "没有因为重放把事件算两遍 → token/cost 不翻倍");
+    }
+
+    #[test]
+    fn crash_replay_with_pending_upgrade_is_deterministic() {
+        // M2：段已 flush + upgrade 已补写 + 崩溃重放重叠窗口 —— 折叠结果（含补写字段）必须确定不变。
+        // 重点：去重保留的是段里的 base 版本（不带 upgrade），upgrade 是折叠后另叠的；崩溃重放把 base
+        // 重新灌回内存表后，两份 base 同 event_id 去重，upgrade 仍按 (trace,span) 叠上 → 字段取值不漂移。
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store.clone());
+
+        let e1 = ev(1, 10, 1, Some(0), None, &["start"]);
+        let e2 = ev(1, 10, 2, None, Some(500), &["end"]);
+        wc.ingest(vec![e1.clone(), e2.clone()]);
+        // flush 进段但 watermark 只到 0 → 段与 WAL 重放重叠（崩溃窗口）。
+        wc.commit_flush(&[e1.clone(), e2.clone()], WalLsn::new(0));
+
+        // 补写：eval_score + model + output_text（base 里没有的字段，正是会被"丢一份"误伤的对象）。
+        wc.commit_upgrade(
+            SegmentId::new(1),
+            1,
+            10,
+            SpanFields {
+                eval_score: Some(900),
+                model: Some("qwen3".into()),
+                output_text: Some("研判结论".into()),
+                ..Default::default()
+            },
+        );
+
+        let before = wc.read_spans(&wc.pin_snapshot());
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].eval_score, Some(900));
+        assert_eq!(before[0].model.as_deref(), Some("qwen3"));
+        assert_eq!(before[0].output_text.as_deref(), Some("研判结论"));
+
+        // 崩溃丢内存表 → 重放 watermark(0) 之后的 base 事件回内存表（upgrade 在 manifest，不随内存表丢）。
+        wc.simulate_crash_lose_memtable();
+        wc.recover();
+
+        let after = wc.read_spans(&wc.pin_snapshot());
+        assert_eq!(after, before, "崩溃重放前后逐字段一致 —— 补写字段没因重叠去重而丢");
+        assert_eq!(after[0].event_count, 2, "base 事件没被算两遍");
+        assert_eq!(after[0].eval_score, Some(900), "补写的 eval_score 重放后仍在");
     }
 
     #[test]

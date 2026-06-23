@@ -63,8 +63,17 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
     let output_tokens = first_u64(attrs, &["gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens", "llm.token_count.completion"]);
     let agent_name = first_str(attrs, &["gen_ai.agent.name", "agent.name"]);
     let tool_name = first_str(attrs, &["gen_ai.tool.name", "tool.name"]);
-    let input_text = first_str(attrs, &["input.value", "gen_ai.prompt"]);
-    let output_text = first_str(attrs, &["output.value", "gen_ai.completion"]);
+    // 大文本：OTel GenAI 的 gen_ai.prompt/completion 常是 **JSON 消息数组串**（[{role,content}]），
+    // 不是人读的纯文本——直接存会把 eval 的输入/输出污染成 JSON。这里拍平成纯文本；OpenInference 的
+    // input.value/output.value 是扁平串，flatten_messages 原样返回。再不行就从 span events 里捞
+    //（新版 GenAI 约定把内容放在 span 事件里，不在属性上）。
+    let mut input_text = first_str(attrs, &["input.value", "gen_ai.prompt"]).map(|s| flatten_messages(&s));
+    let mut output_text = first_str(attrs, &["output.value", "gen_ai.completion"]).map(|s| flatten_messages(&s));
+    if input_text.is_none() || output_text.is_none() {
+        let (ev_in, ev_out) = texts_from_events(sp);
+        input_text = input_text.or(ev_in);
+        output_text = output_text.or(ev_out);
+    }
     // 会话 id：OTLP 里是字符串（session.id / 会话 id）。本引擎要 u64 → 数字直接解析，否则确定性哈希。
     let session_id = first_str(attrs, &["session.id", "gen_ai.conversation.id", "session_id"]).map(|s| str_to_u64(&s));
 
@@ -160,6 +169,65 @@ fn first_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
 /// 字符串会话 id → u64：纯数字直接解析，否则用 yt-core 的确定性 FNV-1a 64（不再自己抄一份哈希常量）。
 fn str_to_u64(s: &str) -> u64 {
     s.parse::<u64>().unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes()))
+}
+
+/// 把"可能是 JSON 消息数组"的文本拍平成纯文本。GenAI 的 gen_ai.prompt/completion 常是
+/// `[{"role":"user","content":"…"}]`（content 也可能是 `[{"type":"text","text":"…"}]` 多模态分片）。
+/// 不是 JSON（OpenInference 扁平串）或解析失败 → 原样返回，绝不丢原文。
+fn flatten_messages(s: &str) -> String {
+    let t = s.trim_start();
+    if !t.starts_with('[') && !t.starts_with('{') {
+        return s.to_string(); // 扁平串,原样
+    }
+    let Ok(j) = parse(s) else { return s.to_string() };
+    let arr = j.as_array();
+    // 数组 → 逐条消息；单对象 → 当一条消息。
+    let msgs: &[Json] = if arr.is_empty() { std::slice::from_ref(&j) } else { arr };
+    let mut texts: Vec<String> = Vec::new();
+    for m in msgs {
+        let Some(c) = m.get("content") else { continue };
+        if let Some(flat) = c.as_str() {
+            texts.push(flat.to_string());
+        } else {
+            // content 是多模态分片数组 [{type:text, text:"…"}]
+            for part in c.as_array() {
+                if let Some(x) = part.get("text").and_then(Json::as_str) {
+                    texts.push(x.to_string());
+                }
+            }
+        }
+    }
+    if texts.is_empty() {
+        s.to_string() // 没抽到 content,别丢原文
+    } else {
+        texts.join("\n")
+    }
+}
+
+/// 从 span 的 `events[]` 里捞输入/输出文本（新版 GenAI 约定把内容放事件里，不在 span 属性上）。
+/// 事件名含 completion/assistant/choice → 输出；含 prompt/user/system/message → 输入。
+/// 内容从事件属性的多种 key 兜底取，再 `flatten_messages` 拍平。
+fn texts_from_events(sp: &Json) -> (Option<String>, Option<String>) {
+    let events = sp.get("events").map(Json::as_array).unwrap_or(&[]);
+    let mut inp: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for ev in events {
+        let attrs = ev.get("attributes").map(Json::as_array).unwrap_or(&[]);
+        let Some(body) =
+            first_str(attrs, &["gen_ai.prompt", "gen_ai.completion", "gen_ai.event.content", "content", "message"])
+        else {
+            continue;
+        };
+        let text = flatten_messages(&body);
+        let n = ev.get("name").and_then(Json::as_str).unwrap_or("").to_ascii_lowercase();
+        if n.contains("completion") || n.contains("assistant") || n.contains("choice") {
+            out.push(text);
+        } else if n.contains("prompt") || n.contains("user") || n.contains("system") || n.contains("message") {
+            inp.push(text);
+        }
+    }
+    let join = |v: Vec<String>| if v.is_empty() { None } else { Some(v.join("\n")) };
+    (join(inp), join(out))
 }
 
 #[cfg(test)]
@@ -263,6 +331,65 @@ mod tests {
     fn rejects_non_otlp() {
         assert!(parse_otlp_traces("not json").is_err());
         assert!(parse_otlp_traces(r#"{"foo":1}"#).is_err(), "缺 resourceSpans 应报错");
+    }
+
+    #[test]
+    fn genai_prompt_completion_json_arrays_are_flattened() {
+        // GenAI 的 gen_ai.prompt/completion 是 JSON 消息数组串 → 拍平成纯文本（不是存原始 JSON）。
+        let j = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "traceId":"abc","spanId":"00000000000000aa",
+            "name":"chat","startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[
+              {"key":"gen_ai.prompt","value":{"stringValue":"[{\"role\":\"system\",\"content\":\"你是风控助手\"},{\"role\":\"user\",\"content\":\"这笔交易可疑吗\"}]"}},
+              {"key":"gen_ai.completion","value":{"stringValue":"[{\"role\":\"assistant\",\"content\":\"疑似盗刷,建议拦截\"}]"}}
+            ]
+        }]}]}]}"#;
+        let recs = parse_otlp_traces(j).unwrap();
+        let start = &recs[0];
+        assert_eq!(
+            start.input_text.as_deref(),
+            Some("你是风控助手\n这笔交易可疑吗"),
+            "消息数组的 content 被抽出拍平,不是存 JSON 串"
+        );
+        assert_eq!(start.output_text.as_deref(), Some("疑似盗刷,建议拦截"));
+    }
+
+    #[test]
+    fn genai_multimodal_content_parts_are_flattened() {
+        // content 是多模态分片数组 [{type:text,text:"…"}] → 取出 text 拼接。
+        let j = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "traceId":"abc","spanId":"00000000000000aa",
+            "name":"chat","startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[
+              {"key":"gen_ai.prompt","value":{"stringValue":"[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"看这张图\"},{\"type\":\"image\",\"url\":\"x\"}]}]"}}
+            ]
+        }]}]}]}"#;
+        let recs = parse_otlp_traces(j).unwrap();
+        assert_eq!(recs[0].input_text.as_deref(), Some("看这张图"), "多模态分片只取 text 部分");
+    }
+
+    #[test]
+    fn genai_content_from_span_events() {
+        // 新版约定:内容在 span events[] 里,不在属性上 → 从事件捞 + 按事件名分输入/输出。
+        let j = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "traceId":"abc","spanId":"00000000000000aa",
+            "name":"chat","startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[],
+            "events":[
+              {"name":"gen_ai.user.message","attributes":[{"key":"content","value":{"stringValue":"这笔交易可疑吗"}}]},
+              {"name":"gen_ai.choice","attributes":[{"key":"content","value":{"stringValue":"疑似盗刷"}}]}
+            ]
+        }]}]}]}"#;
+        let recs = parse_otlp_traces(j).unwrap();
+        assert_eq!(recs[0].input_text.as_deref(), Some("这笔交易可疑吗"), "user.message 事件 → 输入");
+        assert_eq!(recs[0].output_text.as_deref(), Some("疑似盗刷"), "choice 事件 → 输出");
+    }
+
+    #[test]
+    fn flatten_messages_leaves_flat_text_untouched() {
+        // OpenInference 的扁平串不受影响(不是 JSON → 原样)。
+        assert_eq!(flatten_messages("请研判这笔交易"), "请研判这笔交易");
+        assert_eq!(flatten_messages("  not json [oops"), "  not json [oops");
     }
 
     #[test]

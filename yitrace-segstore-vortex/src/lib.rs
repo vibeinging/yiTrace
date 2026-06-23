@@ -4,8 +4,9 @@
 //! 随机访问任意列常数时间）。`input_text`/`output_text` 是大列，列式让"数 token / 列表 / 聚合"等查询
 //! 完全不碰它们——这是上列式最大的单点收益。
 //!
-//! 当前是**第一版 round-trip**：一批 `WalRecord` 写成列式文件、读回逐字段一致。投影/谓词下推（Vortex 的
-//! `.scan().with_filter(...)` / 列裁剪）是下一步——接缝已在，trait 后续加投影参数即可。
+//! 已落地：写读 round-trip + **谓词下推**（`scan().with_filter(...)` 按时间窗剪行）+ **投影下推**
+//! （`scan().with_projection(select(...))` 只解码命中列，聚合查询跳过大文本列）。写入用 Vortex 默认
+//! BtrBlocks 压缩策略（字符串列走 FSST/dict），大文本列在盘上是压缩态。
 //! 决策与计划见 `docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`。
 
 use std::path::{Path, PathBuf};
@@ -34,9 +35,53 @@ use yt_core::ids::SegmentId;
 use yt_engine::{Projection, SegmentStore};
 use yt_wal::WalRecord;
 
-/// logs（Vec<String>）压成单列：用 NUL 连接，空 logs → None。日志文本里出现 NUL 概率极低（v1 简化，
-/// 后续换真正的 list<utf8> 列）。
-const LOG_SEP: char = '\u{0}';
+/// logs（Vec<String>）压成单列：转义后用记录分隔符 `\u{1e}` 连接。**对任意内容可逆**——金融系统日志
+/// 可能含二进制错误码/协议帧/NUL/换行，所以分隔符与转义符在内容里出现时都被转义（NUL 不再是特殊字符）。
+/// 按 `char` 处理，多字节 UTF-8（中文）安全。空 logs → None（不占列）。
+/// （比真正的 list<utf8> 列省事，且对当前一段一文件的布局够用；要列内按元素下推再升级 list。）
+const LOG_SEP: char = '\u{1e}';
+const LOG_ESC: char = '\\';
+
+/// 把一条 span 的 logs 编码成单列字符串；空 → None。
+fn encode_logs(logs: &[String]) -> Option<String> {
+    if logs.is_empty() {
+        return None;
+    }
+    let mut s = String::new();
+    for (i, l) in logs.iter().enumerate() {
+        if i > 0 {
+            s.push(LOG_SEP);
+        }
+        for c in l.chars() {
+            if c == LOG_ESC || c == LOG_SEP {
+                s.push(LOG_ESC); // 内容里的分隔符/转义符 → 转义,解码时还原
+            }
+            s.push(c);
+        }
+    }
+    Some(s)
+}
+
+/// 解码单列字符串回 logs（与 `encode_logs` 互逆）。
+fn decode_logs(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            cur.push(c);
+            esc = false;
+        } else if c == LOG_ESC {
+            esc = true;
+        } else if c == LOG_SEP {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
 
 /// 投影 → 要 `select` 的列名。身份/分组列（trace_id/span_id/ts/seq/event_type/ext_span_id）**恒选**
 /// （折叠去重/定序/分组要用）；可折叠值列按 `proj` 的位选。`proj.is_all()` → `None` = 不裁列、读全表
@@ -125,13 +170,7 @@ impl VortexSegmentStore {
         let input_text = strcol(&|r| r.fields.input_text.clone());
         let output_text = strcol(&|r| r.fields.output_text.clone());
         let eval_label = strcol(&|r| r.fields.eval_label.clone());
-        let logs = strcol(&|r| {
-            if r.fields.logs.is_empty() {
-                None
-            } else {
-                Some(r.fields.logs.join(&LOG_SEP.to_string()))
-            }
-        });
+        let logs = strcol(&|r| encode_logs(&r.fields.logs));
 
         StructArray::from_fields(&[
             ("trace_id", trace_id),
@@ -222,7 +261,7 @@ impl VortexSegmentStore {
                     eval_label: gstr(&eval_label, i),
                     logs: match gstr(&logs, i) {
                         None => Vec::new(),
-                        Some(s) => s.split(LOG_SEP).map(|x| x.to_string()).collect(),
+                        Some(s) => decode_logs(&s),
                     },
                 },
             })
@@ -433,6 +472,71 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].ts, 300);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logs_encoding_survives_separator_nul_and_cjk() {
+        // logs 编码对任意内容可逆：含分隔符/转义符本身、NUL、二进制、换行、中文都 round-trip。
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["".into()],
+            vec!["开始".into(), "研判".into()],
+            vec!["含分隔符\u{1e}和转义符\\的日志".into()],
+            vec!["二进制\u{0}错误码\u{0}帧".into()], // NUL —— 老的 NUL 连接会在这切坏
+            vec!["多行\n日志\r\n带制表\t符".into(), "第二条".into()],
+            vec!["协议帧\u{1e}\\\u{0}\u{1f}混合".into()],
+        ];
+        for logs in cases {
+            let round = match encode_logs(&logs) {
+                None => Vec::new(),
+                Some(s) => decode_logs(&s),
+            };
+            assert_eq!(round, logs, "logs 编解码可逆: {logs:?}");
+        }
+    }
+
+    #[test]
+    fn logs_round_trip_through_segment_with_nul() {
+        // 端到端：带 NUL 的 logs 写进列式段、读回一致（不是只测内存编解码）。
+        let dir = temp_dir();
+        let store = VortexSegmentStore::open(&dir).unwrap();
+        let seg = SegmentId::new(11);
+        let mut a = rec(1, 10, 1);
+        a.fields.logs = vec!["帧\u{0}头".into(), "正常日志".into()];
+        store.flush_to_segment(seg, &[a]);
+        let back = store.scan_records(seg);
+        assert_eq!(back[0].fields.logs, vec!["帧\u{0}头", "正常日志"], "含 NUL 的 logs 过段不丢不错切");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_compresses_repetitive_text() {
+        // Vortex 默认写策略是 BtrBlocks（字符串走 FSST/dict）—— 高度重复的大文本列应被压到远小于原文。
+        // 这条同时是"压缩确实开着"的回归守卫（若未来误关压缩,文件会暴涨,这里会失败）。
+        // ⚠️ 阈值 1/5 是按**当前默认压缩策略（BtrBlocks + FSST）对高度重复文本**定的经验值,不是协议保证。
+        //    若升级 Vortex 后默认策略变了（或我们改用 with_strategy 自定义压缩器）,这个硬阈值可能误伤,
+        //    需同步重测一组真实样本再调——它守的是"压缩没被关掉",不是某个固定压缩比。
+        let dir = temp_dir();
+        let store = VortexSegmentStore::open(&dir).unwrap();
+        let seg = SegmentId::new(12);
+        let big = "疑似盗刷,建议拦截并人工复核。".repeat(50); // 单行约 1.5KB
+        let raw_per_row = big.len();
+        let rows: Vec<WalRecord> = (1..=200)
+            .map(|i| {
+                let mut r = rec(1, i, i);
+                r.fields.output_text = Some(big.clone());
+                r
+            })
+            .collect();
+        store.flush_to_segment(seg, &rows);
+        let file = store.seg_path(seg);
+        let on_disk = std::fs::metadata(&file).unwrap().len() as usize;
+        let raw_total = raw_per_row * rows.len(); // 仅这一列的原始字节量
+        assert!(
+            on_disk < raw_total / 5,
+            "高度重复文本应被压到原文的 1/5 以下：盘上 {on_disk} vs 原文 {raw_total}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
