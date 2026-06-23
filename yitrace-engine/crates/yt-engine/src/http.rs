@@ -137,6 +137,15 @@ impl HttpIngestServer {
             return;
         }
 
+        // ③ 静态资源（内嵌的控制台前端）：GET 且非 /v1/* → 从编译期内嵌资源服务（无 body）。
+        if method == "GET" && !path.starts_with("/v1") {
+            let p = path.split('?').next().unwrap_or("/");
+            if self.serve_static(&mut stream, p) {
+                self.audit(&method, &path, 200, 0);
+                return;
+            }
+        }
+
         let mut body_buf = vec![0u8; content_length];
         if content_length > 0 && reader.read_exact(&mut body_buf).is_err() {
             return;
@@ -155,6 +164,38 @@ impl HttpIngestServer {
         let (status, resp_body) = self.route(&method, &path, &body);
         self.respond(&mut stream, status, &resp_body);
         self.audit(&method, &path, status, content_length);
+    }
+
+    /// 从内嵌资源服务静态文件。`/` → index.html；未知无扩展名路径 → 回退 index.html（SPA 前端路由）。
+    /// 返回是否命中（命中已写响应）。console_dist 未构建时 ASSETS 为空 → 一律 miss。
+    fn serve_static(&self, stream: &mut TcpStream, path: &str) -> bool {
+        let want = if path == "/" { "/index.html" } else { path };
+        for (url, ct, bytes) in crate::assets::ASSETS {
+            if *url == want {
+                self.respond_bytes(stream, ct, bytes);
+                return true;
+            }
+        }
+        // SPA 回退：无扩展名的路径当前端路由，回 index.html。
+        if !path.contains('.') {
+            for (url, ct, bytes) in crate::assets::ASSETS {
+                if *url == "/index.html" {
+                    self.respond_bytes(stream, ct, bytes);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn respond_bytes(&self, stream: &mut TcpStream, content_type: &str, body: &[u8]) {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
     }
 
     fn respond(&self, stream: &mut TcpStream, status: u16, body: &str) {
@@ -212,7 +253,9 @@ impl HttpIngestServer {
 
     /// 纯路由（无 socket，便于单测）。返回 (status, json_body)。
     pub fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
-        match (method, path) {
+        // 切掉查询串：精确路由按 base 匹配，查询参数（分页 cursor/limit）单独解析。
+        let (base, query) = path.split_once('?').unwrap_or((path, ""));
+        match (method, base) {
             ("POST", "/v1/ingest") => match parse_wire_batch(body) {
                 Ok(recs) => {
                     let n = recs.len();
@@ -222,7 +265,6 @@ impl HttpIngestServer {
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
             // OTLP/HTTP 标准 trace 端点（生态入口）：OpenTelemetry / OpenInference 埋点直接 POST 到这里。
-            // 与下面 GET /v1/traces 同路径不同方法,各管摄入/查询。
             ("POST", "/v1/traces") => match self.coord.ingest_otlp(body) {
                 Ok(_) => (200, r#"{"partialSuccess":{}}"#.to_string()), // OTLP 约定的成功响应体
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
@@ -230,6 +272,20 @@ impl HttpIngestServer {
             ("GET", "/v1/traces") => (200, self.traces_json()),
             // 检索端点（产品差异化的出口）：中文 BM25 + 可选属性过滤(agent/状态/时间/trace)。
             ("POST", "/v1/search") => self.search_json(body),
+            // 控制台数据端点（前端 yitrace-console 对接）：会话游标分页 / 轮次 / trace span / span 详情。
+            ("GET", "/v1/sessions") => (200, self.sessions_page_json(query)),
+            _ => self.route_console(method, base),
+        }
+    }
+
+    /// 带路径参数的控制台路由（/v1/sessions/:id/turns 等）。
+    fn route_console(&self, method: &str, base: &str) -> (u16, String) {
+        let segs: Vec<&str> = base.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        match (method, segs.as_slice()) {
+            ("GET", ["v1", "sessions", id, "turns"]) => self.turns_json(id),
+            ("GET", ["v1", "traces", id]) => self.trace_json(id),
+            ("GET", ["v1", "traces", id, "steps"]) => self.steps_json(id),
+            ("GET", ["v1", "traces", id, "spans", sid]) => self.span_detail_json(id, sid),
             _ => (404, r#"{"error":"not found"}"#.to_string()),
         }
     }
@@ -300,6 +356,231 @@ impl HttpIngestServer {
             })
             .collect();
         format!("[{}]", items.join(","))
+    }
+
+    // ───────────────────── 控制台数据端点（游标分页 / 轮次 / span / 详情） ─────────────────────
+
+    /// GET /v1/sessions?cursor=&limit=：会话列表，offset 游标分页。
+    /// 注：当前每页都全量扫一遍 span 聚合（O(spans)）——小数据可接受；上量要加 session 边车索引。
+    fn sessions_page_json(&self, query: &str) -> String {
+        let (mut offset, mut limit, mut filter) = (0usize, 50usize, String::new());
+        for kv in query.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                match k {
+                    "cursor" => offset = v.parse().unwrap_or(0),
+                    "limit" => limit = v.parse().unwrap_or(50).clamp(1, 500),
+                    "filter" => filter = url_decode(v),
+                    _ => {}
+                }
+            }
+        }
+        let snap = self.coord.pin_snapshot();
+        let mut all = self.coord.console_sessions(&snap);
+        if !filter.is_empty() {
+            all.retain(|s| s.title.contains(&filter) || s.session_id.to_string().contains(&filter));
+        }
+        let total = all.len();
+        let end = (offset + limit).min(total);
+        let page = if offset < total { &all[offset..end] } else { &[][..] };
+        let items: Vec<String> = page
+            .iter()
+            .map(|s| {
+                format!(
+                    r#"{{"sessionId":"{}","title":"{}","turnCount":{},"totalCost":{},"status":"{}","startedAt":{},"firstTraceId":"{}"}}"#,
+                    s.session_id,
+                    json_escape(&s.title),
+                    s.turn_count,
+                    cost_num(s.input_tokens, s.output_tokens),
+                    if s.has_error { "error" } else { "ok" },
+                    s.session_id,
+                    s.first_trace_id,
+                )
+            })
+            .collect();
+        let next = if end < total { end.to_string() } else { "null".to_string() };
+        format!(r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#, items.join(","), next, total)
+    }
+
+    /// GET /v1/sessions/:id/turns：一个会话的轮次（按时序）。
+    fn turns_json(&self, id: &str) -> (u16, String) {
+        let Ok(sid) = id.parse::<u64>() else { return (400, r#"{"error":"bad session id"}"#.to_string()) };
+        let snap = self.coord.pin_snapshot();
+        let tl = self.coord.load_session_timeline(&snap, sid);
+        let items: Vec<String> = tl
+            .turns
+            .iter()
+            .map(|t| {
+                // 真实耗时：对该轮 trace 求 span 时长之和（毫秒）。
+                let spans = self.coord.console_trace_spans(&snap, t.trace_id);
+                let dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
+                let name = t.user_input.as_deref().map(trunc).unwrap_or_else(|| format!("第{}轮", t.turn_index + 1));
+                format!(
+                    r#"{{"traceId":"{}","sessionId":"{}","turnIndex":{},"name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
+                    t.trace_id,
+                    sid,
+                    t.turn_index,
+                    json_escape(&name),
+                    dur_ms,
+                    cost_num(t.input_tokens, t.output_tokens),
+                    t.span_count,
+                    if t.error_count > 0 { "error" } else { "ok" },
+                )
+            })
+            .collect();
+        (200, format!("[{}]", items.join(",")))
+    }
+
+    /// GET /v1/traces/:id：一条 trace 的折叠 span（瀑布）+ 摘要。
+    fn trace_json(&self, id: &str) -> (u16, String) {
+        let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
+        let snap = self.coord.pin_snapshot();
+        let spans = self.coord.console_trace_spans(&snap, tid);
+        if spans.is_empty() {
+            return (404, r#"{"error":"trace not found"}"#.to_string());
+        }
+        // 深度：顺父指针数（用 span_id→parent 映射 + 记忆化）。
+        let parent: std::collections::HashMap<u64, Option<u64>> = spans.iter().map(|s| (s.span_id, s.parent_span_id)).collect();
+        let depth_of = |mut id: u64| -> usize {
+            let mut d = 0;
+            while let Some(Some(p)) = parent.get(&id) {
+                d += 1;
+                if d > 64 {
+                    break;
+                }
+                id = *p;
+            }
+            d
+        };
+        let total_dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
+        let (in_tok, out_tok): (u64, u64) = spans.iter().fold((0, 0), |(i, o), s| (i + s.input_tokens, o + s.output_tokens));
+        let any_err = spans.iter().any(|s| s.has_error);
+        let name = spans.first().map(|s| s.name.clone()).unwrap_or_default();
+        let span_items: Vec<String> = spans
+            .iter()
+            .map(|s| {
+                format!(
+                    r#"{{"id":"{}","parentId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{}}}"#,
+                    s.span_id,
+                    s.parent_span_id.map_or("null".to_string(), |p| format!("\"{p}\"")),
+                    s.kind,
+                    json_escape(&s.name),
+                    s.start_ns / 1_000_000,
+                    s.duration_ns / 1_000_000,
+                    if s.has_error { "error" } else { "ok" },
+                    cost_num(s.input_tokens, s.output_tokens),
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
+                    depth_of(s.span_id),
+                )
+            })
+            .collect();
+        let summary = format!(
+            r#"{{"traceId":"{}","name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
+            tid,
+            json_escape(&name),
+            total_dur_ms,
+            cost_num(in_tok, out_tok),
+            spans.len(),
+            if any_err { "error" } else { "ok" },
+        );
+        (200, format!(r#"{{"summary":{},"spans":[{}]}}"#, summary, span_items.join(",")))
+    }
+
+    /// GET /v1/traces/:id/steps：步骤流视图 —— 每个 span 连同输入/输出大文本一次给全。
+    /// 与瀑布的晚物化相反：步骤流的本意就是看每一步的输入→输出，故在此端点物化。
+    fn steps_json(&self, id: &str) -> (u16, String) {
+        let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
+        let snap = self.coord.pin_snapshot();
+        let spans = self.coord.console_trace_spans(&snap, tid);
+        if spans.is_empty() {
+            return (404, r#"{"error":"trace not found"}"#.to_string());
+        }
+        let items: Vec<String> = spans
+            .iter()
+            .map(|s| {
+                format!(
+                    r#"{{"id":"{}","kind":"{}","name":"{}","status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{}}}"#,
+                    s.span_id,
+                    s.kind,
+                    json_escape(&s.name),
+                    if s.has_error { "error" } else { "ok" },
+                    s.duration_ns / 1_000_000,
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
+                    s.input_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    s.output_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                )
+            })
+            .collect();
+        (200, format!("[{}]", items.join(",")))
+    }
+
+    /// GET /v1/traces/:id/spans/:spanId：单个 span 的大字段（晚物化）。
+    fn span_detail_json(&self, id: &str, span_id: &str) -> (u16, String) {
+        let (Ok(tid), Ok(sid)) = (id.parse::<u64>(), span_id.parse::<u64>()) else {
+            return (400, r#"{"error":"bad id"}"#.to_string());
+        };
+        let snap = self.coord.pin_snapshot();
+        let spans = self.coord.console_trace_spans(&snap, tid);
+        match spans.into_iter().find(|s| s.span_id == sid) {
+            Some(s) => (
+                200,
+                format!(
+                    r#"{{"id":"{}","input":{},"output":{}}}"#,
+                    sid,
+                    s.input_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    s.output_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                ),
+            ),
+            None => (404, r#"{"error":"span not found"}"#.to_string()),
+        }
+    }
+}
+
+/// 极小 URL 解码（只处理 %XX 与 +）：会话过滤词可能是中文 → 解 percent-encoding。
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let h = |c: u8| (c as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (h(b[i + 1]), h(b[i + 2])) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 千分制成本（与 SDK/前端 mock 同口径）：输入 8e-7、输出 4e-6 每 token。输出 JSON number。
+fn cost_num(in_tok: u64, out_tok: u64) -> String {
+    format!("{:.3}", in_tok as f64 * 8e-7 + out_tok as f64 * 4e-6)
+}
+
+/// 截断长文本当标题（按字符，不切坏 UTF-8）。
+fn trunc(s: &str) -> String {
+    let max = 40;
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect::<String>() + "…"
     }
 }
 
@@ -417,6 +698,54 @@ mod tests {
         let (st3, body3) = s.route("POST", "/v1/search", r#"{"vector":[0.1,0.1],"k":5,"filter":{"agent_name":"风控"}}"#);
         assert_eq!(st3, 200);
         assert!(body3.contains("\"trace_id\":1") && !body3.contains("\"trace_id\":2"), "{body3}");
+    }
+
+    #[test]
+    fn route_console_sessions_turns_trace_detail() {
+        // 控制台数据端点端到端：灌 1 个会话(2 轮) → 会话分页 → 轮次 → trace span → span 详情。
+        let s = server();
+        let batch = r#"[
+          {"trace_id":11,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"11-1","session_id":900,"agent_name":"风控研判","input_tokens":500,"input_text":"对账户A做研判"},
+          {"trace_id":11,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"11-1","session_id":900,"status":0,"duration_ns":2000000,"output_tokens":120,"output_text":"触发规则R12"},
+          {"trace_id":12,"span_id":1,"ts":3,"seq":1,"event_type":1,"ext_span_id":"12-1","session_id":900,"agent_name":"风控研判","input_tokens":300,"input_text":"继续核查"},
+          {"trace_id":12,"span_id":1,"ts":4,"seq":2,"event_type":2,"ext_span_id":"12-1","session_id":900,"status":0,"duration_ns":1000000,"output_tokens":80}
+        ]"#;
+        assert_eq!(s.route("POST", "/v1/ingest", batch).0, 200);
+
+        // 会话分页：1 个会话、2 轮、标题取 agent。
+        let (st, body) = s.route("GET", "/v1/sessions?cursor=0&limit=50", "");
+        assert_eq!(st, 200, "{body}");
+        assert!(body.contains("\"sessionId\":\"900\""), "{body}");
+        assert!(body.contains("\"turnCount\":2"), "{body}");
+        assert!(body.contains("\"title\":\"风控研判\""), "{body}");
+        assert!(body.contains("\"total\":1"), "{body}");
+        assert!(body.contains("\"nextCursor\":null"), "{body}");
+
+        // 轮次：2 轮，首轮名取 input_text。
+        let (st2, turns) = s.route("GET", "/v1/sessions/900/turns", "");
+        assert_eq!(st2, 200, "{turns}");
+        assert!(turns.contains("\"turnIndex\":0") && turns.contains("\"turnIndex\":1"), "{turns}");
+        assert!(turns.contains("对账户A做研判"), "{turns}");
+        assert!(turns.contains("\"durMs\":2"), "首轮 2ms: {turns}");
+
+        // trace span：trace 11 有 span，kind=agent。
+        let (st3, trace) = s.route("GET", "/v1/traces/11", "");
+        assert_eq!(st3, 200, "{trace}");
+        assert!(trace.contains("\"kind\":\"agent\"") && trace.contains("风控研判"), "{trace}");
+        assert!(trace.contains("\"summary\""), "{trace}");
+
+        // span 详情：晚物化大字段。
+        let (st4, detail) = s.route("GET", "/v1/traces/11/spans/1", "");
+        assert_eq!(st4, 200, "{detail}");
+        assert!(detail.contains("触发规则R12"), "{detail}");
+
+        // 步骤流：带输入/输出文本一次给全。
+        let (st5, steps) = s.route("GET", "/v1/traces/11/steps", "");
+        assert_eq!(st5, 200, "{steps}");
+        assert!(steps.contains("对账户A做研判") && steps.contains("触发规则R12"), "{steps}");
+
+        // 不存在的 trace → 404。
+        assert_eq!(s.route("GET", "/v1/traces/999", "").0, 404);
     }
 
     #[test]

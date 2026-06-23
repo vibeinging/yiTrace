@@ -46,6 +46,13 @@ mod vecstore;
 mod http;
 pub use http::HttpIngestServer;
 
+/// 编译期嵌入的控制台静态资源（build.rs 生成；console_dist/ 不存在则为空表）。
+pub mod assets {
+    include!(concat!(env!("OUT_DIR"), "/assets.rs"));
+}
+
+pub mod evalkit;
+
 // ───────────────────────── 段生命周期 ─────────────────────────
 
 /// 段五态（草案 1 §D1.2）。building/sealed 不进 manifest；dead 已从 manifest 移除、等回收。
@@ -451,6 +458,67 @@ pub struct AgentGraph {
     pub nodes: Vec<AgentGraphNode>,
     /// 按 (from, to) 升序。已剔除同角色自环（只留跨角色的调用/移交）。
     pub edges: Vec<AgentGraphEdge>,
+}
+
+/// 多轮对话里的**一轮** = 会话内的一条 trace，抽成「用户问 → agent 答」的对子 + 该轮统计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTurn {
+    pub trace_id: u64,
+    /// 轮次序号（0 起）。按 trace_id 升序定序 —— trace id 单调下发，是对话时间序的可靠代理
+    /// （折叠后的 span 不保留 ts，故不按 ts 排）。
+    pub turn_index: usize,
+    /// 该轮输入：span_id 最小的、带 input_text 的 span（通常是编排根 span 上的提示词）。
+    pub user_input: Option<String>,
+    /// 该轮最终答复：span_id 最大的、带 output_text 的 span（最末一步的作答）。
+    pub agent_output: Option<String>,
+    /// 该轮参与的 agent（去重升序）。
+    pub agents: Vec<String>,
+    pub span_count: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// 该轮 status≠0 的 span 数（这一轮有没有出错）。
+    pub error_count: usize,
+    /// 该轮答复 span 的评测分（若已 eval 写回）。
+    pub eval_score: Option<u32>,
+}
+
+/// 一个会话的**多轮对话流**（多轮会话视图直接渲染）：把会话内多条 trace 按时间序拼成对话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTimeline {
+    pub session_id: u64,
+    /// 按 turn_index 升序。
+    pub turns: Vec<SessionTurn>,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+}
+
+/// 控制台会话行（一次扫描聚合）。比 `SessionSummary` 多了标题/状态/首 trace，给前端列表直接用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleSession {
+    pub session_id: u64,
+    pub title: String,
+    pub turn_count: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub has_error: bool,
+    pub first_trace_id: u64,
+}
+
+/// 控制台瀑布的一行 span（kind/name/起始时刻为派生值，见 `console_trace_spans`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleSpan {
+    pub span_id: u64,
+    pub parent_span_id: Option<u64>,
+    pub kind: &'static str,
+    pub name: String,
+    pub start_ns: u64,
+    pub duration_ns: u64,
+    pub has_error: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub model: Option<String>,
+    pub input_text: Option<String>,
+    pub output_text: Option<String>,
 }
 
 /// 一个会话的摘要（多轮对话/agent 会话视图）。
@@ -1118,6 +1186,139 @@ impl WriteCoordinator {
                 span_count,
                 total_input_tokens: i,
                 total_output_tokens: o,
+            })
+            .collect()
+    }
+
+    /// 装一个会话的**多轮对话流**：把同一 `session_id` 的多条 trace（每条=一轮）按 trace_id 升序
+    /// 拼成「用户问 → agent 答」的时间线。这是多轮会话视图的渲染源，也是会话级评测的输入。
+    ///
+    /// 取原文要读全列。当前没有 session→trace 倒排，按 session_id **扫全量过滤**（O(全库)）——
+    /// 会话视图是低频操作可接受；真要高频再加 session 边车索引。
+    pub fn load_session_timeline(&self, snap: &Snapshot, session_id: u64) -> SessionTimeline {
+        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
+        // 按 trace 分组本会话的 span（BTreeMap → trace_id 升序 = 轮次序）。
+        let mut by_trace: BTreeMap<u64, Vec<FoldedSpan>> = BTreeMap::new();
+        for s in spans {
+            if s.session_id == Some(session_id) {
+                by_trace.entry(s.trace_id).or_default().push(s);
+            }
+        }
+        let mut turns = Vec::with_capacity(by_trace.len());
+        let mut total_in = 0u64;
+        let mut total_out = 0u64;
+        for (turn_index, (trace_id, mut sps)) in by_trace.into_iter().enumerate() {
+            sps.sort_by_key(|s| s.span_id);
+            // 输入取最早（span_id 最小）带 input_text 的；答复取最末带 output_text 的。
+            let user_input = sps.iter().find(|s| s.input_text.is_some()).and_then(|s| s.input_text.clone());
+            let answer = sps.iter().rev().find(|s| s.output_text.is_some());
+            let agent_output = answer.and_then(|s| s.output_text.clone());
+            let eval_score = answer.and_then(|s| s.eval_score);
+            let mut agents: Vec<String> = sps.iter().filter_map(|s| s.agent_name.clone()).collect();
+            agents.sort();
+            agents.dedup();
+            let input_tokens: u64 = sps.iter().map(|s| s.input_tokens.unwrap_or(0)).sum();
+            let output_tokens: u64 = sps.iter().map(|s| s.output_tokens.unwrap_or(0)).sum();
+            let error_count = sps.iter().filter(|s| s.status.unwrap_or(0) != 0).count();
+            total_in += input_tokens;
+            total_out += output_tokens;
+            turns.push(SessionTurn {
+                trace_id,
+                turn_index,
+                user_input,
+                agent_output,
+                agents,
+                span_count: sps.len(),
+                input_tokens,
+                output_tokens,
+                error_count,
+                eval_score,
+            });
+        }
+        SessionTimeline { session_id, turns, total_input_tokens: total_in, total_output_tokens: total_out }
+    }
+
+    /// 控制台用：一次扫描把所有 span 按 session→trace 聚合成会话行（标题/轮数/状态/token/首 trace）。
+    /// 标题取会话内首个非空 agent_name（没有就用 session id）；状态有错即 error。按 session_id **降序**
+    /// （单调下发≈时间新→旧），调用方按游标分页。一次 O(spans) 扫描，避免每会话各扫一遍。
+    pub fn console_sessions(&self, snap: &Snapshot) -> Vec<ConsoleSession> {
+        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
+        // session_id -> 聚合
+        let mut acc: BTreeMap<u64, ConsoleSession> = BTreeMap::new();
+        let mut seen_trace: HashMap<u64, std::collections::HashSet<u64>> = HashMap::new();
+        for s in spans {
+            let Some(sid) = s.session_id else { continue };
+            let e = acc.entry(sid).or_insert_with(|| ConsoleSession {
+                session_id: sid,
+                title: String::new(),
+                turn_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                has_error: false,
+                first_trace_id: s.trace_id,
+            });
+            seen_trace.entry(sid).or_default().insert(s.trace_id);
+            e.input_tokens += s.input_tokens.unwrap_or(0);
+            e.output_tokens += s.output_tokens.unwrap_or(0);
+            if s.status.unwrap_or(0) != 0 {
+                e.has_error = true;
+            }
+            if e.title.is_empty() {
+                if let Some(a) = &s.agent_name {
+                    e.title = a.clone();
+                }
+            }
+            if s.trace_id < e.first_trace_id {
+                e.first_trace_id = s.trace_id;
+            }
+        }
+        for (sid, e) in acc.iter_mut() {
+            e.turn_count = seen_trace.get(sid).map_or(0, |t| t.len());
+            if e.title.is_empty() {
+                e.title = format!("会话 {sid}");
+            }
+        }
+        // session_id 降序
+        let mut out: Vec<ConsoleSession> = acc.into_values().collect();
+        out.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+        out
+    }
+
+    /// 控制台用：一条 trace 的折叠 span（瀑布）。引擎不存 span 的 kind/name/起始时刻，这里**派生**：
+    /// kind = agent>tool>model>other；name = 同源；起始时刻按 span_id 升序累加 duration 顺排（逻辑瀑布）。
+    pub fn console_trace_spans(&self, snap: &Snapshot, trace_id: u64) -> Vec<ConsoleSpan> {
+        let (mut spans, _) = self.read_spans_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX));
+        spans.sort_by_key(|s| s.span_id);
+        let mut start = 0u64;
+        spans
+            .into_iter()
+            .map(|s| {
+                let (kind, name) = if let Some(a) = &s.agent_name {
+                    ("agent", a.clone())
+                } else if let Some(t) = &s.tool_name {
+                    ("tool", t.clone())
+                } else if let Some(m) = &s.model {
+                    ("llm", m.clone())
+                } else {
+                    ("other", format!("span {}", s.span_id))
+                };
+                let dur = s.duration_ns.unwrap_or(0);
+                let cs = ConsoleSpan {
+                    span_id: s.span_id,
+                    parent_span_id: s.parent_span_id,
+                    kind,
+                    name,
+                    start_ns: start,
+                    duration_ns: dur,
+                    has_error: s.status.unwrap_or(0) != 0,
+                    input_tokens: s.input_tokens.unwrap_or(0),
+                    output_tokens: s.output_tokens.unwrap_or(0),
+                    model: s.model.clone(),
+                    input_text: s.input_text.clone(),
+                    output_text: s.output_text.clone(),
+                };
+                start += dur;
+                cs
             })
             .collect()
     }
@@ -2949,6 +3150,50 @@ mod tests {
         assert_eq!(find("规划").input_tokens, 180, "120+60");
         assert_eq!(find("规划").span_count, 2);
         assert_eq!(find("执行").input_tokens, 80);
+    }
+
+    #[test]
+    fn session_timeline_orders_turns_and_pairs_input_output() {
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store);
+        // 会话 700 两轮：trace 20 故意先灌（乱序），timeline 应按 trace_id 升序 → trace 10 在前。
+        // 每轮两个 span：span1 带输入、span2 带输出，验证「输入取最早、答复取最末」的配对。
+        let mut t2s1 = ev(20, 1, 1, Some(0), Some(10), &[]);
+        t2s1.fields.session_id = Some(700);
+        t2s1.fields.agent_name = Some("客服助手".into());
+        t2s1.fields.input_text = Some("还是不行".into());
+        t2s1.fields.input_tokens = Some(40);
+        let mut t2s2 = ev(20, 2, 1, Some(1), Some(10), &[]);
+        t2s2.fields.session_id = Some(700);
+        t2s2.fields.output_text = Some("请联系人工客服".into());
+        t2s2.fields.output_tokens = Some(15);
+        let mut t1s1 = ev(10, 1, 1, Some(0), Some(10), &[]);
+        t1s1.fields.session_id = Some(700);
+        t1s1.fields.agent_name = Some("客服助手".into());
+        t1s1.fields.input_text = Some("如何修改预留手机号".into());
+        t1s1.fields.input_tokens = Some(60);
+        let mut t1s2 = ev(10, 2, 1, Some(0), Some(10), &[]);
+        t1s2.fields.session_id = Some(700);
+        t1s2.fields.output_text = Some("到安全中心修改".into());
+        t1s2.fields.output_tokens = Some(20);
+        wc.ingest(vec![t2s1, t2s2, t1s1, t1s2]);
+
+        let snap = wc.pin_snapshot();
+        let tl = wc.load_session_timeline(&snap, 700);
+        assert_eq!(tl.turns.len(), 2, "两轮");
+        // 按 trace_id 升序定序：trace 10 是第 0 轮、trace 20 是第 1 轮（即便乱序灌入）。
+        assert_eq!(tl.turns[0].turn_index, 0);
+        assert_eq!(tl.turns[0].trace_id, 10);
+        assert_eq!(tl.turns[0].user_input.as_deref(), Some("如何修改预留手机号"));
+        assert_eq!(tl.turns[0].agent_output.as_deref(), Some("到安全中心修改"));
+        assert_eq!(tl.turns[0].error_count, 0);
+        assert_eq!(tl.turns[1].trace_id, 20);
+        assert_eq!(tl.turns[1].user_input.as_deref(), Some("还是不行"));
+        assert_eq!(tl.turns[1].agent_output.as_deref(), Some("请联系人工客服"));
+        assert_eq!(tl.turns[1].error_count, 1, "第二轮 span2 status=1");
+        // token 全会话汇总。
+        assert_eq!(tl.total_input_tokens, 100, "60+40");
+        assert_eq!(tl.total_output_tokens, 35, "20+15");
     }
 
     #[test]

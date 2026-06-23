@@ -32,3 +32,7 @@ vectors.dat
 *~
 .idea/
 .vscode/
+.gstack/
+
+# 控制台前端构建产物（vite build 后拷入，编译期内嵌）
+yitrace-engine/crates/yt-engine/console_dist/
