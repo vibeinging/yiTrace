@@ -1,0 +1,23 @@
+# yt-vecindex-graph —— 团队 graph_index（图式向量 ANN）接入引擎的 GraphIndex trait。
+#
+# 设计同 Vortex / jieba：外部 C/C++ 依赖关在工作区外独立 crate，引擎骨架保持零依赖、离线可编。
+# 核心 = 带过滤近邻搜索的「进图过滤」：搜索过程中回调 Rust 谓词决定收点（护城河，见 graph.rs 实证）。
+# 用法：CoordinatorBuilder::new().with_graph(Arc::new(GraphAnnFfi::open(dim,m,ef)?)).open_durable(dir)
+#
+# features：
+#   - mock（默认）：crate 内 Rust 桩提供 C 符号（精确过滤 top-k），离线可编可测，验证回调跨 FFI 编组正确。
+#   - link：build.rs 链接团队真 graph_index 库（vexgraph）。生产构建：
+#       cargo build -p yt-vecindex-graph --no-default-features --features link
+[package]
+name = "yt-vecindex-graph"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = ["mock"]
+mock = []
+link = []
+
+[dependencies]
+yt-engine = { path = "../yitrace-engine/crates/yt-engine" }
