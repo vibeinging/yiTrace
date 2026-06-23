@@ -31,6 +31,7 @@ class Span:
         name: str,
         parent_span_id: int | None = None,
         session_id: int | None = None,
+        tenant_id: int | None = None,
     ) -> None:
         self.tracer = tracer
         self.trace_id = trace_id
@@ -43,6 +44,7 @@ class Span:
         self._input_tokens: int | None = None
         self._output_tokens: int | None = None
         self._session_id = session_id  # 会话 id：从 trace 透传下来
+        self._tenant_id = tenant_id  # 租户 id：从 trace 透传下来（隔离维度）
         self._agent_name: str | None = None
         self._tool_name: str | None = None
         self._model: str | None = None
@@ -69,6 +71,7 @@ class Span:
                 input_tokens=self._input_tokens,
                 output_tokens=self._output_tokens,
                 session_id=self._session_id,
+                tenant_id=self._tenant_id,
                 agent_name=self._agent_name,
                 tool_name=self._tool_name,
                 model=self._model,
@@ -113,8 +116,8 @@ class Span:
             self._output_text = output_text
 
     def span(self, name: str):
-        """嵌套子 span：自动以当前 span 为父，并继承会话 id。"""
-        return _scoped_span(self.tracer, self.trace_id, name, self.span_id, self._session_id)
+        """嵌套子 span：自动以当前 span 为父，并继承会话 id / 租户 id。"""
+        return _scoped_span(self.tracer, self.trace_id, name, self.span_id, self._session_id, self._tenant_id)
 
     # —— 上下文管理 ——
     def _start(self) -> None:
@@ -129,10 +132,10 @@ class Span:
 
 @contextmanager
 def _scoped_span(
-    tracer: "Tracer", trace_id: int, name: str, parent_span_id: int | None, session_id: int | None = None
+    tracer: "Tracer", trace_id: int, name: str, parent_span_id: int | None, session_id: int | None = None, tenant_id: int | None = None
 ) -> Iterator[Span]:
     span_id = tracer._sf.next()
-    sp = Span(tracer, trace_id, span_id, name, parent_span_id, session_id)
+    sp = Span(tracer, trace_id, span_id, name, parent_span_id, session_id, tenant_id)
     sp._start()
     try:
         yield sp
@@ -144,15 +147,16 @@ def _scoped_span(
 
 
 class Trace:
-    def __init__(self, tracer: "Tracer", trace_id: int, name: str, session_id: int | None = None) -> None:
+    def __init__(self, tracer: "Tracer", trace_id: int, name: str, session_id: int | None = None, tenant_id: int | None = None) -> None:
         self.tracer = tracer
         self.trace_id = trace_id
         self.name = name
         self.session_id = session_id  # 会话 id：多轮对话/agent 会话，串起多条 trace
+        self.tenant_id = tenant_id  # 租户 id：逻辑隔离维度，本 trace 的所有 span 都带它
 
     def span(self, name: str):
-        """根 span（无父），继承本 trace 的会话 id。"""
-        return _scoped_span(self.tracer, self.trace_id, name, None, self.session_id)
+        """根 span（无父），继承本 trace 的会话 id / 租户 id。"""
+        return _scoped_span(self.tracer, self.trace_id, name, None, self.session_id, self.tenant_id)
 
 
 class Tracer:
@@ -161,10 +165,10 @@ class Tracer:
         self._sf = Snowflake(node_id)
 
     @contextmanager
-    def trace(self, name: str, session_id: int | None = None) -> Iterator[Trace]:
-        """开一条 trace。传 session_id 把它归入某会话（同一会话的多条 trace 用同一 id）。"""
+    def trace(self, name: str, session_id: int | None = None, tenant_id: int | None = None) -> Iterator[Trace]:
+        """开一条 trace。session_id 归会话；tenant_id 标租户（隔离维度，该 trace 全部 span 都带）。"""
         trace_id = self._sf.next()
-        yield Trace(self, trace_id, name, session_id)
+        yield Trace(self, trace_id, name, session_id, tenant_id)
 
     def _emit(self, event: SpanEvent) -> None:
         self.exporter.export(event)

@@ -120,7 +120,7 @@ async function asyncTests(): Promise<void> {
   const ev: SpanEvent = {
     traceId: 1n, spanId: 1n, ts: 1n, seq: 1n, eventType: EventType.SpanEnd, extSpanId: "s1",
     parentSpanId: null, status: 0, durationNs: null, inputTokens: null, outputTokens: null,
-    sessionId: null, agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
+    sessionId: null, tenantId: null, agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
   };
   const origFetch = globalThis.fetch;
   try {

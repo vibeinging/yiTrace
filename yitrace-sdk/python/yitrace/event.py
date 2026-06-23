@@ -57,6 +57,7 @@ class SpanEvent:
     input_tokens: int | None = None  # LLM 输入 token（成本核心）
     output_tokens: int | None = None
     session_id: int | None = None  # 会话 id（多轮对话/agent 会话，串起多条 trace）
+    tenant_id: int | None = None  # 租户 id（逻辑隔离维度；多租户共享索引、查询强制按 tenant 过滤）
     agent_name: str | None = None  # agent 名（成本/可观测按 agent 下钻）
     tool_name: str | None = None  # 工具名（tool/function call span）
     model: str | None = None  # 模型名（成本按模型归因）
@@ -83,6 +84,7 @@ class SpanEvent:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "session_id": self.session_id,
+            "tenant_id": self.tenant_id,
             "agent_name": self.agent_name,
             "tool_name": self.tool_name,
             "model": self.model,

@@ -62,6 +62,7 @@ export interface SpanEvent {
   inputTokens: bigint | null; // LLM 输入 token（成本核心）
   outputTokens: bigint | null;
   sessionId: bigint | null; // 会话 id（多轮对话/agent 会话，串起多条 trace）
+  tenantId: bigint | null; // 租户 id（逻辑隔离维度；多租户共享索引、查询强制按 tenant 过滤）
   agentName: string | null; // agent 名（成本/可观测按 agent 下钻）
   toolName: string | null; // 工具名（tool/function call span）
   model: string | null; // 模型名（成本按模型归因）
@@ -86,6 +87,7 @@ export function toWire(e: SpanEvent): Record<string, unknown> {
     input_tokens: e.inputTokens === null ? null : e.inputTokens.toString(),
     output_tokens: e.outputTokens === null ? null : e.outputTokens.toString(),
     session_id: e.sessionId === null ? null : e.sessionId.toString(),
+    tenant_id: e.tenantId === null ? null : e.tenantId.toString(),
     agent_name: e.agentName,
     tool_name: e.toolName,
     model: e.model,

@@ -30,6 +30,7 @@ export class Span {
   private inputTokensV: bigint | null = null;
   private outputTokensV: bigint | null = null;
   private sessionIdV: bigint | null = null; // 会话 id：从 trace 透传下来
+  private tenantIdV: bigint | null = null; // 租户 id：从 trace 透传下来（隔离维度）
   private agentNameV: string | null = null;
   private toolNameV: string | null = null;
   private modelV: string | null = null;
@@ -44,6 +45,7 @@ export class Span {
     name: string,
     parentSpanId: bigint | null = null,
     sessionId: bigint | null = null,
+    tenantId: bigint | null = null,
   ) {
     this.tracer = tracer;
     this.traceId = traceId;
@@ -51,12 +53,13 @@ export class Span {
     this.name = name;
     this.parentSpanId = parentSpanId;
     this.sessionIdV = sessionId;
+    this.tenantIdV = tenantId;
     this.extSpanId = `${traceId}-${spanId}`; // 跨进程稳定身份,与引擎一致
   }
 
-  // 嵌套子 span：自动以当前 span 为父，并继承会话 id。
+  // 嵌套子 span：自动以当前 span 为父，并继承会话 id / 租户 id。
   span<T>(name: string, fn: (s: Span) => T): T {
-    return runSpan(this.tracer, this.traceId, name, this.spanId, fn, this.sessionIdV);
+    return runSpan(this.tracer, this.traceId, name, this.spanId, fn, this.sessionIdV, this.tenantIdV);
   }
 
   private nextSeq(): bigint {
@@ -81,6 +84,7 @@ export class Span {
       inputTokens: this.inputTokensV,
       outputTokens: this.outputTokensV,
       sessionId: this.sessionIdV,
+      tenantId: this.tenantIdV,
       agentName: this.agentNameV,
       toolName: this.toolNameV,
       model: this.modelV,
@@ -145,9 +149,10 @@ function runSpan<T>(
   parentSpanId: bigint | null,
   fn: (s: Span) => T,
   sessionId: bigint | null = null,
+  tenantId: bigint | null = null,
 ): T {
   const spanId = tracer.sf.next();
-  const sp = new Span(tracer, traceId, spanId, name, parentSpanId, sessionId);
+  const sp = new Span(tracer, traceId, spanId, name, parentSpanId, sessionId, tenantId);
   sp.start();
   try {
     return fn(sp);
@@ -164,17 +169,19 @@ export class Trace {
   traceId: bigint;
   name: string;
   sessionId: bigint | null; // 会话 id：多轮对话/agent 会话，串起多条 trace
+  tenantId: bigint | null; // 租户 id：逻辑隔离维度，本 trace 全部 span 都带它
 
-  constructor(tracer: Tracer, traceId: bigint, name: string, sessionId: bigint | null = null) {
+  constructor(tracer: Tracer, traceId: bigint, name: string, sessionId: bigint | null = null, tenantId: bigint | null = null) {
     this.tracer = tracer;
     this.traceId = traceId;
     this.name = name;
     this.sessionId = sessionId;
+    this.tenantId = tenantId;
   }
 
-  // 根 span（无父），继承本 trace 的会话 id。
+  // 根 span（无父），继承本 trace 的会话 id / 租户 id。
   span<T>(name: string, fn: (s: Span) => T): T {
-    return runSpan(this.tracer, this.traceId, name, null, fn, this.sessionId);
+    return runSpan(this.tracer, this.traceId, name, null, fn, this.sessionId, this.tenantId);
   }
 }
 
@@ -187,11 +194,12 @@ export class Tracer {
     this.sf = new Snowflake(nodeId);
   }
 
-  // 开一条 trace。传 sessionId 把它归入某会话（同一会话的多条 trace 用同一 id）。
-  trace<T>(name: string, fn: (t: Trace) => T, sessionId?: bigint | number): T {
+  // 开一条 trace。sessionId 归会话；tenantId 标租户（隔离维度，该 trace 全部 span 都带）。
+  trace<T>(name: string, fn: (t: Trace) => T, sessionId?: bigint | number, tenantId?: bigint | number): T {
     const traceId = this.sf.next();
     const sid = sessionId === undefined ? null : BigInt(sessionId);
-    return fn(new Trace(this, traceId, name, sid));
+    const tid = tenantId === undefined ? null : BigInt(tenantId);
+    return fn(new Trace(this, traceId, name, sid, tid));
   }
 
   emitEvent(e: SpanEvent): void {
