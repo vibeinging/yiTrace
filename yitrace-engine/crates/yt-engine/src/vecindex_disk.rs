@@ -27,6 +27,33 @@ use crate::GraphIndex;
 const MAGIC: u32 = 0x56474958; // "VGIX"
 const VERSION: u32 = 1;
 
+// ───── 快哈希（整数键内部索引用，无依赖）：默认 HashMap 走抗 DoS 的 SipHash，对 visited/缓存这类
+// 整数键热结构太慢；这里乘移位的廉价哈希快 3-5×，建图/检索全程受益。仅用于内部、非对外暴露的 key。
+#[derive(Default)]
+struct FastHasher(u64);
+impl std::hash::Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7C_C1_B7_27_22_0A_95);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+type FastBuild = std::hash::BuildHasherDefault<FastHasher>;
+type FastMap<K, V> = HashMap<K, V, FastBuild>;
+type FastSet<K> = std::collections::HashSet<K, FastBuild>;
+
 /// 距离度量（本阶段先 L2；cosine/内积后续）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Metric {
@@ -48,7 +75,7 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 struct VecCache {
     budget_bytes: usize,
     cur_bytes: usize,
-    map: HashMap<u64, (Arc<[f32]>, u64)>,
+    map: FastMap<u64, (Arc<[f32]>, u64)>,
     tick: u64,
     hits: u64,
     misses: u64,
@@ -56,7 +83,7 @@ struct VecCache {
 
 impl VecCache {
     fn new(budget_bytes: usize) -> Self {
-        Self { budget_bytes, cur_bytes: 0, map: HashMap::new(), tick: 0, hits: 0, misses: 0 }
+        Self { budget_bytes, cur_bytes: 0, map: FastMap::default(), tick: 0, hits: 0, misses: 0 }
     }
 
     fn get(&mut self, id: u64) -> Option<Arc<[f32]>> {
@@ -104,25 +131,25 @@ impl VecCache {
 /// 写穿（write_node 同步更新），O(1) 访问的 tick-LRU，按**条数**封顶（节点记录小，默认上限大）。
 struct NodeCache {
     cap: usize,
-    map: HashMap<u32, (NodeRec, u64)>,
+    map: FastMap<u32, (Arc<NodeRec>, u64)>,
     tick: u64,
 }
 
 impl NodeCache {
     fn new(cap: usize) -> Self {
-        Self { cap: cap.max(1), map: HashMap::new(), tick: 0 }
+        Self { cap: cap.max(1), map: FastMap::default(), tick: 0 }
     }
-    fn get(&mut self, id: u32) -> Option<NodeRec> {
+    fn get(&mut self, id: u32) -> Option<Arc<NodeRec>> {
         self.tick += 1;
         let t = self.tick;
         if let Some(e) = self.map.get_mut(&id) {
             e.1 = t;
-            Some(e.0.clone())
+            Some(e.0.clone()) // Arc 克隆 = 加引用计数，不复制 NodeRec
         } else {
             None
         }
     }
-    fn put(&mut self, id: u32, rec: NodeRec) {
+    fn put(&mut self, id: u32, rec: Arc<NodeRec>) {
         self.tick += 1;
         self.map.insert(id, (rec, self.tick));
         if self.map.len() > self.cap {
@@ -314,16 +341,21 @@ impl DiskGraphStore {
         self.write_node(id as u64, rec.trace_id, rec.span_id, rec.deleted, level, &rec.neighbors)
     }
 
-    /// 读节点记录（先查节点缓存、未命中才 pread + 解码并回填）。
+    /// 读节点记录（拷贝出 `NodeRec`，给需要拥有所有权的调用方）。
     pub fn read_node(&self, id: u32) -> std::io::Result<NodeRec> {
-        if let Some(rec) = self.node_cache.lock().unwrap().get(id) {
-            return Ok(rec);
+        self.node_arc(id).map(|a| (*a).clone())
+    }
+
+    /// 读节点记录（`Arc<NodeRec>`，热路径用，命中只加引用计数、不复制邻居 Vec）。
+    pub fn node_arc(&self, id: u32) -> std::io::Result<Arc<NodeRec>> {
+        if let Some(a) = self.node_cache.lock().unwrap().get(id) {
+            return Ok(a);
         }
         let mut buf = vec![0u8; self.node_rec_size];
         self.nodes.read_exact_at(&mut buf, id as u64 * self.node_rec_size as u64)?;
-        let rec = decode_node(&buf);
-        self.node_cache.lock().unwrap().put(id, rec.clone());
-        Ok(rec)
+        let a = Arc::new(decode_node(&buf));
+        self.node_cache.lock().unwrap().put(id, a.clone());
+        Ok(a)
     }
 
     /// 读向量（`Arc<[f32]>`，热路径用，命中只加引用计数、不复制）。
@@ -375,7 +407,7 @@ impl DiskGraphStore {
         let buf = encode_node(self.node_rec_size, self.max_deg, trace_id, span_id, deleted, level, &nb);
         self.nodes.write_all_at(&buf, id * self.node_rec_size as u64)?;
         // 写穿：节点缓存同步更新，读路径直接命中、不回盘。
-        self.node_cache.lock().unwrap().put(id as u32, NodeRec { trace_id, span_id, deleted, level, neighbors: nb });
+        self.node_cache.lock().unwrap().put(id as u32, Arc::new(NodeRec { trace_id, span_id, deleted, level, neighbors: nb }));
         Ok(())
     }
 }
@@ -558,7 +590,7 @@ impl DiskGraphIndex {
     /// HNSW search-layer：在某一层从 `entries` 出发 beam 扩展。`admit` 决定收点 + 驱动停止，
     /// 导航穿过所有未访问邻居（含 admit=false 的）⇒ 进图过滤。返回 (id, 距离) 升序。
     fn search_layer(&self, query: &[f32], entries: &[u32], ef: usize, level: u8, admit: &dyn Fn(u32) -> bool) -> Vec<(u32, f32)> {
-        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut visited: FastSet<u32> = FastSet::default();
         let mut frontier: BinaryHeap<Reverse<(OrdF32, u32)>> = BinaryHeap::new();
         let mut result: BinaryHeap<(OrdF32, u32)> = BinaryHeap::new();
 
@@ -580,7 +612,18 @@ impl DiskGraphIndex {
                     }
                 }
             }
-            for nb in self.neighbors_at(cur, level) {
+            // 取 cur 在该层的邻居：level 0（热）借 Arc 不克隆；上层取稀疏小表。
+            let arc0 = if level == 0 { self.store.node_arc(cur).ok() } else { None };
+            let upper_v: Vec<u32>;
+            let nbrs: &[u32] = if let Some(n) = &arc0 {
+                &n.neighbors
+            } else if level == 0 {
+                &[]
+            } else {
+                upper_v = self.upper.lock().unwrap().get(&(cur, level)).cloned().unwrap_or_default();
+                &upper_v
+            };
+            for &nb in nbrs {
                 if !visited.insert(nb) {
                     continue;
                 }
@@ -617,7 +660,7 @@ impl DiskGraphIndex {
             return Ok(());
         };
 
-        let alive = |q: u32| self.store.read_node(q).map(|r| !r.deleted).unwrap_or(false);
+        let alive = |q: u32| self.store.node_arc(q).map(|a| !a.deleted).unwrap_or(false);
 
         // 1) 顶层贪心下沉到 level+1，找靠近插入点的入口（ef=1）。
         let mut lc = top;
@@ -693,7 +736,7 @@ impl GraphIndex for DiskGraphIndex {
         let Some((mut ep, top)) = *self.entry.lock().unwrap() else {
             return Vec::new();
         };
-        let alive = |q: u32| self.store.read_node(q).map(|r| !r.deleted).unwrap_or(false);
+        let alive = |q: u32| self.store.node_arc(q).map(|a| !a.deleted).unwrap_or(false);
 
         // 顶层贪心下沉到 level 1（只导航、ef=1）。
         let mut lc = top;
@@ -705,9 +748,9 @@ impl GraphIndex for DiskGraphIndex {
             lc -= 1;
         }
 
-        // 底层 ef_search beam + 进图过滤（admit = 未删 + 业务谓词）。
-        let admit = |q: u32| match self.store.read_node(q) {
-            Ok(r) => !r.deleted && filter(r.trace_id, r.span_id),
+        // 底层 ef_search beam + 进图过滤（admit = 未删 + 业务谓词）。node_arc 不克隆。
+        let admit = |q: u32| match self.store.node_arc(q) {
+            Ok(a) => !a.deleted && filter(a.trace_id, a.span_id),
             Err(_) => false,
         };
         let ef = self.ef_search.max(k);

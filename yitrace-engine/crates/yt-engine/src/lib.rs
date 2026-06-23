@@ -1030,7 +1030,20 @@ impl CoordinatorBuilder {
         self
     }
 
-    /// 设持久磁盘向量索引的完整参数（缓冲预算 / m / ef）。仅没注入自定义 graph 时生效。
+    /// 设**建图候选列表宽度 `ef_construction`**（对齐 graph_index）：越大召回越好、建图越慢；
+    /// 想要更快建图就调小（如 32），是建图速度/召回的主旋钮。默认 64。仅没注入自定义 graph 时生效。
+    pub fn with_ef_construction(mut self, ef: usize) -> Self {
+        self.vec_cfg = Some(self.vec_cfg.unwrap_or_default().with_ef_construction(ef));
+        self
+    }
+
+    /// 设**查询候选列表宽度 `ef_search`**（对齐 `hnsw_ef_search`）：越大召回越高、查询越慢。默认 100。
+    pub fn with_ef_search(mut self, ef: usize) -> Self {
+        self.vec_cfg = Some(self.vec_cfg.unwrap_or_default().with_ef_search(ef));
+        self
+    }
+
+    /// 设持久磁盘向量索引的完整参数（缓冲预算 / m / ef_construction / ef_search）。仅没注入自定义 graph 时生效。
     pub fn with_disk_graph_config(mut self, cfg: DiskGraphConfig) -> Self {
         self.vec_cfg = Some(cfg);
         self
