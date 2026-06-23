@@ -15,12 +15,12 @@
 #![allow(dead_code)]
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt; // 定位读写（read_at/write_at），无文件游标 → 并发只读安全
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::GraphIndex;
 
@@ -41,56 +41,101 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 
 /// 向量缓冲池：**按内存预算（字节）** 缓存热向量，对齐 graph_index 的 `vector_buffers`。
 /// 例：预算 1GiB、索引 10GiB → 只有约 1GiB 的热向量常驻，冷向量淘汰、再访问回磁盘读。
-/// 命中移到队尾（LRU），放入后若超预算就从队首（最久未用）淘汰，直到不超（至少留 1 条防抖动）。
+///
+/// **O(1) 访问**：每项记一个访问 tick，命中只更 tick（不再每次线性扫整个缓存更 LRU 顺序——那是建图/
+/// 检索慢的主因之一）；仅在**超预算时**才 O(n) 批量淘汰最久未用的、一次腾出 ~10% 余量（摊销，命中区无淘汰）。
+/// 向量存 `Arc<[f32]>`：命中返回 Arc 克隆（仅加引用计数），不复制 dim 个 f32。
 struct VecCache {
     budget_bytes: usize,
     cur_bytes: usize,
-    map: HashMap<u64, Vec<f32>>,
-    order: VecDeque<u64>,
+    map: HashMap<u64, (Arc<[f32]>, u64)>,
+    tick: u64,
     hits: u64,
     misses: u64,
 }
 
 impl VecCache {
     fn new(budget_bytes: usize) -> Self {
-        Self { budget_bytes, cur_bytes: 0, map: HashMap::new(), order: VecDeque::new(), hits: 0, misses: 0 }
+        Self { budget_bytes, cur_bytes: 0, map: HashMap::new(), tick: 0, hits: 0, misses: 0 }
     }
 
-    fn get(&mut self, id: u64) -> Option<Vec<f32>> {
-        if let Some(v) = self.map.get(&id).cloned() {
+    fn get(&mut self, id: u64) -> Option<Arc<[f32]>> {
+        self.tick += 1;
+        let t = self.tick;
+        if let Some(e) = self.map.get_mut(&id) {
+            e.1 = t;
             self.hits += 1;
-            self.touch(id);
-            Some(v)
+            Some(e.0.clone())
         } else {
             self.misses += 1;
             None
         }
     }
 
-    fn put(&mut self, id: u64, v: Vec<f32>) {
+    fn put(&mut self, id: u64, v: Arc<[f32]>) {
+        self.tick += 1;
         let bytes = v.len() * 4;
-        if let Some(old) = self.map.insert(id, v) {
-            self.cur_bytes -= old.len() * 4;
-            self.touch(id);
-        } else {
-            self.order.push_back(id);
+        match self.map.insert(id, (v, self.tick)) {
+            Some((old, _)) => self.cur_bytes = self.cur_bytes + bytes - old.len() * 4,
+            None => self.cur_bytes += bytes,
         }
-        self.cur_bytes += bytes;
-        // 超预算就淘汰最久未用的，直到不超（至少保 1 条，防单条大于预算时反复抖动）。
-        while self.cur_bytes > self.budget_bytes && self.order.len() > 1 {
-            if let Some(old_id) = self.order.pop_front() {
-                if let Some(ov) = self.map.remove(&old_id) {
-                    self.cur_bytes -= ov.len() * 4;
-                }
-            }
+        if self.cur_bytes > self.budget_bytes {
+            self.evict();
         }
     }
 
-    fn touch(&mut self, id: u64) {
-        if let Some(pos) = self.order.iter().position(|&x| x == id) {
-            self.order.remove(pos);
+    /// 超预算时批量淘汰最久未用的，腾到 ~90% 预算（一次腾够、不是每 put 都淘）。
+    fn evict(&mut self) {
+        let target = (self.budget_bytes * 9 / 10).max(1);
+        let mut by_tick: Vec<(u64, u64, usize)> =
+            self.map.iter().map(|(&id, (v, t))| (*t, id, v.len() * 4)).collect();
+        by_tick.sort_unstable_by_key(|x| x.0);
+        for (_, id, bytes) in by_tick {
+            if self.cur_bytes <= target || self.map.len() <= 1 {
+                break;
+            }
+            self.map.remove(&id);
+            self.cur_bytes -= bytes;
         }
-        self.order.push_back(id);
+    }
+}
+
+/// 节点记录缓存（图拓扑，对齐 graph_index 把邻边/元数据放 shared_buffers）：消除每次访问的 pread 系统调用。
+/// 写穿（write_node 同步更新），O(1) 访问的 tick-LRU，按**条数**封顶（节点记录小，默认上限大）。
+struct NodeCache {
+    cap: usize,
+    map: HashMap<u32, (NodeRec, u64)>,
+    tick: u64,
+}
+
+impl NodeCache {
+    fn new(cap: usize) -> Self {
+        Self { cap: cap.max(1), map: HashMap::new(), tick: 0 }
+    }
+    fn get(&mut self, id: u32) -> Option<NodeRec> {
+        self.tick += 1;
+        let t = self.tick;
+        if let Some(e) = self.map.get_mut(&id) {
+            e.1 = t;
+            Some(e.0.clone())
+        } else {
+            None
+        }
+    }
+    fn put(&mut self, id: u32, rec: NodeRec) {
+        self.tick += 1;
+        self.map.insert(id, (rec, self.tick));
+        if self.map.len() > self.cap {
+            let target = self.cap * 9 / 10;
+            let mut by_tick: Vec<(u64, u32)> = self.map.iter().map(|(&id, (_, t))| (*t, id)).collect();
+            by_tick.sort_unstable_by_key(|x| x.0);
+            for (_, id) in by_tick {
+                if self.map.len() <= target {
+                    break;
+                }
+                self.map.remove(&id);
+            }
+        }
     }
 }
 
@@ -176,6 +221,7 @@ pub struct DiskGraphStore {
     /// 已分配节点数（= nodes 文件长度 / 记录长，开盘时据此恢复，无需单独持久）。
     count: AtomicU64,
     cache: Mutex<VecCache>,
+    node_cache: Mutex<NodeCache>,
 }
 
 impl DiskGraphStore {
@@ -214,6 +260,8 @@ impl DiskGraphStore {
             node_rec_size,
             count: AtomicU64::new(count),
             cache: Mutex::new(VecCache::new(cfg.vector_cache_bytes)),
+            // 节点记录（图拓扑）缓存，消除每次访问 pread。默认上限 1M 条（~小几百 MB），上量可调。
+            node_cache: Mutex::new(NodeCache::new(1 << 20)),
         })
     }
 
@@ -244,8 +292,7 @@ impl DiskGraphStore {
         self.write_node(id, trace_id, span_id, false, level, &[])?;
         // 两个文件都落盘后才提交计数（读者据此判可见）。
         self.count.store(id + 1, Ordering::Release);
-        let mut c = self.cache.lock().unwrap();
-        c.put(id, vector.to_vec());
+        self.cache.lock().unwrap().put(id, Arc::from(vector.to_vec()));
         Ok(Some(id as u32))
     }
 
@@ -267,23 +314,33 @@ impl DiskGraphStore {
         self.write_node(id as u64, rec.trace_id, rec.span_id, rec.deleted, level, &rec.neighbors)
     }
 
-    /// 读节点记录。
+    /// 读节点记录（先查节点缓存、未命中才 pread + 解码并回填）。
     pub fn read_node(&self, id: u32) -> std::io::Result<NodeRec> {
+        if let Some(rec) = self.node_cache.lock().unwrap().get(id) {
+            return Ok(rec);
+        }
         let mut buf = vec![0u8; self.node_rec_size];
         self.nodes.read_exact_at(&mut buf, id as u64 * self.node_rec_size as u64)?;
-        Ok(decode_node(&buf))
+        let rec = decode_node(&buf);
+        self.node_cache.lock().unwrap().put(id, rec.clone());
+        Ok(rec)
     }
 
-    /// 读向量（先查缓冲、未命中读盘并回填）。
-    pub fn read_vector(&self, id: u32) -> std::io::Result<Vec<f32>> {
+    /// 读向量（`Arc<[f32]>`，热路径用，命中只加引用计数、不复制）。
+    pub fn read_vector_arc(&self, id: u32) -> std::io::Result<Arc<[f32]>> {
         if let Some(v) = self.cache.lock().unwrap().get(id as u64) {
             return Ok(v);
         }
         let mut buf = vec![0u8; self.dim * 4];
         self.vectors.read_exact_at(&mut buf, id as u64 * self.dim as u64 * 4)?;
-        let v: Vec<f32> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let v: Arc<[f32]> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         self.cache.lock().unwrap().put(id as u64, v.clone());
         Ok(v)
+    }
+
+    /// 读向量（拷成 `Vec<f32>`，给外部 API / 测试用）。
+    pub fn read_vector(&self, id: u32) -> std::io::Result<Vec<f32>> {
+        self.read_vector_arc(id).map(|v| v.to_vec())
     }
 
     /// 缓冲命中/未命中计数（测"向量不全量常驻"用）。
@@ -314,8 +371,12 @@ impl DiskGraphStore {
     }
 
     fn write_node(&self, id: u64, trace_id: u64, span_id: u64, deleted: bool, level: u8, neighbors: &[u32]) -> std::io::Result<()> {
-        let buf = encode_node(self.node_rec_size, self.max_deg, trace_id, span_id, deleted, level, neighbors);
-        self.nodes.write_all_at(&buf, id * self.node_rec_size as u64)
+        let nb: Vec<u32> = neighbors.iter().take(self.max_deg).copied().collect();
+        let buf = encode_node(self.node_rec_size, self.max_deg, trace_id, span_id, deleted, level, &nb);
+        self.nodes.write_all_at(&buf, id * self.node_rec_size as u64)?;
+        // 写穿：节点缓存同步更新，读路径直接命中、不回盘。
+        self.node_cache.lock().unwrap().put(id as u32, NodeRec { trace_id, span_id, deleted, level, neighbors: nb });
+        Ok(())
     }
 }
 
@@ -462,9 +523,9 @@ impl DiskGraphIndex {
         &self.store
     }
 
-    /// 节点向量与查询的 L2 距离（按需读向量，走缓冲）。读失败返回 +inf。
+    /// 节点向量与查询的 L2 距离（按需读向量，走缓冲；Arc 命中不复制）。读失败返回 +inf。
     fn dist(&self, query: &[f32], id: u32) -> f32 {
-        match self.store.read_vector(id) {
+        match self.store.read_vector_arc(id) {
             Ok(v) => l2_sq(query, &v),
             Err(_) => f32::INFINITY,
         }
@@ -582,7 +643,7 @@ impl DiskGraphIndex {
                     adj.push(id);
                 }
                 if adj.len() > cap {
-                    let base = self.store.read_vector(nb).unwrap_or_default();
+                    let base = self.store.read_vector_arc(nb).unwrap_or_else(|_| Arc::from(Vec::new()));
                     adj.sort_by(|&a, &b| self.dist(&base, a).total_cmp(&self.dist(&base, b)));
                     adj.truncate(cap);
                 }

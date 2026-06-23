@@ -803,6 +803,47 @@ pub struct WriteCoordinator {
     filter_attrs: Mutex<HashMap<(u64, u64), FilterAttrs>>,
     /// 控制台会话边车索引：摄入时**增量差量**维护（O(1)/事件），delete/upgrade 标脏、下次读重建。
     session_idx: Mutex<SessionIndex>,
+    /// **段折叠缓存**：不可变段首次解码后缓存（行 + (trace,span)→行号 索引），检索路径只取候选行、
+    /// 不再每查重读+重解码整段。段 unlink（compaction/GC）时失效。LRU、按总行数封顶。
+    seg_fold_cache: Mutex<SegFoldCache>,
+}
+
+/// 一个段解码折叠后的缓存：全部行 + (trace,span)→行号 索引（行号=段内顺序，删除位图照行号生效）。
+struct SegFold {
+    rows: Vec<FoldInput>,
+    by_key: HashMap<(u64, u64), Vec<u32>>,
+}
+
+/// 段折叠缓存（LRU，按总缓存行数封顶；段不可变，命中即用、unlink 时移除）。
+struct SegFoldCache {
+    cap_rows: usize,
+    cur_rows: usize,
+    map: HashMap<u64, (Arc<SegFold>, u64)>,
+    tick: u64,
+}
+
+impl SegFoldCache {
+    fn new(cap_rows: usize) -> Self {
+        Self { cap_rows: cap_rows.max(1), cur_rows: 0, map: HashMap::new(), tick: 0 }
+    }
+    fn remove(&mut self, seg: u64) {
+        if let Some((sf, _)) = self.map.remove(&seg) {
+            self.cur_rows -= sf.rows.len();
+        }
+    }
+    fn evict(&mut self) {
+        let target = (self.cap_rows * 9 / 10).max(1);
+        let mut by_tick: Vec<(u64, u64, usize)> =
+            self.map.iter().map(|(&seg, (sf, t))| (*t, seg, sf.rows.len())).collect();
+        by_tick.sort_unstable_by_key(|x| x.0);
+        for (_, seg, n) in by_tick {
+            if self.cur_rows <= target || self.map.len() <= 1 {
+                break;
+            }
+            self.map.remove(&seg);
+            self.cur_rows -= n;
+        }
+    }
 }
 
 /// 一个 span 在边车里的当前聚合（last-non-null 口径，与折叠一致）。用于算会话级差量。
@@ -957,6 +998,8 @@ impl SessionIndex {
 pub struct CoordinatorBuilder {
     bm25: Option<Arc<dyn Bm25Index>>,
     graph: Option<Arc<dyn GraphIndex>>,
+    /// 持久模式磁盘向量索引的参数（缓冲预算 / m / ef）。None = 默认。仅在没注入自定义 graph 时生效。
+    vec_cfg: Option<DiskGraphConfig>,
 }
 
 impl CoordinatorBuilder {
@@ -981,6 +1024,18 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// 设持久磁盘向量索引的**缓冲预算（字节）**，如 `1 << 30` = 1GiB。仅没注入自定义 graph 时生效。
+    pub fn with_vector_cache_bytes(mut self, bytes: usize) -> Self {
+        self.vec_cfg = Some(self.vec_cfg.unwrap_or_default().with_cache_bytes(bytes));
+        self
+    }
+
+    /// 设持久磁盘向量索引的完整参数（缓冲预算 / m / ef）。仅没注入自定义 graph 时生效。
+    pub fn with_disk_graph_config(mut self, cfg: DiskGraphConfig) -> Self {
+        self.vec_cfg = Some(cfg);
+        self
+    }
+
     /// 内存 WAL（测试/开发）。
     pub fn build(self, segments: Arc<dyn SegmentStore>) -> Arc<WriteCoordinator> {
         WriteCoordinator::build_full(segments, Wal::new(), Manifest::empty(), 1, 1, None, None, self.bm25, self.graph)
@@ -991,9 +1046,9 @@ impl CoordinatorBuilder {
         Ok(WriteCoordinator::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, self.bm25, self.graph))
     }
 
-    /// 全持久化引擎（与 `WriteCoordinator::open_durable` 同语义，外加注入的索引）。
+    /// 全持久化引擎（与 `WriteCoordinator::open_durable` 同语义，外加注入的索引 / 磁盘向量索引参数）。
     pub fn open_durable(self, dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
-        WriteCoordinator::open_durable_inner(dir, self.bm25, self.graph)
+        WriteCoordinator::open_durable_inner(dir, self.bm25, self.graph, self.vec_cfg)
     }
 }
 
@@ -1013,14 +1068,15 @@ impl WriteCoordinator {
     /// 重启用同一目录 `open_durable` + `recover()`：先从 manifest 重建段集合(指向盘上段文件)、再 WAL 重放
     /// 水位之后的尾巴 —— **flush 过的数据(水位之前、WAL 不再重放)从持久段读回,真正重启不丢**。
     pub fn open_durable(dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
-        Self::open_durable_inner(dir, None, None)
+        Self::open_durable_inner(dir, None, None, None)
     }
 
-    /// open_durable 的内部实现，多收两个可选索引覆盖（[`CoordinatorBuilder`] 用它注入 jieba/自定义索引）。
+    /// open_durable 的内部实现，多收可选索引覆盖 + 磁盘向量索引参数（[`CoordinatorBuilder`] 用它注入）。
     fn open_durable_inner(
         dir: impl AsRef<std::path::Path>,
         bm25: Option<Arc<dyn Bm25Index>>,
         graph: Option<Arc<dyn GraphIndex>>,
+        vec_cfg: Option<DiskGraphConfig>,
     ) -> std::io::Result<Arc<Self>> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -1037,7 +1093,7 @@ impl WriteCoordinator {
         let (graph, vector_path): (Option<Arc<dyn GraphIndex>>, Option<std::path::PathBuf>) = match graph {
             Some(g) => (Some(g), Some(dir.join("vectors.dat"))),
             None => {
-                let disk = DurableGraphIndex::open(dir.join("vecindex"), DiskGraphConfig::default());
+                let disk = DurableGraphIndex::open(dir.join("vecindex"), vec_cfg.unwrap_or_default());
                 (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
             }
         };
@@ -1080,6 +1136,8 @@ impl WriteCoordinator {
             vector_path,
             filter_attrs: Mutex::new(HashMap::new()),
             session_idx: Mutex::new(SessionIndex::default()),
+            seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
+
         })
     }
 
@@ -1292,6 +1350,40 @@ impl WriteCoordinator {
         self.read_spans_query(snap, &TraceQuery::all()).0
     }
 
+    /// 取某段的折叠缓存（不可变段，首次解码全列 + 建 (trace,span)→行号 索引，之后命中直接用）。
+    fn seg_fold(&self, seg: SegmentId) -> Arc<SegFold> {
+        {
+            let mut c = self.seg_fold_cache.lock().unwrap();
+            c.tick += 1;
+            let t = c.tick;
+            if let Some(e) = c.map.get_mut(&seg.get()) {
+                e.1 = t;
+                return e.0.clone();
+            }
+        }
+        // 未命中：在锁外解码整段一次（之后所有查询命中缓存）。
+        let raw = self.segments.scan_fold_inputs(seg);
+        let mut rows = Vec::with_capacity(raw.len());
+        let mut by_key: HashMap<(u64, u64), Vec<u32>> = HashMap::new();
+        for (row, fi) in raw {
+            by_key.entry((fi.trace_id, fi.span_id)).or_default().push(row);
+            rows.push(fi);
+        }
+        let n = rows.len();
+        let sf = Arc::new(SegFold { rows, by_key });
+        let mut c = self.seg_fold_cache.lock().unwrap();
+        c.tick += 1;
+        let tk = c.tick;
+        if let Some((old, _)) = c.map.insert(seg.get(), (sf.clone(), tk)) {
+            c.cur_rows -= old.rows.len();
+        }
+        c.cur_rows += n;
+        if c.cur_rows > c.cap_rows {
+            c.evict();
+        }
+        sf
+    }
+
     /// 带剪枝的读路径。按时间窗（段 zone-map）+ trace_id 剪枝，减少触及的段数（活 trace 读扇出上界）。
     /// 返回 (折叠出的 span, 实际扫描的段数)。所有判定只用快照里钉死的版本。
     pub fn read_spans_query(&self, snap: &Snapshot, q: &TraceQuery) -> (Vec<FoldedSpan>, usize) {
@@ -1323,48 +1415,61 @@ impl WriteCoordinator {
                 continue; // 时间窗外，整段剪掉
             }
             scanned += 1;
-            // 行源,三条路（投影 `proj` 贯穿全部——列式段据此只解码命中列）：
-            //   ① 段无删除 + 有真实时间窗 → **时间下推 + 投影**：时间过滤推进段扫描、只解码命中行的命中列
-            //      （下推丢物理行号，但段无删除、用不到行号）。
-            //   ② 否则尝试**纯投影下推**：只裁列、不丢行 → 行号完整，删除位图照常按行号生效（任何查询都能用）。
-            //   ③ 都不支持（None）→ 回退 `scan_fold_inputs` 读全列。
-            let time_pushed = if entry.deletion_seq == 0 && (q.time_from != i64::MIN || q.time_to != i64::MAX) {
-                self.segments.scan_fold_inputs_in_time(entry.segment_id, q.time_from, q.time_to, proj)
-            } else {
-                None
-            };
-            match time_pushed {
-                Some(folds) => {
-                    // 行已被下推按时间过滤、段又无删除；只补 trace_id + keys 过滤。
-                    for fi in folds {
-                        if q.trace_id.map_or(false, |tid| fi.trace_id != tid) {
+            match keys {
+                // ★ 检索快路：已知候选 key → 段折叠缓存 + 段内 key→行号 索引，**只取候选行**、不扫全段。
+                //   首次解码该段后缓存，之后所有查询命中缓存（这是把检索 QPS 从"每查全段扫"解放出来的关键）。
+                Some(ks) => {
+                    let sf = self.seg_fold(entry.segment_id);
+                    for &(t, s) in ks {
+                        if q.trace_id.map_or(false, |tid| t != tid) {
                             continue;
                         }
-                        if !in_keys(fi.trace_id, fi.span_id) {
-                            continue;
+                        let Some(rowlist) = sf.by_key.get(&(t, s)) else { continue };
+                        for &row in rowlist {
+                            if entry.deletion_vec.is_deleted(row) {
+                                continue; // 删除位图按行号照查
+                            }
+                            // 时间窗已由段 zone-map 整段剪枝（FoldInput 不带行级 ts，与投影路一致）。
+                            inputs.push(sf.rows[row as usize].clone()); // 只克隆候选行（极少）
                         }
-                        inputs.push(fi);
                     }
                 }
+                // 普通读/聚合：三条扫描路（投影 `proj` 贯穿——列式段据此只解码命中列）：
+                //   ① 段无删除 + 有真实时间窗 → 时间下推 + 投影（丢行号，段无删除用不到）。
+                //   ② 否则纯投影下推：只裁列、不丢行 → 行号完整，删除位图照行号生效。
+                //   ③ 都不支持 → 回退 `scan_fold_inputs` 读全列。
                 None => {
-                    // 投影下推带回物理行号 → 删除检查照旧；不支持则全列扫描。两路下游过滤完全一致。
-                    let rows = self
-                        .segments
-                        .scan_fold_inputs_projected(entry.segment_id, proj)
-                        .unwrap_or_else(|| self.segments.scan_fold_inputs(entry.segment_id));
-                    for (row, fi) in rows {
-                        if entry.deletion_vec.is_deleted(row) {
-                            continue;
-                        }
-                        if let Some(tid) = q.trace_id {
-                            if fi.trace_id != tid {
-                                continue; // trace_id 不匹配（行级）
+                    let time_pushed = if entry.deletion_seq == 0 && (q.time_from != i64::MIN || q.time_to != i64::MAX) {
+                        self.segments.scan_fold_inputs_in_time(entry.segment_id, q.time_from, q.time_to, proj)
+                    } else {
+                        None
+                    };
+                    match time_pushed {
+                        Some(folds) => {
+                            for fi in folds {
+                                if q.trace_id.map_or(false, |tid| fi.trace_id != tid) {
+                                    continue;
+                                }
+                                inputs.push(fi);
                             }
                         }
-                        if !in_keys(fi.trace_id, fi.span_id) {
-                            continue; // 检索命中集之外的行不折叠
+                        None => {
+                            let rows = self
+                                .segments
+                                .scan_fold_inputs_projected(entry.segment_id, proj)
+                                .unwrap_or_else(|| self.segments.scan_fold_inputs(entry.segment_id));
+                            for (row, fi) in rows {
+                                if entry.deletion_vec.is_deleted(row) {
+                                    continue;
+                                }
+                                if let Some(tid) = q.trace_id {
+                                    if fi.trace_id != tid {
+                                        continue;
+                                    }
+                                }
+                                inputs.push(fi);
+                            }
                         }
-                        inputs.push(fi);
                     }
                 }
             }
@@ -2196,6 +2301,7 @@ impl WriteCoordinator {
                 && !self.current.contains_segment(r.seg);
             if ok {
                 self.segments.unlink_segment(r.seg);
+                self.seg_fold_cache.lock().unwrap().remove(r.seg.get()); // 段没了，缓存失效
                 freed += 1;
                 false // 出 dead_set
             } else {
