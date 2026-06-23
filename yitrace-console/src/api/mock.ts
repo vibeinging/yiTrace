@@ -1,7 +1,7 @@
 // Mock 数据层：确定性生成「上千会话」+ 大 trace，证明虚拟滚动 + 游标分页扛得住量。
 // 真实部署把这个换成 httpApi（见 http.ts），上层组件/hook 不动。
 
-import type { Span, SpanDetail, SpanKind, Status, Step, TraceApi, TraceSummary, SessionSummary } from './types'
+import type { SearchHit, Span, SpanDetail, SpanKind, Status, Step, TraceApi, TraceSummary, SessionSummary } from './types'
 
 const SESSION_COUNT = 4000 // 故意上千：试虚拟滚动与分页
 const PAGE_LIMIT_DEFAULT = 50
@@ -167,5 +167,23 @@ export const mockApi: TraceApi = {
       output: s.status === 'error' ? '执行报错：KeyError 列名拼写' : '已完成，返回观察结果并更新状态。',
     }))
     return delay(steps, 100)
+  },
+  async searchSpans(query, k) {
+    // 简化的中文召回：扫前若干会话，标题命中 query 的当命中，按相关度（命中位置）排序。
+    const hits: SearchHit[] = []
+    const q = query.trim()
+    for (let i = 0; i < 600 && hits.length < k; i++) {
+      const s = sessionMeta(i)
+      if (q && !s.title.includes(q)) continue
+      hits.push({
+        traceId: s.firstTraceId,
+        spanId: `${s.firstTraceId}-s0`,
+        score: Math.round((0.95 - hits.length * 0.03) * 100) / 100,
+        status: s.status === 'error' ? 'error' : 'ok',
+        agentName: s.title,
+        snippet: `${s.title} … 命中「${q}」`,
+      })
+    }
+    return delay(hits, 120)
   },
 }

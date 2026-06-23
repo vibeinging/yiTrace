@@ -50,6 +50,16 @@ export interface SpanDetail {
   error?: string
 }
 
+/** 语义检索命中（POST /v1/search 的一行）。 */
+export interface SearchHit {
+  traceId: string
+  spanId: string
+  score: number
+  status: Status
+  agentName?: string
+  snippet?: string
+}
+
 /** 步骤流的一步 = 一个 span 连同输入/输出文本（步骤流视图专用，一次物化）。 */
 export interface Step {
   id: string
@@ -83,4 +93,6 @@ export interface TraceApi {
   getSpanDetail(traceId: string, spanId: string): Promise<SpanDetail>
   /** 步骤流：每步连同输入/输出文本（切到步骤流视图才拉）。 */
   getSteps(traceId: string): Promise<Step[]>
+  /** 语义检索：中文 BM25 召回命中的 span（回车触发）。 */
+  searchSpans(query: string, k: number): Promise<SearchHit[]>
 }

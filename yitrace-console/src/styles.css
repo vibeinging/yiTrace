@@ -22,6 +22,20 @@ button{font:inherit}
 .search input{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:7px 12px 7px 34px;color:var(--txt);font-size:13px;outline:none}
 .search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,141,239,.16)}
 .search .ic{position:absolute;left:11px;top:7px;color:var(--muted)}
+.search input{padding-right:84px}
+.searchbadge{position:absolute;right:8px;top:6px;font-size:10px;color:var(--accent2);background:rgba(124,92,255,.12);padding:2px 7px;border-radius:5px;border:1px solid rgba(124,92,255,.25)}
+
+/* search results */
+.ph .hlq{color:var(--accent2)}
+.clearbtn{cursor:pointer;color:var(--muted);font-size:11px;text-transform:none;letter-spacing:0}
+.clearbtn:hover{color:var(--txt)}
+.hititem{display:flex;gap:10px;align-items:flex-start;padding:10px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s}
+.hititem:hover{background:var(--panel2)}
+.hititem.sel{background:linear-gradient(90deg,rgba(91,141,239,.12),transparent 72%);box-shadow:inset 3px 0 0 var(--accent)}
+.hititem .score{font-family:var(--mono);font-size:11px;color:#fff;background:linear-gradient(90deg,var(--accent2),var(--accent));padding:2px 7px;border-radius:5px;flex:none;margin-top:1px}
+.hitbody{min-width:0;flex:1}
+.hitname{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--txt);font-weight:600;margin-bottom:4px}
+.hitsnip{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ctx{display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px}
 .pill{background:var(--panel2);border:1px solid var(--border);padding:4px 10px;border-radius:6px}
 .pill b{color:var(--txt)}

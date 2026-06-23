@@ -19,6 +19,15 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  return res.json() as Promise<T>
+}
+
+// 引擎 /v1/search 返回的命中行（蛇形字段）→ 控制台 SearchHit。
+interface RawHit { trace_id: number; span_id: number; score: number; status: number | null; agent_name: string | null; logs: string[] }
+
 export const httpApi: TraceApi = {
   listSessions: ({ cursor, limit, filter }) => {
     const q = new URLSearchParams()
@@ -31,4 +40,15 @@ export const httpApi: TraceApi = {
   getTrace: (traceId) => get(`/traces/${encodeURIComponent(traceId)}`),
   getSpanDetail: (traceId, spanId) => get<SpanDetail>(`/traces/${encodeURIComponent(traceId)}/spans/${encodeURIComponent(spanId)}`),
   getSteps: (traceId) => get<Step[]>(`/traces/${encodeURIComponent(traceId)}/steps`),
+  searchSpans: async (query, k) => {
+    const hits = await post<RawHit[]>('/search', { text: query, k })
+    return hits.map((h) => ({
+      traceId: String(h.trace_id),
+      spanId: String(h.span_id),
+      score: h.score,
+      status: h.status === null ? 'ok' : h.status === 0 ? 'ok' : 'error',
+      agentName: h.agent_name ?? undefined,
+      snippet: h.logs?.[0],
+    }))
+  },
 }

@@ -40,7 +40,8 @@ GET /v1/traces/:id/spans/:spanId            span 大字段（晚物化）
 
 > 引擎数据模型的现实约束（前端据此降级）：折叠后的 span **不保留 kind / name / 起始时刻**，
 > 故 kind/name 由 agent/tool/model 派生、瀑布起始时刻按 span_id 顺序累加 duration（逻辑瀑布）。
-> 会话列表聚合**按写代次缓存**：无新写入时分页读 O(page)，有写入才重算（引擎 `console_sessions`）。
+> 会话列表走**增量边车索引**：摄入时按 per-span 差量 O(1) 维护会话聚合，分页不全扫
+> （引擎 `SessionIndex`）；delete/upgrade 这类不走摄入路径的写则标脏、下次读一次性重建。
 
 ## 开发
 

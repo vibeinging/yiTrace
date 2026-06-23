@@ -50,3 +50,13 @@ export function useSteps(traceId: string | null, enabled: boolean) {
     staleTime: 60_000,
   })
 }
+
+/** 语义检索：提交查询（回车）才拉。 */
+export function useSearch(query: string) {
+  return useQuery({
+    queryKey: ['search', query],
+    queryFn: () => api.searchSpans(query, 50),
+    enabled: !!query,
+    staleTime: 30_000,
+  })
+}
