@@ -105,6 +105,8 @@ impl HttpIngestServer {
         let mut content_length = 0usize;
         let mut auth: Option<String> = None;
         let mut encoding: Option<String> = None;
+        // 租户来自**鉴权上下文**（X-Tenant-Id 头），不信任请求体——客户端不能自选租户。
+        let mut tenant: Option<u64> = None;
         loop {
             let mut h = String::new();
             if reader.read_line(&mut h).unwrap_or(0) == 0 {
@@ -121,6 +123,8 @@ impl HttpIngestServer {
                 auth = h.splitn(2, ':').nth(1).map(|s| s.trim().to_string());
             } else if let Some(v) = hl.strip_prefix("content-encoding:") {
                 encoding = Some(v.trim().to_string());
+            } else if let Some(v) = hl.strip_prefix("x-tenant-id:") {
+                tenant = v.trim().parse().ok();
             }
         }
 
@@ -161,7 +165,7 @@ impl HttpIngestServer {
         };
         let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        let (status, resp_body) = self.route(&method, &path, &body);
+        let (status, resp_body) = self.route_with_tenant(&method, &path, &body, tenant);
         self.respond(&mut stream, status, &resp_body);
         self.audit(&method, &path, status, content_length);
     }
@@ -253,6 +257,11 @@ impl HttpIngestServer {
 
     /// 纯路由（无 socket，便于单测）。返回 (status, json_body)。
     pub fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        self.route_with_tenant(method, path, body, None)
+    }
+
+    /// 带租户上下文的路由（`tenant` 来自 X-Tenant-Id 头）：检索/列表端点据此强制隔离。
+    pub fn route_with_tenant(&self, method: &str, path: &str, body: &str, tenant: Option<u64>) -> (u16, String) {
         // 切掉查询串：精确路由按 base 匹配，查询参数（分页 cursor/limit）单独解析。
         let (base, query) = path.split_once('?').unwrap_or((path, ""));
         match (method, base) {
@@ -269,9 +278,9 @@ impl HttpIngestServer {
                 Ok(_) => (200, r#"{"partialSuccess":{}}"#.to_string()), // OTLP 约定的成功响应体
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
-            ("GET", "/v1/traces") => (200, self.traces_json()),
-            // 检索端点（产品差异化的出口）：中文 BM25 + 可选属性过滤(agent/状态/时间/trace)。
-            ("POST", "/v1/search") => self.search_json(body),
+            ("GET", "/v1/traces") => (200, self.traces_json(tenant)),
+            // 检索端点（产品差异化的出口）：中文 BM25 + 可选属性过滤(agent/状态/时间/trace) + 租户隔离。
+            ("POST", "/v1/search") => self.search_json(body, tenant),
             // 控制台数据端点（前端 yitrace-console 对接）：会话游标分页 / 轮次 / trace span / span 详情。
             ("GET", "/v1/sessions") => (200, self.sessions_page_json(query)),
             _ => self.route_console(method, base),
@@ -292,7 +301,7 @@ impl HttpIngestServer {
 
     /// 处理 `POST /v1/search`：body = `{"text":"盗刷","vector":[..],"k":10,"filter":{"agent_name":"风控"}}`。
     /// 按给了什么自动选检索路:只 text→中文检索;只 vector→找相似;两个都给→混合(RRF)。都按 filter 过滤。
-    fn search_json(&self, body: &str) -> (u16, String) {
+    fn search_json(&self, body: &str, tenant: Option<u64>) -> (u16, String) {
         use crate::wire::{field, parse, Json};
         let v = match parse(body) {
             Ok(v) => v,
@@ -311,6 +320,8 @@ impl HttpIngestServer {
             filter.time_from = field(f, "time_from").and_then(Json::as_i64);
             filter.time_to = field(f, "time_to").and_then(Json::as_i64);
         }
+        // 租户来自鉴权头（X-Tenant-Id），覆盖请求体——客户端不能越权查别的租户。
+        filter.tenant_id = tenant;
 
         let snap = self.coord.pin_snapshot();
         let hits = match (!text.is_empty(), !vector.is_empty()) {
@@ -337,9 +348,11 @@ impl HttpIngestServer {
         (200, format!("[{}]", items.join(",")))
     }
 
-    fn traces_json(&self) -> String {
+    fn traces_json(&self, tenant: Option<u64>) -> String {
         let snap = self.coord.pin_snapshot();
-        let traces = self.coord.list_traces(&snap, &TraceQuery::all());
+        let mut q = TraceQuery::all();
+        q.tenant_id = tenant; // 租户隔离：只列本租户的 trace
+        let traces = self.coord.list_traces(&snap, &q);
         let items: Vec<String> = traces
             .iter()
             .map(|t| {
@@ -626,6 +639,27 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"trace_id\":7"), "{body}");
         assert!(body.contains("\"total_input_tokens\":900"));
+    }
+
+    #[test]
+    fn http_tenant_header_isolates_traces_and_search() {
+        // HTTP 端到端租户隔离：摄入两租户，GET /v1/traces 与 POST /v1/search 带 X-Tenant-Id 头 → 只见本租户。
+        let s = server();
+        let batch = r#"[
+          {"trace_id":1,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"1-1","tenant_id":1,"duration_ns":10,"logs":["盗刷"]},
+          {"trace_id":2,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"2-1","tenant_id":2,"duration_ns":20,"logs":["盗刷"]}
+        ]"#;
+        assert_eq!(s.route("POST", "/v1/ingest", batch).0, 200);
+
+        // 不带租户：两条都列。
+        let all = s.route("GET", "/v1/traces", "").1;
+        assert!(all.contains("\"trace_id\":1") && all.contains("\"trace_id\":2"));
+        // 带租户 1：只见 trace 1。
+        let t1 = s.route_with_tenant("GET", "/v1/traces", "", Some(1)).1;
+        assert!(t1.contains("\"trace_id\":1") && !t1.contains("\"trace_id\":2"), "列表按租户头隔离: {t1}");
+        // 检索同样隔离：查"盗刷"租户 1 只回 trace 1。
+        let r1 = s.route_with_tenant("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#, Some(1)).1;
+        assert!(r1.contains("\"trace_id\":1") && !r1.contains("\"trace_id\":2"), "检索按租户头隔离: {r1}");
     }
 
     #[test]

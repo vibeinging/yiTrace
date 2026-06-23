@@ -111,6 +111,7 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             input_tokens: opt_u64("input_tokens"),
             output_tokens: opt_u64("output_tokens"),
             session_id: opt_u64("session_id"),
+            tenant_id: opt_u64("tenant_id"),
             agent_name: opt_str("agent_name"),
             tool_name: opt_str("tool_name"),
             model: opt_str("model"),

@@ -179,6 +179,7 @@ fn emit_span(
         input_tokens: if in_tok > 0 { Some(in_tok) } else { None },
         output_tokens: None,
         session_id: Some(session),
+        tenant_id: None,
         agent_name: agent.map(str::to_string),
         tool_name: tool.map(str::to_string),
         model: Some(model.to_string()),
@@ -200,6 +201,7 @@ fn emit_span(
         input_tokens: None,
         output_tokens: if out_tok > 0 { Some(out_tok) } else { None },
         session_id: Some(session),
+        tenant_id: None,
         agent_name: agent.map(str::to_string),
         tool_name: tool.map(str::to_string),
         model: Some(model.to_string()),
@@ -325,7 +327,7 @@ pub fn run_harness(coord: &Arc<WriteCoordinator>, n_per: usize, seed: u64) -> Ha
         let (from, to) = scenario_window(i);
         let gen = generate_scenario(coord, sc, n_per, base_trace, from, &mut rng);
 
-        let q = TraceQuery { trace_id: None, time_from: from, time_to: to };
+        let q = TraceQuery { trace_id: None, time_from: from, time_to: to, tenant_id: None };
         // 打分写回（内部会先 flush，把 answer span 落段、upgrade 有落点）。
         coord.eval_and_writeback(&base_scorer, &q);
 

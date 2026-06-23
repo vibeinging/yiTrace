@@ -91,6 +91,7 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         input_tokens,
         output_tokens,
         session_id,
+        tenant_id: None, // OTLP 的 tenant 透传作后续（标准格式扩展属性映射）
         agent_name,
         tool_name,
         model,
@@ -112,6 +113,7 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         input_tokens: None,
         output_tokens: None,
         session_id: None,
+        tenant_id: None,
         agent_name: None,
         tool_name: None,
         model: None,

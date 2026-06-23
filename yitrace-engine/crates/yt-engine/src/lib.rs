@@ -46,6 +46,9 @@ pub use segstore::FileSegmentStore;
 mod persist;
 mod vecstore;
 
+mod vecindex_disk;
+pub use vecindex_disk::{DiskGraphConfig, DiskGraphIndex, DiskGraphStore, DurableGraphIndex};
+
 mod http;
 pub use http::HttpIngestServer;
 
@@ -95,8 +98,9 @@ impl Projection {
     pub const EVAL_SCORE: u16 = 1 << 11;
     pub const EVAL_LABEL: u16 = 1 << 12;
     pub const LOGS: u16 = 1 << 13;
+    pub const TENANT_ID: u16 = 1 << 14;
 
-    const MASK: u16 = (1 << 14) - 1;
+    const MASK: u16 = (1 << 15) - 1;
 
     /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
     pub const ALL: Projection = Projection(Self::MASK);
@@ -210,6 +214,9 @@ pub trait GraphIndex: Send + Sync {
     /// 带过滤的近邻搜索：`filter` 是下推进图搜索的谓词（service/time/status…）。
     /// 返回 (trace_id, span_id, 距离)，按距离升序、取前 k。真实实现把 filter 接进 search_layer 的导航。
     fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)>;
+    /// 落盘点（提交时调）：插入只写不刷的实现（如磁盘索引）在此批量 fsync。内存实现默认空操作。
+    /// 我们的场景 **append 极多、删除少** —— 插入走"只写不刷"，靠这里在提交点批量持久，吞吐才扛得住。
+    fn flush(&self) {}
 }
 
 /// 朴素内存 BM25 骨架：按 span 存文本，检索按「查询子串命中数」打分。
@@ -310,15 +317,22 @@ pub struct TraceQuery {
     /// 时间窗 [from, to]（闭区间）。
     pub time_from: i64,
     pub time_to: i64,
+    /// **租户隔离**：设了它，只读该租户的 span。服务层须按鉴权身份注入（与检索路径一致）。
+    pub tenant_id: Option<u64>,
 }
 
 impl TraceQuery {
     /// 全开窗、所有 trace（等价于不剪枝）。
     pub fn all() -> Self {
-        Self { trace_id: None, time_from: i64::MIN, time_to: i64::MAX }
+        Self { trace_id: None, time_from: i64::MIN, time_to: i64::MAX, tenant_id: None }
     }
     pub fn trace(trace_id: u64, time_from: i64, time_to: i64) -> Self {
-        Self { trace_id: Some(trace_id), time_from, time_to }
+        Self { trace_id: Some(trace_id), time_from, time_to, tenant_id: None }
+    }
+    /// 限定租户（链式）。
+    pub fn for_tenant(mut self, tenant_id: u64) -> Self {
+        self.tenant_id = Some(tenant_id);
+        self
     }
 }
 
@@ -330,6 +344,8 @@ struct FilterAttrs {
     agent_name: Option<String>,
     min_ts: i64,
     max_ts: i64,
+    /// 租户隔离维度（last-non-null）。
+    tenant_id: Option<u64>,
 }
 
 /// 检索过滤条件（产品维度）。下推进图搜索 / 后置过滤关键词候选。全 None = 不过滤。
@@ -341,16 +357,28 @@ pub struct SearchFilter {
     pub status: Option<u8>,
     pub time_from: Option<i64>,
     pub time_to: Option<i64>,
+    /// **租户隔离**：设了它，只返回该租户的 span。服务层须按鉴权身份对每个查询注入它。
+    pub tenant_id: Option<u64>,
 }
 
 impl SearchFilter {
-    /// 是否带"要查属性边车"的约束（agent/status/时间）。仅 trace_id 约束不算（trace_id 在 key 里直接判）。
+    /// 是否带"要查属性边车"的约束（agent/status/时间/租户）。仅 trace_id 约束不算（trace_id 在 key 里直接判）。
     fn needs_attrs(&self) -> bool {
-        self.agent_name.is_some() || self.status.is_some() || self.time_from.is_some() || self.time_to.is_some()
+        self.agent_name.is_some()
+            || self.status.is_some()
+            || self.time_from.is_some()
+            || self.time_to.is_some()
+            || self.tenant_id.is_some()
     }
 
     /// 属性是否匹配（不含 trace_id，那个在 key 上单独判）。
     fn attrs_match(&self, a: &FilterAttrs) -> bool {
+        // 租户隔离：tenant 不符直接出局（最先判，隔离优先）。
+        if let Some(t) = self.tenant_id {
+            if a.tenant_id != Some(t) {
+                return false;
+            }
+        }
         if let Some(ag) = &self.agent_name {
             if a.agent_name.as_deref() != Some(ag.as_str()) {
                 return false;
@@ -698,6 +726,7 @@ pub struct WireRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub session_id: Option<u64>,
+    pub tenant_id: Option<u64>,
     pub agent_name: Option<String>,
     pub tool_name: Option<String>,
     pub model: Option<String>,
@@ -724,6 +753,7 @@ impl WireRecord {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
                 session_id: self.session_id,
+                tenant_id: self.tenant_id,
                 agent_name: self.agent_name,
                 tool_name: self.tool_name,
                 model: self.model,
@@ -1002,8 +1032,16 @@ impl WriteCoordinator {
             Some(s) => (s.manifest, s.next_segment_id, s.next_chunk_id),
             None => (Manifest::empty(), 1, 1),
         };
-        let vector_path = dir.join("vectors.dat");
-        Ok(Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), Some(vector_path), bm25, graph))
+        // 默认向量索引 = **磁盘图索引**（向量+图都落盘、重启不 rebuild、append 友好），不用 vecstore。
+        // 注入了自定义 graph（可能内存型）则保留 vecstore 重建路径（向后兼容）。
+        let (graph, vector_path): (Option<Arc<dyn GraphIndex>>, Option<std::path::PathBuf>) = match graph {
+            Some(g) => (Some(g), Some(dir.join("vectors.dat"))),
+            None => {
+                let disk = DurableGraphIndex::open(dir.join("vecindex"), DiskGraphConfig::default());
+                (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
+            }
+        };
+        Ok(Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph))
     }
 
     fn build(segments: Arc<dyn SegmentStore>, wal: Wal) -> Arc<Self> {
@@ -1055,6 +1093,8 @@ impl WriteCoordinator {
             next_chunk_id: *self.next_chunk_id.lock().unwrap(),
         };
         let _ = persist::save(path, &state);
+        // 提交点：向量索引批量刷盘（append 期间只写不刷，靠这里持久；删除少、append 多场景的吞吐取舍）。
+        self.graph.flush();
     }
 
     /// 提交新 manifest 版本并（若开了持久化）落盘。所有 commit 走这里,保证段集合改动都持久。
@@ -1095,6 +1135,9 @@ impl WriteCoordinator {
         }
         if r.fields.agent_name.is_some() {
             a.agent_name = r.fields.agent_name.clone();
+        }
+        if r.fields.tenant_id.is_some() {
+            a.tenant_id = r.fields.tenant_id;
         }
         a.min_ts = a.min_ts.min(r.ts);
         a.max_ts = a.max_ts.max(r.ts);
@@ -1267,6 +1310,8 @@ impl WriteCoordinator {
         keys: Option<&std::collections::HashSet<(u64, u64)>>,
         proj: Projection,
     ) -> (Vec<FoldedSpan>, usize) {
+        // 租户隔离时，强制把 tenant_id 列纳入投影（否则列式段窄投影读不到 tenant，过滤会误删全部）。
+        let proj = if q.tenant_id.is_some() { Projection::of(proj.bits() | Projection::TENANT_ID) } else { proj };
         let mut inputs: Vec<FoldInput> = Vec::new();
         let mut scanned = 0usize;
         let in_keys = |t: u64, s: u64| keys.map_or(true, |ks| ks.contains(&(t, s)));
@@ -1364,6 +1409,10 @@ impl WriteCoordinator {
             if let Some(patch) = upgrades.get(&(sp.trace_id, sp.span_id)) {
                 sp.apply_patch(patch);
             }
+        }
+        // 租户隔离：只留本租户的 span（列表/读路径与检索路径一致地强制过滤）。
+        if let Some(t) = q.tenant_id {
+            spans.retain(|sp| sp.tenant_id == Some(t));
         }
         (spans, scanned)
     }
@@ -2637,7 +2686,7 @@ mod tests {
         assert_eq!(store.pushdowns.load(Ordering::Relaxed), n0, "全开窗不触发下推");
 
         // 时间窗 [150,250] → 触发下推,行级过滤只剩 span20(ts=200)。
-        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250 });
+        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250, tenant_id: None });
         assert!(store.pushdowns.load(Ordering::Relaxed) > n0, "有时间窗 → 走下推");
         assert_eq!(hit.len(), 1, "下推做了段内行级时间过滤");
         assert_eq!(hit[0].span_id, 20);
@@ -2739,6 +2788,69 @@ mod tests {
         let hits = wc.search_text(&snap, "风控", 10);
         assert_eq!(hits.len(), 1, "注入的分词器一路生效到检索");
         assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (1, 10));
+    }
+
+    #[test]
+    fn tenant_filter_isolates_list_and_read_paths() {
+        // 列表/读路径的租户隔离：read_spans_query / list_traces 带 tenant → 只见本租户。
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store);
+        let mut a = ev(1, 10, 1, Some(0), Some(100), &["t1"]);
+        a.fields.tenant_id = Some(1);
+        let mut b = ev(2, 20, 1, Some(0), Some(200), &["t2"]);
+        b.fields.tenant_id = Some(2);
+        let all = vec![a, b];
+        wc.ingest(all.clone());
+        wc.commit_flush(&all, WalLsn::new(2));
+        let snap = wc.pin_snapshot();
+
+        // 不带 tenant：两条都见。
+        assert_eq!(wc.read_spans_query(&snap, &TraceQuery::all()).0.len(), 2);
+        // 带 tenant 1：只见 trace 1。
+        let (s1, _) = wc.read_spans_query(&snap, &TraceQuery::all().for_tenant(1));
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].trace_id, 1);
+        // 列表也隔离。
+        let l1 = wc.list_traces(&snap, &TraceQuery::all().for_tenant(1));
+        assert!(l1.iter().all(|t| t.trace_id == 1) && !l1.is_empty(), "列表只见租户1");
+        let l2 = wc.list_traces(&snap, &TraceQuery::all().for_tenant(2));
+        assert!(l2.iter().all(|t| t.trace_id == 2) && !l2.is_empty(), "列表只见租户2");
+    }
+
+    #[test]
+    fn tenant_filter_isolates_search_across_tenants() {
+        // 逻辑隔离：共享一套索引，查询强制带 tenant 过滤 → 只见本租户的 span（BM25 文本 + 向量找相似都隔离）。
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store);
+
+        // 两个租户各一条"盗刷"相关 span，文本相同、向量相近 —— 不隔离的话会互相召回。
+        let mut a = ev(1, 10, 1, Some(0), Some(100), &["疑似盗刷 已拦截"]);
+        a.fields.tenant_id = Some(1);
+        let mut b = ev(2, 20, 1, Some(0), Some(200), &["疑似盗刷 已拦截"]);
+        b.fields.tenant_id = Some(2);
+        let all = vec![a.clone(), b.clone()];
+        wc.ingest(all.clone());
+        wc.commit_flush(&all, WalLsn::new(2));
+        wc.index_embedding(1, 10, vec![0.0, 0.0]);
+        wc.index_embedding(2, 20, vec![0.01, 0.0]); // 和租户1的几乎重合
+        let snap = wc.pin_snapshot();
+
+        let t1 = SearchFilter { tenant_id: Some(1), ..Default::default() };
+        let t2 = SearchFilter { tenant_id: Some(2), ..Default::default() };
+
+        // BM25 文本检索：查"盗刷"，scope 租户1 → 只回 (1,10)，不漏租户2。
+        let txt1 = wc.search_text_attr(&snap, "盗刷", 10, &t1);
+        assert!(txt1.iter().all(|(s, _)| s.trace_id == 1), "租户1 文本检索不漏租户2");
+        assert!(txt1.iter().any(|(s, _)| s.span_id == 10));
+        let txt2 = wc.search_text_attr(&snap, "盗刷", 10, &t2);
+        assert!(txt2.iter().all(|(s, _)| s.trace_id == 2), "租户2 文本检索不漏租户1");
+
+        // 向量找相似：scope 租户1 → 即便租户2的向量更近也不返回（进图过滤隔离）。
+        let sim1 = wc.search_similar_attr(&snap, &[0.0, 0.0], 10, &t1);
+        assert!(!sim1.is_empty());
+        assert!(sim1.iter().all(|(s, _)| s.trace_id == 1), "租户1 找相似不漏租户2（向量更近也挡）");
+        let sim2 = wc.search_similar_attr(&snap, &[0.0, 0.0], 10, &t2);
+        assert!(sim2.iter().all(|(s, _)| s.trace_id == 2), "租户2 找相似不漏租户1");
     }
 
     #[test]
@@ -3023,6 +3135,7 @@ mod tests {
                 input_tokens: Some(900),
                 output_tokens: None,
                 session_id: None,
+                tenant_id: None,
                 agent_name: None,
                 tool_name: None,
                 model: None,
@@ -3043,6 +3156,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: Some(150),
                 session_id: None,
+                tenant_id: None,
                 agent_name: None,
                 tool_name: None,
                 model: None,
@@ -3336,6 +3450,42 @@ mod tests {
         assert!(filtered.iter().all(|(s, _)| s.span_id == 10), "重启后按 agent 过滤还生效");
         assert!(!filtered.is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_uses_disk_vector_index_and_survives_restart_without_rebuild() {
+        // 阶段 3：持久引擎默认用**磁盘图索引**——向量+图都落盘到 dir/vecindex，不用 vecstore，
+        // 重启从盘恢复、不全量 rebuild。append 多删除少场景：插入只写、提交点批量刷。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir()
+            .join(format!("yt_diskvec_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            let e1 = ev(1, 10, 1, Some(0), Some(100), &["a"]);
+            let e2 = ev(2, 20, 1, Some(0), Some(200), &["b"]);
+            let e3 = ev(3, 30, 1, Some(0), Some(300), &["c"]);
+            wc.ingest(vec![e1, e2, e3]);
+            wc.index_embedding(1, 10, vec![0.0, 0.0, 0.0]);
+            wc.index_embedding(2, 20, vec![1.0, 0.0, 0.0]);
+            wc.index_embedding(3, 30, vec![9.0, 9.0, 9.0]);
+            wc.flush_memtable(); // 走提交 → graph.flush() 把向量索引刷盘
+        }
+
+        // 默认走磁盘图索引：vecindex 目录在、旧 vecstore 文件不在。
+        assert!(dir.join("vecindex").join("meta").exists(), "磁盘图索引已落盘");
+        assert!(!dir.join("vectors.dat").exists(), "不再用 vecstore");
+
+        // 重启：不 rebuild（recover 不重放向量，磁盘图索引自带持久），找相似照常。
+        let wc2 = WriteCoordinator::open_durable(&dir).unwrap();
+        wc2.recover();
+        let snap = wc2.pin_snapshot();
+        let sim = wc2.search_similar(&snap, &[0.9, 0.0, 0.0], 2);
+        assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (2, 20), "重启后磁盘图搜索：最近的排第一");
+        assert_eq!(sim[0].0.duration_ns, Some(200), "折叠出完整 span");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
