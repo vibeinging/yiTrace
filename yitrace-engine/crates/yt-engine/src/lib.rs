@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use yt_core::chunk::{DeletionVec, UpgradeColChunk};
@@ -768,6 +768,10 @@ pub struct WriteCoordinator {
     /// 检索过滤的属性边车：(trace,span) → 可过滤元数据（带过滤 ANN 的 payload）。
     /// 派生数据：摄入时建,`recover` 时从持久段重建。
     filter_attrs: Mutex<HashMap<(u64, u64), FilterAttrs>>,
+    /// 数据写代次：任何改变可见数据的写（ingest/delete/upgrade）都 +1。控制台会话列表缓存据此失效。
+    data_gen: AtomicU64,
+    /// 控制台会话列表缓存：`(算它时的代次, 结果)`。代次没变就直接用 → 分页读 O(page) 而非每页全扫。
+    sessions_cache: Mutex<Option<(u64, Vec<ConsoleSession>)>>,
 }
 
 impl WriteCoordinator {
@@ -830,6 +834,8 @@ impl WriteCoordinator {
             manifest_path,
             vector_path,
             filter_attrs: Mutex::new(HashMap::new()),
+            data_gen: AtomicU64::new(0),
+            sessions_cache: Mutex::new(None),
         })
     }
 
@@ -919,6 +925,7 @@ impl WriteCoordinator {
         if self.memtable.lock().unwrap().len() >= self.flush_threshold.load(Ordering::Relaxed) {
             self.flush_memtable_locked();
         }
+        self.data_gen.fetch_add(1, Ordering::Relaxed); // 数据变了 → 会话缓存失效
         last
     }
 
@@ -1238,10 +1245,26 @@ impl WriteCoordinator {
         SessionTimeline { session_id, turns, total_input_tokens: total_in, total_output_tokens: total_out }
     }
 
-    /// 控制台用：一次扫描把所有 span 按 session→trace 聚合成会话行（标题/轮数/状态/token/首 trace）。
-    /// 标题取会话内首个非空 agent_name（没有就用 session id）；状态有错即 error。按 session_id **降序**
-    /// （单调下发≈时间新→旧），调用方按游标分页。一次 O(spans) 扫描，避免每会话各扫一遍。
+    /// 控制台用：会话行列表（标题/轮数/状态/token/首 trace），按 session_id 降序。
+    /// **按写代次缓存**：没有新写入（ingest/delete/upgrade）时直接复用上次结果 → 分页读 O(page)，
+    /// 不必每页全扫；有写入则失效重算（正确）。对"浏览为主、偶有写入"的控制台正合适。
     pub fn console_sessions(&self, snap: &Snapshot) -> Vec<ConsoleSession> {
+        let gen = self.data_gen.load(Ordering::Relaxed);
+        {
+            let cache = self.sessions_cache.lock().unwrap();
+            if let Some((g, v)) = cache.as_ref() {
+                if *g == gen {
+                    return v.clone();
+                }
+            }
+        }
+        let computed = self.console_sessions_scan(snap);
+        *self.sessions_cache.lock().unwrap() = Some((gen, computed.clone()));
+        computed
+    }
+
+    /// 全量扫描实现（缓存未命中时走它）：一次 O(spans) 扫描按 session→trace 聚合。
+    fn console_sessions_scan(&self, snap: &Snapshot) -> Vec<ConsoleSession> {
         let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
         // session_id -> 聚合
         let mut acc: BTreeMap<u64, ConsoleSession> = BTreeMap::new();
@@ -1803,6 +1826,7 @@ impl WriteCoordinator {
             entry.deletion_seq += 1;
         }
         self.commit_and_persist(draft);
+        self.data_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 属性补写（upgrade）提交：给某段 (trace_id, span_id) 补写**非身份属性**，与 delete 完全对称——
@@ -1819,6 +1843,7 @@ impl WriteCoordinator {
             entry.upgrade_seq += 1;
         }
         self.commit_and_persist(draft);
+        self.data_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     /// compaction 第 1 步：选段，记录选段瞬间各输入段的 (deletion_seq, upgrade_seq)。
@@ -3194,6 +3219,33 @@ mod tests {
         // token 全会话汇总。
         assert_eq!(tl.total_input_tokens, 100, "60+40");
         assert_eq!(tl.total_output_tokens, 35, "20+15");
+    }
+
+    #[test]
+    fn console_sessions_cache_serves_then_invalidates_on_write() {
+        let wc = WriteCoordinator::new(Arc::new(CapturingStore::default()));
+        let mut e1 = ev(1, 1, 1, Some(0), Some(10), &[]);
+        e1.fields.session_id = Some(100);
+        e1.fields.agent_name = Some("风控研判".into());
+        e1.fields.input_tokens = Some(500);
+        wc.ingest(vec![e1]);
+
+        let snap = wc.pin_snapshot();
+        let a = wc.console_sessions(&snap);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].title, "风控研判");
+        // 同代次再读 → 命中缓存、结果一致。
+        let b = wc.console_sessions(&snap);
+        assert_eq!(a, b, "缓存命中返回同一结果");
+
+        // 新写入 → 代次变、缓存失效，能看到第二个会话。
+        let mut e2 = ev(2, 1, 1, Some(0), Some(10), &[]);
+        e2.fields.session_id = Some(200);
+        e2.fields.agent_name = Some("反洗钱核查".into());
+        wc.ingest(vec![e2]);
+        let snap2 = wc.pin_snapshot();
+        let c = wc.console_sessions(&snap2);
+        assert_eq!(c.len(), 2, "写入后缓存失效、能看到新会话");
     }
 
     #[test]

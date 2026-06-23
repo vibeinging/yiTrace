@@ -361,7 +361,7 @@ impl HttpIngestServer {
     // ───────────────────── 控制台数据端点（游标分页 / 轮次 / span / 详情） ─────────────────────
 
     /// GET /v1/sessions?cursor=&limit=：会话列表，offset 游标分页。
-    /// 注：当前每页都全量扫一遍 span 聚合（O(spans)）——小数据可接受；上量要加 session 边车索引。
+    /// `console_sessions` 按写代次缓存：没有新写入时分页读 O(page)，不必每页全扫（见引擎实现）。
     fn sessions_page_json(&self, query: &str) -> String {
         let (mut offset, mut limit, mut filter) = (0usize, 50usize, String::new());
         for kv in query.split('&') {
