@@ -98,6 +98,7 @@ fn projected_field_names(proj: Projection) -> Option<Vec<&'static str>> {
         (Projection::INPUT_TOKENS, "input_tokens"),
         (Projection::OUTPUT_TOKENS, "output_tokens"),
         (Projection::SESSION_ID, "session_id"),
+        (Projection::TENANT_ID, "tenant_id"),
         (Projection::AGENT_NAME, "agent_name"),
         (Projection::TOOL_NAME, "tool_name"),
         (Projection::MODEL, "model"),
@@ -159,6 +160,7 @@ impl VortexSegmentStore {
         let input_tokens = u64col!(|r: &WalRecord| r.fields.input_tokens);
         let output_tokens = u64col!(|r: &WalRecord| r.fields.output_tokens);
         let session_id = u64col!(|r: &WalRecord| r.fields.session_id);
+        let tenant_id = u64col!(|r: &WalRecord| r.fields.tenant_id);
         let eval_score = PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.eval_score)).into_array();
 
         let strcol = |f: &dyn Fn(&WalRecord) -> Option<String>| {
@@ -185,6 +187,7 @@ impl VortexSegmentStore {
             ("input_tokens", input_tokens),
             ("output_tokens", output_tokens),
             ("session_id", session_id),
+            ("tenant_id", tenant_id),
             ("eval_score", eval_score),
             ("agent_name", agent_name),
             ("tool_name", tool_name),
@@ -218,6 +221,7 @@ impl VortexSegmentStore {
         let input_tokens = optu64("input_tokens");
         let output_tokens = optu64("output_tokens");
         let session_id = optu64("session_id");
+        let tenant_id = optu64("tenant_id");
         let status = st.column_by_name("status").map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
         let eval_score = st.column_by_name("eval_score").map(|c| c.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
         let optsv = |name: &str| st.column_by_name(name).map(|c| c.as_string_view().clone());
@@ -252,6 +256,7 @@ impl VortexSegmentStore {
                     input_tokens: gu64(&input_tokens, i),
                     output_tokens: gu64(&output_tokens, i),
                     session_id: gu64(&session_id, i),
+                    tenant_id: gu64(&tenant_id, i),
                     eval_score: gu32(&eval_score, i),
                     agent_name: gstr(&agent_name, i),
                     tool_name: gstr(&tool_name, i),
@@ -600,7 +605,7 @@ mod tests {
         // 全开窗:3 条都在(从列式段读回)
         assert_eq!(wc.read_spans_query(&snap, &TraceQuery::all()).0.len(), 3);
         // 时间窗 [150,250]:引擎走 Vortex 下推,只回 ts=200 的 span2
-        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250 });
+        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250, tenant_id: None });
         assert_eq!(hit.len(), 1, "Vortex 下推穿过引擎读路径,行级时间过滤");
         assert_eq!(hit[0].span_id, 2);
 
