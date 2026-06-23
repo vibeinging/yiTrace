@@ -228,9 +228,38 @@ HTTP `/v1/search` 走 `search_text_attr`，是产品差异化的对外出口。
 
 ## 8. 评测与数据集
 
+### 8.1 单 span / per-agent 评测
+
 - `eval_and_writeback(scorer, q)`：对查询命中的 span 跑 `Scorer`（如 `KeywordScorer`），分数（千分制整数，保住 `Eq`）经 **upgrade 通道补写回** span 的 `eval_score`/`eval_label`——评测结果是 trace 的一部分，但走补写而非重摄入。
-- `eval_summary(q, threshold)`：按通过阈值聚合，看一批 span 的通过率。
-- `dataset(name)` / `eval_dataset(name, scorer, threshold)`：把采集的 span 固化成数据集（`DatasetExample`），在数据集上跑评测——支撑「改了 prompt 之后是变好还是变差」的回归判断。
+- `eval_summary(q, threshold)`：按通过阈值聚合，看一批 span 的通过率（整体一行 + 每 agent 一行，回归视图「哪个 agent 退步了」）。
+- `dataset(name)` / `eval_dataset(name, scorer, threshold)`：把采集的 span 固化成数据集（`DatasetExample`，存 span 快照而非引用，底层 trace 被回收也不影响），在数据集上跑评测——支撑「改了 prompt 之后是变好还是变差」的回归判断。
+
+### 8.2 会话与多轮对话
+
+层级是 **event → span → trace → session**：一**轮**用户问答 = 一条 trace（一棵 span 树），**多轮** = 同一 `session_id` 串起的多条 trace。session 不是新实体，就是 `SpanFields` 上一个按 last-non-null 折叠的字段，由 SDK 从 trace 透传到下面所有 span。
+
+两个查询出口：
+
+- `list_sessions(snap, q)`：按 `session_id` 聚合（distinct trace 数 / span 数 / token 汇总），只投影 `SESSION_ID + token` 列、跳过文本。
+- `load_session_timeline(snap, session_id)`：把一个会话的多条 trace 拼成**多轮对话流** `SessionTimeline`——每条 trace 抽成一个 `SessionTurn`（`user_input` 取最早带输入的 span、`agent_output` 取最末带输出的 span、加该轮 agent/token/出错数/eval 分）。**轮次按 `trace_id` 升序定序**：折叠后的 `FoldedSpan` 不保留 ts，而 trace id 单调下发，是对话时间序的可靠代理。当前没有 session→trace 倒排索引，按 session_id 扫全量过滤（会话视图低频，可接受；高频再加边车索引）。
+
+### 8.3 会话级（多轮专属）评测
+
+把评测从 per-span 推到 per-session（`evalkit::score_session`，规则版）。多轮专属指标：
+
+- **是否最终解决**（resolved）：最后一轮成功（无坏词、无错）。
+- **是否绕圈**（looped）：双路检测——连续 ≥2 轮失败 **或** 同一问题被重复问 ≥2 次。
+- 综合分 / 标签：未解决=0、绕圈后解决=500、一次到位=1000。
+
+换 LLM-judge 做会话级评判时只换 `score_session` 函数体，其余不动。
+
+### 8.4 evalkit —— eval 测试框架 / 场景模拟器
+
+`evalkit.rs`：一套**自造数据、走真实摄入、跑完整闭环**的端到端 eval 框架（既当验证、也当可跑演示，`cargo run -p yt-engine --example eval_harness`）。
+
+- **自产测试数据**：4 类内置 agent 场景（客服问答 / 风控研判多 agent / 代码助手 / 数据分析），每条 trace 拆成 root(编排)+tool(工具)+answer(作答) 三 span，带中文 input/output、token、状态；失败答案埋坏词留信号。用 splitmix64 确定性伪随机（同 seed 可复现、零依赖、不碰时钟）。
+- **走真实摄入**：全部经 `ingest_wire`（与 SDK 线格式同一入口），确定性 event_id、折叠、落盘真实经过，不是塞内存表。
+- **跑完整闭环**：单 span 评测（注入失败被 eval 精确还原、per-agent 差异可见）→ 数据集回归（更严 scorer 通过率下降即检出退步）；会话级 `run_session_harness` 造连贯多轮会话（一次到位 / 重试后成功 / 重复问后成功 / 始终失败四种弧线），逐会话装对话流再打分、分类对账。
 
 ---
 
@@ -280,7 +309,7 @@ Vortex 段存储**刻意建在引擎工作区之外**（`yitrace-segstore-vortex
 ## 12. 构建、测试与现状
 
 - **构建**：`cd yitrace-engine && cargo check`（离线可过，零外部依赖）。Vortex 段存储单独 `cd yitrace-segstore-vortex && cargo build`。
-- **测试**：86 个测试，全绿。多数是**验证级、带会失败的测试**——刻意构造「占位实现会挂、真实现才过」的用例，用来证明技术前提成立（中文非连续多概念召回、in-graph 召回 ≫ post-filter、崩溃重放幂等、flush 后重启不丢、并发快照隔离）。
+- **测试**：引擎 82（76 单测 + 6 eval 框架集成），加列式段 7、Python/TS SDK 各 8，全绿。多数是**验证级、带会失败的测试**——刻意构造「占位实现会挂、真实现才过」的用例，用来证明技术前提成立（中文非连续多概念召回、in-graph 召回 ≫ post-filter、崩溃重放幂等、flush 后重启不丢、并发快照隔离、eval 精确还原注入失败、会话级绕圈检测）。
 
 ### 现状与诚实边界
 
@@ -304,8 +333,9 @@ Vortex 段存储**刻意建在引擎工作区之外**（`yitrace-segstore-vortex
 | 快照 pin / 回收水位 | `crates/yt-manifest/src/lib.rs` |
 | WAL 帧格式 / 崩溃重放 | `crates/yt-wal/src/lib.rs` |
 | 内存表双水位 / flush gate | `crates/yt-memtable/src/lib.rs` |
-| 协调器 / 四源归并 / 读与检索 API | `crates/yt-engine/src/lib.rs` |
+| 协调器 / 四源归并 / 读与检索 API / 会话时间线 | `crates/yt-engine/src/lib.rs` |
 | 中文 BM25 / 图式 ANN | `crates/yt-engine/src/{bm25,graph}.rs` |
+| eval 测试框架 / 场景模拟器 / 会话级评测 | `crates/yt-engine/src/evalkit.rs`、`examples/eval_harness.rs`、`tests/eval_harness.rs` |
 | 段 / manifest / 向量落盘 | `crates/yt-engine/src/{segstore,persist,vecstore}.rs` |
 | 线格式 / OTLP / HTTP | `crates/yt-engine/src/{wire,otlp,http}.rs` |
 | Vortex 列式段 | `yitrace-segstore-vortex/src/lib.rs` |

@@ -45,11 +45,12 @@
     padding:3px 9px;border-radius:14px;cursor:pointer}
   .filters .f.on{color:var(--accent);border-color:var(--accent)}
   /* trace list item */
-  .titem{padding:11px 14px;border-bottom:1px solid var(--border);cursor:pointer;position:relative}
+  .titem{padding:13px 16px;border-bottom:1px solid var(--border);cursor:pointer;position:relative;transition:background .12s}
   .titem:hover{background:var(--panel2)}
-  .titem.sel{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
-  .titem .tname{font-size:13px;color:var(--txt);margin-bottom:5px;display:flex;gap:6px;align-items:center}
-  .titem .tmeta{display:flex;gap:10px;font-size:11px;color:var(--muted);font-family:var(--mono)}
+  .titem.sel{background:linear-gradient(90deg,rgba(91,141,239,.12),transparent 72%);box-shadow:inset 3px 0 0 var(--accent)}
+  .titem .tname{font-size:13.5px;font-weight:600;color:var(--txt);margin-bottom:7px;display:flex;gap:7px;align-items:center;line-height:1.35}
+  .titem .tmeta{display:flex;gap:9px;font-size:11px;color:var(--dim);font-family:var(--mono);align-items:center}
+  .titem .tmeta .thchip{margin-right:2px}
   .dot{width:7px;height:7px;border-radius:50%;flex:none}
   .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.run{background:var(--run);box-shadow:0 0 0 0 var(--run);animation:pulse 1.6s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(45,212,191,.5)}70%{box-shadow:0 0 0 6px rgba(45,212,191,0)}100%{box-shadow:0 0 0 0 rgba(45,212,191,0)}}
@@ -66,10 +67,12 @@
   .btn:hover{border-color:var(--accent)}
   .btn .k{color:var(--accent2)}
   /* token 汇总条 */
-  .summary{display:flex;align-items:center;gap:20px;padding:9px 16px;border-bottom:1px solid var(--border);background:var(--bg);flex-wrap:wrap}
-  .summary .blk{display:flex;align-items:center;gap:8px}
+  .summary{display:flex;align-items:center;gap:0;padding:9px 16px;border-bottom:1px solid var(--border);background:var(--bg);flex-wrap:wrap}
+  .summary .blk{display:flex;align-items:center;gap:8px;padding:0 18px}
+  .summary .blk:first-child{padding-left:0}
+  .summary .blk+.blk{border-left:1px solid var(--border)}
   .summary .lab{color:var(--muted);font-size:11px}
-  .summary .big{font-family:var(--mono);font-size:15px;color:var(--txt);font-weight:600}
+  .summary .big{font-family:var(--mono);font-size:16px;color:var(--txt);font-weight:700;letter-spacing:.2px}
   .summary .big.cost{color:var(--ok)}
   .summary .iobar{width:130px;height:9px;border-radius:5px;overflow:hidden;display:flex;background:var(--panel2)}
   .summary .iobar i{background:#44557a}.summary .iobar o{background:var(--accent2)}
@@ -123,11 +126,13 @@
   .flbl{font-size:10.5px;color:#fff;white-space:nowrap;overflow:hidden;text-shadow:0 1px 2px rgba(0,0,0,.45);font-weight:500}
   .fblk.b-chain .flbl,.fblk.b-retr .flbl{color:#0d1117;text-shadow:none}
   .fhint{padding:2px 16px 10px;font-size:11px;color:var(--dim)}
-  .tree{flex:1;overflow:auto;padding:8px 0}
+  .tree{flex:1;overflow:auto;padding:8px 0;
+    background:radial-gradient(circle at 1px 1px,rgba(124,140,170,.05) 1px,transparent 0) 0 0/24px 24px}
   /* waterfall ruler */
-  .ruler{display:flex;font-size:10px;color:var(--dim);font-family:var(--mono);padding:2px 16px 6px 16px;border-bottom:1px solid var(--border);gap:0}
-  .ruler span{flex:1;text-align:left;border-left:1px solid var(--border);padding-left:4px}
-  .ruler span:first-child{border:none}
+  .ruler{display:flex;font-size:10.5px;color:var(--muted);font-family:var(--mono);padding:4px 16px 6px 16px;border-bottom:1px solid var(--border);gap:0;background:var(--panel2)}
+  .ruler span{flex:1;text-align:left;border-left:1px solid #2b3647;padding-left:5px;position:relative}
+  .ruler span::before{content:'';position:absolute;left:-1px;top:-4px;width:1px;height:5px;background:var(--muted)}
+  .ruler span:first-child{border:none}.ruler span:first-child::before{display:none}
   /* span row */
   .srow{display:flex;align-items:center;height:30px;padding-right:14px;cursor:pointer;position:relative;font-size:12.5px}
   .srow:hover{background:var(--panel2)}
@@ -175,6 +180,64 @@
     border-radius:8px;font-size:12px;color:var(--run);display:flex;align-items:center;gap:8px}
   .scroll::-webkit-scrollbar{width:9px;height:9px}.scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
   *::-webkit-scrollbar{width:9px;height:9px}*::-webkit-scrollbar-thumb{background:#26303f;border-radius:5px}*::-webkit-scrollbar-track{background:transparent}
+
+  /* ===== 精修 v2 ===== */
+  /* 留白用起来：本 trace 洞察面板（耗时/成本 Top） */
+  .insight{margin:20px 16px 28px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .icard{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+  .icard h5{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:0 0 13px;font-weight:600;display:flex;align-items:center;gap:7px}
+  .irow{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12px;cursor:pointer}
+  .irow:last-child{margin-bottom:0}
+  .irow:hover .iname{color:var(--txt)}
+  .irank{width:17px;height:17px;border-radius:5px;flex:none;font-family:var(--mono);font-size:10px;font-weight:600;
+    display:flex;align-items:center;justify-content:center;color:var(--muted);background:var(--bg);border:1px solid var(--border)}
+  .irow:first-child .irank{color:#fff;background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
+  .iname{flex:1;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:color .12s}
+  .imeter{width:84px;height:6px;border-radius:3px;background:var(--bg);overflow:hidden;flex:none}
+  .imeter i{display:block;height:100%;border-radius:3px}
+  .ival{width:56px;text-align:right;font-family:var(--mono);font-size:11px;color:var(--txt);flex:none}
+  /* 更大胆：顶栏紫描边 + 搜索聚焦光晕 */
+  .topbar{box-shadow:0 1px 0 rgba(124,92,255,.18)}
+  .search input:focus{box-shadow:0 0 0 3px rgba(91,141,239,.16)}
+  /* 更大胆：区头加强调竖条 */
+  .ph{box-shadow:inset 2px 0 0 var(--accent2)}
+  /* 更大胆：kind 标签提饱和加粗 */
+  .kind{font-weight:600;letter-spacing:.3px}
+  .k-llm{background:rgba(124,92,255,.18)} .k-tool{background:rgba(91,141,239,.18)}
+  .k-chain{background:rgba(210,153,34,.18)} .k-retr{background:rgba(63,185,80,.18)} .k-agent{background:rgba(232,121,201,.18)}
+  /* 更大胆：总 Token 主数字渐变字 */
+  .summary .blk:first-child .big{background:linear-gradient(90deg,var(--accent),var(--accent2));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  /* 多轮会话徽章：让 session 多轮一眼可见、可点开时间线 */
+  .mt{font-size:10px;color:#fff;background:linear-gradient(90deg,var(--accent2),var(--accent));
+    padding:2px 8px;border-radius:10px;margin-left:auto;cursor:pointer;font-weight:600;white-space:nowrap;flex:none;
+    box-shadow:0 1px 6px rgba(124,92,255,.3)}
+  .mt:hover{filter:brightness(1.13)}
+  .titem.sel .mt{box-shadow:0 1px 8px rgba(124,92,255,.5)}
+  /* 多轮会话的列表项：左缘换成紫色，与单轮区分 */
+  .titem.multi{box-shadow:inset 3px 0 0 var(--accent2)}
+  .titem.multi.sel{box-shadow:inset 3px 0 0 var(--accent2),0 0 0 1px rgba(124,92,255,.25)}
+  /* 线程弹窗里把"轮数"做强 */
+  .thhd .tag.turns{color:#fff;background:linear-gradient(90deg,var(--accent2),var(--accent));border-color:transparent;font-weight:600}
+  /* ===== 左栏按 session 分组 ===== */
+  .thsingle{color:var(--dim);font-family:var(--mono)}
+  .sgroup{border-bottom:1px solid var(--border)}
+  .sgroup.cur{background:rgba(124,92,255,.045)}
+  .shead{display:flex;align-items:center;gap:8px;padding:11px 14px 0;cursor:pointer}
+  .shead:hover .sttl{color:#fff}
+  .scaret{color:var(--muted);font-size:9px;width:10px;flex:none;text-align:center}
+  .shead .dot{flex:none}
+  .sttl{font-size:13px;font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .shead .mt{margin-left:auto;margin-top:-1px}
+  .ssub{padding:4px 14px 9px 32px;font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+  .sturns{margin:0 0 8px 21px;border-left:2px solid var(--border)}
+  .tturn{display:flex;align-items:center;gap:9px;padding:6px 14px 6px 13px;cursor:pointer;font-size:12px;transition:background .12s}
+  .tturn:hover{background:var(--panel2)}
+  .tturn.sel{background:var(--panel2);box-shadow:inset 2px 0 0 var(--accent);margin-left:-2px;padding-left:15px}
+  .tturn .ti{font-family:var(--mono);font-size:10px;color:var(--accent2);flex:none;font-weight:600}
+  .tturn .tn{flex:1;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tturn:hover .tn,.tturn.sel .tn{color:var(--txt)}
+  .tturn .tmm{font-family:var(--mono);font-size:10px;color:var(--dim);flex:none}
 </style>
 </head>
 <body>
@@ -195,7 +258,7 @@
   <div class="main">
     <!-- LEFT: trace list -->
     <div class="pane list scroll">
-      <div class="ph">Trace 列表 <span id="lcnt" style="color:var(--dim)"></span></div>
+      <div class="ph">会话列表 <span id="lcnt" style="color:var(--dim)"></span></div>
       <div class="filters">
         <span class="f on">全部</span><span class="f">错误</span><span class="f">运行中</span>
         <span class="f">耗时&gt;5s</span><span class="f">成本&gt;$0.1</span><span class="f">已标注</span>
@@ -505,14 +568,47 @@ function renderFlame(){
   }
   document.getElementById('tree').innerHTML=html+'</div>';
 }
+/* 左栏按 session(thread) 分组：每个会话一组，多轮会话把每一轮折叠在组里。 */
+const sessOpen={};                                  // thread -> 是否展开（默认展开）
+function toggleSess(th){ sessOpen[th]=sessOpen[th]===false; renderList(); }
+function dotcls(t){ return t.status==='run'?'run':(t.status==='err'?'err':'ok'); }
 function renderList(){
-  document.getElementById('lcnt').textContent='('+TRACES.length+')';
-  document.getElementById('tlist').innerHTML=TRACES.map(t=>{
-    const cls=t.status==='run'?'run':(t.status==='err'?'err':'ok');
-    return `<div class="titem ${t===curTrace?'sel':''}" onclick="selTrace('${t.id}')">
-      <div class="tname"><span class="dot ${cls}"></span>${t.name}${t.live?'<span class="runtag">● 运行中</span>':''}</div>
-      <div class="tmeta"><span class="thchip" onclick="event.stopPropagation();openThread('${t.thread}')" title="线程重建：串起本会话所有 trace">🧵${t.thread}</span><span>${fmt(t.dur)}</span><span>$${t.cost}</span><span>${t.spans} spans</span></div>
-    </div>`;}).join('');
+  // 按会话分组，保留首次出现顺序；组内按时序排轮次。
+  const order=[], g={};
+  TRACES.forEach(t=>{ if(!g[t.thread]){ g[t.thread]=[]; order.push(t.thread);} g[t.thread].push(t); });
+  order.forEach(th=>g[th].sort((a,b)=>tkey(a.started)-tkey(b.started)));
+  document.getElementById('lcnt').textContent='('+order.length+' 会话 · '+TRACES.length+' trace)';
+  document.getElementById('tlist').innerHTML=order.map(th=>{
+    const turns=g[th];
+    return turns.length===1 ? singleItem(turns[0]) : sessionGroup(th,turns);
+  }).join('');
+}
+// 单轮会话：一条普通项。
+function singleItem(t){
+  return `<div class="titem ${t===curTrace?'sel':''}" onclick="selTrace('${t.id}')">
+    <div class="tname"><span class="dot ${dotcls(t)}"></span>${t.name}${t.live?'<span class="runtag">● 运行中</span>':''}</div>
+    <div class="tmeta"><span class="thsingle">🧵 单轮</span><span>${fmt(t.dur)}</span><span>$${t.cost}</span><span>${t.spans} spans</span></div>
+  </div>`;
+}
+// 多轮会话：组头（会话标题 + N 轮 + 合计）+ 折叠在下面的每一轮。
+function sessionGroup(th,turns){
+  const n=turns.length, open=sessOpen[th]!==false;
+  const totCost=turns.reduce((s,t)=>s+(t.cost||0),0);
+  const dc=turns.some(t=>t.status==='run')?'run':(turns.some(t=>t.status==='err')?'err':'ok');
+  const hasCur=turns.some(t=>t===curTrace);
+  const head=`<div class="shead" onclick="toggleSess('${th}')">
+    <span class="scaret">${open?'▾':'▸'}</span><span class="dot ${dc}"></span>
+    <span class="sttl">${turns[0].name}</span>
+    <span class="mt" onclick="event.stopPropagation();openThread('${th}')" title="看 ${n} 轮对话时间线（🧑问→🤖答）">🧵 ${n} 轮</span>
+  </div>
+  <div class="ssub">🧵 ${th} · ${n} 轮对话 · 合计 $${totCost.toFixed(3)}</div>`;
+  const body=open ? '<div class="sturns">'+turns.map((t,i)=>`
+    <div class="tturn ${t===curTrace?'sel':''}" onclick="selTrace('${t.id}')" title="${esc(t.name)}">
+      <span class="ti">第${i+1}轮</span>
+      <span class="tn">${t.name}${t.live?' <span class="runtag">● 运行中</span>':''}</span>
+      <span class="tmm">${fmt(t.dur)} · $${t.cost}</span>
+    </div>`).join('')+'</div>' : '';
+  return `<div class="sgroup ${hasCur?'cur':''}">${head}${body}</div>`;
 }
 function renderRuler(){
   maxEnd=Math.max(curTrace.root.dur||curTrace.dur||1,1);
@@ -541,7 +637,27 @@ function renderTree(){
       <div class="tokcell">${tcell}</div>
       <div class="scost">$${(s.cost||0).toFixed(3)}</div>
       <div class="sdur">${fmt(s.dur)}</div>
-    </div>`;}).join('');
+    </div>`;}).join('') + insightPanel(rows);
+}
+/* 本 trace 洞察：把瀑布下方留白用起来 —— 耗时 / 成本 Top5，点行选中对应 span */
+const KVAR={llm:'llm',tool:'tool',chain:'chain',retriever:'retr',agent:'agent'};
+function insightPanel(rows){
+  const leaves=rows.filter(s=>s.id!==curTrace.root.id);
+  if(leaves.length<2)return '';
+  const byDur=[...leaves].sort((a,b)=>b.dur-a.dur).slice(0,5);
+  const byCost=[...leaves].sort((a,b)=>(b.cost||0)-(a.cost||0)).slice(0,5);
+  const maxDur=Math.max(1,...byDur.map(s=>s.dur));
+  const maxCost=Math.max(1e-6,...byCost.map(s=>s.cost||0));
+  const row=(s,frac,val,color)=>`<div class="irow" onclick="selSpan('${s.id}')" title="${esc(s.name)}">
+    <span class="irank">${KIND[s.kind][0][0]}</span><span class="iname">${esc(s.name)}</span>
+    <span class="imeter"><i style="width:${Math.max(frac*100,5)}%;background:${color}"></i></span>
+    <span class="ival">${val}</span></div>`;
+  const durRows=byDur.map(s=>row(s,s.dur/maxDur,fmt(s.dur),`var(--${KVAR[s.kind]})`)).join('');
+  const costRows=byCost.map(s=>row(s,(s.cost||0)/maxCost,'$'+(s.cost||0).toFixed(3),'var(--ok)')).join('');
+  return `<div class="insight">
+    <div class="icard"><h5>⏱ 耗时 Top 5</h5>${durRows}</div>
+    <div class="icard"><h5>💰 成本 Top 5</h5>${costRows}</div>
+  </div>`;
 }
 function findSpan(node,id){ if(node.id===id)return node; if(node.children)for(const c of node.children){const r=findSpan(c,id);if(r)return r;} return null;}
 function toggle(id){const s=findSpan(curTrace.root,id);s._open=s._open===false?true:false;renderTree();}
@@ -581,7 +697,7 @@ function renderSimilar(){
   return `<div class="dsec"><h4>🧭 语义找相似 trace（招牌·带过滤召回）</h4>
    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">在 <span class="tag">本租户</span> <span class="tag">近90天</span> <span class="tag">cost&gt;$0.05</span> 内，语义最接近本 trace 的历史轨迹</div>
    <div class="sim" style="padding:0">${SIMILAR.map(s=>`<div class="simitem"><span class="score">${s.score}</span><div class="simn">${s.name}<br><small>${s.meta}</small></div><span class="tag" style="margin-left:auto;flex:none">${s.tag}</span></div>`).join('')}</div>
-   <div style="font-size:11px;color:var(--dim);margin-top:6px">SmithDB/Langfuse 给不了这个：对象存储+无状态架构与 ANN 哲学冲突。本地 NVMe DiskANN 带过滤召回 → 毫秒级。</div></div>`;
+   <div style="font-size:11px;line-height:1.55;color:var(--muted);margin-top:8px;padding:7px 10px;border-left:2px solid var(--accent2);background:rgba(124,92,255,.06);border-radius:0 6px 6px 0">对象存储+无状态架构与 ANN 哲学冲突，竞品给不了这个；本地 NVMe 带过滤召回 → 毫秒级。</div></div>`;
 }
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 /* ===== 线程重建：点 thread → 同会话多条 trace 串成时间线 ===== */
@@ -590,7 +706,7 @@ function openThread(tid){if(!tid)return;
   const turns=TRACES.filter(t=>t.thread===tid).sort((a,b)=>tkey(a.started)-tkey(b.started));
   let totC=0,totS=0,totT=0;turns.forEach(t=>{totC+=t.cost;totS+=(typeof t.spans==='number'?t.spans:parseInt(t.spans)||0);totT+=stats(t.root,{itok:0,otok:0,cost:0,n:0,models:{},mtok:{}}).itok;});
   document.getElementById('thid').textContent=tid;
-  document.getElementById('thmeta').innerHTML=`<span class="tag">${turns.length} 轮对话</span><span class="tag">合计 $${totC.toFixed(3)}</span><span class="tag">${totS}+ spans</span>`;
+  document.getElementById('thmeta').innerHTML=`<span class="tag turns">🧵 ${turns.length} 轮对话</span><span class="tag">合计 $${totC.toFixed(3)}</span><span class="tag">${totS}+ spans</span>`;
   document.getElementById('thbody').innerHTML=turns.map((t,i)=>{
     const cls=t.status==='run'?'run':t.status==='err'?'err':'ok';const o=(t.root.out||'');
     return `<div class="turn" onclick="closeThread();selTrace('${t.id}')">
