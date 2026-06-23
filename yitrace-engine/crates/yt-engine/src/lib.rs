@@ -35,7 +35,10 @@ mod graph;
 pub use graph::GraphAnnIndex;
 
 mod bm25;
-pub use bm25::Bm25TextIndex;
+pub use bm25::{Bm25TextIndex, CjkBigramTokenizer, Tokenizer};
+
+mod tokenizer_cn;
+pub use tokenizer_cn::{ChineseTokenizer, Dict};
 
 mod segstore;
 pub use segstore::FileSegmentStore;
@@ -910,6 +913,60 @@ impl SessionIndex {
     }
 }
 
+/// 引擎构造器：注入自定义检索索引（团队 jieba 分词的 BM25、自有 graph_index）后再起引擎。
+/// 不传 = 用默认（bigram BM25 / 内置图式 ANN），所以现有 `WriteCoordinator::new/open/open_durable`
+/// 行为不变。外部隔离 crate（如 jieba FFI）走这里把实现接进来，骨架本身仍零依赖。
+///
+/// ```ignore
+/// // 团队 jieba 库就位后：
+/// let eng = CoordinatorBuilder::new()
+///     .with_tokenizer(Box::new(JiebaTokenizer::open("dict/")?)) // 只换分词层
+///     .open_durable("/data/trace")?;
+/// ```
+#[derive(Default)]
+pub struct CoordinatorBuilder {
+    bm25: Option<Arc<dyn Bm25Index>>,
+    graph: Option<Arc<dyn GraphIndex>>,
+}
+
+impl CoordinatorBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 整体替换 BM25 实现（最一般）。
+    pub fn with_bm25(mut self, bm25: Arc<dyn Bm25Index>) -> Self {
+        self.bm25 = Some(bm25);
+        self
+    }
+
+    /// 便捷：只换 BM25 的分词器（团队 jieba 词级分词），倒排与评分仍用自有 `Bm25TextIndex`。
+    pub fn with_tokenizer(self, tokenizer: Box<dyn Tokenizer>) -> Self {
+        self.with_bm25(Arc::new(Bm25TextIndex::with_tokenizer(tokenizer)))
+    }
+
+    /// 替换向量 ANN 实现（接团队 graph_index 时用）。
+    pub fn with_graph(mut self, graph: Arc<dyn GraphIndex>) -> Self {
+        self.graph = Some(graph);
+        self
+    }
+
+    /// 内存 WAL（测试/开发）。
+    pub fn build(self, segments: Arc<dyn SegmentStore>) -> Arc<WriteCoordinator> {
+        WriteCoordinator::build_full(segments, Wal::new(), Manifest::empty(), 1, 1, None, None, self.bm25, self.graph)
+    }
+
+    /// 文件 WAL。
+    pub fn open(self, segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
+        Ok(WriteCoordinator::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, self.bm25, self.graph))
+    }
+
+    /// 全持久化引擎（与 `WriteCoordinator::open_durable` 同语义，外加注入的索引）。
+    pub fn open_durable(self, dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
+        WriteCoordinator::open_durable_inner(dir, self.bm25, self.graph)
+    }
+}
+
 impl WriteCoordinator {
     /// 内存 WAL（测试/开发，不落盘）。
     pub fn new(segments: Arc<dyn SegmentStore>) -> Arc<Self> {
@@ -919,13 +976,22 @@ impl WriteCoordinator {
     /// 文件 WAL（真落盘）：重启后用同一路径 `open` + `recover()` 可从盘上重放(WAL 持久化)。
     /// 注意：段/manifest 不持久化,崩溃后靠 WAL 全量重放进 MemTable 恢复。要"flush 后重启不丢"用 `open_durable`。
     pub fn open(segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
-        Ok(Self::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None))
+        Ok(Self::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, None, None))
     }
 
     /// **全持久化引擎**：一个目录下放段(`segments/`)+ WAL(`wal.log`)+ manifest(`manifest.dat`)。
     /// 重启用同一目录 `open_durable` + `recover()`：先从 manifest 重建段集合(指向盘上段文件)、再 WAL 重放
     /// 水位之后的尾巴 —— **flush 过的数据(水位之前、WAL 不再重放)从持久段读回,真正重启不丢**。
     pub fn open_durable(dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
+        Self::open_durable_inner(dir, None, None)
+    }
+
+    /// open_durable 的内部实现，多收两个可选索引覆盖（[`CoordinatorBuilder`] 用它注入 jieba/自定义索引）。
+    fn open_durable_inner(
+        dir: impl AsRef<std::path::Path>,
+        bm25: Option<Arc<dyn Bm25Index>>,
+        graph: Option<Arc<dyn GraphIndex>>,
+    ) -> std::io::Result<Arc<Self>> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let segments = Arc::new(FileSegmentStore::open(dir.join("segments"))?);
@@ -937,13 +1003,14 @@ impl WriteCoordinator {
             None => (Manifest::empty(), 1, 1),
         };
         let vector_path = dir.join("vectors.dat");
-        Ok(Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), Some(vector_path)))
+        Ok(Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), Some(vector_path), bm25, graph))
     }
 
     fn build(segments: Arc<dyn SegmentStore>, wal: Wal) -> Arc<Self> {
-        Self::build_full(segments, wal, Manifest::empty(), 1, 1, None, None)
+        Self::build_full(segments, wal, Manifest::empty(), 1, 1, None, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_full(
         segments: Arc<dyn SegmentStore>,
         wal: Wal,
@@ -952,6 +1019,8 @@ impl WriteCoordinator {
         next_chunk_id: u64,
         manifest_path: Option<std::path::PathBuf>,
         vector_path: Option<std::path::PathBuf>,
+        bm25: Option<Arc<dyn Bm25Index>>,
+        graph: Option<Arc<dyn GraphIndex>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             write_lock: Mutex::new(()),
@@ -961,8 +1030,10 @@ impl WriteCoordinator {
             segments,
             dead_set: Mutex::new(Vec::new()),
             buffer_pins: BufferPins::default(),
-            bm25: Arc::new(Bm25TextIndex::new()), // 真 BM25 中文倒排（替子串占位）
-            graph: Arc::new(GraphAnnIndex::default()), // 真图式 ANN（替暴力 L2 占位）
+            // 默认 BM25 用纯 Rust 中文词级分词（jieba 全量词典，开箱即生产级）/ 图式 ANN；
+            // 可被 builder 注入覆盖（团队 jieba FFI、bigram、或叠了自有词典的 ChineseTokenizer）。
+            bm25: bm25.unwrap_or_else(|| Arc::new(Bm25TextIndex::with_tokenizer(Box::new(ChineseTokenizer::full())))),
+            graph: graph.unwrap_or_else(|| Arc::new(GraphAnnIndex::default())),
             flush_threshold: AtomicUsize::new(4096),
             next_segment_id: Mutex::new(next_segment_id),
             next_chunk_id: Mutex::new(next_chunk_id),
@@ -2638,6 +2709,65 @@ mod tests {
         assert_eq!(sim.len(), 2);
         assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (2, 20));
         assert_eq!((sim[1].0.trace_id, sim[1].0.span_id), (1, 10));
+    }
+
+    #[test]
+    fn builder_injects_custom_tokenizer_end_to_end() {
+        // 注入口验证：用 CoordinatorBuilder 换分词器后起引擎，自定义分词一路贯穿到 search_text。
+        // 这条就是「团队 jieba 到位后只换分词层」在引擎层的契约。
+        struct WordTokenizer; // 按空白切，整段中文当一个词（不拆 bigram）
+        impl Tokenizer for WordTokenizer {
+            fn tokenize(&self, text: &str) -> Vec<String> {
+                text.split_whitespace().map(|w| w.to_lowercase()).collect()
+            }
+        }
+
+        let store = Arc::new(CapturingStore::default());
+        let wc = CoordinatorBuilder::new()
+            .with_tokenizer(Box::new(WordTokenizer))
+            .build(store);
+
+        // (1,10) 文本里 "风控" 是独立词；(2,20) 没有空格分隔的 "风控" 词。
+        let e1 = ev(1, 10, 1, Some(0), Some(100), &["盗刷 风控 已拦截"]);
+        let e2 = ev(2, 20, 1, Some(0), Some(200), &["盗刷风控合并成一个词"]);
+        let all = vec![e1.clone(), e2.clone()];
+        wc.ingest(all.clone());
+        wc.commit_flush(&all, WalLsn::new(2));
+        let snap = wc.pin_snapshot();
+
+        // 注入的分词器决定切分：查 "风控" 只命中 (1,10)（默认 bigram 会把两条都命中）。
+        let hits = wc.search_text(&snap, "风控", 10);
+        assert_eq!(hits.len(), 1, "注入的分词器一路生效到检索");
+        assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (1, 10));
+    }
+
+    #[test]
+    fn builder_injects_custom_graph_index_end_to_end() {
+        // 注入口验证：用 CoordinatorBuilder 换 GraphIndex 后，search_similar 走的是注入的实现，不是默认 ANN。
+        // 这条是「团队 graph_index 到位后只换向量索引层」在引擎层的契约（与 jieba 那条对称）。
+        struct StubGraph; // 无视查询向量，永远只返回 (7,99) —— 默认 L2 ANN 不会这么选
+        impl GraphIndex for StubGraph {
+            fn index_embedding(&self, _t: u64, _s: u64, _e: Vec<f32>) {}
+            fn search(&self, _q: &[f32], _k: usize, _f: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+                vec![(7, 99, 0.0)]
+            }
+        }
+
+        let store = Arc::new(CapturingStore::default());
+        let wc = CoordinatorBuilder::new().with_graph(Arc::new(StubGraph)).build(store);
+
+        // 两个 span 都摄入（才能被折叠出来）；查询向量明显更靠近 (1,10)。
+        let e1 = ev(1, 10, 1, Some(0), Some(100), &["a"]);
+        let e2 = ev(7, 99, 1, Some(0), Some(700), &["b"]);
+        let all = vec![e1.clone(), e2.clone()];
+        wc.ingest(all.clone());
+        wc.commit_flush(&all, WalLsn::new(2));
+        let snap = wc.pin_snapshot();
+
+        let sim = wc.search_similar(&snap, &[0.0, 0.0], 5);
+        assert_eq!(sim.len(), 1, "注入的图索引决定返回什么");
+        assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (7, 99), "走的是 StubGraph，不是默认 L2");
+        assert_eq!(sim[0].0.duration_ns, Some(700), "返回折叠出的完整 span");
     }
 
     #[test]
