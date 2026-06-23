@@ -94,18 +94,6 @@ button{font:inherit}
 .seg button.on{background:var(--accent);color:#fff}
 .viewscroll{flex:1;overflow:auto;background:radial-gradient(circle at 1px 1px,rgba(124,140,170,.05) 1px,transparent 0) 0 0/24px 24px}
 
-/* flame */
-.flamewrap{padding:4px 0 14px}
-.fhint{padding:8px 16px 10px;font-size:11px;color:var(--dim)}
-.flame{padding:0 16px}
-.flevel{position:relative;height:23px;margin-bottom:3px}
-.fblk{position:absolute;top:0;height:21px;border-radius:3px;overflow:hidden;cursor:pointer;display:flex;align-items:center;padding:0 6px;min-width:3px;opacity:.92}
-.fblk:hover{opacity:1;box-shadow:0 0 0 1px var(--txt) inset}
-.fblk.fsel{box-shadow:0 0 0 2px #fff inset}
-.fblk.b-llm{background:var(--llm)}.fblk.b-tool{background:var(--tool)}.fblk.b-chain{background:var(--chain)}
-.fblk.b-retriever{background:var(--retr)}.fblk.b-agent{background:linear-gradient(90deg,var(--agent),var(--accent2))}.fblk.b-other{background:#44557a}.fblk.b-err{background:var(--err)}
-.flbl{font-size:10.5px;color:#fff;white-space:nowrap;overflow:hidden;text-shadow:0 1px 2px rgba(0,0,0,.45);font-weight:500}
-
 /* step stream */
 .stream{padding:14px 20px}
 .scard{position:relative;padding:0 0 18px 24px;border-left:2px solid var(--border);margin-left:6px}

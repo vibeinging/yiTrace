@@ -2,11 +2,10 @@ import { useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useTrace } from '../hooks/queries'
 import type { Span } from '../api'
-import { Flame } from './Flame'
 import { AgentGraph } from './AgentGraph'
 import { StepStream } from './StepStream'
 
-type View = 'wf' | 'flame' | 'steps' | 'graph'
+type View = 'wf' | 'steps' | 'graph'
 
 const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms')
 const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT' }
@@ -51,7 +50,6 @@ export function Waterfall({
         </div>
         <div className="seg">
           <button className={view === 'wf' ? 'on' : ''} onClick={() => setView('wf')}>瀑布</button>
-          <button className={view === 'flame' ? 'on' : ''} onClick={() => setView('flame')}>火焰图</button>
           <button className={view === 'steps' ? 'on' : ''} onClick={() => setView('steps')}>步骤流</button>
           <button className={view === 'graph' ? 'on' : ''} onClick={() => setView('graph')}>Agent图</button>
         </div>
@@ -80,14 +78,12 @@ export function Waterfall({
             ))}
           </div>
         </div>
-      ) : view === 'flame' ? (
-        <div className="viewscroll"><Flame spans={spans} selectedSpan={selectedSpan} onSelectSpan={onSelectSpan} /></div>
       ) : view === 'steps' ? (
         <StepStream traceId={traceId} active={view === 'steps'} />
       ) : (
         <div className="viewscroll"><AgentGraph spans={spans} /></div>
       )}
-      {(view === 'wf' || view === 'flame') && spans.length > 1 && <Insight spans={spans} onSelect={onSelectSpan} />}
+      {view === 'wf' && spans.length > 1 && <Insight spans={spans} onSelect={onSelectSpan} />}
     </div>
   )
 }
