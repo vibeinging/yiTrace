@@ -111,6 +111,32 @@ def test_exception_marks_error_status():
     assert end.status == 1, "异常退出 → 状态非0"
 
 
+def test_batch_exporter_hands_off_whole_batch_once():
+    # BatchExporter 攒够一批 → 整批一次交下游 export_batch（不是逐条 export）。
+    from yitrace.event import SpanEvent  # noqa: E402
+    from yitrace.exporter import BatchExporter, Exporter  # noqa: E402
+
+    class RecordingSink(Exporter):
+        def __init__(self):
+            self.batches = []
+            self.single = 0
+
+        def export(self, e):
+            self.single += 1
+
+        def export_batch(self, events):
+            self.batches.append(len(events))
+
+    sink = RecordingSink()
+    be = BatchExporter(sink, max_batch=3)
+    for i in range(7):
+        be.export(SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                            event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i))
+    be.close()  # flush 余下的
+    assert sink.single == 0, "整批走 export_batch,不逐条 export"
+    assert sink.batches == [3, 3, 1], "攒满 3 各发一批,剩 1 在 close 时发"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

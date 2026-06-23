@@ -13,6 +13,11 @@ class Exporter(abc.ABC):
     def export(self, event: SpanEvent) -> None:
         ...
 
+    def export_batch(self, events: list[SpanEvent]) -> None:
+        """一次收一批。默认逐条转 `export`；能真正批量的传输（HttpExporter）覆盖成单次请求。"""
+        for e in events:
+            self.export(e)
+
     def close(self) -> None:
         pass
 
@@ -35,7 +40,8 @@ class CollectingExporter(Exporter):
 
 
 class BatchExporter(Exporter):
-    """攒批再发（真实部署：批量 POST 到引擎摄入端）。这里只攒批 + 留 `_send` 钩子。"""
+    """攒批缓冲装饰器：攒够一批就**整批**交给下游 sink 的 `export_batch`（一次请求/一次落盘），
+    不再逐条转。要批量 HTTP 直接用 `HttpExporter`（它本身就攒批）；要给任意 sink 加攒批语义才套这个。"""
 
     def __init__(self, sink: Exporter, max_batch: int = 256) -> None:
         self._sink = sink
@@ -48,9 +54,10 @@ class BatchExporter(Exporter):
             self.flush()
 
     def flush(self) -> None:
-        for e in self._buf:
-            self._sink.export(e)  # TODO: 真实实现这里改成一次 HTTP/OTLP 批量请求
-        self._buf.clear()
+        if not self._buf:
+            return
+        batch, self._buf = self._buf, []
+        self._sink.export_batch(batch)  # 整批一次交下游（sink 能批就批）
 
     def close(self) -> None:
         self.flush()
@@ -71,13 +78,22 @@ class HttpExporter(Exporter):
         if len(self._buf) >= self.max:
             self.flush()
 
+    def export_batch(self, events: list[SpanEvent]) -> None:
+        """整批一次 POST（覆盖默认逐条）——这是真正的批量传输。"""
+        self._post(events)
+
     def flush(self) -> None:
         if not self._buf:
             return
-        body = json.dumps([e.to_wire() for e in self._buf]).encode("utf-8")
+        batch, self._buf = self._buf, []
+        self._post(batch)
+
+    def _post(self, events: list[SpanEvent]) -> None:
+        if not events:
+            return
+        body = json.dumps([e.to_wire() for e in events]).encode("utf-8")
         req = urllib.request.Request(self.url, data=body, method="POST", headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=self.timeout).read()
-        self._buf.clear()
 
     def close(self) -> None:
         self.flush()

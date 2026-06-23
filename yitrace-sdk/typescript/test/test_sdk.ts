@@ -1,5 +1,5 @@
 // SDK 测试。`node test/test_sdk.ts`（Node 23+ 原生跑 .ts）。
-import { CollectingExporter, EventType, Tracer, eventId, toWire, type SpanEvent } from "../src/index.ts";
+import { CollectingExporter, EventType, HttpExporter, Tracer, eventId, toWire, type SpanEvent } from "../src/index.ts";
 
 let passed = 0;
 function check(cond: boolean, msg: string): void {
@@ -115,4 +115,33 @@ test("异常退出 → 状态非0", () => {
   check(end.status === 1, "异常 → 状态1");
 });
 
+// 异步测试：HttpExporter 上报失败时退回缓冲 + 回调 onError，不静默吞掉。
+async function asyncTests(): Promise<void> {
+  const ev: SpanEvent = {
+    traceId: 1n, spanId: 1n, ts: 1n, seq: 1n, eventType: EventType.SpanEnd, extSpanId: "s1",
+    parentSpanId: null, status: 0, durationNs: null, inputTokens: null, outputTokens: null,
+    sessionId: null, agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
+  };
+  const origFetch = globalThis.fetch;
+  try {
+    let errs = 0;
+    globalThis.fetch = (() => Promise.reject(new Error("network down"))) as typeof fetch;
+    const exp = new HttpExporter({ url: "http://x", max: 1, onError: () => { errs++; } });
+    exp.export(ev); // max=1 → 触发 flush → 失败
+    await new Promise((r) => setTimeout(r, 0));
+    check(errs === 1, "失败回调 onError 一次");
+    // 失败的批退回缓冲：恢复 fetch 后 flush 应把它发出去（成功 → 缓冲清空）。
+    let posted = 0;
+    globalThis.fetch = (() => Promise.resolve(new Response("", { status: 200 }))) as typeof fetch;
+    await exp.flush();
+    posted++;
+    check(posted === 1 && errs === 1, "恢复后重试成功,不再报错（trace 没被静默丢）");
+    passed++;
+    console.log("OK  HttpExporter 失败退回缓冲 + onError 上报");
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+}
+
+await asyncTests();
 console.log("\n" + passed + " passed");
