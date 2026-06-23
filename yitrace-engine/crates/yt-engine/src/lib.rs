@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use yt_core::chunk::{DeletionVec, UpgradeColChunk};
@@ -768,10 +768,146 @@ pub struct WriteCoordinator {
     /// 检索过滤的属性边车：(trace,span) → 可过滤元数据（带过滤 ANN 的 payload）。
     /// 派生数据：摄入时建,`recover` 时从持久段重建。
     filter_attrs: Mutex<HashMap<(u64, u64), FilterAttrs>>,
-    /// 数据写代次：任何改变可见数据的写（ingest/delete/upgrade）都 +1。控制台会话列表缓存据此失效。
-    data_gen: AtomicU64,
-    /// 控制台会话列表缓存：`(算它时的代次, 结果)`。代次没变就直接用 → 分页读 O(page) 而非每页全扫。
-    sessions_cache: Mutex<Option<(u64, Vec<ConsoleSession>)>>,
+    /// 控制台会话边车索引：摄入时**增量差量**维护（O(1)/事件），delete/upgrade 标脏、下次读重建。
+    session_idx: Mutex<SessionIndex>,
+}
+
+/// 一个 span 在边车里的当前聚合（last-non-null 口径，与折叠一致）。用于算会话级差量。
+#[derive(Default, Clone)]
+struct SpanAgg {
+    session: Option<u64>,
+    in_tok: u64,
+    out_tok: u64,
+    error: bool,
+    agent: Option<String>,
+    trace: u64,
+}
+
+/// 一个会话在边车里的增量聚合。
+#[derive(Default, Clone)]
+struct SessionAgg {
+    traces: std::collections::HashSet<u64>,
+    in_tok: u64,
+    out_tok: u64,
+    error_spans: usize,
+    title: String,
+    first_trace: u64,
+    first_trace_set: bool,
+}
+
+/// 控制台会话边车：span 级聚合 + 会话级增量聚合 + 排序结果缓存。
+#[derive(Default)]
+struct SessionIndex {
+    span: HashMap<(u64, u64), SpanAgg>,
+    sess: BTreeMap<u64, SessionAgg>,
+    /// delete/upgrade 改了段（不走 index_record）→ 标脏，下次读全量重建。
+    dirty: bool,
+    /// 任何改动 +1；排序结果缓存据此判失效。
+    ver: u64,
+    cache: Option<(u64, Vec<ConsoleSession>)>,
+}
+
+impl SessionIndex {
+    /// 把一个 span 的"当前聚合 → 新聚合"差量应用到会话级（增量、O(1)）。
+    fn apply_span(&mut self, key: (u64, u64), new: SpanAgg) {
+        let old = self.span.get(&key).cloned().unwrap_or_default();
+        if old.session != new.session {
+            if let Some(os) = old.session {
+                self.sub(os, &old);
+            }
+            if let Some(ns) = new.session {
+                self.add(ns, &new);
+            }
+        } else if let Some(s) = new.session {
+            // 同会话：只动 token / error 差量。
+            let e = self.sess.entry(s).or_default();
+            e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
+            e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
+            e.error_spans = (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
+            if e.title.is_empty() {
+                if let Some(a) = &new.agent {
+                    e.title = a.clone();
+                }
+            }
+        }
+        self.span.insert(key, new);
+        self.ver += 1;
+        self.cache = None;
+    }
+
+    fn add(&mut self, sid: u64, s: &SpanAgg) {
+        let e = self.sess.entry(sid).or_default();
+        e.in_tok += s.in_tok;
+        e.out_tok += s.out_tok;
+        e.error_spans += s.error as usize;
+        e.traces.insert(s.trace);
+        if !e.first_trace_set || s.trace < e.first_trace {
+            e.first_trace = s.trace;
+            e.first_trace_set = true;
+        }
+        if e.title.is_empty() {
+            if let Some(a) = &s.agent {
+                e.title = a.clone();
+            }
+        }
+    }
+
+    fn sub(&mut self, sid: u64, s: &SpanAgg) {
+        if let Some(e) = self.sess.get_mut(&sid) {
+            e.in_tok = e.in_tok.saturating_sub(s.in_tok);
+            e.out_tok = e.out_tok.saturating_sub(s.out_tok);
+            e.error_spans = e.error_spans.saturating_sub(s.error as usize);
+            // traces / first_trace 不在此精确回收（会话切换极罕见）；delete/upgrade 走标脏重建纠正。
+        }
+    }
+
+    /// 从折叠 span 全量重建（delete/upgrade 标脏后、或首次）。
+    fn rebuild(&mut self, spans: &[FoldedSpan]) {
+        self.span.clear();
+        self.sess.clear();
+        for s in spans {
+            let sa = SpanAgg {
+                session: s.session_id,
+                in_tok: s.input_tokens.unwrap_or(0),
+                out_tok: s.output_tokens.unwrap_or(0),
+                error: s.status.unwrap_or(0) != 0,
+                agent: s.agent_name.clone(),
+                trace: s.trace_id,
+            };
+            if let Some(sid) = sa.session {
+                self.add(sid, &sa);
+            }
+            self.span.insert((s.trace_id, s.span_id), sa);
+        }
+        self.dirty = false;
+        self.ver += 1;
+        self.cache = None;
+    }
+
+    /// 产出按 session_id 降序的会话行（带缓存，ver 没变直接复用）。
+    fn rows(&mut self) -> Vec<ConsoleSession> {
+        if let Some((v, c)) = &self.cache {
+            if *v == self.ver {
+                return c.clone();
+            }
+        }
+        let mut out: Vec<ConsoleSession> = self
+            .sess
+            .iter()
+            .map(|(sid, a)| ConsoleSession {
+                session_id: *sid,
+                title: if a.title.is_empty() { format!("会话 {sid}") } else { a.title.clone() },
+                turn_count: a.traces.len(),
+                input_tokens: a.in_tok,
+                output_tokens: a.out_tok,
+                has_error: a.error_spans > 0,
+                first_trace_id: a.first_trace,
+            })
+            .collect();
+        out.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+        self.cache = Some((self.ver, out.clone()));
+        out
+    }
 }
 
 impl WriteCoordinator {
@@ -834,8 +970,7 @@ impl WriteCoordinator {
             manifest_path,
             vector_path,
             filter_attrs: Mutex::new(HashMap::new()),
-            data_gen: AtomicU64::new(0),
-            sessions_cache: Mutex::new(None),
+            session_idx: Mutex::new(SessionIndex::default()),
         })
     }
 
@@ -892,6 +1027,31 @@ impl WriteCoordinator {
         }
         a.min_ts = a.min_ts.min(r.ts);
         a.max_ts = a.max_ts.max(r.ts);
+        drop(fa);
+
+        // 会话边车：用 last-non-null 算出该 span 的新聚合，差量更新会话级（增量、O(1)/事件）。
+        let key = (r.trace_id, r.span_id);
+        let mut idx = self.session_idx.lock().unwrap();
+        let mut new = idx.span.get(&key).cloned().unwrap_or_default();
+        new.trace = r.trace_id;
+        if let Some(s) = r.fields.session_id {
+            new.session = Some(s);
+        }
+        if let Some(t) = r.fields.input_tokens {
+            new.in_tok = t;
+        }
+        if let Some(t) = r.fields.output_tokens {
+            new.out_tok = t;
+        }
+        if let Some(st) = r.fields.status {
+            new.error = st != 0;
+        }
+        if new.agent.is_none() {
+            if let Some(a) = &r.fields.agent_name {
+                new.agent = Some(a.clone());
+            }
+        }
+        idx.apply_span(key, new);
     }
 
     /// 写入：先进 WAL（ack 后才算持久），同步进活 MemTable，再推进已提交尾。
@@ -925,7 +1085,7 @@ impl WriteCoordinator {
         if self.memtable.lock().unwrap().len() >= self.flush_threshold.load(Ordering::Relaxed) {
             self.flush_memtable_locked();
         }
-        self.data_gen.fetch_add(1, Ordering::Relaxed); // 数据变了 → 会话缓存失效
+        // 会话边车已在 index_record 里逐事件增量维护，这里无需额外动作。
         last
     }
 
@@ -1246,65 +1406,19 @@ impl WriteCoordinator {
     }
 
     /// 控制台用：会话行列表（标题/轮数/状态/token/首 trace），按 session_id 降序。
-    /// **按写代次缓存**：没有新写入（ingest/delete/upgrade）时直接复用上次结果 → 分页读 O(page)，
-    /// 不必每页全扫；有写入则失效重算（正确）。对"浏览为主、偶有写入"的控制台正合适。
+    /// 走**增量边车索引**：摄入时已逐事件 O(1) 维护，这里直接产出（带排序缓存）→ 写多读少也不全扫。
+    /// 仅当 delete/upgrade 标脏时，才在此做一次全量重建（这两类不走 index_record）。
     pub fn console_sessions(&self, snap: &Snapshot) -> Vec<ConsoleSession> {
-        let gen = self.data_gen.load(Ordering::Relaxed);
-        {
-            let cache = self.sessions_cache.lock().unwrap();
-            if let Some((g, v)) = cache.as_ref() {
-                if *g == gen {
-                    return v.clone();
-                }
+        // 先看是否标脏（不持锁去扫，避免 session_idx→memtable 的锁序反转死锁）。
+        let dirty = self.session_idx.lock().unwrap().dirty;
+        if dirty {
+            let (spans, _) = self.read_spans_query(snap, &TraceQuery::all()); // 不持 session_idx 锁
+            let mut idx = self.session_idx.lock().unwrap();
+            if idx.dirty {
+                idx.rebuild(&spans);
             }
         }
-        let computed = self.console_sessions_scan(snap);
-        *self.sessions_cache.lock().unwrap() = Some((gen, computed.clone()));
-        computed
-    }
-
-    /// 全量扫描实现（缓存未命中时走它）：一次 O(spans) 扫描按 session→trace 聚合。
-    fn console_sessions_scan(&self, snap: &Snapshot) -> Vec<ConsoleSession> {
-        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
-        // session_id -> 聚合
-        let mut acc: BTreeMap<u64, ConsoleSession> = BTreeMap::new();
-        let mut seen_trace: HashMap<u64, std::collections::HashSet<u64>> = HashMap::new();
-        for s in spans {
-            let Some(sid) = s.session_id else { continue };
-            let e = acc.entry(sid).or_insert_with(|| ConsoleSession {
-                session_id: sid,
-                title: String::new(),
-                turn_count: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                has_error: false,
-                first_trace_id: s.trace_id,
-            });
-            seen_trace.entry(sid).or_default().insert(s.trace_id);
-            e.input_tokens += s.input_tokens.unwrap_or(0);
-            e.output_tokens += s.output_tokens.unwrap_or(0);
-            if s.status.unwrap_or(0) != 0 {
-                e.has_error = true;
-            }
-            if e.title.is_empty() {
-                if let Some(a) = &s.agent_name {
-                    e.title = a.clone();
-                }
-            }
-            if s.trace_id < e.first_trace_id {
-                e.first_trace_id = s.trace_id;
-            }
-        }
-        for (sid, e) in acc.iter_mut() {
-            e.turn_count = seen_trace.get(sid).map_or(0, |t| t.len());
-            if e.title.is_empty() {
-                e.title = format!("会话 {sid}");
-            }
-        }
-        // session_id 降序
-        let mut out: Vec<ConsoleSession> = acc.into_values().collect();
-        out.sort_by(|a, b| b.session_id.cmp(&a.session_id));
-        out
+        self.session_idx.lock().unwrap().rows()
     }
 
     /// 控制台用：一条 trace 的折叠 span（瀑布）。引擎不存 span 的 kind/name/起始时刻，这里**派生**：
@@ -1826,7 +1940,7 @@ impl WriteCoordinator {
             entry.deletion_seq += 1;
         }
         self.commit_and_persist(draft);
-        self.data_gen.fetch_add(1, Ordering::Relaxed);
+        self.session_idx.lock().unwrap().dirty = true; // 删除改了段，边车下次读重建
     }
 
     /// 属性补写（upgrade）提交：给某段 (trace_id, span_id) 补写**非身份属性**，与 delete 完全对称——
@@ -1843,7 +1957,7 @@ impl WriteCoordinator {
             entry.upgrade_seq += 1;
         }
         self.commit_and_persist(draft);
-        self.data_gen.fetch_add(1, Ordering::Relaxed);
+        self.session_idx.lock().unwrap().dirty = true; // 补写改了段，边车下次读重建
     }
 
     /// compaction 第 1 步：选段，记录选段瞬间各输入段的 (deletion_seq, upgrade_seq)。
@@ -3246,6 +3360,40 @@ mod tests {
         let snap2 = wc.pin_snapshot();
         let c = wc.console_sessions(&snap2);
         assert_eq!(c.len(), 2, "写入后缓存失效、能看到新会话");
+    }
+
+    #[test]
+    fn console_sidecar_token_delta_no_double_count() {
+        // 增量边车：token 分布在 start(in) / end(out) 两个事件，差量累加不能重复计数（要与折叠一致）。
+        let wc = WriteCoordinator::new(Arc::new(CapturingStore::default()));
+        let mut start = ev(1, 1, 1, Some(0), None, &[]);
+        start.fields.session_id = Some(100);
+        start.fields.agent_name = Some("风控研判".into());
+        start.fields.input_tokens = Some(500);
+        let mut end = ev(1, 1, 2, Some(0), Some(10), &[]);
+        end.fields.session_id = Some(100);
+        end.fields.output_tokens = Some(120);
+        // 再来一条同会话的 trace（第 2 轮）。
+        let mut t2 = ev(2, 1, 1, Some(0), Some(10), &[]);
+        t2.fields.session_id = Some(100);
+        t2.fields.input_tokens = Some(300);
+        wc.ingest(vec![start, end, t2]);
+
+        let snap = wc.pin_snapshot();
+        let r = wc.console_sessions(&snap);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].input_tokens, 800, "500(span1) + 300(span2)，end 不重复加 in");
+        assert_eq!(r[0].output_tokens, 120, "只 end 的 out");
+        assert_eq!(r[0].turn_count, 2, "两条 trace = 两轮");
+        assert_eq!(r[0].title, "风控研判");
+
+        // 增量结果应与全量重建一致。
+        let mut idx = wc.session_idx.lock().unwrap();
+        let (spans, _) = (wc.read_spans_query(&snap, &TraceQuery::all()).0, 0);
+        idx.rebuild(&spans);
+        let rebuilt = idx.rows();
+        drop(idx);
+        assert_eq!(rebuilt, r, "增量维护与全量重建结果一致");
     }
 
     #[test]
