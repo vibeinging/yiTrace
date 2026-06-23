@@ -1,0 +1,22 @@
+# yt-tokenizer-jieba —— 团队 jieba 词级分词的 FFI 接入，实现引擎的 Tokenizer trait。
+#
+# 刻意建在 std-only 引擎工作区之外（Vortex 同款隔离）：C 依赖只在这里，引擎骨架保持零依赖、离线可编。
+# 用法：CoordinatorBuilder::new().with_tokenizer(Box::new(JiebaTokenizer::open(dict)?)).open_durable(dir)
+#
+# features：
+#   - mock（默认）：用 crate 内 Rust 桩提供 C 符号，离线可编可测，验证 FFI 编组正确（非生产分词质量）。
+#   - link：build.rs 链接团队真 cppjieba 包装库（vexjieba）。生产构建：
+#       cargo build -p yt-tokenizer-jieba --no-default-features --features link
+[package]
+name = "yt-tokenizer-jieba"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[features]
+default = ["mock"]
+mock = []
+link = []
+
+[dependencies]
+yt-engine = { path = "../yitrace-engine/crates/yt-engine" }
