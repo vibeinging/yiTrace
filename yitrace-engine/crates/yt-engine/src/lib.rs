@@ -48,6 +48,8 @@ mod vecstore;
 
 mod gc_log;
 
+pub mod olog;
+
 mod vecindex_disk;
 pub use vecindex_disk::{DiskGraphConfig, DiskGraphIndex, DiskGraphStore, DurableGraphIndex};
 
@@ -1349,6 +1351,10 @@ impl WriteCoordinator {
             self.flush_memtable_locked();
         }
         // 会话边车已在 index_record 里逐事件增量维护，这里无需额外动作。
+        let n = first;
+        let cnt = last.get() - first + 1;
+        let tail = last.get();
+        olog::log(olog::Level::Debug, "ingest", &[("lsn", &n), ("count", &cnt), ("tail", &tail)]);
         last
     }
 
@@ -1380,7 +1386,15 @@ impl WriteCoordinator {
     /// 主动把内存表当前内容封成一个段（周期刷盘 / 关机前）。
     pub fn flush_memtable(&self) {
         let _w = self.write_lock.lock().unwrap();
+        let before = self.memtable.lock().unwrap().len();
+        let v_before = self.current.version();
         self.flush_memtable_locked();
+        let seg = v_before;
+        olog::log(olog::Level::Info, "flush", &[
+            ("seg", &seg),
+            ("rows", &before),
+            ("version", &self.current.version()),
+        ]);
     }
 
     /// 把内存表内容封段（调用方须已持 write_lock）。watermark 推进到内存表最新 LSN。
@@ -2174,8 +2188,10 @@ impl WriteCoordinator {
     /// - BM25 + 属性边车是**派生数据**：扫持久段(水位之前)+ 重放的 WAL 尾(水位之后)各喂一次,合起来覆盖全部、不重不漏。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
+        olog::log(olog::Level::Info, "recover_start", &[("version", &self.current.version())]);
         // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车；顺带重建段级 key bloom。
         let m = self.current.manifest();
+        let seg_count = m.segments.len();
         for entry in m.segments.values() {
             let recs = self.segments.scan_records(entry.segment_id);
             let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
@@ -2186,14 +2202,17 @@ impl WriteCoordinator {
         }
         drop(m);
         // 2) 向量：从独立向量文件重载,喂回图索引。
+        let mut vec_count = 0u64;
         if let Some(p) = &self.vector_path {
             for ((t, s), v) in vecstore::load(p) {
                 self.graph.index_embedding(t, s, v);
+                vec_count += 1;
             }
         }
         // 3) WAL 重放：水位之后的尾巴进 MemTable,并喂派生索引(与段不重叠,因 manifest 水位与段同事务持久)。
         let wal = self.wal.lock().unwrap();
         let mut mt = self.memtable.lock().unwrap();
+        let mut wal_count = 0u64;
         for (lsn, r) in wal.replay_after(WalLsn::new(self.current.memtable_watermark())) {
             self.index_record(&r);
             mt.append(MemRow {
@@ -2204,9 +2223,17 @@ impl WriteCoordinator {
                 identity: r.identity.clone(), // seq 来自 WAL 原值，绝不重补
                 fields: r.fields.clone(),
             });
+            wal_count += 1;
         }
         // 已提交尾从 WAL 恢复（重启后 committed_tail 不是持久态，由 WAL 重新确定）。
-        self.current.advance_committed_tail(wal.committed_tail());
+        let tail = wal.committed_tail();
+        self.current.advance_committed_tail(tail);
+        olog::log(olog::Level::Info, "recover_done", &[
+            ("segs_scanned", &seg_count),
+            ("vectors_reloaded", &vec_count),
+            ("wal_replayed", &wal_count),
+            ("committed_tail", &tail.get()),
+        ]);
     }
 
     /// 测试/演示：模拟崩溃，丢弃易失的 MemTable。WAL 与 manifest 是持久的，保留不动。
@@ -2374,8 +2401,13 @@ impl WriteCoordinator {
 
     /// 便捷：无并发窗口的一次性 compaction（begin + finish 连续）。
     pub fn commit_compaction(&self, inputs: &[SegmentId]) {
+        let n_in = inputs.len();
         let plan = self.compaction_begin(inputs);
         self.compaction_finish(&plan);
+        olog::log(olog::Level::Info, "compaction", &[
+            ("inputs", &n_in),
+            ("version", &self.current.version()),
+        ]);
     }
 
     /// 取 / 放一个段文件的 buffer pin（读路径扫段字节时持有，用完释放）。
@@ -2429,6 +2461,9 @@ impl WriteCoordinator {
             freed += 1;
             false // 出 dead_set
         });
+        if freed > 0 {
+            olog::log(olog::Level::Info, "reclaim", &[("freed", &freed), ("remaining_dead", &dead.len())]);
+        }
         freed
     }
 
