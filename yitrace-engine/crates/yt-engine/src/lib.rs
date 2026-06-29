@@ -817,6 +817,25 @@ pub struct WriteCoordinator {
     /// **GC 日志**（崩溃安全）：Some = reclaim 走"MARK→fsync→unlink→DONE→fsync"，崩溃在中途重启补删；
     /// None = 纯内存态（非持久模式，reclaim 直接删，旧路径）。
     gc_log: Mutex<Option<gc_log::GcLog>>,
+    /// 数据目录路径（持久模式 = Some）。`backup_snapshot` 用它知道拷哪些文件。
+    dir: Option<std::path::PathBuf>,
+}
+
+/// 递归拷贝目录（备份用，零依赖）。
+fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// 段级 key Bloom 过滤器（双哈希 + 位组，std-only，无依赖）。`maybe_contains` 假阳允许、假阴不允许：
@@ -1107,12 +1126,12 @@ impl CoordinatorBuilder {
 
     /// 内存 WAL（测试/开发）。
     pub fn build(self, segments: Arc<dyn SegmentStore>) -> Arc<WriteCoordinator> {
-        WriteCoordinator::build_full(segments, Wal::new(), Manifest::empty(), 1, 1, None, None, self.bm25, self.graph)
+        WriteCoordinator::build_full(segments, Wal::new(), Manifest::empty(), 1, 1, None, None, self.bm25, self.graph, None)
     }
 
     /// 文件 WAL。
     pub fn open(self, segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
-        Ok(WriteCoordinator::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, self.bm25, self.graph))
+        Ok(WriteCoordinator::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, self.bm25, self.graph, None))
     }
 
     /// 全持久化引擎（与 `WriteCoordinator::open_durable` 同语义，外加注入的索引 / 磁盘向量索引参数）。
@@ -1130,7 +1149,7 @@ impl WriteCoordinator {
     /// 文件 WAL（真落盘）：重启后用同一路径 `open` + `recover()` 可从盘上重放(WAL 持久化)。
     /// 注意：段/manifest 不持久化,崩溃后靠 WAL 全量重放进 MemTable 恢复。要"flush 后重启不丢"用 `open_durable`。
     pub fn open(segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
-        Ok(Self::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, None, None))
+        Ok(Self::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, None, None, None))
     }
 
     /// **全持久化引擎**：一个目录下放段(`segments/`)+ WAL(`wal.log`)+ manifest(`manifest.dat`)。
@@ -1167,7 +1186,7 @@ impl WriteCoordinator {
                 (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
             }
         };
-        let coord = Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph);
+        let coord = Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph, Some(dir.to_path_buf()));
         // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
         let entries = gc_log::GcLog::scan(&gc_log_path).unwrap_or_default();
         for seg in gc_log::pending_deletions(&entries) {
@@ -1186,7 +1205,7 @@ impl WriteCoordinator {
     }
 
     fn build(segments: Arc<dyn SegmentStore>, wal: Wal) -> Arc<Self> {
-        Self::build_full(segments, wal, Manifest::empty(), 1, 1, None, None, None, None)
+        Self::build_full(segments, wal, Manifest::empty(), 1, 1, None, None, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1200,6 +1219,7 @@ impl WriteCoordinator {
         vector_path: Option<std::path::PathBuf>,
         bm25: Option<Arc<dyn Bm25Index>>,
         graph: Option<Arc<dyn GraphIndex>>,
+        dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             write_lock: Mutex::new(()),
@@ -1224,6 +1244,7 @@ impl WriteCoordinator {
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
             seg_key_bloom: Mutex::new(HashMap::new()),
             gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
+            dir,
 
         })
     }
@@ -2470,6 +2491,42 @@ impl WriteCoordinator {
     /// 待回收 dead 资源数（可观测 / 测试用）。
     pub fn dead_count(&self) -> usize {
         self.dead_set.lock().unwrap().len()
+    }
+
+    /// **在线快照备份**（§3.3 数据安全底线）。
+    ///
+    /// 走 pin 协议拿一致快照（持有的版本不会被 GC），把所有持久文件拷到目标目录，
+    /// 得到一个可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。
+    ///
+    /// 拷的文件：`segments/`（目录）+ `wal.log` + `manifest.dat` + `vecindex/`（或 `vectors.dat`）+ `gc.log`。
+    /// 段文件是不可变的、manifest 是当前版本快照——拷的是那一刻的一致态。
+    /// WAL 可能比 manifest 新（有未 flush 的事务），recover 时重放水位之后的尾巴,幂等（确定性 event_id）。
+    pub fn backup_snapshot(&self, dest: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let dest = dest.as_ref();
+        let src = self.dir.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "backup 需要 open_durable 的数据目录")
+        })?;
+        // pin 住当前版本——拷贝期间 reclaim 不会删这个版本引用的段文件。
+        let _snap = self.current.pin_snapshot();
+        let version = self.current.version();
+        olog::log(olog::Level::Info, "backup_start", &[("dest", &dest.to_string_lossy().to_string()), ("version", &version)]);
+
+        std::fs::create_dir_all(dest)?;
+        // 拷贝数据文件/目录。segments/ 和 vecindex/ 是目录,其余是文件。
+        for name in ["segments", "vecindex"] {
+            let s = src.join(name);
+            if s.exists() {
+                copy_dir_recursive(&s, &dest.join(name))?;
+            }
+        }
+        for name in ["wal.log", "manifest.dat", "vectors.dat", "gc.log"] {
+            let s = src.join(name);
+            if s.exists() {
+                std::fs::copy(&s, dest.join(name))?;
+            }
+        }
+        olog::log(olog::Level::Info, "backup_done", &[("dest", &dest.to_string_lossy().to_string()), ("version", &version)]);
+        Ok(())
     }
 
     /// 生产可观测（§3.1）：聚合所有关键运行态，供 /metrics 端点输出。
@@ -4365,5 +4422,44 @@ mod tests {
                 oracle.len()
             );
         }
+    }
+
+    #[test]
+    fn backup_snapshot_restores_consistent_data() {
+        // §3.3：在线快照备份 → 从备份恢复 → 数据一致。
+        let dir = std::env::temp_dir().join(format!("yt_backup_{}", std::process::id()));
+        let backup_dir = std::env::temp_dir().join(format!("yt_backup_copy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+
+        // 1) 灌数据 + flush（落盘）+ 检索索引建起来
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.ingest(vec![ev(1, 10, 1, Some(0), Some(100), &["盗刷 拦截"])]);
+            wc.flush_memtable(); // → seg1 落盘
+            wc.index_embedding(1, 10, vec![0.1, 0.2, 0.3]);
+
+            // 2) 备份
+            wc.backup_snapshot(&backup_dir).unwrap();
+        }
+
+        // 3) 从备份恢复 → 数据一致
+        let restored = WriteCoordinator::open_durable(&backup_dir).unwrap();
+        restored.recover();
+        let snap = restored.pin_snapshot();
+        let spans = restored.read_spans(&snap);
+        assert_eq!(spans.len(), 1, "备份恢复后应有一条 span");
+        assert_eq!(spans[0].trace_id, 1);
+        assert_eq!(spans[0].span_id, 10);
+        assert_eq!(spans[0].status, Some(0));
+        assert_eq!(spans[0].duration_ns, Some(100));
+
+        // 4) 检索索引也恢复了（BM25 能搜到）
+        let empty_filter = SearchFilter::default();
+        let hits = restored.search_text_attr(&snap, "盗刷", 10, &empty_filter);
+        assert!(!hits.is_empty(), "备份恢复后中文检索应命中");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&backup_dir);
     }
 }
