@@ -12,8 +12,8 @@
 //! - 这里用 `RwLock<Arc<Manifest>>` 当「current 原子指针」+ `Mutex<Vec<slot>>` 当读者登记表。
 //!   真实实现换 `arc-swap`（无锁原子换指针）+ `crossbeam-epoch`（无锁纪元回收）。
 //!   但「先登记后解引用」的**次序**在这里是忠实的——次序才是正确性，锁实现只是性能。
-//! - Tentative slot 的处理这里用最保守策略（有未落定读者就不回收任何 dead 资源）。
-//!   真实实现按 `observed_epoch` 设回收下限，见 `safe_version` 注释。
+//! - Tentative slot 的处理：用 `observed_min_version` 设精确回收下限（登记时的 current 版本）。
+//!   它绝不会 pin 到比这更老的版本，所以下限安全，且避免"有未落定读者就完全不回收"的堆积问题。
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +28,11 @@ struct ReaderSlot {
     observed_epoch: AtomicU64,
     /// pin 的版本号；`PINNED_TENTATIVE` 表示「已登记、版本尚未落定」。
     pinned_version: AtomicU64,
+    /// **登记那一刻的 current 版本**（在 (a) 读 epoch 之后、(c) 解引用 current 之前读到）。
+    /// Tentative slot（pinned_version 还没落定）用它当回收下限——它绝不会 pin 到比这更老的版本
+    /// （slot 已公开，写者 commit 得先更新 current 才推进 epoch，读者 (c) 读在公开之后）。
+    /// 这是精确下限，替代旧的「有 Tentative 就返回 0」保守做法（避免 dead_set 无限堆积）。
+    observed_min_version: AtomicU64,
     /// 本读者 MemTable 读取的下界保留点（= pin 版本的 memtable_watermark）。
     /// MemTable 物理 evict 受所有活跃读者此值的最小值 gate（草案 2 §D2.3，堵 flush-evict 漏行）。
     retained_watermark: AtomicU64,
@@ -102,9 +107,12 @@ impl Current {
             // (a) 先读 epoch
             let local_epoch = self.global_epoch.load(Ordering::Acquire);
             // (b) 先公开 slot（store-release：经 Mutex 发布，严格先于下面的解引用）
+            //     observed_min_version 记登记那一刻的 current 版本（此锁内读，和 slot 发布原子）。
+            let cur_version_at_register = self.version();
             let slot = Arc::new(ReaderSlot {
                 observed_epoch: AtomicU64::new(local_epoch),
                 pinned_version: AtomicU64::new(PINNED_TENTATIVE),
+                observed_min_version: AtomicU64::new(cur_version_at_register),
                 retained_watermark: AtomicU64::new(0),
                 active: AtomicBool::new(true),
             });
@@ -139,9 +147,11 @@ impl Current {
 
     /// 回收水位：所有活跃读者 pinned_version 的最小值；无读者时 = current 版本。
     ///
-    /// Tentative slot 的保守处理：只要存在「已登记但未落定」的读者，就把水位压到
-    /// 其 observed_epoch 之前不可回收。这里用最保守形式——存在任一 Tentative 即返回 0
-    /// （即不回收任何 dead 资源）。真实实现按 observed_epoch 做精确下限，避免长期卡水位。
+    /// **Tentative slot（已登记、版本未落定）用 `observed_min_version` 当精确下限**——
+    /// 它绝不会 pin 到比"登记那一刻 current 版本"更老的版本（slot 已公开，写者 commit 得先更新
+    /// current 才推进 epoch，读者 (c) 读在公开之后）。这替代旧的"有 Tentative 就返回 0"保守做法，
+    /// 避免高并发读时 dead_set 无限堆积。正确性仍守住：Tentative 读者的实际 pin 版本要么 == 它
+    /// (c) 读到的（≥ observed_min_version），要么校验失败重试看到更新版本——都 ≥ observed_min_version。
     pub fn safe_version(&self) -> u64 {
         let readers = self.readers.lock().unwrap();
         let mut min_v = self.version(); // 无读者时 = current
@@ -150,12 +160,14 @@ impl Current {
                 continue;
             }
             let pv = s.pinned_version.load(Ordering::Acquire);
-            if pv == PINNED_TENTATIVE {
-                // 保守：有未落定读者，不回收任何 dead 资源（堵 (b)→(d) 残窗）。
-                return 0;
-            }
-            if pv < min_v {
-                min_v = pv;
+            let contribution = if pv == PINNED_TENTATIVE {
+                // 未落定：用登记时的下限（绝不会比它 pin 到的更老）。
+                s.observed_min_version.load(Ordering::Acquire)
+            } else {
+                pv
+            };
+            if contribution < min_v {
+                min_v = contribution;
             }
         }
         min_v
@@ -308,10 +320,49 @@ mod tests {
         let m = c.cow_next();
         c.commit(m); // v1
         let s_new = c.pin_snapshot(); // v1
-        assert_eq!(c.safe_version(), 0); // 取最老读者
+        assert_eq!(c.safe_version(), 0); // 取最老读者（s_old pin 在 v0）
         drop(s_old);
         assert_eq!(c.safe_version(), 1);
         drop(s_new);
         assert_eq!(c.safe_version(), 1); // 无读者 = current
+    }
+
+    /// §1.2 生产就绪路线：Tentative 读者用 observed_min_version 当精确下限，
+    /// 不再"有未落定读者就完全不回收（返回 0）"。这避免高并发读时 dead_set 无限堆积。
+    ///
+    /// 场景：current 在 v3，手动构造一个 Tentative slot（observed_min_version=v3），
+    /// 验证 safe_version = 3（不是 0），即 v≤3 的 dead 资源**可回收**——
+    /// 旧代码这里返回 0、什么都不让回收。
+    #[test]
+    fn tentative_reader_uses_observed_min_version_not_zero() {
+        let c = Current::new(Manifest::empty());
+        // 推到 v3
+        for _ in 0..3 {
+            let m = c.cow_next();
+            c.commit(m);
+        }
+        assert_eq!(c.version(), 3);
+
+        // 手动塞一个 Tentative slot（模拟"已登记、版本未落定"的中间态），
+        // observed_min_version = 登记时 current = 3。
+        let tentative = Arc::new(ReaderSlot {
+            observed_epoch: AtomicU64::new(c.global_epoch.load(Ordering::Acquire)),
+            pinned_version: AtomicU64::new(PINNED_TENTATIVE),
+            observed_min_version: AtomicU64::new(3),
+            retained_watermark: AtomicU64::new(0),
+            active: AtomicBool::new(true),
+        });
+        c.readers.lock().unwrap().push(tentative.clone());
+
+        // ★ 精确下限：safe_version = 3（Tentative 贡献 observed_min_version），不是 0。
+        assert_eq!(c.safe_version(), 3, "Tentative 读者用 observed_min_version 当下限，不卡到 0");
+        // v≤3 的 dead 资源可回收（旧代码这里 can_reclaim 全 false）
+        assert!(c.can_reclaim(3, true, true), "v3 可回收（≤ Tentative 的 observed_min_version）");
+        // v>3 的不可回收
+        assert!(!c.can_reclaim(4, true, true));
+
+        // 落定后（pin 到 v3）行为不变
+        tentative.pinned_version.store(3, Ordering::Release);
+        assert_eq!(c.safe_version(), 3);
     }
 }

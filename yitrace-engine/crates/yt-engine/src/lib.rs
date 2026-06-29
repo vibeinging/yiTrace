@@ -46,6 +46,8 @@ pub use segstore::FileSegmentStore;
 mod persist;
 mod vecstore;
 
+mod gc_log;
+
 mod vecindex_disk;
 pub use vecindex_disk::{DiskGraphConfig, DiskGraphIndex, DiskGraphStore, DurableGraphIndex};
 
@@ -806,6 +808,58 @@ pub struct WriteCoordinator {
     /// **段折叠缓存**：不可变段首次解码后缓存（行 + (trace,span)→行号 索引），检索路径只取候选行、
     /// 不再每查重读+重解码整段。段 unlink（compaction/GC）时失效。LRU、按总行数封顶。
     seg_fold_cache: Mutex<SegFoldCache>,
+    /// **段级 key Bloom**（对齐 ClickHouse bloom_filter 跳过索引）：seg_id → 该段 (trace,span) 的 bloom。
+    /// 检索折叠定位时，bloom 判"这个段肯定没有任何候选 key" → 整段跳过，不碰折叠缓存。派生数据：flush
+    /// 时建、recover 时随重建索引一起重建、unlink 时移除。每段几 KB，常驻内存可控。
+    seg_key_bloom: Mutex<HashMap<u64, Arc<KeyBloom>>>,
+    /// **GC 日志**（崩溃安全）：Some = reclaim 走"MARK→fsync→unlink→DONE→fsync"，崩溃在中途重启补删；
+    /// None = 纯内存态（非持久模式，reclaim 直接删，旧路径）。
+    gc_log: Mutex<Option<gc_log::GcLog>>,
+}
+
+/// 段级 key Bloom 过滤器（双哈希 + 位组，std-only，无依赖）。`maybe_contains` 假阳允许、假阴不允许：
+/// 返回 false = **肯定没有**（可放心跳段），返回 true = 可能有（要进一步查）。约 10 bit/key、7 个哈希。
+struct KeyBloom {
+    bits: Vec<u64>,
+    mask: usize, // m_bits-1（m_bits 取 2 的幂，用 & 代 %）
+    k: u32,
+}
+
+impl KeyBloom {
+    fn build<I: IntoIterator<Item = (u64, u64)>>(keys: I, n_hint: usize) -> Self {
+        let m_bits = (n_hint.max(1) * 10).next_power_of_two().max(64);
+        let mut b = KeyBloom { bits: vec![0u64; m_bits / 64], mask: m_bits - 1, k: 7 };
+        for key in keys {
+            b.insert(key);
+        }
+        b
+    }
+    fn pair(key: (u64, u64)) -> (u64, u64) {
+        let h1 = splitmix64m(key.0 ^ key.1.rotate_left(32));
+        let h2 = splitmix64m(key.0.wrapping_add(0x9E37_79B9_7F4A_7C15) ^ key.1) | 1; // 奇数，保证步长与 m 互质
+        (h1, h2)
+    }
+    fn insert(&mut self, key: (u64, u64)) {
+        let (h1, h2) = Self::pair(key);
+        for i in 0..self.k as u64 {
+            let p = (h1.wrapping_add(i.wrapping_mul(h2)) as usize) & self.mask;
+            self.bits[p >> 6] |= 1u64 << (p & 63);
+        }
+    }
+    fn maybe_contains(&self, key: (u64, u64)) -> bool {
+        let (h1, h2) = Self::pair(key);
+        (0..self.k as u64).all(|i| {
+            let p = (h1.wrapping_add(i.wrapping_mul(h2)) as usize) & self.mask;
+            self.bits[p >> 6] & (1u64 << (p & 63)) != 0
+        })
+    }
+}
+
+fn splitmix64m(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
 }
 
 /// 一个段解码折叠后的缓存：全部行 + (trace,span)→行号 索引（行号=段内顺序，删除位图照行号生效）。
@@ -1096,6 +1150,7 @@ impl WriteCoordinator {
         let segments = Arc::new(FileSegmentStore::open(dir.join("segments"))?);
         let wal = Wal::open(dir.join("wal.log"))?;
         let manifest_path = dir.join("manifest.dat");
+        let gc_log_path = dir.join("gc.log");
         // 有持久 manifest 就从它恢复段集合与 id 计数器；否则从空开始。
         let (manifest, next_seg, next_chunk) = match persist::load(&manifest_path) {
             Some(s) => (s.manifest, s.next_segment_id, s.next_chunk_id),
@@ -1110,7 +1165,22 @@ impl WriteCoordinator {
                 (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
             }
         };
-        Ok(Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph))
+        let coord = Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph);
+        // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
+        let entries = gc_log::GcLog::scan(&gc_log_path).unwrap_or_default();
+        for seg in gc_log::pending_deletions(&entries) {
+            // 段文件可能已删了一半（崩溃在 unlink 中）；补删幂等（不存在就跳过）。
+            coord.segments.unlink_segment(SegmentId(seg));
+            // 这些段上次崩溃前 manifest 已不引用（reclaim 前提），不用动 manifest。
+            // 段 id 不复用、dead_set 是内存态重启后清空，所以不用动 dead_set。
+        }
+        // 重置 gc.log：已补删的不再记；之后 reclaim 重新记新意图。truncate 即可。
+        let _ = std::fs::write(&gc_log_path, b"");
+        // GC 日志和 WAL/manifest 同等重要（崩溃安全的承重组件）——打开失败必须 fail-fast，
+        // 不能静默降级成"无 GC 日志、reclaim 直接删"（那样崩溃恢复失效且无人知晓）。
+        let log = gc_log::GcLog::open(&gc_log_path)?;
+        *coord.gc_log.lock().unwrap() = Some(log);
+        Ok(coord)
     }
 
     fn build(segments: Arc<dyn SegmentStore>, wal: Wal) -> Arc<Self> {
@@ -1150,6 +1220,8 @@ impl WriteCoordinator {
             filter_attrs: Mutex::new(HashMap::new()),
             session_idx: Mutex::new(SessionIndex::default()),
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
+            seg_key_bloom: Mutex::new(HashMap::new()),
+            gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
 
         })
     }
@@ -1191,6 +1263,12 @@ impl WriteCoordinator {
         }
         if let Some(t) = r.fields.output_text.as_deref() {
             parts.push(t);
+        }
+        // agent/tool/model 名也索引——用户会按"搜某个 agent/tool 的 trace"（如"搜风控 agent 的报错"）。
+        for field in [&r.fields.agent_name, &r.fields.tool_name, &r.fields.model] {
+            if let Some(t) = field.as_deref() {
+                parts.push(t);
+            }
         }
         for l in &r.fields.logs {
             parts.push(l);
@@ -1326,6 +1404,9 @@ impl WriteCoordinator {
         };
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, &records);
+        // 段级 key bloom：从这批记录的 (trace,span) 建，供检索折叠定位跳过无关段。
+        let bloom = KeyBloom::build(records.iter().map(|r| (r.trace_id, r.span_id)), records.len());
+        self.seg_key_bloom.lock().unwrap().insert(seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(&records);
         let mut draft = self.current.cow_next();
         draft.memtable_watermark = WalLsn::new(max_lsn);
@@ -1432,8 +1513,16 @@ impl WriteCoordinator {
                 // ★ 检索快路：已知候选 key → 段折叠缓存 + 段内 key→行号 索引，**只取候选行**、不扫全段。
                 //   首次解码该段后缓存，之后所有查询命中缓存（这是把检索 QPS 从"每查全段扫"解放出来的关键）。
                 Some(ks) => {
-                    let sf = self.seg_fold(entry.segment_id);
+                    // 段级 bloom：这个段肯定没有任何候选 key → 整段跳过折叠定位（upgrade 仍在下面照常处理）。
+                    let bloom_skip = self
+                        .seg_key_bloom
+                        .lock()
+                        .unwrap()
+                        .get(&entry.segment_id.get())
+                        .map_or(false, |b| !ks.iter().any(|&k| b.maybe_contains(k)));
+                    let sf = if bloom_skip { None } else { Some(self.seg_fold(entry.segment_id)) };
                     for &(t, s) in ks {
+                        let Some(sf) = &sf else { break };
                         if q.trace_id.map_or(false, |tid| t != tid) {
                             continue;
                         }
@@ -2085,11 +2174,14 @@ impl WriteCoordinator {
     /// - BM25 + 属性边车是**派生数据**：扫持久段(水位之前)+ 重放的 WAL 尾(水位之后)各喂一次,合起来覆盖全部、不重不漏。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
-        // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车。
+        // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车；顺带重建段级 key bloom。
         let m = self.current.manifest();
         for entry in m.segments.values() {
-            for r in self.segments.scan_records(entry.segment_id) {
-                self.index_record(&r);
+            let recs = self.segments.scan_records(entry.segment_id);
+            let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
+            self.seg_key_bloom.lock().unwrap().insert(entry.segment_id.get(), Arc::new(bloom));
+            for r in &recs {
+                self.index_record(r);
             }
         }
         drop(m);
@@ -2142,6 +2234,8 @@ impl WriteCoordinator {
         let _w = self.write_lock.lock().unwrap();
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, records); // building→sealed（写完 fsync）
+        let bloom = KeyBloom::build(records.iter().map(|r| (r.trace_id, r.span_id)), records.len());
+        self.seg_key_bloom.lock().unwrap().insert(seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(records);
         let mut draft = self.current.cow_next();
         draft.memtable_watermark = up_to_lsn; // 与下面加段同事务
@@ -2245,6 +2339,8 @@ impl WriteCoordinator {
 
         let new_seg = self.alloc_segment_id();
         self.segments.flush_to_segment(new_seg, &merged);
+        let bloom = KeyBloom::build(merged.iter().map(|r| (r.trace_id, r.span_id)), merged.len());
+        self.seg_key_bloom.lock().unwrap().insert(new_seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(&merged);
         let has_upgrade = merged_upgrade.iter().next().is_some();
 
@@ -2296,30 +2392,42 @@ impl WriteCoordinator {
     ///   (3) ∧ 不被当前 manifest 引用 (防崩溃竞态)
     /// 返回这一轮回收了多少个段。真实实现是后台线程 + IO 限速。
     ///
-    /// ⚠️ **骨架近似，未达文档承诺的崩溃安全（上量必换，见 docs/CURRENT_STATE.md §6）**：
-    /// - 条件 (3) 的"已提交 manifest 不再引用"用**当前内存版本** `contains_segment` 近似，不是查持久
-    ///   metastore；且 `safe_version()` 与 `dead_set.lock()` 之间**无联合原子性**，retain 内每条 dead
-    ///   段单独读版本。
-    /// - 当前安全**只因为**：段 id 永不复用 + compaction 只产新段、绝不复活旧段 id（所以判定 false 之后
-    ///   不会有写者重新引用同一 seg）。这是个**不变量依赖**，不是真正的崩溃竞态防护。
-    /// - 真实实现：持久化 **GC 日志**——写「即将删 seg X」→ fsync → 删文件 → 标记完成。崩溃在中途，重启
-    ///   据日志要么补完删除、要么回滚，绝不留"删一半 + manifest 没更新"的不一致。这是必须补的工程债。
+    /// **崩溃安全**：持久模式（gc.log 存在）下，每个可删段走 MARK→fsync→unlink→DONE→fsync。
+    /// 崩溃在 unlink 前（只写了 MARK）：重启据 gc.log 补删（文件还在 → 删）；崩溃在 unlink 后 DONE 前
+    /// （文件已没）：重启据 gc.log 判定文件可能已删，幂等补删（不存在跳过）。两边都不留"删一半 +
+    /// manifest 没更新"的不一致。
+    ///
+    /// **非持久模式**（gc.log 不存在）：reclaim 走旧的"直接删"路径——仅靠"段 id 永不复用 + compaction
+    /// 只产新段"这两个不变量兜底，没有崩溃恢复。这是纯内存 / 测试场景可接受的退化。
     pub fn reclaim(&self) -> usize {
         let safe = self.current.safe_version();
         let mut freed = 0;
         let mut dead = self.dead_set.lock().unwrap();
+        let mut gc = self.gc_log.lock().unwrap();
         dead.retain(|r| {
             let ok = r.v_dead <= safe
                 && !self.buffer_pins.is_pinned(r.seg)
                 && !self.current.contains_segment(r.seg);
-            if ok {
-                self.segments.unlink_segment(r.seg);
-                self.seg_fold_cache.lock().unwrap().remove(r.seg.get()); // 段没了，缓存失效
-                freed += 1;
-                false // 出 dead_set
-            } else {
-                true // 留着，下一轮再看
+            if !ok {
+                return true; // 留着，下一轮再看
             }
+            // 崩溃安全路径：MARK → fsync → unlink → DONE → fsync。
+            if let Some(log) = gc.as_mut() {
+                // MARK 写失败 = 意图没落盘，不能进 unlink（否则崩溃后无法恢复）。保守不删，留下轮。
+                if log.mark(r.seg.get()).is_err() {
+                    return true;
+                }
+            }
+            self.segments.unlink_segment(r.seg);
+            self.seg_fold_cache.lock().unwrap().remove(r.seg.get()); // 段没了，缓存失效
+            self.seg_key_bloom.lock().unwrap().remove(&r.seg.get()); // bloom 同失效
+            if let Some(log) = gc.as_mut() {
+                // DONE 写失败：文件已删但完成标记没落盘。重启时会当成"MARK 没 DONE"补删——
+                // 文件不存在了，unlink 幂等（store 实现容忍），正确。所以这里不回滚、继续。
+                let _ = log.done(r.seg.get());
+            }
+            freed += 1;
+            false // 出 dead_set
         });
         freed
     }
@@ -2907,6 +3015,35 @@ mod tests {
         let hits = wc.search_text(&snap, "风控", 10);
         assert_eq!(hits.len(), 1, "注入的分词器一路生效到检索");
         assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (1, 10));
+    }
+
+    #[test]
+    fn segment_key_bloom_skips_unrelated_segments_keeps_results() {
+        // 段级 bloom：候选 key 只在段 A，段 B 的 bloom 拒绝它 → B 被跳过，结果仍正确。
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store);
+        // 段 A：trace 1 含"盗刷"
+        let a = ev(1, 10, 1, Some(0), Some(100), &["疑似盗刷 已拦截"]);
+        wc.ingest(vec![a.clone()]);
+        wc.flush_memtable(); // → 段 A，建 bloom（含 (1,10)）
+        // 段 B：trace 2 不含"盗刷"，且 key 不同
+        let b = ev(2, 20, 1, Some(0), Some(200), &["正常转账"]);
+        wc.ingest(vec![b.clone()]);
+        wc.flush_memtable(); // → 段 B，建 bloom（含 (2,20)，不含 (1,10)）
+
+        // 两段都有 bloom
+        assert_eq!(wc.seg_key_bloom.lock().unwrap().len(), 2);
+        let snap = wc.pin_snapshot();
+        // 查"盗刷"：候选 (1,10) 只在段 A；段 B 的 bloom 拒绝它 → 只回 trace 1，结果正确。
+        let hits = wc.search_text(&snap, "盗刷", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (1, 10));
+        assert_eq!(hits[0].0.duration_ns, Some(100), "折叠出完整 span（跨段定位正确）");
+        // 直接验证 bloom 语义：段 B 的 bloom 对 (1,10) 说"肯定没有"。
+        let blooms = wc.seg_key_bloom.lock().unwrap();
+        let seg_ids: Vec<u64> = snap.manifest.segments.keys().copied().collect();
+        let any_rejects_a = seg_ids.iter().any(|sid| blooms.get(sid).map_or(false, |bl| !bl.maybe_contains((1, 10))));
+        assert!(any_rejects_a, "应有段的 bloom 对 (1,10) 判定肯定没有");
     }
 
     #[test]
@@ -3938,5 +4075,68 @@ mod tests {
         let find = |id: u64| after.iter().find(|s| s.span_id == id).unwrap();
         assert_eq!(find(10).eval_score, Some(1000));
         assert_eq!(find(20).eval_score, None, "无输出文本的 span 不应被打分");
+    }
+
+    #[test]
+    fn gc_log_crash_after_mark_completes_delete_on_restart() {
+        // 生产就绪路线 §1.1：持久化 GC 日志的崩溃安全。
+        // 场景：compaction 产生死段 seg1 → reclaim 写了 MARK(意图落盘) → 在 unlink 前 / DONE 前"崩"。
+        // 模拟：正常跑完一次 reclaim（MARK+DONE 都写了），然后手动把 gc.log 改回"只有 MARK"，
+        //       并把段文件留着（= 模拟"MARK 后、unlink 前崩"）。
+        // 预期：open_durable 重启时扫 gc.log，发现"MARK 没 DONE"的 seg1 → 补删段文件 → 不留垃圾。
+        let dir = std::env::temp_dir().join(format!("yt_gc_crash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 1) 灌数据 → flush 成 seg1 → 再 flush 成 seg2 → compaction 合出 seg3，seg1 死。
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.ingest(vec![ev(1, 10, 1, Some(0), Some(100), &["a"])]);
+            wc.flush_memtable(); // → seg1
+            wc.ingest(vec![ev(1, 10, 2, None, Some(200), &["b"])]);
+            wc.flush_memtable(); // → seg2
+            // compaction：把 seg1 + seg2 合成 seg3，seg1/seg2 进 dead_set
+            wc.commit_compaction(&[SegmentId::new(1), SegmentId::new(2)]);
+            // reclaim：正常走完 MARK + unlink + DONE。seg1/seg2 文件应已删、gc.log 有完整 MARK/DONE。
+            let freed = wc.reclaim();
+            assert!(freed >= 1, "至少回收到死段");
+        }
+
+        // 2) 模拟"MARK 后、unlink 前崩"：重写 gc.log 只留 MARK，并人为把段文件放回来。
+        //    （真实崩溃 unlink 没执行，文件还在；这里用 MARK-only 模拟那个状态。）
+        let seg_dir = dir.join("segments");
+        // 段文件已被 reclaim 删了 → 重新造一个假的 seg1 文件模拟"还在"
+        std::fs::write(seg_dir.join("seg-1.dat"), b"fake-leftover-seg1").unwrap();
+        // gc.log 改成只有 MARK 1（没有 DONE 1）
+        std::fs::write(dir.join("gc.log"), b"MARK 1\n").unwrap();
+        assert!(seg_dir.join("seg-1.dat").exists(), "模拟：段文件还在（unlink 前崩）");
+
+        // 3) 重启：open_durable 应扫 gc.log → 发 seg1 "MARK 没 DONE" → 补删。
+        let _wc2 = WriteCoordinator::open_durable(&dir).unwrap();
+        assert!(!seg_dir.join("seg-1.dat").exists(), "重启后补删了残留段文件（崩溃安全）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_log_normal_reclaim_writes_mark_and_done() {
+        // 正常路径：reclaim 在持久模式下应写 MARK 和 DONE 两条（不只删文件）。
+        let dir = std::env::temp_dir().join(format!("yt_gc_normal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.ingest(vec![ev(1, 10, 1, Some(0), Some(100), &["a"])]);
+            wc.flush_memtable(); // seg1
+            wc.ingest(vec![ev(1, 10, 2, None, Some(200), &["b"])]);
+            wc.flush_memtable(); // seg2
+            wc.commit_compaction(&[SegmentId::new(1), SegmentId::new(2)]);
+            wc.reclaim();
+        }
+
+        let log = std::fs::read_to_string(dir.join("gc.log")).unwrap();
+        assert!(log.contains("MARK"), "reclaim 写了 MARK");
+        assert!(log.contains("DONE"), "reclaim 写了 DONE");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
