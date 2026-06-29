@@ -10,8 +10,16 @@
 //! 3. **缓冲池**（[`VecCache`] LRU）：向量不全量常驻，热向量留缓存、冷的读盘。这就是 graph_index 比
 //!    原生 HNSW（向量内联、整图常驻）省内存的关键。
 //!
-//! 本阶段（持久化基座）：定长存储 + 元页 + 缓冲 + **重启读回**，配暴力精确搜索做正确性基线。
-//! 图导航（NSW/HNSW beam search 按需读页）、进图过滤在后续阶段加。
+//! 已落地的能力（不再只是持久化基座）：
+//! - **多层 HNSW 导航**：顶层贪心下沉 + 底层 beam search（按需读页），重启不 rebuild。
+//! - **进图过滤**：导航穿过不满足谓词的点当路由跳板、只收满足的，选择性谓词下召回不塌。
+//! - **邻居选择启发式**（hnswlib heuristic）：选分布更散的邻居，高维连通性好、召回高（替代朴素「取最近 m 个」）。
+//! - **SIMD 距离内核**（[`simd`] 子模块）：std::arch 运行时派发，x86_64 走 AVX-512/AVX2/SSE2、
+//!   aarch64 走 NEON，零外部依赖。768 维实测加速 ~5.5×。
+//! - **多度量**（[`Metric`]）：L2 / Cosine（索引+查询归一化后复用 L2 路径）/ InnerProduct。
+//! - 定长存储 + 元页 + 缓冲 + 软删 + append 友好（只写不刷、批量 fsync）。
+//!
+//! 待升级：向量量化（PQ/SQ 省内存+IO）、并发多线程建图、大规模召回对标。
 #![allow(dead_code)]
 
 use std::cmp::Reverse;
@@ -54,14 +62,353 @@ type FastBuild = std::hash::BuildHasherDefault<FastHasher>;
 type FastMap<K, V> = HashMap<K, V, FastBuild>;
 type FastSet<K> = std::collections::HashSet<K, FastBuild>;
 
-/// 距离度量（本阶段先 L2；cosine/内积后续）。
+/// 距离度量（索引级配置）。归一化存储后 cosine 与 L2² 单调等价，整条建图/检索路径复用 L2；
+/// InnerProduct 单独走负点积。持久化时存成 1 字节（见 `Meta`），旧索引读回默认 L2。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Metric {
-    L2,
+    L2 = 0,
+    Cosine = 1,
+    InnerProduct = 2,
+}
+
+impl Default for Metric {
+    fn default() -> Self {
+        Metric::L2
+    }
 }
 
 fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+    simd::l2_sq(a, b)
+}
+
+// ───────────────────────── SIMD 距离内核（std::arch，运行时派发，零外部依赖） ─────────────────────────
+//
+// 距离是建图（search_layer 每次 dist）+ 检索的主成本。按 CPU 特征运行时派发到最快的向量化实现：
+// x86_64：AVX-512(16×f32) → AVX2(8×) → SSE2(4×，基线保证)；aarch64：NEON(4×，编译期保证)；
+// 其余退化标量。横向求和顺序与标量不同，故有 ~1e-5 级浮点误差（测试用容差断言）。
+// unsafe 仅在各 #[target_feature] 实现内部；intrinsic 名在 Rust 1.9x 不自动可见，故各 fn 内 `use`。
+mod simd {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as sx;
+    #[cfg(target_arch = "aarch64")]
+    use std::arch::aarch64 as sx;
+
+    /// L2 平方距离的主入口：运行时派发。
+    #[cfg(target_arch = "x86_64")]
+    pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+        // SAFETY: is_x86_feature_detected! 保证目标特征可用；切片同长由调用方保证。
+        unsafe {
+            if is_x86_feature_detected!("avx512f") {
+                l2_sq_avx512(a, b)
+            } else if is_x86_feature_detected!("avx2") {
+                l2_sq_avx2(a, b)
+            } else {
+                l2_sq_sse2(a, b)
+            }
+        }
+    }
+
+    /// L2 平方距离的主入口：运行时派发。
+    #[cfg(target_arch = "aarch64")]
+    pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+        unsafe { l2_sq_neon(a, b) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+        l2_sq_scalar(a, b)
+    }
+
+    /// 点积（InnerProduct / 归一化后的 cosine 复用）。
+    #[cfg(target_arch = "x86_64")]
+    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            if is_x86_feature_detected!("avx512f") {
+                dot_avx512(a, b)
+            } else if is_x86_feature_detected!("avx2") {
+                dot_avx2(a, b)
+            } else {
+                dot_sse2(a, b)
+            }
+        }
+    }
+
+    /// 点积（InnerProduct / 归一化后的 cosine 复用）。
+    #[cfg(target_arch = "aarch64")]
+    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        unsafe { dot_neon(a, b) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+        dot_scalar(a, b)
+    }
+
+    /// 把向量归一化成单位向量（cosine 模式：索引时归一化存储、查询时归一化查询）。
+    /// 范数为 0 的退化向量保持原样（避免除 0）。返回归一化后的向量 + 原 L2 范数。
+    pub fn normalize(v: &[f32]) -> (Vec<f32>, f32) {
+        let norm_sq = dot(v, v);
+        let norm = norm_sq.sqrt();
+        if norm < 1e-12 {
+            return (v.to_vec(), 0.0);
+        }
+        let inv = 1.0 / norm;
+        (v.iter().map(|x| x * inv).collect(), norm)
+    }
+
+    // ───── 标量实现（所有平台的兜底 + 横向求和收尾 + 测试参照） ─────
+    fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(&x, &y)| (x - y) * (x - y)).sum()
+    }
+    fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+    }
+
+    // ───── x86_64：SSE2(4×f32) 基线 ─────
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    unsafe fn l2_sq_sse2(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let va = _mm_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm_loadu_ps(b.as_ptr().add(i));
+            let d = _mm_sub_ps(va, vb);
+            acc = _mm_add_ps(acc, _mm_mul_ps(d, d));
+            i += 4;
+        }
+        hsum_ps(acc) + l2_sq_scalar(&a[i..], &b[i..])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    unsafe fn dot_sse2(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let va = _mm_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm_loadu_ps(b.as_ptr().add(i));
+            acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+            i += 4;
+        }
+        hsum_ps(acc) + dot_scalar(&a[i..], &b[i..])
+    }
+
+    // ───── x86_64：AVX2(8×f32) ─────
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn l2_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm256_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            let d = _mm256_sub_ps(va, vb);
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(d, d));
+            i += 8;
+        }
+        hsum_ps256(acc) + l2_sq_scalar(&a[i..], &b[i..])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm256_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let va = _mm256_loadu_ps(a.as_ptr().add(i));
+            let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(va, vb));
+            i += 8;
+        }
+        hsum_ps256(acc) + dot_scalar(&a[i..], &b[i..])
+    }
+
+    // ───── x86_64：AVX-512(16×f32) ─────
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn l2_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm512_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 16 <= n {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i) as *const f32);
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i) as *const f32);
+            let d = _mm512_sub_ps(va, vb);
+            acc = _mm512_add_ps(acc, _mm512_mul_ps(d, d));
+            i += 16;
+        }
+        _mm512_reduce_add_ps(acc) + l2_sq_scalar(&a[i..], &b[i..])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm512_setzero_ps();
+        let n = a.len();
+        let mut i = 0;
+        while i + 16 <= n {
+            let va = _mm512_loadu_ps(a.as_ptr().add(i) as *const f32);
+            let vb = _mm512_loadu_ps(b.as_ptr().add(i) as *const f32);
+            acc = _mm512_add_ps(acc, _mm512_mul_ps(va, vb));
+            i += 16;
+        }
+        _mm512_reduce_add_ps(acc) + dot_scalar(&a[i..], &b[i..])
+    }
+
+    // ───── aarch64：NEON(4×f32，编译期保证) ─────
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn l2_sq_neon(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::aarch64::*;
+        let mut acc = [0f32; 4];
+        let mut accv = vld1q_f32(acc.as_ptr());
+        let n = a.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let va = vld1q_f32(a.as_ptr().add(i));
+            let vb = vld1q_f32(b.as_ptr().add(i));
+            let d = vsubq_f32(va, vb);
+            accv = vfmaq_f32(accv, d, d); // fused multiply-add：acc + d*d
+            i += 4;
+        }
+        vst1q_f32(acc.as_mut_ptr(), accv);
+        acc.iter().sum::<f32>() + l2_sq_scalar(&a[i..], &b[i..])
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+        use std::arch::aarch64::*;
+        let mut acc = [0f32; 4];
+        let mut accv = vld1q_f32(acc.as_ptr());
+        let n = a.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let va = vld1q_f32(a.as_ptr().add(i));
+            let vb = vld1q_f32(b.as_ptr().add(i));
+            accv = vfmaq_f32(accv, va, vb);
+            i += 4;
+        }
+        vst1q_f32(acc.as_mut_ptr(), accv);
+        acc.iter().sum::<f32>() + dot_scalar(&a[i..], &b[i..])
+    }
+
+    // ───── 横向求和（x86）：4 通道 SSE → 1 个 f32；8 通道 AVX2 → 先降到 4 通道 ─────
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "sse2")]
+    unsafe fn hsum_ps(v: sx::__m128) -> f32 {
+        use std::arch::x86_64::*;
+        let buf = [0f32; 4];
+        _mm_storeu_ps(buf.as_ptr() as *mut f32, v);
+        buf.iter().sum()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx,sse2")]
+    unsafe fn hsum_ps256(v: sx::__m256) -> f32 {
+        use std::arch::x86_64::*;
+        // 256 → 128 高低半相加，复用 hsum_ps。
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        hsum_ps(_mm_add_ps(lo, hi))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rand_vec(seed: u64, n: usize) -> Vec<f32> {
+            let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+            (0..n)
+                .map(|_| {
+                    s = (s ^ (s >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    s = (s ^ (s >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    ((s ^ (s >> 31)) >> 8) as f32 / (1u64 << 40) as f32 * 20.0 - 10.0
+                })
+                .collect()
+        }
+
+        #[test]
+        fn l2_sq_matches_scalar_various_dims() {
+            for &n in &[1usize, 3, 4, 7, 8, 15, 16, 17, 33, 128, 129, 768] {
+                let a = rand_vec(1, n);
+                let b = rand_vec(2, n);
+                let sim = l2_sq(&a, &b);
+                let sca = l2_sq_scalar(&a, &b);
+                assert!((sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5, "dim={n}: simd={sim} scalar={sca}");
+            }
+        }
+
+        #[test]
+        fn dot_matches_scalar_various_dims() {
+            for &n in &[1usize, 4, 8, 16, 31, 128, 768] {
+                let a = rand_vec(3, n);
+                let b = rand_vec(4, n);
+                let sim = dot(&a, &b);
+                let sca = dot_scalar(&a, &b);
+                assert!((sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5, "dim={n}: simd={sim} scalar={sca}");
+            }
+        }
+
+        #[test]
+        fn normalize_produces_unit_vector() {
+            let v = rand_vec(5, 128);
+            let (unit, norm) = normalize(&v);
+            let unit_norm_sq = dot(&unit, &unit);
+            assert!((unit_norm_sq - 1.0).abs() < 1e-4, "归一化后范数²应=1，实={unit_norm_sq}");
+            assert!((norm - dot(&v, &v).sqrt()).abs() < 1e-3);
+        }
+
+        #[test]
+        fn normalize_zero_vector_is_safe() {
+            let z = vec![0.0; 8];
+            let (unit, norm) = normalize(&z);
+            assert_eq!(norm, 0.0);
+            assert!(unit.iter().all(|x| *x == 0.0));
+        }
+
+        // SIMD vs 标量加速比（忽略测试，--ignored --nocapture 跑；release 才有意义）。
+        #[test]
+        #[ignore]
+        fn bench_l2_sq_simd_vs_scalar() {
+            fn bench<F: Fn(&[f32], &[f32]) -> f32>(f: F, a: &[Vec<f32>], b: &[Vec<f32>], iters: usize) -> (f64, f32) {
+                let mut acc = 0f32;
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    for (x, y) in a.iter().zip(b) {
+                        acc += f(x, y);
+                    }
+                }
+                // 用 black_box 阻止编译器把 acc 算掉。
+                let acc = std::hint::black_box(acc);
+                (t.elapsed().as_secs_f64(), acc)
+            }
+            let mut s = 0xDEAD_BEEF_CAFE_F00Du64;
+            let mk = |n: usize| -> Vec<Vec<f32>> {
+                (0..n).map(|_| rand_vec(s.rotate_left(7), 768)).collect()
+            };
+            let a = mk(1000);
+            let b = mk(1000);
+            let iters = 500;
+            let (t_sim, _) = bench(l2_sq, &a, &b, iters);
+            let (t_sca, _) = bench(l2_sq_scalar, &a, &b, iters);
+            eprintln!(
+                "[SIMD bench] dim=768, {}×{} 距离: simd={t_sim:.4}s scalar={t_sca:.4}s 加速比={:.2}×",
+                a.len(), iters, t_sca / t_sim
+            );
+        }
+    }
 }
 
 // ───────────────────────── 向量缓冲池（按字节预算的 LRU） ─────────────────────────
@@ -178,11 +525,13 @@ pub struct DiskGraphConfig {
     pub ef_construction: usize,
     /// 查询时候选列表宽度（对齐 `hnsw_ef_search`）。越大召回越高、查询越慢；实际取 `max(ef_search, k)`。
     pub ef_search: usize,
+    /// 距离度量。L2（默认）；Cosine 在索引/查询时归一化后复用 L2 路径；InnerProduct 走负点积。
+    pub metric: Metric,
 }
 
 impl Default for DiskGraphConfig {
     fn default() -> Self {
-        Self { m: 16, vector_cache_bytes: 256 << 20, ef_construction: 64, ef_search: 100 }
+        Self { m: 16, vector_cache_bytes: 256 << 20, ef_construction: 64, ef_search: 100, metric: Metric::L2 }
     }
 }
 
@@ -201,6 +550,10 @@ impl DiskGraphConfig {
     }
     pub fn with_ef_search(mut self, ef: usize) -> Self {
         self.ef_search = ef;
+        self
+    }
+    pub fn with_metric(mut self, metric: Metric) -> Self {
+        self.metric = metric;
         self
     }
 }
@@ -244,6 +597,7 @@ pub struct DiskGraphStore {
     dim: usize,
     m: usize,
     max_deg: usize,
+    metric: Metric,
     node_rec_size: usize,
     /// 已分配节点数（= nodes 文件长度 / 记录长，开盘时据此恢复，无需单独持久）。
     count: AtomicU64,
@@ -259,12 +613,12 @@ impl DiskGraphStore {
         std::fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
 
-        // 元页：有则读回（dim/m 以盘上为准），无则按传入值创建并落盘。
-        let (dim, m) = match Meta::load(&meta_path) {
-            Some(meta) => (meta.dim, meta.m),
+        // 元页：有则读回（dim/m/metric 以盘上为准），无则按传入值创建并落盘。
+        let (dim, m, metric) = match Meta::load(&meta_path) {
+            Some(meta) => (meta.dim, meta.m, meta.metric),
             None => {
-                Meta { dim, m: cfg.m, metric: Metric::L2 }.store(&meta_path)?;
-                (dim, cfg.m)
+                Meta { dim, m: cfg.m, metric: cfg.metric }.store(&meta_path)?;
+                (dim, cfg.m, cfg.metric)
             }
         };
 
@@ -284,6 +638,7 @@ impl DiskGraphStore {
             dim,
             m,
             max_deg,
+            metric,
             node_rec_size,
             count: AtomicU64::new(count),
             cache: Mutex::new(VecCache::new(cfg.vector_cache_bytes)),
@@ -300,6 +655,9 @@ impl DiskGraphStore {
     }
     pub fn max_deg(&self) -> usize {
         self.max_deg
+    }
+    pub fn metric(&self) -> Metric {
+        self.metric
     }
     pub fn len(&self) -> u64 {
         self.count.load(Ordering::Acquire)
@@ -469,7 +827,12 @@ impl Meta {
         }
         let dim = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
         let m = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
-        Some(Meta { dim, m, metric: Metric::L2 })
+        let metric = match bytes[16] {
+            1 => Metric::Cosine,
+            2 => Metric::InnerProduct,
+            _ => Metric::L2, // 旧索引（VERSION 1 未写 metric 字节）回退默认 L2。
+        };
+        Some(Meta { dim, m, metric })
     }
 
     fn store(&self, path: &Path) -> std::io::Result<()> {
@@ -510,6 +873,7 @@ pub struct DiskGraphIndex {
     ef_search: usize,
     m: usize,
     max_deg: usize,
+    metric: Metric,
     ml: f64, // 层级归一 = 1/ln(m)
     /// 上层（level≥1）邻边：稀疏、小，常驻内存。键 (node_id, level)。
     upper: Mutex<HashMap<(u32, u8), Vec<u32>>>,
@@ -539,6 +903,7 @@ impl DiskGraphIndex {
             entry = best;
         }
         Ok(Self {
+            metric: store.metric(),
             store,
             ef_construction: cfg.ef_construction.max(cfg.m),
             ef_search: cfg.ef_search.max(1),
@@ -555,10 +920,18 @@ impl DiskGraphIndex {
         &self.store
     }
 
-    /// 节点向量与查询的 L2 距离（按需读向量，走缓冲；Arc 命中不复制）。读失败返回 +inf。
+    /// 节点向量与查询的距离（按需读向量，走缓冲；Arc 命中不复制）。读失败返回 +inf。
+    /// L2 / Cosine：归一化（cosine 在 index/search 入口做）后用 l2_sq，两者单调等价、复用整条建图路径。
+    /// InnerProduct：负点积（点积越大 = 越「近」，取负进堆排序）。
     fn dist(&self, query: &[f32], id: u32) -> f32 {
         match self.store.read_vector_arc(id) {
-            Ok(v) => l2_sq(query, &v),
+            Ok(v) => {
+                if self.metric == Metric::InnerProduct {
+                    -simd::dot(query, &v)
+                } else {
+                    l2_sq(query, &v)
+                }
+            }
             Err(_) => f32::INFINITY,
         }
     }
@@ -585,6 +958,39 @@ impl DiskGraphIndex {
             self.upper.lock().unwrap().insert((id, level), neighbors.to_vec());
             Ok(())
         }
+    }
+
+    /// **邻居选择启发式**（hnswlib heuristic）：从候选里选出与查询点分布更散的 m 个邻居，
+    /// 替代朴素的「取最近 m 个」。后者在高维下会让近邻簇聚成一团、图连通性变差、召回掉。
+    ///
+    /// 规则：候选按到 query 的距离升序排；依次考察 e，仅当 e 比**所有已选入的点**都更靠近 query
+    /// （即 dist(query,e) < dist(e, r) 对每个已选 r 成立）才选入 —— e 没被任何已选点「挡住」，
+    /// 保证选入的点彼此分散。距离函数由 `dist` 闭包给出（复用 self.dist 的按需读 + 缓冲）。
+    ///
+    /// `candidates` = (id, dist_to_query) 升序；排除 query 自身（id）。
+    fn select_neighbors(
+        &self,
+        _query: &[f32],
+        candidates: &[(u32, f32)],
+        m: usize,
+        dist: &dyn Fn(&[f32], u32) -> f32,
+    ) -> Vec<u32> {
+        let mut kept: Vec<(u32, f32)> = Vec::with_capacity(m);
+        for &(e, de) in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            // e 与所有已选点 r 比：只要有一个 r 挡住 e（dist(e,r) < dist(query,e)），丢 e。
+            let dominated = kept.iter().any(|&(r, dr)| {
+                // dist(query, e) = de；dist(query, r) = dr；这里算 dist(e, r)。
+                let er = dist(&self.store.read_vector_arc(e).unwrap_or_else(|_| Arc::from(Vec::new())), r);
+                er < de.max(dr)
+            });
+            if !dominated {
+                kept.push((e, de));
+            }
+        }
+        kept.into_iter().map(|(id, _)| id).collect()
     }
 
     /// HNSW search-layer：在某一层从 `entries` 出发 beam 扩展。`admit` 决定收点 + 驱动停止，
@@ -672,12 +1078,15 @@ impl DiskGraphIndex {
             lc -= 1;
         }
 
-        // 2) 从 min(level,top) 到 0：search_layer(ef_construction) → 连边 + 反向剪枝。
+        // 2) 从 min(level,top) 到 0：search_layer(ef_construction) → 启发式选邻居连边 + 反向剪枝。
         let mut entries = vec![ep];
         for lc in (0..=level.min(top)).rev() {
             let cap = if lc == 0 { self.max_deg } else { self.m };
             let cands = self.search_layer(vector, &entries, self.ef_construction, lc, &alive);
-            let chosen: Vec<u32> = cands.iter().map(|&(c, _)| c).filter(|&c| c != id).take(self.m).collect();
+            // 启发式选 m 个分散邻居（候选已升序、排除自身 id）。
+            let cands_clean: Vec<(u32, f32)> = cands.into_iter().filter(|&(c, _)| c != id).collect();
+            let dist = |q: &[f32], x: u32| self.dist(q, x);
+            let chosen = self.select_neighbors(vector, &cands_clean, self.m, &dist);
             self.set_neighbors_at(id, lc, &chosen)?;
 
             for &nb in &chosen {
@@ -686,14 +1095,17 @@ impl DiskGraphIndex {
                     adj.push(id);
                 }
                 if adj.len() > cap {
+                    // 反向边也用启发式：以 nb 为查询点，从它的邻边里选 cap 个分散的。
                     let base = self.store.read_vector_arc(nb).unwrap_or_else(|_| Arc::from(Vec::new()));
-                    adj.sort_by(|&a, &b| self.dist(&base, a).total_cmp(&self.dist(&base, b)));
-                    adj.truncate(cap);
+                    let mut scored: Vec<(u32, f32)> = adj.iter().map(|&x| (x, self.dist(&base, x))).collect();
+                    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    let dist2 = |q: &[f32], x: u32| self.dist(q, x);
+                    adj = self.select_neighbors(&base, &scored, cap, &dist2);
                 }
                 self.set_neighbors_at(nb, lc, &adj)?;
             }
             // 下一层的入口 = 这一层找到的近邻。
-            entries = if cands.is_empty() { vec![ep] } else { cands.iter().map(|&(c, _)| c).collect() };
+            entries = if cands_clean.is_empty() { vec![ep] } else { cands_clean.iter().map(|&(c, _)| c).collect() };
         }
 
         // 3) 新点层级更高 → 成为新入口。
@@ -705,13 +1117,18 @@ impl DiskGraphIndex {
 
     /// 暴力精确搜索（测试用 ground-truth；带过滤、跳软删）。
     pub fn brute_force(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+        // Cosine：归一化查询（与索引时的归一化对齐）。IP：不归一化、不取 sqrt（距离已是 -dot）。
+        let q: Vec<f32> = if self.metric == Metric::Cosine { simd::normalize(query).0 } else { query.to_vec() };
+        let finalize = |d: f32| -> f32 {
+            if self.metric == Metric::InnerProduct { d } else { d.max(0.0).sqrt() }
+        };
         let mut scored: Vec<(f32, u64, u64)> = Vec::new();
         for id in 0..self.store.len() as u32 {
             let Ok(node) = self.store.read_node(id) else { continue };
             if node.deleted || !filter(node.trace_id, node.span_id) {
                 continue;
             }
-            scored.push((self.dist(query, id).sqrt(), node.trace_id, node.span_id));
+            scored.push((finalize(self.dist(&q, id)), node.trace_id, node.span_id));
         }
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(k);
@@ -726,13 +1143,22 @@ impl DiskGraphIndex {
 
 impl GraphIndex for DiskGraphIndex {
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
-        let _ = self.insert(trace_id, span_id, &embedding);
+        // Cosine：索引时归一化成单位向量存储。归一化后 cosine 距离与 L2² 单调等价 → 整条建图/检索复用 l2_sq。
+        let v: Vec<f32> = if self.metric == Metric::Cosine {
+            simd::normalize(&embedding).0
+        } else {
+            embedding
+        };
+        let _ = self.insert(trace_id, span_id, &v);
     }
 
     fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
         if k == 0 || query.len() != self.store.dim {
             return Vec::new();
         }
+        // Cosine：归一化查询（与索引时的归一化对齐）。
+        let q: Vec<f32> = if self.metric == Metric::Cosine { simd::normalize(query).0 } else { query.to_vec() };
+        let query: &[f32] = &q;
         let Some((mut ep, top)) = *self.entry.lock().unwrap() else {
             return Vec::new();
         };
@@ -754,10 +1180,14 @@ impl GraphIndex for DiskGraphIndex {
             Err(_) => false,
         };
         let ef = self.ef_search.max(k);
+        // IP：距离已是 -dot，不取 sqrt；L2/Cosine 取 sqrt 还原真实距离。
+        let finalize = |d: f32| -> f32 {
+            if self.metric == Metric::InnerProduct { d } else { d.max(0.0).sqrt() }
+        };
         let mut out: Vec<(u64, u64, f32)> = self
             .search_layer(query, &[ep], ef, 0, &admit)
             .into_iter()
-            .filter_map(|(id, d)| self.store.read_node(id).ok().map(|r| (r.trace_id, r.span_id, d.sqrt())))
+            .filter_map(|(id, d)| self.store.read_node(id).ok().map(|r| (r.trace_id, r.span_id, finalize(d))))
             .collect();
         out.truncate(k);
         out
@@ -1025,7 +1455,7 @@ mod tests {
         // 图导航的核心：beam search 召回 ≈ 暴力 ground-truth（证明"按需读页的图遍历"找得到近邻）。
         let dir = tmpdir();
         let dim = 8usize;
-        let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 64, ef_search: 64, vector_cache_bytes: 1 << 20 }).unwrap();
+        let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 64, ef_search: 64, vector_cache_bytes: 1 << 20, metric: Metric::L2 }).unwrap();
         let mut rng = Lcg(0x51A6_3D11);
         for i in 0..150u64 {
             idx.index_embedding(1, i, rng.vec(dim));
@@ -1057,7 +1487,7 @@ mod tests {
         let mut rng = Lcg(0x7A5E);
         let top_level;
         {
-            let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 48, ef_search: 48, vector_cache_bytes: 1 << 20 }).unwrap();
+            let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 48, ef_search: 48, vector_cache_bytes: 1 << 20, metric: Metric::L2 }).unwrap();
             for i in 0..300u64 {
                 idx.index_embedding(1, i, rng.vec(dim));
             }
@@ -1113,6 +1543,34 @@ mod tests {
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|&(t, _, _)| t == 1), "只返回满足谓词的点");
         assert!(hits.windows(2).all(|w| w[0].2 <= w[1].2), "按距离升序");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cosine_mode_search_recalls_brute_force() {
+        // Cosine 模式：图检索召回应 ≈ 同一索引的暴力精确搜索（与 L2 同款断言，验证归一化路径对齐）。
+        let dir = tmpdir();
+        let dim = 8usize;
+        let cfg = DiskGraphConfig { m: 8, ef_construction: 64, ef_search: 64, vector_cache_bytes: 1 << 20, metric: Metric::Cosine };
+        let idx = DiskGraphIndex::open(&dir, dim, cfg).unwrap();
+        let mut rng = Lcg(0xC05E);
+        for _ in 0..150u64 {
+            idx.index_embedding(1, 0, rng.vec(dim));
+        }
+        let k = 10;
+        let mut hit_sum = 0usize;
+        let mut probes = 0usize;
+        for _ in 0..8 {
+            let query = rng.vec(dim);
+            let truth: std::collections::HashSet<(u64, u64)> =
+                idx.brute_force(&query, k, &|_, _| true).into_iter().map(|(t, s, _)| (t, s)).collect();
+            let got = idx.search(&query, k, &|_, _| true);
+            hit_sum += got.iter().filter(|(t, s, _)| truth.contains(&(*t, *s))).count();
+            probes += 1;
+        }
+        let recall = hit_sum as f32 / (k * probes) as f32;
+        eprintln!("[磁盘图索引·cosine] 召回@{k} = {recall:.2}");
+        assert!(recall >= 0.85, "cosine 召回应接近暴力，实={recall:.2}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

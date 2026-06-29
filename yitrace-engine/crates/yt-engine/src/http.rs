@@ -430,13 +430,15 @@ impl HttpIngestServer {
                 let dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
                 let name = t.user_input.as_deref().map(trunc).unwrap_or_else(|| format!("第{}轮", t.turn_index + 1));
                 format!(
-                    r#"{{"traceId":"{}","sessionId":"{}","turnIndex":{},"name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
+                    r#"{{"traceId":"{}","sessionId":"{}","turnIndex":{},"name":"{}","durMs":{},"cost":{},"inTok":{},"outTok":{},"spanCount":{},"status":"{}"}}"#,
                     t.trace_id,
                     sid,
                     t.turn_index,
                     json_escape(&name),
                     dur_ms,
                     cost_num(t.input_tokens, t.output_tokens),
+                    t.input_tokens,
+                    t.output_tokens,
                     t.span_count,
                     if t.error_count > 0 { "error" } else { "ok" },
                 )
