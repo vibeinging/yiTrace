@@ -14,13 +14,29 @@
 //! BM25 按 bigram 把它拆成 盗刷/刷风/风控，命中"盗刷"和"风控"两概念的文档排第一，按 tf-idf 给出相关性序。
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Mutex;
 
 use crate::Bm25Index;
 
 const K1: f32 = 1.5;
 const B: f32 = 0.75;
+
+/// f32 全序包装（NaN 也定序），WAND 的 top-k 阈值堆用。
+#[derive(Clone, Copy, PartialEq)]
+struct OrdF32(f32);
+impl Eq for OrdF32 {}
+impl PartialOrd for OrdF32 {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for OrdF32 {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0)
+    }
+}
 
 /// **分词接缝**：把一段文本切成检索词。索引与评分对分词只认这个 trait —— 换分词器（bigram → 团队 jieba
 /// 词级）只换实现、不动倒排逻辑。实现方负责大小写归一、标点处理等；返回的每个 token 原样进倒排。
@@ -92,12 +108,63 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 #[derive(Default)]
 struct Bm25State {
-    /// token → (文档 → 词频)。
+    /// token → (文档 → 词频)。增量建图用（HashMap 插入快）。
     postings: HashMap<String, HashMap<(u64, u64), u32>>,
     /// 文档 → 词数（BM25 长度归一用）。
     doc_len: HashMap<(u64, u64), u32>,
     /// 所有文档词数之和（算 avgdl）。
     total_len: u64,
+    /// WAND 用：token → 分块的有序 postings（脏时从 `postings` 重建、查询期缓存，build-then-query 摊销）。
+    sorted: HashMap<String, Postings>,
+    dirty: bool,
+}
+
+/// 每块 128 篇文档，存 max_tf/min_dl 算块上界（block-max-WAND：块上界 < 阈值 → 整块跳）。
+const BLOCK_SIZE: usize = 128;
+
+/// 一个 token 的分块有序 postings。
+struct Postings {
+    docs: Vec<((u64, u64), u32)>, // 按 doc 升序
+    blocks: Vec<BlockMeta>,
+}
+struct BlockMeta {
+    end: usize,  // 该块覆盖 docs[start..end]（end 为下个块起点）
+    max_tf: u32, // 块内最大词频
+    min_dl: u32, // 块内最短文档长度（norm 在 tf 大、dl 小时最大 → (max_tf,min_dl) 给块上界）
+}
+
+impl Bm25State {
+    /// 脏了就重建分块有序 postings（DAAT 要求 cursor 按 doc 推进；block-max 要每块的 max_tf/min_dl）。
+    fn ensure_sorted(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.sorted.clear();
+        for (tok, plist) in &self.postings {
+            let mut docs: Vec<((u64, u64), u32)> = plist.iter().map(|(&d, &tf)| (d, tf)).collect();
+            docs.sort_unstable_by_key(|&(d, _)| d);
+            let mut blocks = Vec::new();
+            let mut i = 0;
+            while i < docs.len() {
+                let end = (i + BLOCK_SIZE).min(docs.len());
+                let mut max_tf = 0u32;
+                let mut min_dl = u32::MAX;
+                for &(d, tf) in &docs[i..end] {
+                    max_tf = max_tf.max(tf);
+                    min_dl = min_dl.min(self.doc_len[&d]);
+                }
+                blocks.push(BlockMeta { end, max_tf, min_dl });
+                i = end;
+            }
+            self.sorted.insert(tok.clone(), Postings { docs, blocks });
+        }
+        self.dirty = false;
+    }
+}
+
+/// BM25 词频长度归一（tf·(k1+1) / (tf + k1·(1-b+b·dl/avgdl))）。上确界 = k1+1（tf→∞）。
+fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
+    tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))
 }
 
 /// 真 BM25 中文倒排索引。实现引擎的 `Bm25Index` trait，可直接替掉 `InMemoryBm25`。
@@ -138,37 +205,161 @@ impl Bm25Index for Bm25TextIndex {
         for t in toks {
             *st.postings.entry(t).or_default().entry(doc).or_insert(0) += 1;
         }
+        st.dirty = true;
     }
 
+    /// **block-max-WAND**（DAAT + 上界剪枝 + 块跳过）。剪枝用**严格 `<` 阈值**（θ = 当前第 k 高分）：
+    /// 被剪文档/块的上界严格小于 θ → 实际分严格小于最终第 k 高分 → 绝不进 top-k（含同分边界安全）。
+    /// 候选全量打分后**终排（分降序、(trace,span) 升序）取 top-k**，与暴力逐位一致（有测试钉死）。
+    /// 单词查询走块跳过（块上界 = idf·norm(max_tf,min_dl) < θ → 整块跳）；多词查询走 term 级 WAND（剪掉只命中弱词的文档）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
         let n = st.doc_len.len();
-        if n == 0 {
+        if n == 0 || k == 0 {
             return Vec::new();
         }
+        st.ensure_sorted();
         let avgdl = st.total_len as f32 / n as f32;
 
-        let mut scores: HashMap<(u64, u64), f32> = HashMap::new();
-        // 查询词去重（同一 token 重复不重复加 idf）。
-        let mut seen = std::collections::HashSet::new();
-        for tok in self.tokenizer.tokenize(query) {
-            if !seen.insert(tok.clone()) {
-                continue;
+        // 查询词去重 + 排序（确定性求和顺序：按 token 序加各词贡献，与暴力一致）。
+        let mut toks: Vec<String> = self.tokenizer.tokenize(query);
+        toks.sort_unstable();
+        toks.dedup();
+
+        // 命中词：(idf, &分块postings)。
+        let mut hits: Vec<(f32, &Postings)> = Vec::new();
+        for tok in &toks {
+            if let Some(pp) = st.sorted.get(tok) {
+                let df = pp.docs.len() as f32;
+                let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
+                hits.push((idf, pp));
             }
-            let Some(plist) = st.postings.get(&tok) else { continue };
-            let df = plist.len() as f32;
-            // idf = ln(1 + (N - df + 0.5)/(df + 0.5))，恒正（BM25+ 形式）。
-            let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
-            for (&doc, &tf) in plist {
-                let dl = st.doc_len[&doc] as f32;
-                let tf = tf as f32;
-                let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl));
-                *scores.entry(doc).or_insert(0.0) += idf * norm;
+        }
+        if hits.is_empty() {
+            return Vec::new();
+        }
+
+        let mut topk: BinaryHeap<Reverse<OrdF32>> = BinaryHeap::new();
+        let mut scored: Vec<(u64, u64, f32)> = Vec::new();
+        let theta = |h: &BinaryHeap<Reverse<OrdF32>>| if h.len() >= k { h.peek().unwrap().0 .0 } else { f32::NEG_INFINITY };
+
+        if hits.len() == 1 {
+            // 单词：block-max 块跳过。块上界 < θ → 整块不打分。
+            let (idf, pp) = hits[0];
+            let mut i = 0usize;
+            for blk in &pp.blocks {
+                let bmax = idf * bm25_norm(blk.max_tf as f32, blk.min_dl as f32, avgdl);
+                if bmax < theta(&topk) {
+                    i = blk.end;
+                    continue; // 整块跳
+                }
+                for &(doc, tf) in &pp.docs[i..blk.end] {
+                    let dl = st.doc_len[&doc] as f32;
+                    let sc = idf * bm25_norm(tf as f32, dl, avgdl);
+                    scored.push((doc.0, doc.1, sc));
+                    topk.push(Reverse(OrdF32(sc)));
+                    if topk.len() > k {
+                        topk.pop();
+                    }
+                }
+                i = blk.end;
+            }
+        } else {
+            // 多词：term 级 WAND（DAAT，上界 = idf·(k1+1)，按 doc 序选 pivot、剪枝）。
+            struct Cur<'a> {
+                docs: &'a [((u64, u64), u32)],
+                idf: f32,
+                maxi: f32,
+                pos: usize,
+            }
+            let mut curs: Vec<Cur> =
+                hits.iter().map(|&(idf, pp)| Cur { docs: &pp.docs, idf, maxi: idf * (K1 + 1.0), pos: 0 }).collect();
+            loop {
+                curs.retain(|c| c.pos < c.docs.len());
+                if curs.is_empty() {
+                    break;
+                }
+                let mut order: Vec<usize> = (0..curs.len()).collect();
+                order.sort_by_key(|&i| curs[i].docs[curs[i].pos].0);
+                let th = theta(&topk);
+                let mut acc = 0.0f32;
+                let mut pivot: Option<usize> = None;
+                for (oi, &ci) in order.iter().enumerate() {
+                    acc += curs[ci].maxi;
+                    if acc >= th {
+                        pivot = Some(oi);
+                        break;
+                    }
+                }
+                let Some(poi) = pivot else { break };
+                let pivot_doc = curs[order[poi]].docs[curs[order[poi]].pos].0;
+                let first_doc = curs[order[0]].docs[curs[order[0]].pos].0;
+                if first_doc == pivot_doc {
+                    let mut sc = 0.0f32;
+                    let dl = st.doc_len[&pivot_doc] as f32;
+                    for c in curs.iter() {
+                        if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
+                            sc += c.idf * bm25_norm(c.docs[c.pos].1 as f32, dl, avgdl);
+                        }
+                    }
+                    scored.push((pivot_doc.0, pivot_doc.1, sc));
+                    topk.push(Reverse(OrdF32(sc)));
+                    if topk.len() > k {
+                        topk.pop();
+                    }
+                    for c in curs.iter_mut() {
+                        if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
+                            c.pos += 1;
+                        }
+                    }
+                } else {
+                    for &ci in order.iter().take(poi + 1) {
+                        if curs[ci].docs[curs[ci].pos].0 < pivot_doc {
+                            let c = &mut curs[ci];
+                            while c.pos < c.docs.len() && c.docs[c.pos].0 < pivot_doc {
+                                c.pos += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
 
+        // 候选全量打分完 → 终排取 top-k（与暴力一致）。
+        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then((a.0, a.1).cmp(&(b.0, b.1))));
+        scored.truncate(k);
+        scored
+    }
+}
+
+impl Bm25TextIndex {
+    /// 暴力全量打分（**测试基准**）：对命中词的所有文档逐一打分（无剪枝），求和顺序与 WAND 一致
+    /// （按 token 序：外层 token、内层 doc 累加）。WAND 的结果必须与它逐位一致。
+    #[cfg(test)]
+    fn search_exhaustive(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
+        let mut st = self.state.lock().unwrap();
+        let n = st.doc_len.len();
+        if n == 0 || k == 0 {
+            return Vec::new();
+        }
+        st.ensure_sorted();
+        let avgdl = st.total_len as f32 / n as f32;
+        let mut toks: Vec<String> = self.tokenizer.tokenize(query);
+        toks.sort_unstable();
+        toks.dedup();
+        let mut scores: HashMap<(u64, u64), f32> = HashMap::new();
+        for tok in &toks {
+            if let Some(pp) = st.sorted.get(tok) {
+                let df = pp.docs.len() as f32;
+                let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
+                for &(doc, tf) in &pp.docs {
+                    let dl = st.doc_len[&doc] as f32;
+                    *scores.entry(doc).or_insert(0.0) += idf * bm25_norm(tf as f32, dl, avgdl);
+                }
+            }
+        }
         let mut scored: Vec<(u64, u64, f32)> = scores.into_iter().map(|((t, s), sc)| (t, s, sc)).collect();
-        // 分降序；同分按 (trace,span) 升序定序（确定可复算）。
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then((a.0, a.1).cmp(&(b.0, b.1))));
         scored.truncate(k);
         scored
@@ -224,6 +415,36 @@ mod tests {
         assert_eq!((hits[0].0, hits[0].1), (1, 1), "高词频+短文档排第一");
         assert_eq!(hits.len(), 2);
         assert!(hits[0].2 > hits[1].2);
+    }
+
+    #[test]
+    fn wand_matches_exhaustive_on_random_corpus() {
+        // WAND 必须与暴力全量打分**逐位一致**（剪枝只跳掉绝不进 top-k 的文档）。
+        // 随机语料 + 多词查询，扫多个 k 对比。确定性 LCG，不依赖 rand。
+        let words = ["盗刷", "风控", "交易", "转账", "登录", "异常", "拦截", "模型", "会话", "超时"];
+        let mut seed = 0x1234_5678u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let bm = Bm25TextIndex::new();
+        // 800 文档，每篇 3~7 个随机词（空格分隔，bigram 分词会再切，但稳定可复算）。
+        for i in 0..800u64 {
+            let len = 3 + next() % 5;
+            let text: Vec<&str> = (0..len).map(|_| words[next() % words.len()]).collect();
+            bm.index_text(i / 10, i, &text.join(" "));
+        }
+        // 多组随机多词查询 × 多个 k。
+        for _ in 0..60 {
+            let qlen = 1 + next() % 3;
+            let q: Vec<&str> = (0..qlen).map(|_| words[next() % words.len()]).collect();
+            let query = q.join(" ");
+            for &k in &[1usize, 5, 10, 50] {
+                let wand = bm.search(&query, k);
+                let exhaustive = bm.search_exhaustive(&query, k);
+                assert_eq!(wand, exhaustive, "WAND≠暴力: query={query:?} k={k}");
+            }
+        }
     }
 
     #[test]
