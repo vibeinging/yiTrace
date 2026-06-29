@@ -22,6 +22,8 @@ export interface TraceSummary {
   name: string
   durMs: number
   cost: number
+  inTok?: number // 该轮输入 token（时间线节点用，后端已吐）
+  outTok?: number // 该轮输出 token
   spanCount: number
   status: Status
 }

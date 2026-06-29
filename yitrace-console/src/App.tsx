@@ -8,6 +8,7 @@ export default function App() {
   const [filter, setFilter] = useState('')
   const [q, setQ] = useState('')
   const [search, setSearch] = useState('') // 已提交的语义检索词（回车触发）
+  const [sessionId, setSessionId] = useState<string | null>(null) // 选中的会话（右栏时间线按它渲染）
   const [traceId, setTraceId] = useState<string | null>(null)
   const [spanId, setSpanId] = useState<string | null>(null)
 
@@ -41,6 +42,7 @@ export default function App() {
           <SearchResults
             query={search}
             selectedTrace={traceId}
+            // 搜索命中跨会话 span：中栏定位该 trace；sessionId 反查不到时不动时间线（降级不报错）。
             onSelect={(tid, sid) => { setTraceId(tid); setSpanId(sid) }}
             onClear={() => { setSearch(''); setQ('') }}
           />
@@ -48,10 +50,16 @@ export default function App() {
           <SessionList
             selectedTrace={traceId}
             filter={filter}
-            onSelect={(id) => { setTraceId(id); setSpanId(null) }}
+            onSelect={(sid, tid) => { setSessionId(sid); setTraceId(tid); setSpanId(null) }}
           />
         )}
-        <Waterfall traceId={traceId} selectedSpan={spanId} onSelectSpan={setSpanId} />
+        <Waterfall
+          sessionId={sessionId}
+          traceId={traceId}
+          selectedSpan={spanId}
+          onSelectSpan={setSpanId}
+          onSelectTurn={(tid) => { setTraceId(tid); setSpanId(null) }}
+        />
         <SpanDetail traceId={traceId} spanId={spanId} />
       </div>
     </div>

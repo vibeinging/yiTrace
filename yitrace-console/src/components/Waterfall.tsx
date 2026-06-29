@@ -4,6 +4,7 @@ import { useTrace } from '../hooks/queries'
 import type { Span } from '../api'
 import { AgentGraph } from './AgentGraph'
 import { StepStream } from './StepStream'
+import { TurnTimeline } from './TurnTimeline'
 
 type View = 'wf' | 'steps' | 'graph'
 
@@ -11,13 +12,17 @@ const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms +
 const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT' }
 
 export function Waterfall({
+  sessionId,
   traceId,
   selectedSpan,
   onSelectSpan,
+  onSelectTurn,
 }: {
+  sessionId: string | null
   traceId: string | null
   selectedSpan: string | null
   onSelectSpan: (id: string) => void
+  onSelectTurn: (traceId: string) => void
 }) {
   const { data, isLoading } = useTrace(traceId)
   const spans = data?.spans ?? []
@@ -39,51 +44,68 @@ export function Waterfall({
     overscan: 20,
   })
 
-  if (!traceId) return <div className="center"><div className="empty">← 从左侧选一条会话 / 轮次</div></div>
-
   return (
-    <div className="center">
-      <div className="toolbar">
-        <div>
-          <div className="tt">{summary?.name ?? '加载中…'}</div>
-          <div className="sub">{traceId}{summary ? ` · ${summary.spanCount} spans · ${fmtDur(summary.durMs)}` : ''}</div>
+    <div className="cwrap">
+      {/* 中栏左侧：多轮时间线（选会话后渲染，点节点切轮次）。 */}
+      <div className="cleft">
+        <div className="ph tlph">
+          多轮时间线
+          <small>{sessionId ? '各轮演进' : '未选会话'}</small>
         </div>
-        <div className="seg">
-          <button className={view === 'wf' ? 'on' : ''} onClick={() => setView('wf')}>瀑布</button>
-          <button className={view === 'steps' ? 'on' : ''} onClick={() => setView('steps')}>步骤流</button>
-          <button className={view === 'graph' ? 'on' : ''} onClick={() => setView('graph')}>Agent图</button>
+        <div className="cleftbody">
+          <TurnTimeline sessionId={sessionId} selectedTrace={traceId} onSelect={onSelectTurn} />
         </div>
       </div>
-      <div className="summary">
-        <div className="blk"><span className="lab">总 Token</span><span className="big">{agg.tot.toLocaleString()}</span></div>
-        <div className="blk"><span className="lab">成本</span><span className="big cost">${agg.cost.toFixed(3)}</span></div>
-        <div className="blk"><span className="lab">Span</span><span className="big">{spans.length.toLocaleString()}</span></div>
-      </div>
-      {view === 'wf' && (
-        <div className="ruler">
-          {Array.from({ length: 6 }, (_, i) => (
-            <span key={i}>{((maxEnd / 6) * i / 1000).toFixed(1)}s</span>
-          ))}
-        </div>
-      )}
-      {isLoading ? (
-        <div className="spin">加载 span…</div>
-      ) : view === 'wf' ? (
-        <div className="wfwrap" ref={parentRef}>
-          <div className="vinner" style={{ height: virt.getTotalSize() }}>
-            {virt.getVirtualItems().map((vi) => (
-              <div key={vi.key} className="vrow" style={{ transform: `translateY(${vi.start}px)`, height: 30 }}>
-                <SpanRow s={spans[vi.index]} maxEnd={maxEnd} sel={selectedSpan === spans[vi.index].id} onClick={onSelectSpan} />
+      {/* 中栏右侧：选中轮次的瀑布 / 步骤流 / Agent 图。 */}
+      <div className="cright">
+        {!traceId ? (
+          <div className="empty">← 从时间线或会话列表选一轮</div>
+        ) : (
+          <>
+            <div className="toolbar">
+              <div>
+                <div className="tt">{summary?.name ?? '加载中…'}</div>
+                <div className="sub">{traceId}{summary ? ` · ${summary.spanCount} spans · ${fmtDur(summary.durMs)}` : ''}</div>
               </div>
-            ))}
-          </div>
-        </div>
-      ) : view === 'steps' ? (
-        <StepStream traceId={traceId} active={view === 'steps'} />
-      ) : (
-        <div className="viewscroll"><AgentGraph spans={spans} /></div>
-      )}
-      {view === 'wf' && spans.length > 1 && <Insight spans={spans} onSelect={onSelectSpan} />}
+              <div className="seg">
+                <button className={view === 'wf' ? 'on' : ''} onClick={() => setView('wf')}>瀑布</button>
+                <button className={view === 'steps' ? 'on' : ''} onClick={() => setView('steps')}>步骤流</button>
+                <button className={view === 'graph' ? 'on' : ''} onClick={() => setView('graph')}>Agent图</button>
+              </div>
+            </div>
+            <div className="summary">
+              <div className="blk"><span className="lab">总 Token</span><span className="big">{agg.tot.toLocaleString()}</span></div>
+              <div className="blk"><span className="lab">成本</span><span className="big cost">${agg.cost.toFixed(3)}</span></div>
+              <div className="blk"><span className="lab">Span</span><span className="big">{spans.length.toLocaleString()}</span></div>
+            </div>
+            {view === 'wf' && (
+              <div className="ruler">
+                {Array.from({ length: 6 }, (_, i) => (
+                  <span key={i}>{((maxEnd / 6) * i / 1000).toFixed(1)}s</span>
+                ))}
+              </div>
+            )}
+            {isLoading ? (
+              <div className="spin">加载 span…</div>
+            ) : view === 'wf' ? (
+              <div className="wfwrap" ref={parentRef}>
+                <div className="vinner" style={{ height: virt.getTotalSize() }}>
+                  {virt.getVirtualItems().map((vi) => (
+                    <div key={vi.key} className="vrow" style={{ transform: `translateY(${vi.start}px)`, height: 30 }}>
+                      <SpanRow s={spans[vi.index]} maxEnd={maxEnd} sel={selectedSpan === spans[vi.index].id} onClick={onSelectSpan} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : view === 'steps' ? (
+              <StepStream traceId={traceId} active={view === 'steps'} />
+            ) : (
+              <div className="viewscroll"><AgentGraph spans={spans} /></div>
+            )}
+            {view === 'wf' && spans.length > 1 && <Insight spans={spans} onSelect={onSelectSpan} />}
+          </>
+        )}
+      </div>
     </div>
   )
 }

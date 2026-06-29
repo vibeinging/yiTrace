@@ -59,6 +59,8 @@ function turnsOf(sessionId: string, i: number, turnCount: number): TraceSummary[
   return Array.from({ length: turnCount }, (_, t) => {
     const status = t === turnCount - 1 ? 'ok' : statusOf(r)
     const spanCount = 4 + Math.floor(r() * (r() < 0.05 ? 1200 : 40)) // 个别 trace 上千 span
+    const inTok = 200 + Math.floor(r() * 1800)
+    const outTok = 40 + Math.floor(r() * 500)
     return {
       traceId: `tr-${i}-${t}`,
       sessionId,
@@ -66,6 +68,8 @@ function turnsOf(sessionId: string, i: number, turnCount: number): TraceSummary[
       name: `${pick(r, TOPICS)}${turnCount > 1 ? ` · 第${t + 1}步` : ''}`,
       durMs: 800 + Math.floor(r() * 18000),
       cost: Math.round((0.005 + r() * 0.06) * 1000) / 1000,
+      inTok,
+      outTok,
       spanCount,
       status,
     }
