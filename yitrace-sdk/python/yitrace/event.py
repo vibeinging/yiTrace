@@ -4,8 +4,6 @@
 这样 SDK 这边算出的 event_id 和引擎那边算出的相同 —— 同一条 span 事件无论重传几次、跨 SDK/引擎，
 去重都对得上，崩溃重放也幂等。基准值见引擎 `cargo run -p yt-core --example print_event_id`。
 """
-from __future__ import annotations
-
 import enum
 from dataclasses import dataclass, field
 

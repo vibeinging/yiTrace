@@ -1,5 +1,7 @@
 # yitrace SDK（Python）
 
+> 许可证:MIT。要求 Python ≥ 3.10。
+
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②）。
 
 ```

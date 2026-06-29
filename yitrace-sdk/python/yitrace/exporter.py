@@ -1,6 +1,4 @@
 """事件导出。把 SDK 产生的 span 事件送出去（控制台 / 批量到引擎摄入端）。"""
-from __future__ import annotations
-
 import abc
 import json
 import urllib.request

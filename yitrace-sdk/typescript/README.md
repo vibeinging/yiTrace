@@ -1,5 +1,7 @@
 # @yitrace/trace-sdk (TypeScript)
 
+> 许可证:MIT。要求 Node ≥ 18。
+
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②的 TS 半边）。
 
 ```

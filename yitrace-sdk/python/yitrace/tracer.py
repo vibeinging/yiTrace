@@ -11,8 +11,6 @@
 每个 span 产出 SPAN_START（带 span 名）+ 若干 LOG + SPAN_END（带状态+耗时）三类事件，
 seq 在 span 内单调递增、客户端给定 —— 进引擎后按 (trace,span) 折叠成一条完整 span。
 """
-from __future__ import annotations
-
 import time
 from contextlib import contextmanager
 from typing import Iterator

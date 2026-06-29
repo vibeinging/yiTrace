@@ -8,6 +8,10 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "node test/test_sdk.ts"
+    "test": "tsx --test test/test_sdk.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "@types/node": "^20.0.0"
   }
 }
