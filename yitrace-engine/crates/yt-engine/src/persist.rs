@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::olog;
 use yt_core::chunk::{DeletionVec, UpgradeColChunk};
 use yt_core::fold::SpanFields;
 use yt_core::ids::{ChunkId, ManifestVersion, SegmentId, WalLsn};
@@ -19,7 +20,7 @@ use yt_core::manifest::{Manifest, SegState, SegmentEntry};
 use std::collections::BTreeMap;
 
 const MAGIC: u32 = 0x5654_4D46; // "VTMF"
-const FORMAT_VER: u32 = 1;
+pub const FORMAT_VER: u32 = 1;
 
 /// 持久化的引擎状态 = manifest + 两个 id 计数器（段 id / chunk id 永不复用，必须随 manifest 一起恢复）。
 pub struct PersistedState {
@@ -140,7 +141,28 @@ pub fn encode(state: &PersistedState) -> Vec<u8> {
 
 pub fn decode(bytes: &[u8]) -> Option<PersistedState> {
     let mut c = Cur { b: bytes, i: 0 };
-    if c.u32()? != MAGIC || c.u32()? != FORMAT_VER {
+    let magic = c.u32()?;
+    let ver = c.u32()?;
+    if magic != MAGIC {
+        olog::log(olog::Level::Error, "manifest_decode", &[("reason", &"bad magic")]);
+        return None;
+    }
+    if ver > FORMAT_VER {
+        // 未来版本：需要新引擎。明确报错而非静默当损坏。
+        olog::log(olog::Level::Error, "manifest_decode", &[
+            ("reason", &"future version needs newer engine"),
+            ("found", &ver),
+            ("supported", &FORMAT_VER),
+        ]);
+        return None;
+    }
+    if ver < FORMAT_VER {
+        // 老版本：需迁移。骨架阶段直接 None（无旧版本数据）；真实迁移工具见 migrate_manifest。
+        olog::log(olog::Level::Warn, "manifest_decode", &[
+            ("reason", &"old version needs migration"),
+            ("found", &ver),
+            ("current", &FORMAT_VER),
+        ]);
         return None;
     }
     let version = ManifestVersion::new(c.u64()?);

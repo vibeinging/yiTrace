@@ -2551,6 +2551,10 @@ impl WriteCoordinator {
         out.push_str("# TYPE yt_manifest_version gauge\n");
         out.push_str(&format!("yt_manifest_version {version}\n\n"));
 
+        out.push_str("# HELP yt_format_version 数据格式版本（persist::FORMAT_VER，升级迁移用）。\n");
+        out.push_str("# TYPE yt_format_version gauge\n");
+        out.push_str(&format!("yt_format_version {}\n\n", persist::FORMAT_VER));
+
         out.push_str("# HELP yt_segments_live 活跃段数（含 sealed/live/compacting）。\n");
         out.push_str("# TYPE yt_segments_live gauge\n");
         out.push_str(&format!("yt_segments_live {segments}\n\n"));
@@ -2592,6 +2596,70 @@ impl WriteCoordinator {
         out.push_str(&format!("yt_datasets {datasets}\n"));
 
         out
+    }
+
+    /// 当前引擎支持的数据格式版本（persist::FORMAT_VER）。
+    pub fn format_version() -> u32 {
+        persist::FORMAT_VER
+    }
+
+    /// 检查数据目录的 manifest 版本：返回 (磁盘上的版本, 引擎支持的版本)。
+    /// 两者相等 = 兼容；磁盘 < 引擎 = 需迁移；磁盘 > 引擎 = 需新引擎。
+    /// 无 manifest = 新目录（返回 (0, FORMAT_VER)）。
+    pub fn check_format(dir: impl AsRef<std::path::Path>) -> (u32, u32) {
+        let manifest_path = dir.as_ref().join("manifest.dat");
+        match std::fs::read(&manifest_path) {
+            Ok(bytes) => {
+                // 文件布局：[crc32 u32][MAGIC u32][FORMAT_VER u32]...
+                // 跳过 4 字节 crc 前缀读 magic + version。
+                if bytes.len() < 12 {
+                    return (0, persist::FORMAT_VER);
+                }
+                let magic = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                if magic != 0x5654_4D46 {
+                    return (0, persist::FORMAT_VER); // 损坏或非本格式
+                }
+                let disk_ver = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+                (disk_ver, persist::FORMAT_VER)
+            }
+            Err(_) => (0, persist::FORMAT_VER), // 无文件 = 新目录
+        }
+    }
+
+    /// **迁移骨架**（§3.4）：把数据目录从 `from_ver` 升级到当前引擎版本。
+    ///
+    /// 当前 FORMAT_VER=1，无历史老版本数据，所以 from_ver 只可能是 1（无操作）或损坏（报错）。
+    /// 真实迁移工具的逻辑（版本 1→2、2→3…）会在引入格式变更时逐版本实现，沿这个签名扩展。
+    pub fn migrate(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let (disk, current) = Self::check_format(&dir);
+        match disk.cmp(&current) {
+            std::cmp::Ordering::Equal => {
+                olog::log(olog::Level::Info, "migrate", &[("status", &"already current"), ("ver", &disk)]);
+                Ok(())
+            }
+            std::cmp::Ordering::Less => {
+                olog::log(olog::Level::Error, "migrate", &[
+                    ("status", &"old version not yet supported"),
+                    ("disk", &disk),
+                    ("engine", &current),
+                ]);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("从格式版本 {} 迁移到 {} 尚未实现（当前引擎无历史老版本数据）", disk, current),
+                ))
+            }
+            std::cmp::Ordering::Greater => {
+                olog::log(olog::Level::Error, "migrate", &[
+                    ("status", &"data newer than engine"),
+                    ("disk", &disk),
+                    ("engine", &current),
+                ]);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("数据格式版本 {} 比引擎支持的 {} 新，需升级引擎", disk, current),
+                ))
+            }
+        }
     }
 }
 
@@ -4461,5 +4529,32 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&backup_dir);
+    }
+
+    #[test]
+    fn format_version_check_and_migrate() {
+        // §3.4：版本检查 + 迁移。
+        let dir = std::env::temp_dir().join(format!("yt_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 新目录：无 manifest → check_format 返回 (0, FORMAT_VER)。
+        let (disk, engine) = WriteCoordinator::check_format(&dir);
+        assert_eq!(disk, 0, "新目录应报告版本 0");
+        assert_eq!(engine, WriteCoordinator::format_version());
+
+        // 灌数据落盘 → manifest 写了 FORMAT_VER。
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.ingest(vec![ev(1, 1, 1, None, None, &["x"])]);
+            wc.flush_memtable();
+        }
+        let (disk, engine) = WriteCoordinator::check_format(&dir);
+        assert_eq!(disk, engine, "落盘后磁盘版本 == 引擎版本");
+        assert_eq!(disk, 1, "当前 FORMAT_VER=1");
+
+        // migrate：版本相等 → Ok（无需迁移）。
+        assert!(WriteCoordinator::migrate(&dir).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
