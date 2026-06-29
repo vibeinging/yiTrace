@@ -281,6 +281,8 @@ impl HttpIngestServer {
             ("GET", "/v1/traces") => (200, self.traces_json(tenant)),
             // 检索端点（产品差异化的出口）：中文 BM25 + 可选属性过滤(agent/状态/时间/trace) + 租户隔离。
             ("POST", "/v1/search") => self.search_json(body, tenant),
+            // 生产可观测（§3.1）：Prometheus 文本格式，无需租户隔离（全局指标）。
+            ("GET", "/v1/metrics") => (200, self.coord.metrics()),
             // 控制台数据端点（前端 yitrace-console 对接）：会话游标分页 / 轮次 / trace span / span 详情。
             ("GET", "/v1/sessions") => (200, self.sessions_page_json(query)),
             _ => self.route_console(method, base),
@@ -639,6 +641,30 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("\"trace_id\":7"), "{body}");
         assert!(body.contains("\"total_input_tokens\":900"));
+    }
+
+    #[test]
+    fn route_metrics_reports_prometheus_format() {
+        // §3.1：/v1/metrics 输出 Prometheus 文本格式，含关键运行态指标。
+        let s = server();
+        // 灌点数据，让 memtable_rows > 0、committed_tail 推进。
+        s.route("POST", "/v1/ingest", BATCH);
+        let (status, body) = s.route("GET", "/v1/metrics", "");
+        assert_eq!(status, 200);
+        // Prometheus 格式特征：有 # HELP / # TYPE 注释、metric 行。
+        assert!(body.contains("# HELP "), "应有 HELP 注释:\n{body}");
+        assert!(body.contains("# TYPE "), "应有 TYPE 注释:\n{body}");
+        // 关键指标都在。
+        assert!(body.contains("yt_manifest_version"), "缺 manifest 版本:\n{body}");
+        assert!(body.contains("yt_memtable_rows"), "缺内存表行数:\n{body}");
+        assert!(body.contains("yt_wal_committed_tail"), "缺 WAL 尾:\n{body}");
+        assert!(body.contains("yt_segments_live"), "缺活跃段数:\n{body}");
+        assert!(body.contains("yt_readers_active"), "缺活跃读者:\n{body}");
+        // 灌过数据 → committed_tail > 0。
+        assert!(
+            body.lines().any(|l| l.starts_with("yt_wal_committed_tail ") && !l.ends_with(" 0")),
+            "灌数据后 committed_tail 应 > 0:\n{body}"
+        );
     }
 
     #[test]

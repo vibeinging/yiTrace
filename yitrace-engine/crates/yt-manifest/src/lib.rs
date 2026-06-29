@@ -75,6 +75,11 @@ impl Current {
         self.committed_tail.fetch_max(lsn.get(), Ordering::AcqRel);
     }
 
+    /// 已确认的最大 WAL LSN（可观测用，/metrics）。
+    pub fn committed_tail(&self) -> u64 {
+        self.committed_tail.load(Ordering::Acquire)
+    }
+
     /// 写者提交一个新 manifest 版本：原子换指针 + epoch +1。
     /// 调用方（WriteCoordinator）保证单写者串行；这里不做并发写保护之外的事。
     pub fn commit(&self, new_manifest: Manifest) {

@@ -2436,6 +2436,71 @@ impl WriteCoordinator {
     pub fn dead_count(&self) -> usize {
         self.dead_set.lock().unwrap().len()
     }
+
+    /// 生产可观测（§3.1）：聚合所有关键运行态，供 /metrics 端点输出。
+    /// 返回的字符串是 Prometheus 文本格式（每行一个 metric + 注释），零依赖、好排查。
+    /// 返回 owned String，调用者直接写进 HTTP body。
+    pub fn metrics(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        let version = self.current.version();
+        let segments = self.current.manifest().segments.len();
+        let memtable_rows = self.memtable_len();
+        let dead = self.dead_count();
+        let active_readers = self.current.active_reader_count();
+        let committed_tail = self.current.committed_tail();
+        let flush_threshold = self.flush_threshold.load(Ordering::Relaxed);
+        let filter_attrs = self.filter_attrs.lock().unwrap().len();
+        let fold_cache_entries = self.seg_fold_cache.lock().unwrap().map.len();
+        let bloom_count = self.seg_key_bloom.lock().unwrap().len();
+        let datasets = self.datasets.lock().unwrap().len();
+
+        // 确定性 manifest 版本（每次 commit +1）。
+        out.push_str("# HELP yt_manifest_version Manifest 版本号（每次 commit +1）。\n");
+        out.push_str("# TYPE yt_manifest_version gauge\n");
+        out.push_str(&format!("yt_manifest_version {version}\n\n"));
+
+        out.push_str("# HELP yt_segments_live 活跃段数（含 sealed/live/compacting）。\n");
+        out.push_str("# TYPE yt_segments_live gauge\n");
+        out.push_str(&format!("yt_segments_live {segments}\n\n"));
+
+        out.push_str("# HELP yt_memtable_rows 活内存表行数。\n");
+        out.push_str("# TYPE yt_memtable_rows gauge\n");
+        out.push_str(&format!("yt_memtable_rows {memtable_rows}\n\n"));
+
+        out.push_str("# HELP yt_segments_dead 待回收 dead 段数（compaction 摘下、等水位满足删）。\n");
+        out.push_str("# TYPE yt_segments_dead gauge\n");
+        out.push_str(&format!("yt_segments_dead {dead}\n\n"));
+
+        out.push_str("# HELP yt_readers_active 活跃快照读者数（pin 了某版本的）。\n");
+        out.push_str("# TYPE yt_readers_active gauge\n");
+        out.push_str(&format!("yt_readers_active {active_readers}\n\n"));
+
+        out.push_str("# HELP yt_wal_committed_tail 已确认的最大 WAL LSN。\n");
+        out.push_str("# TYPE yt_wal_committed_tail counter\n");
+        out.push_str(&format!("yt_wal_committed_tail {committed_tail}\n\n"));
+
+        out.push_str("# HELP yt_flush_threshold 内存表自动刷盘阈值（行数）。\n");
+        out.push_str("# TYPE yt_flush_threshold gauge\n");
+        out.push_str(&format!("yt_flush_threshold {flush_threshold}\n\n"));
+
+        out.push_str("# HELP yt_filter_attrs 检索过滤属性边车条目数。\n");
+        out.push_str("# TYPE yt_filter_attrs gauge\n");
+        out.push_str(&format!("yt_filter_attrs {filter_attrs}\n\n"));
+
+        out.push_str("# HELP yt_fold_cache_entries 段折叠缓存条目数（解码后的段）。\n");
+        out.push_str("# TYPE yt_fold_cache_entries gauge\n");
+        out.push_str(&format!("yt_fold_cache_entries {fold_cache_entries}\n\n"));
+
+        out.push_str("# HELP yt_seg_bloom_count 段级 key Bloom 条目数。\n");
+        out.push_str("# TYPE yt_seg_bloom_count gauge\n");
+        out.push_str(&format!("yt_seg_bloom_count {bloom_count}\n\n"));
+
+        out.push_str("# HELP yt_datasets 评测数据集数。\n");
+        out.push_str("# TYPE yt_datasets gauge\n");
+        out.push_str(&format!("yt_datasets {datasets}\n"));
+
+        out
+    }
 }
 
 #[cfg(test)]
