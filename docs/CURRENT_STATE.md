@@ -4,6 +4,8 @@
 > 这篇是**现状的唯一权威入口**。docs/ 下文档很多（41+ 篇，含多轮红队过程产物），新读者从这里看，不要被历史过程文档带偏。
 > 一句话：**项目走过一次大转向（openGauss 扩展 → 自研 Rust 引擎），当前承重的是 Rust 引擎；仓库里两套代码并存，本文讲清哪套是当前态。**
 
+> **命名沿革**：项目原名 yiTrace（crate 前缀 `yt-`），2026-06-29 全面更名 **yiTrace**（顶层目录 `yitrace-*`、crate `yt-*`、Rust 标识符 `yt_`、Prometheus 指标 `yt_*`、Python SDK 包 `yitrace`）。文档里的历史叙事仍以 yiTrace 指代原 yiTrace。废弃的 openGauss 扩展（tracevault-extension）已随更名删除。
+
 ---
 
 ## 1. 当前承重代码（看这些）

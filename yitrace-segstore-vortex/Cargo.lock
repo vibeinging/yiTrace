@@ -2717,53 +2717,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yt-core"
-version = "0.0.1"
-
-[[package]]
-name = "yt-engine"
-version = "0.0.1"
-dependencies = [
- "yt-core",
- "yt-manifest",
- "yt-memtable",
- "yt-wal",
-]
-
-[[package]]
-name = "yt-manifest"
-version = "0.0.1"
-dependencies = [
- "yt-core",
-]
-
-[[package]]
-name = "yt-memtable"
-version = "0.0.1"
-dependencies = [
- "yt-core",
-]
-
-[[package]]
-name = "yt-segstore-vortex"
-version = "0.0.1"
-dependencies = [
- "arrow",
- "tokio",
- "vortex",
- "yt-core",
- "yt-engine",
- "yt-wal",
-]
-
-[[package]]
-name = "yt-wal"
-version = "0.0.1"
-dependencies = [
- "yt-core",
-]
-
-[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2914,6 +2867,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "yt-core"
+version = "0.0.1"
+
+[[package]]
+name = "yt-engine"
+version = "0.0.1"
+dependencies = [
+ "yt-core",
+ "yt-manifest",
+ "yt-memtable",
+ "yt-wal",
+]
+
+[[package]]
+name = "yt-manifest"
+version = "0.0.1"
+dependencies = [
+ "yt-core",
+]
+
+[[package]]
+name = "yt-memtable"
+version = "0.0.1"
+dependencies = [
+ "yt-core",
+]
+
+[[package]]
+name = "yt-segstore-vortex"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "tokio",
+ "vortex",
+ "yt-core",
+ "yt-engine",
+ "yt-wal",
+]
+
+[[package]]
+name = "yt-wal"
+version = "0.0.1"
+dependencies = [
+ "yt-core",
 ]
 
 [[package]]
