@@ -143,6 +143,8 @@ const tracer = new Tracer({ exporter: new HttpExporter("http://localhost:7878/v1
 
 已埋点 OTLP/OpenInference 的应用**不改一行**即可灌入——`POST /v1/traces` 是标准 OTLP/HTTP 端点（OTel GenAI `gen_ai.*`、Arize `llm.*`）。
 
+> **完整端点契约**（方法/路径/请求体/响应字段/curl 示例/鉴权/租户）见 [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md)。写自己的前端或对接，照那份文档即可。⚠️ 注意：原始 API（`/v1/traces`、`/v1/search`）是 snake_case，控制台 API（`/v1/sessions`、`/v1/traces/:id` 等）是 camelCase，别混用。
+
 | 方法 | 端点 | 用途 |
 |---|---|---|
 | POST | `/v1/ingest` | 灌入 SDK 线格式 JSON 批（自定义高效格式） |

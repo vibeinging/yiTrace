@@ -72,6 +72,8 @@ curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2],"k"
 
 可选：`YT_TOKEN=secret cargo run ... --example server` 开 Bearer token 鉴权；`cargo test -p yt-engine --features gzip` 含请求体 gzip 解压。
 
+> **想用你自己的前端 / 看板对接 yiTrace？** 自带控制台没有特权——它和任何第三方前端调的是同一套 `/v1/*` JSON API。完整端点、请求/响应字段、curl 示例见 **[HTTP API 文档](docs/API_REFERENCE.md)**。
+
 列式段存储（Vortex）在独立 crate，依赖较重、单独构建：
 
 ```bash

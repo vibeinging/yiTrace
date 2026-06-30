@@ -74,6 +74,8 @@ curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2],"k"
 
 Optional: `YT_TOKEN=secret cargo run ... --example server` enables Bearer-token auth; `cargo test -p yt-engine --features gzip` adds request-body gzip support.
 
+> **Want to build your own UI / dashboard on top of yiTrace?** The bundled console has no privileges — it talks to the same `/v1/*` JSON API as any third-party frontend. See the **[HTTP API Reference](docs/API_REFERENCE.md)** for every endpoint, request/response schema, and curl examples.
+
 The columnar segment store (Vortex) lives in its own crate with heavier deps:
 
 ```bash
