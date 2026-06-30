@@ -1,8 +1,18 @@
 # yiTrace
 
-一台**单机、单目录、零外部依赖**的 AI Agent 可观测性数据库引擎。用 Rust 自研，把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供 trace 还原、中文检索、带过滤的语义召回、成本归因和评测闭环。
+> 单机、单目录、零外部依赖的 **AI Agent 可观测性数据库引擎**。自研 Rust，把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供 trace 还原、中文 BM25 检索、带过滤的向量召回、成本归因和评测闭环。
 
-> 状态：**能编译、能跑、测试全绿的验证级骨架**（引擎 94 · 列式段 7 · Python/TS SDK 各 8）。核心数据通路与检索能力已用代码验证，部分内核（生产级分词 / ANN / 查询执行）仍是可替换的占位实现，详见 [当前状态](#当前状态)。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![crates](https://img.shields.io/badge/crates-yt--*-e879c9)](yitrace-engine)
+[![status](https://img.shields.io/badge/status-validation%20skeleton-3fb950)](#当前状态)
+[![zero--dep](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#特性)
+
+**LLM 可观测性 · Trace 存储 · 中文检索 · 向量 ANN · 成本归因 · Eval 闭环 · OTLP 兼容**
+
+把 OTLP/OpenInference 埋点的应用、或自家 Agent 的 trace 灌进来——一条命令起服务，零外部依赖（引擎主体只用 Rust 标准库，离线可编译）。
+
+> 状态：**能编译、能跑、测试全绿的验证级骨架**（引擎 122 单测 + 6 集成 · 列式段 7 · Python/TS SDK 各 8）。核心数据通路、中文检索、带过滤向量召回、SIMD 距离内核、评测闭环均已用代码验证；部分生产级能力（jieba 真库 FFI / DataFusion 查询执行 / 无锁 manifest）是可替换的 trait 接缝占位，详见 [当前状态](#当前状态)。
 
 ---
 
@@ -133,18 +143,19 @@ with tracer.trace("反洗钱筛查") as t:
 
 **已用测试验证（真会失败的不变量，不是摆设）**：
 
-- 存储正确性：确定性 event_id 去重、四源折叠、快照隔离、崩溃重放幂等、compaction 重读合并、重启不丢。
+- 存储正确性：确定性 event_id 去重、四源折叠、快照隔离、崩溃重放幂等（含真 kill-9 测试）、compaction 重读合并、重启不丢。
 - 检索：中文 BM25 多概念召回完胜朴素子串；带过滤 ANN 的 in-graph 召回 ≫ post-filter（表驱动多选择性实测）。
+- 向量索引：磁盘多层 HNSW（落盘、重启不 rebuild）+ **SIMD 距离内核**（std::arch 运行时派发，x86_64 AVX-512/AVX2/SSE2、aarch64 NEON，768 维实测 ~5.5×）+ 邻居选择启发式（召回@10 = 1.00）+ 多度量（L2/Cosine/IP）。
 - 端到端：SDK / OTLP → HTTP → 折叠 → 检索 / eval / 成本，全程实测。
 - 列式段：Vortex 段写入 + 谓词下推 + 投影下推在引擎读路径跑通。
 
-**仍是验证级或占位实现**：
+**仍是验证级或待接**：
 
-- 中文分词是 CJK bigram（够用、是正路），未上 jieba 词级；图式 ANN 是单层 NSW，无量化/SIMD。生产级要换团队自有索引的 FFI。
-- eval 是规则 scorer，LLM-judge 待接。
+- **中文分词已生产级**：自研纯 Rust `ChineseTokenizer`（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌、开箱即用、支持自有词典叠加）。团队真 jieba 库走 FFI crate 接（`--features link`，引擎逻辑不动）。
+- eval 是规则 scorer，LLM-judge 待接；向量量化（PQ/SQ）、并发多线程建图待升级。
 - manifest 用 `RwLock<Arc<>>` 骨架，生产实现换 arc-swap + crossbeam-epoch 无锁化；查询执行待接 DataFusion。
 
-接口边界（`SegmentStore` / `Bm25Index` / `GraphIndex` trait）已立好，替换实现不动上层。
+接口边界（`SegmentStore` / `Tokenizer` / `Bm25Index` / `GraphIndex` trait）已立好，替换实现不动上层。
 
 ---
 
