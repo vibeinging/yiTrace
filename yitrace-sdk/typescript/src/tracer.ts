@@ -10,9 +10,9 @@
 //   });
 //
 // 每个 span 产出 SpanStart（带名）+ 若干 Log + SpanEnd（带状态+耗时），seq 在 span 内单调递增。
-import { EventType, type SpanEvent } from "./event.ts";
-import { ConsoleExporter, type Exporter } from "./exporter.ts";
-import { Snowflake } from "./snowflake.ts";
+import { EventType, type SpanEvent } from "./event";
+import { ConsoleExporter, type Exporter } from "./exporter";
+import { Snowflake } from "./snowflake";
 
 function nowNs(): bigint {
   return BigInt(Date.now()) * 1_000_000n;

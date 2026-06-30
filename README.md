@@ -1,74 +1,80 @@
 # yiTrace
 
-> 单机、单目录、零外部依赖的 **AI Agent 可观测性数据库引擎**。自研 Rust，把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供 trace 还原、中文 BM25 检索、带过滤的向量召回、成本归因和评测闭环。
+> A single-node, single-directory, **zero-external-dependency AI agent observability database engine**. Built from scratch in Rust. Ingest the traces your agents produce (multi-turn dialogue, tool calls, multi-agent collaboration) and get trace reconstruction, Chinese BM25 search, filtered vector recall, cost attribution, and an eval loop.
+
+**中文文档** · [English (this file)](README.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![crates](https://img.shields.io/badge/crates-yt--*-e879c9)](yitrace-engine)
-[![status](https://img.shields.io/badge/status-validation%20skeleton-3fb950)](#当前状态)
-[![zero--dep](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#特性)
+[![status](https://img.shields.io/badge/status-validation%20skeleton-3fb950)](#current-status)
+[![zero--dep](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#features)
 
-**LLM 可观测性 · Trace 存储 · 中文检索 · 向量 ANN · 成本归因 · Eval 闭环 · OTLP 兼容**
+**LLM Observability · Trace Store · Chinese Search · Vector ANN · Cost Attribution · Eval Loop · OTLP-compatible**
 
-把 OTLP/OpenInference 埋点的应用、或自家 Agent 的 trace 灌进来——一条命令起服务，零外部依赖（引擎主体只用 Rust 标准库，离线可编译）。
+Point your OTLP/OpenInference-instrumented app — or your own agent — at it. One command starts the server; the engine core uses only the Rust standard library and compiles offline.
 
-> 状态：**能编译、能跑、测试全绿的验证级骨架**（引擎 122 单测 + 6 集成 · 列式段 7 · Python/TS SDK 各 8）。核心数据通路、中文检索、带过滤向量召回、SIMD 距离内核、评测闭环均已用代码验证；部分生产级能力（jieba 真库 FFI / DataFusion 查询执行 / 无锁 manifest）是可替换的 trait 接缝占位，详见 [当前状态](#当前状态)。
+![yiTrace console](docs/images/console-overview.png)
 
----
-
-## 特性
-
-- **自研存储引擎**：append-only 事件 + 读时折叠（merge-on-read）、不可变段、写时复制 manifest、快照隔离。
-- **确定性 event_id**：事件 id = 内容哈希，跨 Python / TypeScript / 引擎逐字节一致。重传、崩溃重放都只算一次，token/成本不重复计数。
-- **中文检索**：自研倒排 + BM25，中文走无词典的 CJK bigram 分词，非连续多概念词也能按相关性召回排序。
-- **带过滤语义召回**：向量 ANN 把过滤条件下推进图搜索（in-graph filtering），稀疏过滤下召回不塌。
-- **混合检索**：关键词 + 语义两路用 RRF 融合。
-- **列式段存储**：可选接入 [Vortex](https://github.com/spiraldb/vortex)，谓词下推 + 投影下推已跑通（聚合/成本查询跳过大文本列）。
-- **崩溃安全**：WAL（fsync）、段文件、manifest、向量索引全部落盘，进程崩了重启数据和索引自动重建。
-- **生态入口**：原生接 OTLP / OpenInference（OTel GenAI `gen_ai.*`、Arize `llm.*`），已埋点的应用不改一行即可灌入。
-- **零依赖骨架**：引擎主体只用 Rust 标准库，`cargo test --offline` 离线即过；大依赖（Vortex 等）隔离在独立 crate。
+> **Status:** a compiling, runnable, fully-tested **validation skeleton** (engine 122 unit + 6 integration tests · columnar segment 7 · Python/TS SDK 8 each). Core data paths, Chinese search, filtered vector recall, the SIMD distance kernel, and the eval loop are all verified by code; production-grade pieces (real jieba FFI / DataFusion query exec / lock-free manifest) are swappable trait seams — see [Current Status](#current-status).
 
 ---
 
-## 快速开始
+## Features
 
-需要 Rust 1.80+。
+- **Self-built storage engine**: append-only events + read-time folding (merge-on-read), immutable segments, copy-on-write manifest, snapshot isolation.
+- **Deterministic `event_id`**: id = content hash, byte-identical across Python / TypeScript / engine. Retransmits and crash replays count once; tokens/cost never double-counted.
+- **Chinese search**: self-built inverted index + BM25, CJK-tokenized for unsegmented text — recall ranks by relevance across non-contiguous multi-concept queries.
+- **Filtered semantic recall**: vector ANN pushes the filter down into graph traversal (in-graph filtering); recall holds under sparse filters.
+- **Hybrid retrieval**: keyword + semantic fused via RRF.
+- **Columnar segment store**: optional [Vortex](https://github.com/spiraldb/vortex) backend with predicate pushdown + projection pushdown (cost/aggregation queries skip large-text columns).
+- **Crash-safe**: WAL (fsync), segment files, manifest, and vector index all persist — restart after a crash rebuilds data and indexes automatically.
+- **Ecosystem entry**: native OTLP / OpenInference ingestion (OTel GenAI `gen_ai.*`, Arize `llm.*`) — already-instrumented apps ingest without a line changed.
+- **Zero-dependency skeleton**: the engine body uses only the Rust standard library; `cargo test --offline` passes. Heavy deps (Vortex, etc.) are isolated in separate crates.
+
+---
+
+## Quick Start
+
+Requires Rust 1.80+.
 
 ```bash
 cd yitrace-engine
 
-# 跑全部测试（含并发压测 + socket HTTP 往返 + 带过滤 ANN 召回实测 + 重启不丢）
+# Run all tests (incl. concurrency stress + socket HTTP round-trip +
+# filtered-ANN recall + restart-keeps-data)
 cargo test --offline
 
-# 跑可运行 demo：灌几条假 trace → 折叠读出完整 trace → 中文搜「盗刷」→ 向量找相似 → 混合召回
+# Run the demo: ingest fake traces → fold into full traces →
+# search "盗刷" (fraud) → vector similarity → hybrid recall
 cargo run -p yt-engine --example demo --offline
 
-# 起 HTTP 摄入/查询服务（8 线程池）
+# Start the HTTP ingest/query server (8-thread pool, with seed eval data)
 cargo run -p yt-engine --example server
 ```
 
-服务起来后：
+Once the server is up (`http://127.0.0.1:7878`):
 
 ```bash
-# 摄入（SDK 线格式 JSON 批）
+# Ingest (SDK wire-format JSON batch)
 curl -XPOST localhost:7878/v1/ingest \
-  -d '[{"trace_id":7,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"7-1","status":0,"input_tokens":900,"logs":["开始"]}]'
+  -d '[{"trace_id":7,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"7-1","status":0,"input_tokens":900,"logs":["start"]}]'
 
-# trace 列表
+# Trace list
 curl localhost:7878/v1/traces
 
-# 中文检索 + 按 agent / 状态过滤
+# Chinese search + filter by agent / status
 curl -XPOST localhost:7878/v1/search \
   -d '{"text":"盗刷","k":10,"filter":{"agent_name":"风控","status":1}}'
 
-# 纯向量找相似 / 关键词+语义混合（RRF）
+# Pure-vector similarity / keyword+semantic hybrid (RRF)
 curl -XPOST localhost:7878/v1/search -d '{"vector":[0.1,0.2],"k":10}'
 curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2],"k":10}'
 ```
 
-可选：`YT_TOKEN=secret cargo run ... --example server` 开 Bearer token 鉴权；`cargo test -p yt-engine --features gzip` 含请求体 gzip 解压。
+Optional: `YT_TOKEN=secret cargo run ... --example server` enables Bearer-token auth; `cargo test -p yt-engine --features gzip` adds request-body gzip support.
 
-列式段存储（Vortex）在独立 crate，依赖较重、单独构建：
+The columnar segment store (Vortex) lives in its own crate with heavier deps:
 
 ```bash
 cd yitrace-segstore-vortex && cargo build
@@ -76,50 +82,49 @@ cd yitrace-segstore-vortex && cargo build
 
 ---
 
-## 架构
+## Architecture
 
 ```
 SDK(Py/TS) ─┐
-OTLP/HTTP  ─┼─► 摄入网关 ─► 写前日志(WAL,fsync) ─► 内存表 ──flush──► 不可变段(行式/Vortex列式)
-            │                                        │                    │
-            │                        确定性 event_id 去重          时间分层 compaction
-            ▼                                        ▼
-      检索索引(中文BM25 / 图式向量ANN / 属性边车)   读时四源折叠(内存+段+删除+晚到补写)
-            │                                        │
-            └──────────────► 检索 / 列表 / 树 / eval / 成本 ◄──────┘
-                        全程快照隔离 + 水位安全回收
+OTLP/HTTP  ─┼─► ingest gateway ─► WAL(fsync) ─► memtable ──flush──► immutable segment(row / Vortex columnar)
+            │                              │                  │
+            │              deterministic event_id dedup    tiered compaction
+            ▼                              ▼
+   search index(CJK BM25 / graph-vector ANN / attr sidecar)   4-source read-time fold(mem + seg + delete + late-write)
+            │                              │
+            └──────────────► search / list / tree / eval / cost ◄──────┘
+                       snapshot isolation + watermark-safe reclamation
 ```
 
-三个核心机制：
+Three core mechanisms:
 
-- **事件而非 span**：一个 span 拆成 `SpanStart`/`SpanEnd`/属性补写等多个不可变事件，读时按身份折叠成一条完整 span。写入永远 append-only，无原地更新。
-- **确定性 event_id** = `hash(ext_span_id, seq, event_type)`：去重键由内容决定，重传/重放天然幂等。
-- **四源折叠读**：同一快照上跨「内存表 + 段 + 删除位图 + 晚到补写」归并去重，去重键就是 event_id。
+- **Events, not spans**: a span is split into `SpanStart` / `SpanEnd` / attribute-write immutable events; the reader folds them by identity into one complete span. Writes are always append-only — no in-place updates.
+- **Deterministic `event_id`** = `hash(ext_span_id, seq, event_type)`: the dedup key is content-derived, so retransmit/replay is naturally idempotent.
+- **4-source read fold**: across one snapshot, merge-dedupe "memtable + segments + delete bitmap + late write-back"; the dedup key is `event_id`.
 
-更完整的内部设计见 [`docs/design/2026-06-22_yitrace-技术文档.md`](docs/design/2026-06-22_yitrace-技术文档.md)。
+Full internal design: [`docs/design/2026-06-22_yitrace-技术文档.md`](docs/design/2026-06-22_yitrace-技术文档.md).
 
 ---
 
-## 工程结构
+## Repository Layout
 
 ```
-vex-x/
-├── yitrace-engine/          # 引擎（Rust workspace，std-only 零依赖）
+yitrace-engine/          # engine (Rust workspace, std-only, zero-dep)
 │   └── crates/
-│       ├── yt-core             # 核心类型：标识、确定性 event_id、不可变 Manifest、折叠算法
-│       ├── yt-manifest         # 单写者-多读者：快照 pin 协议、回收水位（正确性脊梁）
-│       ├── yt-wal              # 写前日志：fsync 落盘、崩溃安全帧、零依赖二进制编码
-│       ├── yt-memtable         # 活内存表：上下界双水位 + 受 gate 的 evict
-│       └── yt-engine           # 协调器、四源折叠读、检索、eval、HTTP/OTLP
-├── yitrace-segstore-vortex/ # 列式段存储（Vortex），实现引擎的 SegmentStore trait
-└── yitrace-sdk/             # 打点 SDK
-    ├── python/                  # Python：嵌套 span、token 计数、确定性 event_id
-    └── typescript/              # TypeScript：同款语义，BigInt 处理大整数精度
+│       ├── yt-core         # core types: ids, deterministic event_id, immutable Manifest, fold
+│       ├── yt-manifest     # single-writer/multi-reader: snapshot pin, reclamation watermark
+│       ├── yt-wal          # write-ahead log: fsync, crash-safe frames, zero-dep binary encoding
+│       ├── yt-memtable     # live memtable: dual low/high watermark + gated evict
+│       └── yt-engine       # coordinator, 4-source fold, search, eval, HTTP/OTLP
+yitrace-segstore-vortex/ # columnar segment store (Vortex), implements SegmentStore
+yitrace-sdk/             # instrumentation SDK
+    ├── python/             # Python: nested spans, token counting, deterministic event_id
+    └── typescript/         # TypeScript: same semantics, BigInt for large-int precision
 ```
 
 ---
 
-## SDK 用法
+## SDK
 
 **Python**
 
@@ -128,42 +133,42 @@ from yitrace import Tracer, ConsoleExporter
 
 tracer = Tracer(exporter=ConsoleExporter(), node_id=1)
 
-with tracer.trace("反洗钱筛查") as t:
-    with t.span("交易风控") as root:
-        with root.span("调用LLM研判") as child:   # 嵌套自动建父子
-            child.log("研判结论 需人工复核")
+with tracer.trace("AML screening") as t:
+    with t.span("txn risk control") as root:
+        with root.span("LLM judgment") as child:   # nesting auto-builds parent/child
+            child.log("needs human review")
             child.set_status(0)
 ```
 
-嵌套 `span` 自动建父子关系，trace 在引擎里还原成树。每个 span 产出 `SPAN_START` + 若干 `LOG` + `SPAN_END`，进引擎后按 `(trace, span)` 折叠成一条完整 span。Python 与 TypeScript SDK 对同一身份算出**逐字节一致**的 event_id（用例里有交叉校验）。详见各自 README：[Python](yitrace-sdk/python/README.md) · [TypeScript](yitrace-sdk/typescript/README.md)。
+Nested `span` calls auto-build parent/child edges; the trace reconstructs as a tree in the engine. Each span emits `SPAN_START` + `LOG`s + `SPAN_END`, folded by `(trace, span)` into one complete span on ingest. Python and TypeScript SDKs compute **byte-identical** `event_id` for the same identity (cross-checked in tests). See [Python](yitrace-sdk/python/README.md) · [TypeScript](yitrace-sdk/typescript/README.md).
 
 ---
 
-## 当前状态
+## Current Status
 
-**已用测试验证（真会失败的不变量，不是摆设）**：
+**Verified by tests (real failing invariants, not window dressing):**
 
-- 存储正确性：确定性 event_id 去重、四源折叠、快照隔离、崩溃重放幂等（含真 kill-9 测试）、compaction 重读合并、重启不丢。
-- 检索：中文 BM25 多概念召回完胜朴素子串；带过滤 ANN 的 in-graph 召回 ≫ post-filter（表驱动多选择性实测）。
-- 向量索引：磁盘多层 HNSW（落盘、重启不 rebuild）+ **SIMD 距离内核**（std::arch 运行时派发，x86_64 AVX-512/AVX2/SSE2、aarch64 NEON，768 维实测 ~5.5×）+ 邻居选择启发式（召回@10 = 1.00）+ 多度量（L2/Cosine/IP）。
-- 端到端：SDK / OTLP → HTTP → 折叠 → 检索 / eval / 成本，全程实测。
-- 列式段：Vortex 段写入 + 谓词下推 + 投影下推在引擎读路径跑通。
+- Storage correctness: deterministic `event_id` dedup, 4-source fold, snapshot isolation, crash-replay idempotency (incl. a real `kill -9` test), compaction re-read merge, restart-keeps-data.
+- Search: Chinese BM25 multi-concept recall beats naive substring; in-graph ANN recall ≫ post-filter (table-driven, multi-selectivity).
+- Vector index: on-disk multi-layer HNSW (persists, no rebuild on restart) + **SIMD distance kernel** (std::arch runtime dispatch — x86_64 AVX-512/AVX2/SSE2, aarch64 NEON, ~5.5× on 768-dim) + neighbor-selection heuristic (recall@10 = 1.00) + multi-metric (L2/Cosine/IP).
+- End-to-end: SDK / OTLP → HTTP → fold → search / eval / cost, all exercised.
+- Columnar segment: Vortex write + predicate pushdown + projection pushdown wired into the read path.
 
-**仍是验证级或待接**：
+**Still validation-grade or pending:**
 
-- **中文分词已生产级**：自研纯 Rust `ChineseTokenizer`（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌、开箱即用、支持自有词典叠加）。团队真 jieba 库走 FFI crate 接（`--features link`，引擎逻辑不动）。
-- eval 是规则 scorer，LLM-judge 待接；向量量化（PQ/SQ）、并发多线程建图待升级。
-- manifest 用 `RwLock<Arc<>>` 骨架，生产实现换 arc-swap + crossbeam-epoch 无锁化；查询执行待接 DataFusion。
+- **Chinese tokenization is production-grade**: self-built pure-Rust `ChineseTokenizer` (dictionary DAG + max-probability DP, 349k-word jieba dict embedded, pluggable user dict). The team's real jieba lib plugs in via an FFI crate (`--features link`, engine logic untouched).
+- Eval uses a rule scorer; LLM-judge pending. Vector quantization (PQ/SQ) and concurrent multi-threaded build are future upgrades.
+- Manifest uses a `RwLock<Arc<>>` skeleton; production swaps in arc-swap + crossbeam-epoch. Query execution via DataFusion is pending.
 
-接口边界（`SegmentStore` / `Tokenizer` / `Bm25Index` / `GraphIndex` trait）已立好，替换实现不动上层。
+The trait seams (`SegmentStore` / `Tokenizer` / `Bm25Index` / `GraphIndex`) are in place — swapping implementations doesn't touch the upper layers.
 
 ---
 
-## 构建要求
+## Build Requirements
 
-- Rust 1.80+（引擎，edition 2021，零外部依赖）
-- Rust 1.91+（`yitrace-segstore-vortex`，依赖 Vortex 0.75 + Arrow 58 + Tokio）
-- Python 3.8+ / Node 18+（SDK）
+- Rust 1.80+ (engine, edition 2021, zero external deps)
+- Rust 1.91+ (`yitrace-segstore-vortex`, deps Vortex 0.75 + Arrow 58 + Tokio)
+- Python 3.8+ / Node 18+ (SDK)
 
 ## License
 

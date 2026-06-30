@@ -1,17 +1,46 @@
 {
   "name": "@yitrace/trace-sdk",
   "version": "0.0.1",
-  "description": "yiTrace 打点 SDK (TypeScript)",
+  "description": "yiTrace instrumentation SDK (TypeScript) — emit trace events with deterministic, engine-matching event_id",
   "type": "module",
   "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "observability",
+    "llm",
+    "agent",
+    "tracing",
+    "trace",
+    "opentelemetry"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vibeinging/yiTrace",
+    "directory": "yitrace-sdk/typescript"
+  },
+  "homepage": "https://github.com/vibeinging/yiTrace",
+  "bugs": {
+    "url": "https://github.com/vibeinging/yiTrace/issues"
   },
   "scripts": {
-    "test": "tsx --test test/test_sdk.ts"
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx --test test/test_sdk.ts",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.6.0"
   }
 }

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yitrace"
+version = "0.0.1"
+description = "yiTrace instrumentation SDK — emit trace events with deterministic, engine-matching event_id"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "yiTrace" }]
+keywords = ["observability", "llm", "agent", "tracing", "trace", "opentelemetry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
+dependencies = []  # 纯标准库，零运行时依赖
+
+[project.urls]
+Homepage = "https://github.com/vibeinging/yiTrace"
+Repository = "https://github.com/vibeinging/yiTrace"
+Issues = "https://github.com/vibeinging/yiTrace/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["yitrace"]

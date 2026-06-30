@@ -1,5 +1,5 @@
 // 事件导出。
-import { toWire, type SpanEvent } from "./event.ts";
+import { toWire, type SpanEvent } from "./event";
 
 export interface Exporter {
   export(e: SpanEvent): void;
