@@ -5,7 +5,7 @@
 ## 项目结构
 
 ```
-vex-x/
+yiTrace/
 ├── yitrace-engine/              # 自研 Rust 引擎(工作区,零外部依赖)
 │   ├── crates/
 │   │   ├── yt-core/                # 核心类型:event_id / Manifest / 折叠算法
