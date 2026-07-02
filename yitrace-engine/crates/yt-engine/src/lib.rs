@@ -1386,12 +1386,27 @@ impl WriteCoordinator {
         self.ingest(recs)
     }
 
+    /// HTTP 网关专用摄入：租户来自鉴权上下文（如 `X-Tenant-Id`），覆盖 wire body 里的 tenant_id。
+    /// 这是多租户安全边界；SDK/客户端可以重复发送 body，但不能自选或伪造租户。
+    pub fn ingest_wire_for_tenant(&self, mut records: Vec<WireRecord>, tenant: Option<u64>) -> WalLsn {
+        for r in &mut records {
+            r.tenant_id = tenant;
+        }
+        self.ingest_wire(records)
+    }
+
     /// 摄入 OTLP/OpenInference 标准 trace（OTLP/HTTP JSON）：经适配器映射成 WireRecord 后走正常摄入。
     /// 这是「生态入口」——已用 OpenTelemetry / OpenInference 埋点的 agent 应用不改打点即可灌进来。
     /// 解析失败返回 Err（调用方/HTTP 网关据此回 400）。
     pub fn ingest_otlp(&self, body: &str) -> Result<WalLsn, String> {
         let wires = parse_otlp_traces(body)?;
         Ok(self.ingest_wire(wires))
+    }
+
+    /// HTTP 网关专用 OTLP 摄入：OTLP attributes 里带的 tenant 也不作为安全边界，统一由请求上下文覆盖。
+    pub fn ingest_otlp_for_tenant(&self, body: &str, tenant: Option<u64>) -> Result<WalLsn, String> {
+        let wires = parse_otlp_traces(body)?;
+        Ok(self.ingest_wire_for_tenant(wires, tenant))
     }
 
     /// 设置内存表自动刷盘阈值（行数）。
@@ -1725,7 +1740,12 @@ impl WriteCoordinator {
     /// 取原文要读全列。当前没有 session→trace 倒排，按 session_id **扫全量过滤**（O(全库)）——
     /// 会话视图是低频操作可接受；真要高频再加 session 边车索引。
     pub fn load_session_timeline(&self, snap: &Snapshot, session_id: u64) -> SessionTimeline {
-        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
+        self.load_session_timeline_query(snap, session_id, &TraceQuery::all())
+    }
+
+    /// 带查询约束的会话时间线。控制台网关用它把 tenant 过滤压到折叠读取层。
+    pub fn load_session_timeline_query(&self, snap: &Snapshot, session_id: u64, q: &TraceQuery) -> SessionTimeline {
+        let (spans, _) = self.read_spans_query(snap, q);
         // 按 trace 分组本会话的 span（BTreeMap → trace_id 升序 = 轮次序）。
         let mut by_trace: BTreeMap<u64, Vec<FoldedSpan>> = BTreeMap::new();
         for s in spans {
@@ -1783,10 +1803,32 @@ impl WriteCoordinator {
         self.session_idx.lock().unwrap().rows()
     }
 
+    /// 控制台用：按请求租户隔离的会话行列表。
+    /// 无租户时走增量边车；有租户时基于已过滤 span 临时聚合，避免全局 session_idx 泄露别的租户。
+    pub fn console_sessions_for_tenant(&self, snap: &Snapshot, tenant: Option<u64>) -> Vec<ConsoleSession> {
+        let Some(t) = tenant else { return self.console_sessions(snap) };
+        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all().for_tenant(t));
+        let mut idx = SessionIndex::default();
+        idx.rebuild(&spans);
+        idx.rows()
+    }
+
     /// 控制台用：一条 trace 的折叠 span（瀑布）。引擎不存 span 的 kind/name/起始时刻，这里**派生**：
     /// kind = agent>tool>model>other；name = 同源；起始时刻按 span_id 升序累加 duration 顺排（逻辑瀑布）。
     pub fn console_trace_spans(&self, snap: &Snapshot, trace_id: u64) -> Vec<ConsoleSpan> {
-        let (mut spans, _) = self.read_spans_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX));
+        self.console_trace_spans_for_tenant(snap, trace_id, None)
+    }
+
+    /// 控制台用：按请求租户隔离的一条 trace 折叠 span。
+    pub fn console_trace_spans_for_tenant(
+        &self,
+        snap: &Snapshot,
+        trace_id: u64,
+        tenant: Option<u64>,
+    ) -> Vec<ConsoleSpan> {
+        let mut q = TraceQuery::trace(trace_id, i64::MIN, i64::MAX);
+        q.tenant_id = tenant;
+        let (mut spans, _) = self.read_spans_query(snap, &q);
         spans.sort_by_key(|s| s.span_id);
         let mut start = 0u64;
         spans

@@ -5,7 +5,7 @@ export interface Exporter {
   export(e: SpanEvent): void;
   // 一次收一批。能真正批量的传输（HttpExporter）实现成单次请求；没实现就由调用方逐条转。
   exportBatch?(events: SpanEvent[]): void | Promise<void>;
-  close?(): void;
+  close?(): void | Promise<void>;
 }
 
 // 打印成 JSON 行（调试用）。
@@ -28,6 +28,7 @@ export class BatchExporter implements Exporter {
   private sink: Exporter;
   private max: number;
   private buf: SpanEvent[] = [];
+  private pending: Promise<void> = Promise.resolve();
 
   constructor(sink: Exporter, max = 256) {
     this.sink = sink;
@@ -39,18 +40,25 @@ export class BatchExporter implements Exporter {
     if (this.buf.length >= this.max) this.flush();
   }
 
-  flush(): void {
-    if (this.buf.length === 0) return;
+  async flush(): Promise<void> {
+    if (this.buf.length === 0) return this.pending;
     const batch = this.buf;
     this.buf = [];
-    // 整批一次交下游（sink 能批就批，否则逐条）。
-    if (this.sink.exportBatch) void this.sink.exportBatch(batch);
-    else for (const e of batch) this.sink.export(e);
+    const send = async () => {
+      // 整批一次交下游（sink 能批就批，否则逐条）。
+      if (this.sink.exportBatch) await this.sink.exportBatch(batch);
+      else for (const e of batch) this.sink.export(e);
+    };
+    const next = this.pending.then(send);
+    this.pending = next;
+    void next.catch(() => {});
+    return next;
   }
 
-  close(): void {
-    this.flush();
-    this.sink.close?.();
+  async close(): Promise<void> {
+    await this.flush();
+    await this.pending;
+    await this.sink.close?.();
   }
 }
 
@@ -69,6 +77,7 @@ export class HttpExporter implements Exporter {
   private url: string;
   private max: number;
   private maxBuffered: number;
+  private headers: Record<string, string>;
   private onError: (err: unknown, dropped: number) => void;
   private buf: SpanEvent[] = [];
 
@@ -78,6 +87,9 @@ export class HttpExporter implements Exporter {
       url?: string;
       max?: number;
       maxBuffered?: number;
+      headers?: Record<string, string>;
+      token?: string;
+      tenantId?: bigint | number | string;
       onError?: (err: unknown, dropped: number) => void;
     } = {},
   ) {
@@ -85,6 +97,9 @@ export class HttpExporter implements Exporter {
     this.url = o.url ?? "http://127.0.0.1:7878/v1/ingest";
     this.max = o.max ?? 256;
     this.maxBuffered = o.maxBuffered ?? this.max * 16;
+    this.headers = { ...(o.headers ?? {}) };
+    if (o.token !== undefined) this.headers.Authorization = `Bearer ${o.token}`;
+    if (o.tenantId !== undefined) this.headers["X-Tenant-Id"] = String(o.tenantId);
     this.onError = o.onError ?? ((err) => console.error("[yitrace] 上报失败:", err));
   }
 
@@ -109,7 +124,7 @@ export class HttpExporter implements Exporter {
     try {
       const res = await fetch(this.url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...this.headers },
         body: JSON.stringify(events.map(toWire)),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);

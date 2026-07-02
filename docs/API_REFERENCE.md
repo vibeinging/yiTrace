@@ -26,12 +26,20 @@ cd yitrace-engine && cargo run -p yt-engine --example server
 
 ### 鉴权
 - **不配 token（默认）**：所有请求放行。仅限本机开发。
-- **配了 token**（`YT_TOKEN=secret cargo run ... --example server`）：所有请求须带 `Authorization: Bearer <token>` 头，精确匹配，否则 401。
+- **配了 token**（`YT_TOKEN=secret cargo run ... --example server`）：`/v1/*` API 请求须带 `Authorization: Bearer <token>` 头，精确匹配，否则 401。控制台静态页面 `GET /` 仍可匿名加载，页面里的 API 请求再带 token。
+
+控制台前端的 HTTP 客户端支持：
+
+| 配置 | 用途 |
+|---|---|
+| `VITE_API_TOKEN` | 构建时注入 `Authorization: Bearer <token>` |
+| `VITE_TENANT_ID` | 构建时注入 `X-Tenant-Id` |
+| `localStorage["yitrace.tenantId"]` | 浏览器运行时设置租户（未配置 `VITE_TENANT_ID` 时生效） |
 
 ### 多租户隔离
 - 租户从 **`X-Tenant-Id` 请求头**取（数字），**不信任请求体**——客户端不能越权选别人的租户。
 - 影响的端点：`GET /v1/traces`、`POST /v1/search`、`GET /v1/sessions`（及 turns / trace / span 详情）都按 `X-Tenant-Id` 过滤，只返回该租户的数据。
-- 摄入时（`POST /v1/ingest` / `POST /v1/traces`）：trace 自带 `tenant_id` 字段，但查询侧只认头。
+- 摄入时（`POST /v1/ingest` / `POST /v1/traces`）：服务端会用 `X-Tenant-Id` 覆盖 body / OTLP attributes 里的租户字段。未带租户头时数据按 `tenant_id=null` 写入，仅适合本机开发或单租户调试。
 
 ### 状态码
 | 码 | 含义 |
@@ -106,7 +114,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `input_text`/`output_text` | string? | 大文本（晚物化） |
 | `logs` | string[] | 日志行 |
 
-**响应**：`200 {"ok":true,"ingested":N}`（N=实际灌入条数）。
+**响应**：`200 {"ingested":N}`（N=实际灌入条数）。
 
 > **去重**：`event_id = hash(ext_span_id, seq, event_type)`，内容决定身份——重传/崩溃重放天然幂等，token/成本不重复计数。
 

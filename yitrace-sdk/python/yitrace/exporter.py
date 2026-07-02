@@ -65,10 +65,23 @@ class BatchExporter(Exporter):
 class HttpExporter(Exporter):
     """攒批并 POST 到引擎摄入端 /v1/ingest（线格式 JSON 数组）。"""
 
-    def __init__(self, url: str = "http://127.0.0.1:7878/v1/ingest", max_batch: int = 256, timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        url: str = "http://127.0.0.1:7878/v1/ingest",
+        max_batch: int = 256,
+        timeout: float = 5.0,
+        headers: dict[str, str] | None = None,
+        token: str | None = None,
+        tenant_id: int | str | None = None,
+    ) -> None:
         self.url = url
         self.max = max_batch
         self.timeout = timeout
+        self.headers = dict(headers or {})
+        if token is not None:
+            self.headers["Authorization"] = f"Bearer {token}"
+        if tenant_id is not None:
+            self.headers["X-Tenant-Id"] = str(tenant_id)
         self._buf: list[SpanEvent] = []
 
     def export(self, event: SpanEvent) -> None:
@@ -90,7 +103,8 @@ class HttpExporter(Exporter):
         if not events:
             return
         body = json.dumps([e.to_wire() for e in events]).encode("utf-8")
-        req = urllib.request.Request(self.url, data=body, method="POST", headers={"Content-Type": "application/json"})
+        req_headers = {"Content-Type": "application/json", **self.headers}
+        req = urllib.request.Request(self.url, data=body, method="POST", headers=req_headers)
         urllib.request.urlopen(req, timeout=self.timeout).read()
 
     def close(self) -> None:

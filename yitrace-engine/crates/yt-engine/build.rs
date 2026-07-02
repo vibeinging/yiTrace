@@ -14,9 +14,12 @@ fn main() {
     if root.exists() {
         walk(root, root, &mut entries);
     }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut code = String::from("// 自动生成，勿改。\npub static ASSETS: &[(&str, &str, &[u8])] = &[\n");
-    for (url, ct, abspath) in &entries {
-        code.push_str(&format!("    ({url:?}, {ct:?}, include_bytes!({abspath:?})),\n"));
+    for (url, ct, relpath) in &entries {
+        code.push_str(&format!(
+            "    ({url:?}, {ct:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {relpath:?}))),\n"
+        ));
     }
     code.push_str("];\n");
     fs::write(Path::new(&out).join("assets.rs"), code).unwrap();
@@ -28,10 +31,11 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, &'static str, String)>) 
         let p = entry.path();
         if p.is_dir() {
             walk(root, &p, out);
-        } else if let Ok(abs) = fs::canonicalize(&p) {
+        } else {
             let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
             let url = format!("/{rel}");
-            out.push((url, content_type(&p), abs.to_string_lossy().into_owned()));
+            let relpath = p.to_string_lossy().replace('\\', "/");
+            out.push((url, content_type(&p), relpath));
         }
     }
 }

@@ -1,5 +1,5 @@
 // SDK 测试。`node test/test_sdk.ts`（Node 23+ 原生跑 .ts）。
-import { CollectingExporter, EventType, HttpExporter, Tracer, eventId, toWire, type SpanEvent } from "../src/index.ts";
+import { BatchExporter, CollectingExporter, EventType, HttpExporter, Tracer, eventId, toWire, type Exporter, type SpanEvent } from "../src/index.ts";
 
 let passed = 0;
 function check(cond: boolean, msg: string): void {
@@ -131,13 +131,38 @@ async function asyncTests(): Promise<void> {
     await new Promise((r) => setTimeout(r, 0));
     check(errs === 1, "失败回调 onError 一次");
     // 失败的批退回缓冲：恢复 fetch 后 flush 应把它发出去（成功 → 缓冲清空）。
-    let posted = 0;
-    globalThis.fetch = (() => Promise.resolve(new Response("", { status: 200 }))) as typeof fetch;
+    let postedHeaders: HeadersInit | undefined;
+    globalThis.fetch = ((_url, init) => {
+      postedHeaders = init?.headers;
+      return Promise.resolve(new Response("", { status: 200 }));
+    }) as typeof fetch;
     await exp.flush();
-    posted++;
-    check(posted === 1 && errs === 1, "恢复后重试成功,不再报错（trace 没被静默丢）");
+    check(postedHeaders !== undefined && errs === 1, "恢复后重试成功,不再报错（trace 没被静默丢）");
+
+    const authed = new HttpExporter({ url: "http://x", token: "secret", tenantId: 7n });
+    await authed.exportBatch([ev]);
+    const headers = postedHeaders as Record<string, string>;
+    check(headers.Authorization === "Bearer secret" && headers["X-Tenant-Id"] === "7", "HttpExporter 透传 auth/tenant header");
+
+    let sent = 0;
+    let closeSawSent = false;
+    const asyncSink: Exporter = {
+      export: () => {},
+      exportBatch: async (events) => {
+        await new Promise((r) => setTimeout(r, 0));
+        sent += events.length;
+      },
+      close: async () => {
+        closeSawSent = sent === 1;
+      },
+    };
+    const batch = new BatchExporter(asyncSink, 1);
+    batch.export(ev);
+    await batch.close();
+    check(sent === 1 && closeSawSent, "BatchExporter.close 等待在途异步 exportBatch 完成");
+
     passed++;
-    console.log("OK  HttpExporter 失败退回缓冲 + onError 上报");
+    console.log("OK  HttpExporter 失败退回缓冲 + headers; BatchExporter async close");
   } finally {
     globalThis.fetch = origFetch;
   }

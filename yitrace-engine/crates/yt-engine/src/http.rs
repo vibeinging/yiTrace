@@ -134,20 +134,21 @@ impl HttpIngestServer {
             self.audit(&method, &path, 413, content_length);
             return;
         }
-        // ② 鉴权：未带/错 token → 401，且不读 body。
-        if !self.authorized(auth.as_deref()) {
-            self.respond(&mut stream, 401, r#"{"error":"unauthorized"}"#);
-            self.audit(&method, &path, 401, content_length);
-            return;
-        }
-
-        // ③ 静态资源（内嵌的控制台前端）：GET 且非 /v1/* → 从编译期内嵌资源服务（无 body）。
+        // ② 静态资源（内嵌的控制台前端）：页面本身匿名可取，API 仍按下面 Bearer 鉴权。
+        // 浏览器访问 `/` 不能带 Authorization 头；把鉴权留给 /v1/* 数据请求。
         if method == "GET" && !path.starts_with("/v1") {
             let p = path.split('?').next().unwrap_or("/");
             if self.serve_static(&mut stream, p) {
                 self.audit(&method, &path, 200, 0);
                 return;
             }
+        }
+
+        // ③ 鉴权：未带/错 token → 401，且不读 body。
+        if !self.authorized(auth.as_deref()) {
+            self.respond(&mut stream, 401, r#"{"error":"unauthorized"}"#);
+            self.audit(&method, &path, 401, content_length);
+            return;
         }
 
         let mut body_buf = vec![0u8; content_length];
@@ -268,13 +269,13 @@ impl HttpIngestServer {
             ("POST", "/v1/ingest") => match parse_wire_batch(body) {
                 Ok(recs) => {
                     let n = recs.len();
-                    self.coord.ingest_wire(recs);
+                    self.coord.ingest_wire_for_tenant(recs, tenant);
                     (200, format!(r#"{{"ingested":{n}}}"#))
                 }
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
             // OTLP/HTTP 标准 trace 端点（生态入口）：OpenTelemetry / OpenInference 埋点直接 POST 到这里。
-            ("POST", "/v1/traces") => match self.coord.ingest_otlp(body) {
+            ("POST", "/v1/traces") => match self.coord.ingest_otlp_for_tenant(body, tenant) {
                 Ok(_) => (200, r#"{"partialSuccess":{}}"#.to_string()), // OTLP 约定的成功响应体
                 Err(e) => (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
             },
@@ -284,19 +285,19 @@ impl HttpIngestServer {
             // 生产可观测（§3.1）：Prometheus 文本格式，无需租户隔离（全局指标）。
             ("GET", "/v1/metrics") => (200, self.coord.metrics()),
             // 控制台数据端点（前端 yitrace-console 对接）：会话游标分页 / 轮次 / trace span / span 详情。
-            ("GET", "/v1/sessions") => (200, self.sessions_page_json(query)),
-            _ => self.route_console(method, base),
+            ("GET", "/v1/sessions") => (200, self.sessions_page_json(query, tenant)),
+            _ => self.route_console(method, base, tenant),
         }
     }
 
     /// 带路径参数的控制台路由（/v1/sessions/:id/turns 等）。
-    fn route_console(&self, method: &str, base: &str) -> (u16, String) {
+    fn route_console(&self, method: &str, base: &str, tenant: Option<u64>) -> (u16, String) {
         let segs: Vec<&str> = base.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         match (method, segs.as_slice()) {
-            ("GET", ["v1", "sessions", id, "turns"]) => self.turns_json(id),
-            ("GET", ["v1", "traces", id]) => self.trace_json(id),
-            ("GET", ["v1", "traces", id, "steps"]) => self.steps_json(id),
-            ("GET", ["v1", "traces", id, "spans", sid]) => self.span_detail_json(id, sid),
+            ("GET", ["v1", "sessions", id, "turns"]) => self.turns_json(id, tenant),
+            ("GET", ["v1", "traces", id]) => self.trace_json(id, tenant),
+            ("GET", ["v1", "traces", id, "steps"]) => self.steps_json(id, tenant),
+            ("GET", ["v1", "traces", id, "spans", sid]) => self.span_detail_json(id, sid, tenant),
             _ => (404, r#"{"error":"not found"}"#.to_string()),
         }
     }
@@ -377,7 +378,7 @@ impl HttpIngestServer {
 
     /// GET /v1/sessions?cursor=&limit=：会话列表，offset 游标分页。
     /// `console_sessions` 走增量边车索引（摄入时 O(1) 维护），分页不全扫（见引擎实现）。
-    fn sessions_page_json(&self, query: &str) -> String {
+    fn sessions_page_json(&self, query: &str, tenant: Option<u64>) -> String {
         let (mut offset, mut limit, mut filter) = (0usize, 50usize, String::new());
         for kv in query.split('&') {
             if let Some((k, v)) = kv.split_once('=') {
@@ -390,7 +391,7 @@ impl HttpIngestServer {
             }
         }
         let snap = self.coord.pin_snapshot();
-        let mut all = self.coord.console_sessions(&snap);
+        let mut all = self.coord.console_sessions_for_tenant(&snap, tenant);
         if !filter.is_empty() {
             all.retain(|s| s.title.contains(&filter) || s.session_id.to_string().contains(&filter));
         }
@@ -417,16 +418,18 @@ impl HttpIngestServer {
     }
 
     /// GET /v1/sessions/:id/turns：一个会话的轮次（按时序）。
-    fn turns_json(&self, id: &str) -> (u16, String) {
+    fn turns_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
         let Ok(sid) = id.parse::<u64>() else { return (400, r#"{"error":"bad session id"}"#.to_string()) };
         let snap = self.coord.pin_snapshot();
-        let tl = self.coord.load_session_timeline(&snap, sid);
+        let mut q = TraceQuery::all();
+        q.tenant_id = tenant;
+        let tl = self.coord.load_session_timeline_query(&snap, sid, &q);
         let items: Vec<String> = tl
             .turns
             .iter()
             .map(|t| {
                 // 真实耗时：对该轮 trace 求 span 时长之和（毫秒）。
-                let spans = self.coord.console_trace_spans(&snap, t.trace_id);
+                let spans = self.coord.console_trace_spans_for_tenant(&snap, t.trace_id, tenant);
                 let dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
                 let name = t.user_input.as_deref().map(trunc).unwrap_or_else(|| format!("第{}轮", t.turn_index + 1));
                 format!(
@@ -448,10 +451,10 @@ impl HttpIngestServer {
     }
 
     /// GET /v1/traces/:id：一条 trace 的折叠 span（瀑布）+ 摘要。
-    fn trace_json(&self, id: &str) -> (u16, String) {
+    fn trace_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
         let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans(&snap, tid);
+        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
         if spans.is_empty() {
             return (404, r#"{"error":"trace not found"}"#.to_string());
         }
@@ -506,10 +509,10 @@ impl HttpIngestServer {
 
     /// GET /v1/traces/:id/steps：步骤流视图 —— 每个 span 连同输入/输出大文本一次给全。
     /// 与瀑布的晚物化相反：步骤流的本意就是看每一步的输入→输出，故在此端点物化。
-    fn steps_json(&self, id: &str) -> (u16, String) {
+    fn steps_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
         let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans(&snap, tid);
+        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
         if spans.is_empty() {
             return (404, r#"{"error":"trace not found"}"#.to_string());
         }
@@ -535,12 +538,12 @@ impl HttpIngestServer {
     }
 
     /// GET /v1/traces/:id/spans/:spanId：单个 span 的大字段（晚物化）。
-    fn span_detail_json(&self, id: &str, span_id: &str) -> (u16, String) {
+    fn span_detail_json(&self, id: &str, span_id: &str, tenant: Option<u64>) -> (u16, String) {
         let (Ok(tid), Ok(sid)) = (id.parse::<u64>(), span_id.parse::<u64>()) else {
             return (400, r#"{"error":"bad id"}"#.to_string());
         };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans(&snap, tid);
+        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
         match spans.into_iter().find(|s| s.span_id == sid) {
             Some(s) => (
                 200,
@@ -671,13 +674,17 @@ mod tests {
 
     #[test]
     fn http_tenant_header_isolates_traces_and_search() {
-        // HTTP 端到端租户隔离：摄入两租户，GET /v1/traces 与 POST /v1/search 带 X-Tenant-Id 头 → 只见本租户。
+        // HTTP 端到端租户隔离：摄入时 tenant 来自 X-Tenant-Id，body tenant_id 被覆盖；
+        // GET /v1/traces 与 POST /v1/search 带 X-Tenant-Id 头 → 只见本租户。
         let s = server();
-        let batch = r#"[
-          {"trace_id":1,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"1-1","tenant_id":1,"duration_ns":10,"logs":["盗刷"]},
-          {"trace_id":2,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"2-1","tenant_id":2,"duration_ns":20,"logs":["盗刷"]}
+        let batch1 = r#"[
+          {"trace_id":1,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"1-1","tenant_id":999,"duration_ns":10,"logs":["盗刷"]}
         ]"#;
-        assert_eq!(s.route("POST", "/v1/ingest", batch).0, 200);
+        let batch2 = r#"[
+          {"trace_id":2,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"2-1","tenant_id":999,"duration_ns":20,"logs":["盗刷"]}
+        ]"#;
+        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", batch1, Some(1)).0, 200);
+        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", batch2, Some(2)).0, 200);
 
         // 不带租户：两条都列。
         let all = s.route("GET", "/v1/traces", "").1;
@@ -688,6 +695,8 @@ mod tests {
         // 检索同样隔离：查"盗刷"租户 1 只回 trace 1。
         let r1 = s.route_with_tenant("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#, Some(1)).1;
         assert!(r1.contains("\"trace_id\":1") && !r1.contains("\"trace_id\":2"), "检索按租户头隔离: {r1}");
+        let spoofed = s.route_with_tenant("GET", "/v1/traces", "", Some(999)).1;
+        assert!(!spoofed.contains("\"trace_id\":"), "body tenant_id 不应生效: {spoofed}");
     }
 
     #[test]
@@ -808,6 +817,40 @@ mod tests {
 
         // 不存在的 trace → 404。
         assert_eq!(s.route("GET", "/v1/traces/999", "").0, 404);
+    }
+
+    #[test]
+    fn route_console_endpoints_are_tenant_isolated() {
+        // 控制台详情端点也必须按 X-Tenant-Id 隔离，尤其是 input/output 大文本。
+        let s = server();
+        let t1 = r#"[
+          {"trace_id":11,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"11-1","session_id":900,"tenant_id":999,"agent_name":"租户一","input_text":"租户一问题"},
+          {"trace_id":11,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"11-1","session_id":900,"tenant_id":999,"status":0,"duration_ns":1000000,"output_text":"租户一答案"}
+        ]"#;
+        let t2 = r#"[
+          {"trace_id":22,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"22-1","session_id":900,"tenant_id":999,"agent_name":"租户二","input_text":"租户二机密"},
+          {"trace_id":22,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"22-1","session_id":900,"tenant_id":999,"status":0,"duration_ns":2000000,"output_text":"租户二答案"}
+        ]"#;
+        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", t1, Some(1)).0, 200);
+        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", t2, Some(2)).0, 200);
+
+        let sessions1 = s.route_with_tenant("GET", "/v1/sessions?cursor=0&limit=50", "", Some(1)).1;
+        assert!(sessions1.contains("\"firstTraceId\":\"11\""), "{sessions1}");
+        assert!(!sessions1.contains("\"firstTraceId\":\"22\""), "{sessions1}");
+
+        let turns1 = s.route_with_tenant("GET", "/v1/sessions/900/turns", "", Some(1)).1;
+        assert!(turns1.contains("\"traceId\":\"11\"") && turns1.contains("租户一问题"), "{turns1}");
+        assert!(!turns1.contains("租户二机密"), "{turns1}");
+
+        let (st_cross, body_cross) = s.route_with_tenant("GET", "/v1/traces/22", "", Some(1));
+        assert_eq!(st_cross, 404, "tenant1 不能读 tenant2 trace: {body_cross}");
+        assert_eq!(s.route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(1)).0, 404);
+        assert_eq!(s.route_with_tenant("GET", "/v1/traces/22/steps", "", Some(1)).0, 404);
+
+        let (st2, trace2) = s.route_with_tenant("GET", "/v1/traces/22", "", Some(2));
+        assert_eq!(st2, 200, "{trace2}");
+        let detail2 = s.route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(2)).1;
+        assert!(detail2.contains("租户二答案") && !detail2.contains("租户一答案"), "{detail2}");
     }
 
     #[test]
