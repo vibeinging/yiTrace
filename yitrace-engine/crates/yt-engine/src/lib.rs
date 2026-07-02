@@ -19,8 +19,8 @@ use yt_core::chunk::{DeletionVec, UpgradeColChunk};
 use yt_core::event::{EventIdentity, EventType};
 use yt_core::fold::{fold_events, FoldInput, FoldedSpan, SpanFields};
 use yt_core::ids::{SegmentId, WalLsn};
-use yt_core::rank::rrf_fuse;
 use yt_core::manifest::{Manifest, SegState, SegmentEntry};
+use yt_core::rank::rrf_fuse;
 use yt_manifest::{Current, Snapshot};
 use yt_memtable::{MemRow, MemTable};
 use yt_wal::{Wal, WalRecord};
@@ -150,7 +150,11 @@ pub trait SegmentStore: Send + Sync {
     /// `FoldInput`。投影只裁列、不丢行，故行号完整、与删除位图共存安全——**任何查询都能用**。
     /// 默认 `None` = 不支持，引擎回退 `scan_fold_inputs` 读全列。列式存储（Vortex）覆盖它，让聚合/列表
     /// 查询跳过不读的大文本列（上列式最大的单点收益）。
-    fn scan_fold_inputs_projected(&self, _seg: SegmentId, _proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
+    fn scan_fold_inputs_projected(
+        &self,
+        _seg: SegmentId,
+        _proj: Projection,
+    ) -> Option<Vec<(u32, FoldInput)>> {
         None
     }
 
@@ -158,7 +162,13 @@ pub trait SegmentStore: Send + Sync {
     /// 只解码 `proj` 选中的列。默认 `None` = 不支持下推，引擎回退全扫。列式存储（Vortex）覆盖它，把时间
     /// 过滤推进文件扫描、只解码命中行的命中列。
     /// **注意**：下推丢了物理行号，而删除按物理行号定位，二者不能共存——引擎只在「段无删除」时用它。
-    fn scan_fold_inputs_in_time(&self, _seg: SegmentId, _from: i64, _to: i64, _proj: Projection) -> Option<Vec<FoldInput>> {
+    fn scan_fold_inputs_in_time(
+        &self,
+        _seg: SegmentId,
+        _from: i64,
+        _to: i64,
+        _proj: Projection,
+    ) -> Option<Vec<FoldInput>> {
         None
     }
 }
@@ -198,7 +208,11 @@ impl BufferPins {
         }
     }
     fn is_pinned(&self, seg: SegmentId) -> bool {
-        self.counts.lock().unwrap().get(&seg.get()).map_or(false, |&c| c > 0)
+        self.counts
+            .lock()
+            .unwrap()
+            .get(&seg.get())
+            .map_or(false, |&c| c > 0)
     }
 }
 
@@ -219,7 +233,12 @@ pub trait GraphIndex: Send + Sync {
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>);
     /// 带过滤的近邻搜索：`filter` 是下推进图搜索的谓词（service/time/status…）。
     /// 返回 (trace_id, span_id, 距离)，按距离升序、取前 k。真实实现把 filter 接进 search_layer 的导航。
-    fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)>;
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)>;
     /// 落盘点（提交时调）：插入只写不刷的实现（如磁盘索引）在此批量 fsync。内存实现默认空操作。
     /// 我们的场景 **append 极多、删除少** —— 插入走"只写不刷"，靠这里在提交点批量持久，吞吐才扛得住。
     fn flush(&self) {}
@@ -262,9 +281,17 @@ pub struct InMemoryGraphIndex {
 }
 impl GraphIndex for InMemoryGraphIndex {
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
-        self.vecs.lock().unwrap().insert((trace_id, span_id), embedding);
+        self.vecs
+            .lock()
+            .unwrap()
+            .insert((trace_id, span_id), embedding);
     }
-    fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         let g = self.vecs.lock().unwrap();
         let mut scored: Vec<(u64, u64, f32)> = g
             .iter()
@@ -278,7 +305,11 @@ impl GraphIndex for InMemoryGraphIndex {
 }
 
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
 }
 
 /// 内存段存储（默认实现 / demo / 测试用）。真实实现换 Vortex 列式不可变段。
@@ -289,18 +320,31 @@ pub struct InMemorySegmentStore {
 }
 impl SegmentStore for InMemorySegmentStore {
     fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) {
-        self.rows.lock().unwrap().insert(seg.get(), records.to_vec());
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(seg.get(), records.to_vec());
     }
     fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)> {
         self.rows
             .lock()
             .unwrap()
             .get(&seg.get())
-            .map(|rs| rs.iter().enumerate().map(|(i, r)| (i as u32, r.to_fold_input())).collect())
+            .map(|rs| {
+                rs.iter()
+                    .enumerate()
+                    .map(|(i, r)| (i as u32, r.to_fold_input()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
-        self.rows.lock().unwrap().get(&seg.get()).cloned().unwrap_or_default()
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&seg.get())
+            .cloned()
+            .unwrap_or_default()
     }
     fn unlink_segment(&self, seg: SegmentId) {
         self.rows.lock().unwrap().remove(&seg.get());
@@ -330,10 +374,20 @@ pub struct TraceQuery {
 impl TraceQuery {
     /// 全开窗、所有 trace（等价于不剪枝）。
     pub fn all() -> Self {
-        Self { trace_id: None, time_from: i64::MIN, time_to: i64::MAX, tenant_id: None }
+        Self {
+            trace_id: None,
+            time_from: i64::MIN,
+            time_to: i64::MAX,
+            tenant_id: None,
+        }
     }
     pub fn trace(trace_id: u64, time_from: i64, time_to: i64) -> Self {
-        Self { trace_id: Some(trace_id), time_from, time_to, tenant_id: None }
+        Self {
+            trace_id: Some(trace_id),
+            time_from,
+            time_to,
+            tenant_id: None,
+        }
     }
     /// 限定租户（链式）。
     pub fn for_tenant(mut self, tenant_id: u64) -> Self {
@@ -578,6 +632,18 @@ pub struct ConsoleSpan {
     pub attrs: BTreeMap<String, String>,
 }
 
+/// span 内的原始日志事件视图。它不是折叠后的 `logs` 字符串并集，而是保留事件顺序与 attrs 的明细，
+/// 供 trace/span 详情页还原执行现场，避免业务侧把日志镜像进 `attrs.event_logs`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanLogEvent {
+    pub ts: i64,
+    pub seq: u64,
+    pub event_type: u8,
+    pub event_id: u64,
+    pub messages: Vec<String>,
+    pub attrs: BTreeMap<String, String>,
+}
+
 /// 一个会话的摘要（多轮对话/agent 会话视图）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
@@ -611,7 +677,10 @@ pub struct EvalOutcome {
 
 impl EvalOutcome {
     pub fn new(score: u32, label: impl Into<String>) -> Self {
-        Self { score: score.min(1000), label: label.into() }
+        Self {
+            score: score.min(1000),
+            label: label.into(),
+        }
     }
 }
 
@@ -632,7 +701,9 @@ pub struct KeywordScorer {
 
 impl KeywordScorer {
     pub fn new(bad_words: &[&str]) -> Self {
-        Self { bad_words: bad_words.iter().map(|s| s.to_string()).collect() }
+        Self {
+            bad_words: bad_words.iter().map(|s| s.to_string()).collect(),
+        }
     }
 }
 
@@ -682,7 +753,10 @@ impl EvalSummary {
 
 /// 把一串 (可选 agent 名, 千分制分数) 聚合成评测看板：第 0 行恒为整体，其后按 agent 名升序。
 /// `eval_summary`（线上已打分的 span）和 `eval_dataset`（对数据集现跑 scorer）共用这套口径。
-fn aggregate_eval(scored: impl Iterator<Item = (Option<String>, u32)>, pass_threshold: u32) -> Vec<EvalSummary> {
+fn aggregate_eval(
+    scored: impl Iterator<Item = (Option<String>, u32)>,
+    pass_threshold: u32,
+) -> Vec<EvalSummary> {
     let mut overall = (0usize, 0usize, 0u64);
     let mut by_agent: BTreeMap<String, (usize, usize, u64)> = BTreeMap::new();
     for (agent, score) in scored {
@@ -701,7 +775,11 @@ fn aggregate_eval(scored: impl Iterator<Item = (Option<String>, u32)>, pass_thre
         agent_name,
         scored_spans: scored,
         pass_count: pass,
-        avg_score: if scored == 0 { 0 } else { (sum / scored as u64) as u32 },
+        avg_score: if scored == 0 {
+            0
+        } else {
+            (sum / scored as u64) as u32
+        },
     };
     let mut out = vec![mk(None, overall)]; // 第 0 行恒为整体
     for (agent, acc) in by_agent {
@@ -794,7 +872,7 @@ impl WireRecord {
                 model: self.model,
                 input_text: self.input_text,
                 output_text: self.output_text,
-                eval_score: None,  // 分数由 scorer 事后算、走 upgrade 补写，不从线上摄入
+                eval_score: None, // 分数由 scorer 事后算、走 upgrade 补写，不从线上摄入
                 eval_label: None,
                 logs: self.logs,
                 attrs: self.attrs,
@@ -881,7 +959,11 @@ struct KeyBloom {
 impl KeyBloom {
     fn build<I: IntoIterator<Item = (u64, u64)>>(keys: I, n_hint: usize) -> Self {
         let m_bits = (n_hint.max(1) * 10).next_power_of_two().max(64);
-        let mut b = KeyBloom { bits: vec![0u64; m_bits / 64], mask: m_bits - 1, k: 7 };
+        let mut b = KeyBloom {
+            bits: vec![0u64; m_bits / 64],
+            mask: m_bits - 1,
+            k: 7,
+        };
         for key in keys {
             b.insert(key);
         }
@@ -931,7 +1013,12 @@ struct SegFoldCache {
 
 impl SegFoldCache {
     fn new(cap_rows: usize) -> Self {
-        Self { cap_rows: cap_rows.max(1), cur_rows: 0, map: HashMap::new(), tick: 0 }
+        Self {
+            cap_rows: cap_rows.max(1),
+            cur_rows: 0,
+            map: HashMap::new(),
+            tick: 0,
+        }
     }
     fn remove(&mut self, seg: u64) {
         if let Some((sf, _)) = self.map.remove(&seg) {
@@ -940,8 +1027,11 @@ impl SegFoldCache {
     }
     fn evict(&mut self) {
         let target = (self.cap_rows * 9 / 10).max(1);
-        let mut by_tick: Vec<(u64, u64, usize)> =
-            self.map.iter().map(|(&seg, (sf, t))| (*t, seg, sf.rows.len())).collect();
+        let mut by_tick: Vec<(u64, u64, usize)> = self
+            .map
+            .iter()
+            .map(|(&seg, (sf, t))| (*t, seg, sf.rows.len()))
+            .collect();
         by_tick.sort_unstable_by_key(|x| x.0);
         for (_, seg, n) in by_tick {
             if self.cur_rows <= target || self.map.len() <= 1 {
@@ -1009,7 +1099,8 @@ impl SessionIndex {
             }
             e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
             e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
-            e.error_spans = (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
+            e.error_spans =
+                (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
             if e.title.is_empty() {
                 if let Some(a) = &new.agent {
                     e.title = a.clone();
@@ -1087,7 +1178,11 @@ impl SessionIndex {
             .map(|(sid, a)| ConsoleSession {
                 session_id: *sid,
                 external_session_id: a.external_session.clone(),
-                title: if a.title.is_empty() { format!("会话 {sid}") } else { a.title.clone() },
+                title: if a.title.is_empty() {
+                    format!("会话 {sid}")
+                } else {
+                    a.title.clone()
+                },
                 turn_count: a.traces.len(),
                 input_tokens: a.in_tok,
                 output_tokens: a.out_tok,
@@ -1168,16 +1263,45 @@ impl CoordinatorBuilder {
 
     /// 内存 WAL（测试/开发）。
     pub fn build(self, segments: Arc<dyn SegmentStore>) -> Arc<WriteCoordinator> {
-        WriteCoordinator::build_full(segments, Wal::new(), Manifest::empty(), 1, 1, None, None, self.bm25, self.graph, None)
+        WriteCoordinator::build_full(
+            segments,
+            Wal::new(),
+            Manifest::empty(),
+            1,
+            1,
+            None,
+            None,
+            self.bm25,
+            self.graph,
+            None,
+        )
     }
 
     /// 文件 WAL。
-    pub fn open(self, segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
-        Ok(WriteCoordinator::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, self.bm25, self.graph, None))
+    pub fn open(
+        self,
+        segments: Arc<dyn SegmentStore>,
+        wal_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Arc<WriteCoordinator>> {
+        Ok(WriteCoordinator::build_full(
+            segments,
+            Wal::open(wal_path)?,
+            Manifest::empty(),
+            1,
+            1,
+            None,
+            None,
+            self.bm25,
+            self.graph,
+            None,
+        ))
     }
 
     /// 全持久化引擎（与 `WriteCoordinator::open_durable` 同语义，外加注入的索引 / 磁盘向量索引参数）。
-    pub fn open_durable(self, dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<WriteCoordinator>> {
+    pub fn open_durable(
+        self,
+        dir: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Arc<WriteCoordinator>> {
         WriteCoordinator::open_durable_inner(dir, self.bm25, self.graph, self.vec_cfg)
     }
 }
@@ -1190,8 +1314,22 @@ impl WriteCoordinator {
 
     /// 文件 WAL（真落盘）：重启后用同一路径 `open` + `recover()` 可从盘上重放(WAL 持久化)。
     /// 注意：段/manifest 不持久化,崩溃后靠 WAL 全量重放进 MemTable 恢复。要"flush 后重启不丢"用 `open_durable`。
-    pub fn open(segments: Arc<dyn SegmentStore>, wal_path: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
-        Ok(Self::build_full(segments, Wal::open(wal_path)?, Manifest::empty(), 1, 1, None, None, None, None, None))
+    pub fn open(
+        segments: Arc<dyn SegmentStore>,
+        wal_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Arc<Self>> {
+        Ok(Self::build_full(
+            segments,
+            Wal::open(wal_path)?,
+            Manifest::empty(),
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
     }
 
     /// **全持久化引擎**：一个目录下放段(`segments/`)+ WAL(`wal.log`)+ manifest(`manifest.dat`)。
@@ -1221,14 +1359,27 @@ impl WriteCoordinator {
         };
         // 默认向量索引 = **磁盘图索引**（向量+图都落盘、重启不 rebuild、append 友好），不用 vecstore。
         // 注入了自定义 graph（可能内存型）则保留 vecstore 重建路径（向后兼容）。
-        let (graph, vector_path): (Option<Arc<dyn GraphIndex>>, Option<std::path::PathBuf>) = match graph {
-            Some(g) => (Some(g), Some(dir.join("vectors.dat"))),
-            None => {
-                let disk = DurableGraphIndex::open(dir.join("vecindex"), vec_cfg.unwrap_or_default());
-                (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
-            }
-        };
-        let coord = Self::build_full(segments, wal, manifest, next_seg, next_chunk, Some(manifest_path), vector_path, bm25, graph, Some(dir.to_path_buf()));
+        let (graph, vector_path): (Option<Arc<dyn GraphIndex>>, Option<std::path::PathBuf>) =
+            match graph {
+                Some(g) => (Some(g), Some(dir.join("vectors.dat"))),
+                None => {
+                    let disk =
+                        DurableGraphIndex::open(dir.join("vecindex"), vec_cfg.unwrap_or_default());
+                    (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
+                }
+            };
+        let coord = Self::build_full(
+            segments,
+            wal,
+            manifest,
+            next_seg,
+            next_chunk,
+            Some(manifest_path),
+            vector_path,
+            bm25,
+            graph,
+            Some(dir.to_path_buf()),
+        );
         // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
         let entries = gc_log::GcLog::scan(&gc_log_path).unwrap_or_default();
         for seg in gc_log::pending_deletions(&entries) {
@@ -1247,7 +1398,18 @@ impl WriteCoordinator {
     }
 
     fn build(segments: Arc<dyn SegmentStore>, wal: Wal) -> Arc<Self> {
-        Self::build_full(segments, wal, Manifest::empty(), 1, 1, None, None, None, None, None)
+        Self::build_full(
+            segments,
+            wal,
+            Manifest::empty(),
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1273,7 +1435,11 @@ impl WriteCoordinator {
             buffer_pins: BufferPins::default(),
             // 默认 BM25 用纯 Rust 中文词级分词（jieba 全量词典，开箱即生产级）/ 图式 ANN；
             // 可被 builder 注入覆盖（团队 jieba FFI、bigram、或叠了自有词典的 ChineseTokenizer）。
-            bm25: bm25.unwrap_or_else(|| Arc::new(Bm25TextIndex::with_tokenizer(Box::new(ChineseTokenizer::full())))),
+            bm25: bm25.unwrap_or_else(|| {
+                Arc::new(Bm25TextIndex::with_tokenizer(Box::new(
+                    ChineseTokenizer::full(),
+                )))
+            }),
             graph: graph.unwrap_or_else(|| Arc::new(GraphAnnIndex::default())),
             flush_threshold: AtomicUsize::new(4096),
             next_segment_id: Mutex::new(next_segment_id),
@@ -1287,14 +1453,15 @@ impl WriteCoordinator {
             seg_key_bloom: Mutex::new(HashMap::new()),
             gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
             dir,
-
         })
     }
 
     /// commit 后若开了持久化,原子写 manifest（含 id 计数器）。崩溃在写 manifest 前 = 退回上个 manifest
     /// （那次 commit 的段文件成孤儿,无害,等回收或忽略）；写后 = 新状态生效。两边都不脏读。
     fn persist_manifest(&self) {
-        let Some(path) = &self.manifest_path else { return };
+        let Some(path) = &self.manifest_path else {
+            return;
+        };
         let state = persist::PersistedState {
             manifest: (*self.current.manifest()).clone(),
             next_segment_id: *self.next_segment_id.lock().unwrap(),
@@ -1339,11 +1506,16 @@ impl WriteCoordinator {
             parts.push(l);
         }
         if !parts.is_empty() {
-            self.bm25.index_text(r.trace_id, r.span_id, &parts.join(" "));
+            self.bm25
+                .index_text(r.trace_id, r.span_id, &parts.join(" "));
         }
         // 过滤属性边车：last-non-null 累积 status/agent，ts 取范围（带过滤 ANN 的 payload）。
         let mut fa = self.filter_attrs.lock().unwrap();
-        let a = fa.entry((r.trace_id, r.span_id)).or_insert(FilterAttrs { min_ts: r.ts, max_ts: r.ts, ..Default::default() });
+        let a = fa.entry((r.trace_id, r.span_id)).or_insert(FilterAttrs {
+            min_ts: r.ts,
+            max_ts: r.ts,
+            ..Default::default()
+        });
         if r.fields.status.is_some() {
             a.status = r.fields.status;
         }
@@ -1425,20 +1597,31 @@ impl WriteCoordinator {
         let n = first;
         let cnt = last.get() - first + 1;
         let tail = last.get();
-        olog::log(olog::Level::Debug, "ingest", &[("lsn", &n), ("count", &cnt), ("tail", &tail)]);
+        olog::log(
+            olog::Level::Debug,
+            "ingest",
+            &[("lsn", &n), ("count", &cnt), ("tail", &tail)],
+        );
         last
     }
 
     /// 摄入 SDK 线格式记录：转成内部 WalRecord（引擎自算 event_id）后走正常 `ingest`。
     /// 这是「打点 → 引擎存」的数据契约入口；上面再套一层 HTTP/OTLP 网关即闭环（网关是纯管道）。
     pub fn ingest_wire(&self, records: Vec<WireRecord>) -> WalLsn {
-        let recs: Vec<WalRecord> = records.into_iter().map(WireRecord::into_wal_record).collect();
+        let recs: Vec<WalRecord> = records
+            .into_iter()
+            .map(WireRecord::into_wal_record)
+            .collect();
         self.ingest(recs)
     }
 
     /// HTTP 网关专用摄入：租户来自鉴权上下文（如 `X-Tenant-Id`），覆盖 wire body 里的 tenant_id。
     /// 这是多租户安全边界；SDK/客户端可以重复发送 body，但不能自选或伪造租户。
-    pub fn ingest_wire_for_tenant(&self, mut records: Vec<WireRecord>, tenant: Option<u64>) -> WalLsn {
+    pub fn ingest_wire_for_tenant(
+        &self,
+        mut records: Vec<WireRecord>,
+        tenant: Option<u64>,
+    ) -> WalLsn {
         for r in &mut records {
             r.tenant_id = tenant;
         }
@@ -1454,7 +1637,11 @@ impl WriteCoordinator {
     }
 
     /// HTTP 网关专用 OTLP 摄入：OTLP attributes 里带的 tenant 也不作为安全边界，统一由请求上下文覆盖。
-    pub fn ingest_otlp_for_tenant(&self, body: &str, tenant: Option<u64>) -> Result<WalLsn, String> {
+    pub fn ingest_otlp_for_tenant(
+        &self,
+        body: &str,
+        tenant: Option<u64>,
+    ) -> Result<WalLsn, String> {
         let wires = parse_otlp_traces(body)?;
         Ok(self.ingest_wire_for_tenant(wires, tenant))
     }
@@ -1476,11 +1663,15 @@ impl WriteCoordinator {
         let v_before = self.current.version();
         self.flush_memtable_locked();
         let seg = v_before;
-        olog::log(olog::Level::Info, "flush", &[
-            ("seg", &seg),
-            ("rows", &before),
-            ("version", &self.current.version()),
-        ]);
+        olog::log(
+            olog::Level::Info,
+            "flush",
+            &[
+                ("seg", &seg),
+                ("rows", &before),
+                ("version", &self.current.version()),
+            ],
+        );
     }
 
     /// 把内存表内容封段（调用方须已持 write_lock）。watermark 推进到内存表最新 LSN。
@@ -1505,8 +1696,14 @@ impl WriteCoordinator {
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, &records);
         // 段级 key bloom：从这批记录的 (trace,span) 建，供检索折叠定位跳过无关段。
-        let bloom = KeyBloom::build(records.iter().map(|r| (r.trace_id, r.span_id)), records.len());
-        self.seg_key_bloom.lock().unwrap().insert(seg.get(), Arc::new(bloom));
+        let bloom = KeyBloom::build(
+            records.iter().map(|r| (r.trace_id, r.span_id)),
+            records.len(),
+        );
+        self.seg_key_bloom
+            .lock()
+            .unwrap()
+            .insert(seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(&records);
         let mut draft = self.current.cow_next();
         draft.memtable_watermark = WalLsn::new(max_lsn);
@@ -1560,7 +1757,10 @@ impl WriteCoordinator {
         let mut rows = Vec::with_capacity(raw.len());
         let mut by_key: HashMap<(u64, u64), Vec<u32>> = HashMap::new();
         for (row, fi) in raw {
-            by_key.entry((fi.trace_id, fi.span_id)).or_default().push(row);
+            by_key
+                .entry((fi.trace_id, fi.span_id))
+                .or_default()
+                .push(row);
             rows.push(fi);
         }
         let n = rows.len();
@@ -1597,13 +1797,18 @@ impl WriteCoordinator {
         proj: Projection,
     ) -> (Vec<FoldedSpan>, usize) {
         // 租户隔离时，强制把 tenant_id 列纳入投影（否则列式段窄投影读不到 tenant，过滤会误删全部）。
-        let proj = if q.tenant_id.is_some() { Projection::of(proj.bits() | Projection::TENANT_ID) } else { proj };
+        let proj = if q.tenant_id.is_some() {
+            Projection::of(proj.bits() | Projection::TENANT_ID)
+        } else {
+            proj
+        };
         let mut inputs: Vec<FoldInput> = Vec::new();
         let mut scanned = 0usize;
         let in_keys = |t: u64, s: u64| keys.map_or(true, |ks| ks.contains(&(t, s)));
 
         // 段源：先用段 zone-map(min_ts/max_ts) 做时间窗剪枝 —— 不重叠的段整段跳过、不扫。
-        let mut upgrades: std::collections::BTreeMap<(u64, u64), SpanFields> = std::collections::BTreeMap::new();
+        let mut upgrades: std::collections::BTreeMap<(u64, u64), SpanFields> =
+            std::collections::BTreeMap::new();
         for entry in snap.manifest.segments.values() {
             if entry.max_ts < q.time_from || entry.min_ts > q.time_to {
                 continue; // 时间窗外，整段剪掉
@@ -1620,13 +1825,19 @@ impl WriteCoordinator {
                         .unwrap()
                         .get(&entry.segment_id.get())
                         .map_or(false, |b| !ks.iter().any(|&k| b.maybe_contains(k)));
-                    let sf = if bloom_skip { None } else { Some(self.seg_fold(entry.segment_id)) };
+                    let sf = if bloom_skip {
+                        None
+                    } else {
+                        Some(self.seg_fold(entry.segment_id))
+                    };
                     for &(t, s) in ks {
                         let Some(sf) = &sf else { break };
                         if q.trace_id.map_or(false, |tid| t != tid) {
                             continue;
                         }
-                        let Some(rowlist) = sf.by_key.get(&(t, s)) else { continue };
+                        let Some(rowlist) = sf.by_key.get(&(t, s)) else {
+                            continue;
+                        };
                         for &row in rowlist {
                             if entry.deletion_vec.is_deleted(row) {
                                 continue; // 删除位图按行号照查
@@ -1641,8 +1852,15 @@ impl WriteCoordinator {
                 //   ② 否则纯投影下推：只裁列、不丢行 → 行号完整，删除位图照行号生效。
                 //   ③ 都不支持 → 回退 `scan_fold_inputs` 读全列。
                 None => {
-                    let time_pushed = if entry.deletion_seq == 0 && (q.time_from != i64::MIN || q.time_to != i64::MAX) {
-                        self.segments.scan_fold_inputs_in_time(entry.segment_id, q.time_from, q.time_to, proj)
+                    let time_pushed = if entry.deletion_seq == 0
+                        && (q.time_from != i64::MIN || q.time_to != i64::MAX)
+                    {
+                        self.segments.scan_fold_inputs_in_time(
+                            entry.segment_id,
+                            q.time_from,
+                            q.time_to,
+                            proj,
+                        )
                     } else {
                         None
                     };
@@ -1659,7 +1877,9 @@ impl WriteCoordinator {
                             let rows = self
                                 .segments
                                 .scan_fold_inputs_projected(entry.segment_id, proj)
-                                .unwrap_or_else(|| self.segments.scan_fold_inputs(entry.segment_id));
+                                .unwrap_or_else(|| {
+                                    self.segments.scan_fold_inputs(entry.segment_id)
+                                });
                             for (row, fi) in rows {
                                 if entry.deletion_vec.is_deleted(row) {
                                     continue;
@@ -1768,10 +1988,13 @@ impl WriteCoordinator {
     /// 列出会话摘要（多轮会话视图）：按 session_id 聚合,数 trace 数/span 数/token 汇总。升序。
     pub fn list_sessions(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<SessionSummary> {
         // 按 session 聚合 token —— 只读 session_id + token,跳过文本。
-        let proj = Projection::of(Projection::SESSION_ID | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let proj = Projection::of(
+            Projection::SESSION_ID | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+        );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         // session_id -> (distinct traces, span_count, in_tok, out_tok)
-        let mut acc: BTreeMap<u64, (std::collections::HashSet<u64>, usize, u64, u64)> = BTreeMap::new();
+        let mut acc: BTreeMap<u64, (std::collections::HashSet<u64>, usize, u64, u64)> =
+            BTreeMap::new();
         for s in spans {
             if let Some(sid) = s.session_id {
                 let e = acc.entry(sid).or_default();
@@ -1802,7 +2025,12 @@ impl WriteCoordinator {
     }
 
     /// 带查询约束的会话时间线。控制台网关用它把 tenant 过滤压到折叠读取层。
-    pub fn load_session_timeline_query(&self, snap: &Snapshot, session_id: u64, q: &TraceQuery) -> SessionTimeline {
+    pub fn load_session_timeline_query(
+        &self,
+        snap: &Snapshot,
+        session_id: u64,
+        q: &TraceQuery,
+    ) -> SessionTimeline {
         let (spans, _) = self.read_spans_query(snap, q);
         // 按 trace 分组本会话的 span（BTreeMap → trace_id 升序 = 轮次序）。
         let mut by_trace: BTreeMap<u64, Vec<FoldedSpan>> = BTreeMap::new();
@@ -1817,7 +2045,10 @@ impl WriteCoordinator {
         for (turn_index, (trace_id, mut sps)) in by_trace.into_iter().enumerate() {
             sps.sort_by_key(|s| s.span_id);
             // 输入取最早（span_id 最小）带 input_text 的；答复取最末带 output_text 的。
-            let user_input = sps.iter().find(|s| s.input_text.is_some()).and_then(|s| s.input_text.clone());
+            let user_input = sps
+                .iter()
+                .find(|s| s.input_text.is_some())
+                .and_then(|s| s.input_text.clone());
             let answer = sps.iter().rev().find(|s| s.output_text.is_some());
             let agent_output = answer.and_then(|s| s.output_text.clone());
             let eval_score = answer.and_then(|s| s.eval_score);
@@ -1842,7 +2073,12 @@ impl WriteCoordinator {
                 eval_score,
             });
         }
-        SessionTimeline { session_id, turns, total_input_tokens: total_in, total_output_tokens: total_out }
+        SessionTimeline {
+            session_id,
+            turns,
+            total_input_tokens: total_in,
+            total_output_tokens: total_out,
+        }
     }
 
     /// 控制台用：会话行列表（标题/轮数/状态/token/首 trace），按 session_id 降序。
@@ -1863,8 +2099,14 @@ impl WriteCoordinator {
 
     /// 控制台用：按请求租户隔离的会话行列表。
     /// 无租户时走增量边车；有租户时基于已过滤 span 临时聚合，避免全局 session_idx 泄露别的租户。
-    pub fn console_sessions_for_tenant(&self, snap: &Snapshot, tenant: Option<u64>) -> Vec<ConsoleSession> {
-        let Some(t) = tenant else { return self.console_sessions(snap) };
+    pub fn console_sessions_for_tenant(
+        &self,
+        snap: &Snapshot,
+        tenant: Option<u64>,
+    ) -> Vec<ConsoleSession> {
+        let Some(t) = tenant else {
+            return self.console_sessions(snap);
+        };
         let (spans, _) = self.read_spans_query(snap, &TraceQuery::all().for_tenant(t));
         let mut idx = SessionIndex::default();
         idx.rebuild(&spans);
@@ -1967,10 +2209,85 @@ impl WriteCoordinator {
             .collect()
     }
 
+    /// 读取一条 trace 中可见 span 的原始日志事件。调用方传入已经过租户/删除过滤的 key 集，
+    /// 这里只做原始事件扫描、event_id 去重与时间排序，保证不会把不可见 span 的日志泄漏出去。
+    pub fn log_events_for_trace_keys(
+        &self,
+        snap: &Snapshot,
+        trace_id: u64,
+        keys: &std::collections::HashSet<(u64, u64)>,
+    ) -> BTreeMap<u64, Vec<SpanLogEvent>> {
+        let mut by_event: BTreeMap<u64, (u64, SpanLogEvent)> = BTreeMap::new();
+
+        for entry in snap.manifest.segments.values() {
+            let recs = self.segments.scan_records(entry.segment_id);
+            for (row, rec) in recs.iter().enumerate() {
+                if entry.deletion_vec.is_deleted(row as u32) {
+                    continue;
+                }
+                self.collect_log_event(trace_id, keys, rec, &mut by_event);
+            }
+        }
+
+        {
+            let mt = self.memtable.lock().unwrap();
+            for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+                let rec = WalRecord {
+                    trace_id: row.trace_id,
+                    span_id: row.span_id,
+                    ts: row.ts,
+                    identity: row.identity.clone(),
+                    fields: row.fields.clone(),
+                };
+                self.collect_log_event(trace_id, keys, &rec, &mut by_event);
+            }
+        }
+
+        let mut by_span: BTreeMap<u64, Vec<SpanLogEvent>> = BTreeMap::new();
+        for (_event_id, (span_id, ev)) in by_event {
+            by_span.entry(span_id).or_default().push(ev);
+        }
+        for events in by_span.values_mut() {
+            events.sort_by_key(|ev| (ev.ts, ev.seq, ev.event_id));
+        }
+        by_span
+    }
+
+    fn collect_log_event(
+        &self,
+        trace_id: u64,
+        keys: &std::collections::HashSet<(u64, u64)>,
+        rec: &WalRecord,
+        out: &mut BTreeMap<u64, (u64, SpanLogEvent)>,
+    ) {
+        if rec.trace_id != trace_id
+            || !keys.contains(&(rec.trace_id, rec.span_id))
+            || rec.fields.logs.is_empty()
+        {
+            return;
+        }
+        let event_id = rec.identity.event_id().0;
+        out.entry(event_id).or_insert_with(|| {
+            (
+                rec.span_id,
+                SpanLogEvent {
+                    ts: rec.ts,
+                    seq: rec.identity.seq,
+                    event_type: rec.identity.event_type.tag(),
+                    event_id,
+                    messages: rec.fields.logs.clone(),
+                    attrs: rec.fields.attrs.clone(),
+                },
+            )
+        });
+    }
+
     /// 按 agent 的成本归因（per-agent 成本下钻）：按 agent_name 聚合 token。按 agent 名升序。
     pub fn cost_by_agent(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<AgentCost> {
         // 按 agent 归因 token —— 只读 agent_name + token,跳过文本（成本下钻是典型的"只数不读原文"）。
-        let proj = Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let proj = Projection::of(
+            Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+        );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         let mut acc: BTreeMap<String, (usize, u64, u64)> = BTreeMap::new();
         for s in spans {
@@ -1982,12 +2299,14 @@ impl WriteCoordinator {
             }
         }
         acc.into_iter()
-            .map(|(agent_name, (span_count, input_tokens, output_tokens))| AgentCost {
-                agent_name,
-                span_count,
-                input_tokens,
-                output_tokens,
-            })
+            .map(
+                |(agent_name, (span_count, input_tokens, output_tokens))| AgentCost {
+                    agent_name,
+                    span_count,
+                    input_tokens,
+                    output_tokens,
+                },
+            )
             .collect()
     }
 
@@ -2018,7 +2337,9 @@ impl WriteCoordinator {
                 if q.trace_id.map_or(false, |tid| fi.trace_id != tid) {
                     continue; // trace_id 不匹配（行级）
                 }
-                span_seg.entry((fi.trace_id, fi.span_id)).or_insert(entry.segment_id);
+                span_seg
+                    .entry((fi.trace_id, fi.span_id))
+                    .or_insert(entry.segment_id);
             }
         }
         drop(snap);
@@ -2026,7 +2347,9 @@ impl WriteCoordinator {
         // 4) 逐条打分并写回（scorer 返回 None 的 span 跳过、不写）。
         let mut out = Vec::new();
         for sp in spans {
-            let Some(outcome) = scorer.score(&sp) else { continue };
+            let Some(outcome) = scorer.score(&sp) else {
+                continue;
+            };
             if let Some(&seg) = span_seg.get(&(sp.trace_id, sp.span_id)) {
                 self.commit_upgrade(
                     seg,
@@ -2038,7 +2361,11 @@ impl WriteCoordinator {
                         ..Default::default()
                     },
                 );
-                out.push(ScoredSpan { trace_id: sp.trace_id, span_id: sp.span_id, outcome });
+                out.push(ScoredSpan {
+                    trace_id: sp.trace_id,
+                    span_id: sp.span_id,
+                    outcome,
+                });
             }
         }
         out
@@ -2047,12 +2374,21 @@ impl WriteCoordinator {
     /// 评测看板：把已打分的 span 聚合成 通过率/均分 —— 整体一行 +（有 agent 名的）每 agent 一行。
     /// `pass_threshold` 千分制，分数 ≥ 它算通过。这是 eval 的产品出口:回归视图("哪个 agent 退步了")。
     /// 输出第 0 行恒为整体(agent_name=None),其后按 agent 名升序。
-    pub fn eval_summary(&self, snap: &Snapshot, q: &TraceQuery, pass_threshold: u32) -> Vec<EvalSummary> {
+    pub fn eval_summary(
+        &self,
+        snap: &Snapshot,
+        q: &TraceQuery,
+        pass_threshold: u32,
+    ) -> Vec<EvalSummary> {
         // 看板只看分数 + agent 名 —— 不读被评的原文（原文在打分时已用过、写回成了分数）。
-        let proj = Projection::of(Projection::EVAL_SCORE | Projection::EVAL_LABEL | Projection::AGENT_NAME);
+        let proj = Projection::of(
+            Projection::EVAL_SCORE | Projection::EVAL_LABEL | Projection::AGENT_NAME,
+        );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         // 只取已打分的 span（无 eval_score 的不计），喂进共用聚合口径。
-        let scored = spans.into_iter().filter_map(|s| s.eval_score.map(|sc| (s.agent_name, sc)));
+        let scored = spans
+            .into_iter()
+            .filter_map(|s| s.eval_score.map(|sc| (s.agent_name, sc)));
         aggregate_eval(scored, pass_threshold)
     }
 
@@ -2062,7 +2398,13 @@ impl WriteCoordinator {
         if ds.contains_key(name) {
             return false;
         }
-        ds.insert(name.to_string(), Dataset { name: name.to_string(), examples: Vec::new() });
+        ds.insert(
+            name.to_string(),
+            Dataset {
+                name: name.to_string(),
+                examples: Vec::new(),
+            },
+        );
         true
     }
 
@@ -2079,16 +2421,25 @@ impl WriteCoordinator {
     ) -> usize {
         let (spans, _) = self.read_spans_query(snap, q);
         let mut ds = self.datasets.lock().unwrap();
-        let entry = ds.entry(name.to_string()).or_insert_with(|| Dataset { name: name.to_string(), examples: Vec::new() });
-        let mut existing: std::collections::HashSet<(u64, u64)> =
-            entry.examples.iter().map(|e| (e.span.trace_id, e.span.span_id)).collect();
+        let entry = ds.entry(name.to_string()).or_insert_with(|| Dataset {
+            name: name.to_string(),
+            examples: Vec::new(),
+        });
+        let mut existing: std::collections::HashSet<(u64, u64)> = entry
+            .examples
+            .iter()
+            .map(|e| (e.span.trace_id, e.span.span_id))
+            .collect();
         let mut added = 0;
         for s in spans {
             if !pred(&s) {
                 continue;
             }
             if existing.insert((s.trace_id, s.span_id)) {
-                entry.examples.push(DatasetExample { span: s, expected: None });
+                entry.examples.push(DatasetExample {
+                    span: s,
+                    expected: None,
+                });
                 added += 1;
             }
         }
@@ -2106,29 +2457,45 @@ impl WriteCoordinator {
             .lock()
             .unwrap()
             .values()
-            .map(|d| DatasetSummary { name: d.name.clone(), example_count: d.examples.len() })
+            .map(|d| DatasetSummary {
+                name: d.name.clone(),
+                example_count: d.examples.len(),
+            })
             .collect()
     }
 
     /// 对一个数据集**现跑 scorer**,聚合成通过率/均分看板(整体 + per-agent)——回归基准:
     /// 同一数据集 + 同一 scorer 反复跑,通过率掉了就是 agent/prompt 退步了。返回 None=无此数据集。
     /// 注意:这里直接对数据集里**冻结的 span 快照**评分,不走 upgrade 写回(那是线上 trace 的事)。
-    pub fn eval_dataset(&self, name: &str, scorer: &dyn Scorer, pass_threshold: u32) -> Option<Vec<EvalSummary>> {
+    pub fn eval_dataset(
+        &self,
+        name: &str,
+        scorer: &dyn Scorer,
+        pass_threshold: u32,
+    ) -> Option<Vec<EvalSummary>> {
         let ds = self.datasets.lock().unwrap().get(name).cloned()?;
-        let scored = ds
-            .examples
-            .iter()
-            .filter_map(|ex| scorer.score(&ex.span).map(|o| (ex.span.agent_name.clone(), o.score)));
+        let scored = ds.examples.iter().filter_map(|ex| {
+            scorer
+                .score(&ex.span)
+                .map(|o| (ex.span.agent_name.clone(), o.score))
+        });
         Some(aggregate_eval(scored, pass_threshold))
     }
 
     /// 装一条 trace 的父子树（树+瀑布视图用）：读出该 trace 的 span，按 parent_span_id 连成树。
     /// 父不在本 trace 内的 span 当根（容错：丢了 root 事件也能渲染）。
     pub fn load_trace_tree(&self, snap: &Snapshot, trace_id: u64) -> TraceTree {
-        let (spans, _) = self.read_spans_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX));
+        let (spans, _) =
+            self.read_spans_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX));
         let mut nodes: BTreeMap<u64, TraceNode> = BTreeMap::new();
         for s in spans {
-            nodes.insert(s.span_id, TraceNode { span: s, children: Vec::new() });
+            nodes.insert(
+                s.span_id,
+                TraceNode {
+                    span: s,
+                    children: Vec::new(),
+                },
+            );
         }
         let mut roots = Vec::new();
         let ids: Vec<u64> = nodes.keys().copied().collect();
@@ -2143,7 +2510,11 @@ impl WriteCoordinator {
             n.children.sort_unstable(); // 确定序
         }
         roots.sort_unstable();
-        TraceTree { trace_id, roots, nodes }
+        TraceTree {
+            trace_id,
+            roots,
+            nodes,
+        }
     }
 
     /// 一条 trace 的 **agent 执行图（DAG）**：把 span 父子树按 agent/工具维度收拢成"谁调用了谁"。
@@ -2159,7 +2530,12 @@ impl WriteCoordinator {
                 | Projection::INPUT_TOKENS
                 | Projection::OUTPUT_TOKENS,
         );
-        let (spans, _) = self.fold_query(snap, &TraceQuery::trace(trace_id, i64::MIN, i64::MAX), None, proj);
+        let (spans, _) = self.fold_query(
+            snap,
+            &TraceQuery::trace(trace_id, i64::MIN, i64::MAX),
+            None,
+            proj,
+        );
 
         // 角色判定（返回 (名字, 类型)）。
         let actor_of = |s: &FoldedSpan| -> (String, ActorKind) {
@@ -2188,8 +2564,12 @@ impl WriteCoordinator {
         // 边聚合：父角色 → 子角色（跳过父不在本 trace 内 / 同角色自环）。
         let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
         for s in &spans {
-            let Some(parent_id) = s.parent_span_id else { continue };
-            let Some(from) = span_actor.get(&parent_id) else { continue };
+            let Some(parent_id) = s.parent_span_id else {
+                continue;
+            };
+            let Some(from) = span_actor.get(&parent_id) else {
+                continue;
+            };
             let to = &span_actor[&s.span_id];
             if from == to {
                 continue; // 同角色多步,不算一次调用/移交
@@ -2201,13 +2581,15 @@ impl WriteCoordinator {
             trace_id,
             nodes: nodes
                 .into_iter()
-                .map(|(actor, (kind, span_count, input_tokens, output_tokens))| AgentGraphNode {
-                    actor,
-                    kind,
-                    span_count,
-                    input_tokens,
-                    output_tokens,
-                })
+                .map(
+                    |(actor, (kind, span_count, input_tokens, output_tokens))| AgentGraphNode {
+                        actor,
+                        kind,
+                        span_count,
+                        input_tokens,
+                        output_tokens,
+                    },
+                )
                 .collect(),
             edges: edges
                 .into_iter()
@@ -2234,7 +2616,13 @@ impl WriteCoordinator {
 
     /// 带过滤的中文检索：谓词限定 (trace_id, span_id)（如只搜某些 trace）。BM25 无图可下推，过滤后置 +
     /// 过取候选兜住截断。
-    pub fn search_text_filtered(&self, snap: &Snapshot, query: &str, k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_text_filtered(
+        &self,
+        snap: &Snapshot,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(FoldedSpan, f32)> {
         let mut cands = self.bm25.search(query, k.max(50));
         cands.retain(|&(t, s, _)| filter(t, s));
         cands.truncate(k);
@@ -2242,27 +2630,51 @@ impl WriteCoordinator {
     }
 
     /// 找相似：graph_index 向量近邻找到候选 span，再折叠返回（带距离，按相似度序）。
-    pub fn search_similar(&self, snap: &Snapshot, query: &[f32], k: usize) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_similar(
+        &self,
+        snap: &Snapshot,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(FoldedSpan, f32)> {
         self.search_similar_filtered(snap, query, k, &|_, _| true)
     }
 
     /// **带过滤找相似**：谓词**下推进图搜索**（`graph.search` 走进图过滤）—— 这正是验证过的 in-graph 过滤
     /// 在引擎层真正用起来（选择性谓词下召回不塌，见 `graph.rs` 的实测）。`filter` 按 (trace_id, span_id) 判。
     /// 快照可见性仍由 `join_folded` 自然裁（不在快照里的 span 折叠不出来）。
-    pub fn search_similar_filtered(&self, snap: &Snapshot, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_similar_filtered(
+        &self,
+        snap: &Snapshot,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(FoldedSpan, f32)> {
         let cands = self.graph.search(query, k, filter);
         self.join_folded(snap, cands)
     }
 
     /// 混合检索：BM25 关键词命中 + 向量语义相似，用 RRF 融合成一路排序，再折叠返回。
     /// 同时被关键词和语义命中的 span 排更前 —— 「关键词 + 语义混合召回」，单走一路给不出这个排序。
-    pub fn search_hybrid(&self, snap: &Snapshot, text: &str, query_vec: &[f32], k: usize) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_hybrid(
+        &self,
+        snap: &Snapshot,
+        text: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Vec<(FoldedSpan, f32)> {
         self.search_hybrid_filtered(snap, text, query_vec, k, &|_, _| true)
     }
 
     /// 带过滤的混合检索：向量侧谓词**下推进图搜索**（in-graph 过滤），关键词侧过滤后置（BM25 无图），
     /// 再 RRF 融合。两路都只在满足谓词的 span 上召回。
-    pub fn search_hybrid_filtered(&self, snap: &Snapshot, text: &str, query_vec: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_hybrid_filtered(
+        &self,
+        snap: &Snapshot,
+        text: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(FoldedSpan, f32)> {
         let pool = k.max(10);
         let mut bm = self.bm25.search(text, pool);
         bm.retain(|&(t, s, _)| filter(t, s)); // 关键词侧：后置过滤
@@ -2270,13 +2682,21 @@ impl WriteCoordinator {
         let r1: Vec<(u64, u64)> = bm.iter().map(|&(t, s, _)| (t, s)).collect();
         let r2: Vec<(u64, u64)> = vec.iter().map(|&(t, s, _)| (t, s)).collect();
         let fused = rrf_fuse(&[r1, r2], 60.0);
-        let cands: Vec<(u64, u64, f32)> = fused.into_iter().take(k).map(|((t, s), sc)| (t, s, sc)).collect();
+        let cands: Vec<(u64, u64, f32)> = fused
+            .into_iter()
+            .take(k)
+            .map(|((t, s), sc)| (t, s, sc))
+            .collect();
         self.join_folded(snap, cands)
     }
 
     /// 用 (trace,span) 谓词回调跑一段逻辑，谓词由 `SearchFilter` + 属性边车构造（在锁内有效）。
     /// 把"按产品维度（agent/状态/时间）过滤"翻译成 `graph.search` 认的 `Fn(u64,u64)->bool`。
-    fn with_filter_pred<R>(&self, f: &SearchFilter, body: impl FnOnce(&dyn Fn(u64, u64) -> bool) -> R) -> R {
+    fn with_filter_pred<R>(
+        &self,
+        f: &SearchFilter,
+        body: impl FnOnce(&dyn Fn(u64, u64) -> bool) -> R,
+    ) -> R {
         let attrs = self.filter_attrs.lock().unwrap();
         let need_attrs = f.needs_attrs();
         let pred = move |t: u64, s: u64| -> bool {
@@ -2298,14 +2718,26 @@ impl WriteCoordinator {
 
     /// **按产品维度过滤的找相似**：`SearchFilter`（agent/状态/时间/trace）翻成谓词，下推进图搜索。
     /// 这才是"带过滤 ANN"在真实查询里的样子 —— "找 agent X 报错的相似 span"。
-    pub fn search_similar_attr(&self, snap: &Snapshot, query: &[f32], k: usize, filter: &SearchFilter) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_similar_attr(
+        &self,
+        snap: &Snapshot,
+        query: &[f32],
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Vec<(FoldedSpan, f32)> {
         let cands = self.with_filter_pred(filter, |pred| self.graph.search(query, k, pred));
         self.join_folded(snap, cands)
     }
 
     /// 按产品维度过滤的**中文检索**：BM25 命中后按 `SearchFilter`（agent/状态/时间/trace）后置过滤。
     /// "搜『盗刷』里 agent=风控、报错的那些 span" —— HTTP 检索端点用这个。
-    pub fn search_text_attr(&self, snap: &Snapshot, query: &str, k: usize, filter: &SearchFilter) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_text_attr(
+        &self,
+        snap: &Snapshot,
+        query: &str,
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Vec<(FoldedSpan, f32)> {
         let cands = self.with_filter_pred(filter, |pred| {
             let mut c = self.bm25.search(query, k.max(50));
             c.retain(|&(t, s, _)| pred(t, s));
@@ -2316,7 +2748,14 @@ impl WriteCoordinator {
     }
 
     /// 按产品维度过滤的混合检索（向量侧下推进图、关键词侧后置过滤）。
-    pub fn search_hybrid_attr(&self, snap: &Snapshot, text: &str, query_vec: &[f32], k: usize, filter: &SearchFilter) -> Vec<(FoldedSpan, f32)> {
+    pub fn search_hybrid_attr(
+        &self,
+        snap: &Snapshot,
+        text: &str,
+        query_vec: &[f32],
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Vec<(FoldedSpan, f32)> {
         let pool = k.max(10);
         let (bm, vec) = self.with_filter_pred(filter, |pred| {
             let mut bm = self.bm25.search(text, pool);
@@ -2327,18 +2766,25 @@ impl WriteCoordinator {
         let r1: Vec<(u64, u64)> = bm.iter().map(|&(t, s, _)| (t, s)).collect();
         let r2: Vec<(u64, u64)> = vec.iter().map(|&(t, s, _)| (t, s)).collect();
         let fused = rrf_fuse(&[r1, r2], 60.0);
-        let cands: Vec<(u64, u64, f32)> = fused.into_iter().take(k).map(|((t, s), sc)| (t, s, sc)).collect();
+        let cands: Vec<(u64, u64, f32)> = fused
+            .into_iter()
+            .take(k)
+            .map(|((t, s), sc)| (t, s, sc))
+            .collect();
         self.join_folded(snap, cands)
     }
 
     /// 把检索候选 (trace, span, 分) join 上「在快照里折叠出的完整 span」，保持检索的排序。
     /// **只折叠命中行**：把候选 key 集喂给 `fold_query`，不折叠全库（大数据下检索不再为几条命中折叠整库）。
     fn join_folded(&self, snap: &Snapshot, cands: Vec<(u64, u64, f32)>) -> Vec<(FoldedSpan, f32)> {
-        let keys: std::collections::HashSet<(u64, u64)> = cands.iter().map(|&(t, s, _)| (t, s)).collect();
+        let keys: std::collections::HashSet<(u64, u64)> =
+            cands.iter().map(|&(t, s, _)| (t, s)).collect();
         // 检索结果要展示原文（命中片段），读全列。
         let (hits, _) = self.fold_query(snap, &TraceQuery::all(), Some(&keys), Projection::ALL);
-        let map: HashMap<(u64, u64), FoldedSpan> =
-            hits.into_iter().map(|s| ((s.trace_id, s.span_id), s)).collect();
+        let map: HashMap<(u64, u64), FoldedSpan> = hits
+            .into_iter()
+            .map(|s| ((s.trace_id, s.span_id), s))
+            .collect();
         cands
             .into_iter()
             .filter_map(|(t, s, score)| map.get(&(t, s)).cloned().map(|sp| (sp, score)))
@@ -2354,14 +2800,21 @@ impl WriteCoordinator {
     /// - BM25 + 属性边车是**派生数据**：扫持久段(水位之前)+ 重放的 WAL 尾(水位之后)各喂一次,合起来覆盖全部、不重不漏。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
-        olog::log(olog::Level::Info, "recover_start", &[("version", &self.current.version())]);
+        olog::log(
+            olog::Level::Info,
+            "recover_start",
+            &[("version", &self.current.version())],
+        );
         // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车；顺带重建段级 key bloom。
         let m = self.current.manifest();
         let seg_count = m.segments.len();
         for entry in m.segments.values() {
             let recs = self.segments.scan_records(entry.segment_id);
             let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
-            self.seg_key_bloom.lock().unwrap().insert(entry.segment_id.get(), Arc::new(bloom));
+            self.seg_key_bloom
+                .lock()
+                .unwrap()
+                .insert(entry.segment_id.get(), Arc::new(bloom));
             for r in &recs {
                 self.index_record(r);
             }
@@ -2394,12 +2847,16 @@ impl WriteCoordinator {
         // 已提交尾从 WAL 恢复（重启后 committed_tail 不是持久态，由 WAL 重新确定）。
         let tail = wal.committed_tail();
         self.current.advance_committed_tail(tail);
-        olog::log(olog::Level::Info, "recover_done", &[
-            ("segs_scanned", &seg_count),
-            ("vectors_reloaded", &vec_count),
-            ("wal_replayed", &wal_count),
-            ("committed_tail", &tail.get()),
-        ]);
+        olog::log(
+            olog::Level::Info,
+            "recover_done",
+            &[
+                ("segs_scanned", &seg_count),
+                ("vectors_reloaded", &vec_count),
+                ("wal_replayed", &wal_count),
+                ("committed_tail", &tail.get()),
+            ],
+        );
     }
 
     /// 测试/演示：模拟崩溃，丢弃易失的 MemTable。WAL 与 manifest 是持久的，保留不动。
@@ -2427,8 +2884,14 @@ impl WriteCoordinator {
         let _w = self.write_lock.lock().unwrap();
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, records); // building→sealed（写完 fsync）
-        let bloom = KeyBloom::build(records.iter().map(|r| (r.trace_id, r.span_id)), records.len());
-        self.seg_key_bloom.lock().unwrap().insert(seg.get(), Arc::new(bloom));
+        let bloom = KeyBloom::build(
+            records.iter().map(|r| (r.trace_id, r.span_id)),
+            records.len(),
+        );
+        self.seg_key_bloom
+            .lock()
+            .unwrap()
+            .insert(seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(records);
         let mut draft = self.current.cow_next();
         draft.memtable_watermark = up_to_lsn; // 与下面加段同事务
@@ -2471,12 +2934,22 @@ impl WriteCoordinator {
     /// 属性补写（upgrade）提交：给某段 (trace_id, span_id) 补写**非身份属性**，与 delete 完全对称——
     /// 写时复制出新 upgrade 块（upgrade_seq+1），绝不原地改旧块（旧版本读者读旧块）。
     /// 身份字段冻结（M.7），由上层 schema 保证不进 `fields`。
-    pub fn commit_upgrade(&self, seg: SegmentId, trace_id: u64, span_id: u64, fields: yt_core::fold::SpanFields) {
+    pub fn commit_upgrade(
+        &self,
+        seg: SegmentId,
+        trace_id: u64,
+        span_id: u64,
+        fields: yt_core::fold::SpanFields,
+    ) {
         let _w = self.write_lock.lock().unwrap();
         let chunk_id = self.alloc_chunk_id();
         let mut draft = self.current.cow_next();
         if let Some(entry) = draft.segments.get_mut(&seg.get()) {
-            let base = entry.upgrade_ref.as_deref().cloned().unwrap_or_else(UpgradeColChunk::empty);
+            let base = entry
+                .upgrade_ref
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(UpgradeColChunk::empty);
             let new_chunk = base.with_patch(trace_id, span_id, fields, chunk_id);
             entry.upgrade_ref = Some(Arc::new(new_chunk));
             entry.upgrade_seq += 1;
@@ -2492,9 +2965,16 @@ impl WriteCoordinator {
         let m = self.current.manifest();
         let seqs_at_select = inputs
             .iter()
-            .filter_map(|s| m.segments.get(&s.get()).map(|e| (s.get(), (e.deletion_seq, e.upgrade_seq))))
+            .filter_map(|s| {
+                m.segments
+                    .get(&s.get())
+                    .map(|e| (s.get(), (e.deletion_seq, e.upgrade_seq)))
+            })
             .collect();
-        CompactionPlan { inputs: inputs.to_vec(), seqs_at_select }
+        CompactionPlan {
+            inputs: inputs.to_vec(),
+            seqs_at_select,
+        }
     }
 
     /// compaction 第 3 步：提交（草案 1 §D1.3 / OPEN-3）。
@@ -2511,9 +2991,12 @@ impl WriteCoordinator {
         let up_chunk_id = self.alloc_chunk_id();
 
         for &seg in &plan.inputs {
-            let Some(entry) = m.segments.get(&seg.get()) else { continue };
+            let Some(entry) = m.segments.get(&seg.get()) else {
+                continue;
+            };
             // 选段以来 seq 涨了 = 期间有并发删除/补写打到这个输入段 → 触发重读合并
-            if plan.seqs_at_select.get(&seg.get()) != Some(&(entry.deletion_seq, entry.upgrade_seq)) {
+            if plan.seqs_at_select.get(&seg.get()) != Some(&(entry.deletion_seq, entry.upgrade_seq))
+            {
                 reconciled = true;
             }
             // 用「当前」deletion_vec 过滤（含选段后新增的删除）→ 删除不丢
@@ -2533,7 +3016,10 @@ impl WriteCoordinator {
         let new_seg = self.alloc_segment_id();
         self.segments.flush_to_segment(new_seg, &merged);
         let bloom = KeyBloom::build(merged.iter().map(|r| (r.trace_id, r.span_id)), merged.len());
-        self.seg_key_bloom.lock().unwrap().insert(new_seg.get(), Arc::new(bloom));
+        self.seg_key_bloom
+            .lock()
+            .unwrap()
+            .insert(new_seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(&merged);
         let has_upgrade = merged_upgrade.iter().next().is_some();
 
@@ -2570,10 +3056,11 @@ impl WriteCoordinator {
         let n_in = inputs.len();
         let plan = self.compaction_begin(inputs);
         self.compaction_finish(&plan);
-        olog::log(olog::Level::Info, "compaction", &[
-            ("inputs", &n_in),
-            ("version", &self.current.version()),
-        ]);
+        olog::log(
+            olog::Level::Info,
+            "compaction",
+            &[("inputs", &n_in), ("version", &self.current.version())],
+        );
     }
 
     /// 取 / 放一个段文件的 buffer pin（读路径扫段字节时持有，用完释放）。
@@ -2628,7 +3115,11 @@ impl WriteCoordinator {
             false // 出 dead_set
         });
         if freed > 0 {
-            olog::log(olog::Level::Info, "reclaim", &[("freed", &freed), ("remaining_dead", &dead.len())]);
+            olog::log(
+                olog::Level::Info,
+                "reclaim",
+                &[("freed", &freed), ("remaining_dead", &dead.len())],
+            );
         }
         freed
     }
@@ -2649,12 +3140,22 @@ impl WriteCoordinator {
     pub fn backup_snapshot(&self, dest: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         let dest = dest.as_ref();
         let src = self.dir.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Unsupported, "backup 需要 open_durable 的数据目录")
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "backup 需要 open_durable 的数据目录",
+            )
         })?;
         // pin 住当前版本——拷贝期间 reclaim 不会删这个版本引用的段文件。
         let _snap = self.current.pin_snapshot();
         let version = self.current.version();
-        olog::log(olog::Level::Info, "backup_start", &[("dest", &dest.to_string_lossy().to_string()), ("version", &version)]);
+        olog::log(
+            olog::Level::Info,
+            "backup_start",
+            &[
+                ("dest", &dest.to_string_lossy().to_string()),
+                ("version", &version),
+            ],
+        );
 
         std::fs::create_dir_all(dest)?;
         // 拷贝数据文件/目录。segments/ 和 vecindex/ 是目录,其余是文件。
@@ -2670,7 +3171,14 @@ impl WriteCoordinator {
                 std::fs::copy(&s, dest.join(name))?;
             }
         }
-        olog::log(olog::Level::Info, "backup_done", &[("dest", &dest.to_string_lossy().to_string()), ("version", &version)]);
+        olog::log(
+            olog::Level::Info,
+            "backup_done",
+            &[
+                ("dest", &dest.to_string_lossy().to_string()),
+                ("version", &version),
+            ],
+        );
         Ok(())
     }
 
@@ -2696,7 +3204,9 @@ impl WriteCoordinator {
         out.push_str("# TYPE yt_manifest_version gauge\n");
         out.push_str(&format!("yt_manifest_version {version}\n\n"));
 
-        out.push_str("# HELP yt_format_version 数据格式版本（persist::FORMAT_VER，升级迁移用）。\n");
+        out.push_str(
+            "# HELP yt_format_version 数据格式版本（persist::FORMAT_VER，升级迁移用）。\n",
+        );
         out.push_str("# TYPE yt_format_version gauge\n");
         out.push_str(&format!("yt_format_version {}\n\n", persist::FORMAT_VER));
 
@@ -2708,7 +3218,9 @@ impl WriteCoordinator {
         out.push_str("# TYPE yt_memtable_rows gauge\n");
         out.push_str(&format!("yt_memtable_rows {memtable_rows}\n\n"));
 
-        out.push_str("# HELP yt_segments_dead 待回收 dead 段数（compaction 摘下、等水位满足删）。\n");
+        out.push_str(
+            "# HELP yt_segments_dead 待回收 dead 段数（compaction 摘下、等水位满足删）。\n",
+        );
         out.push_str("# TYPE yt_segments_dead gauge\n");
         out.push_str(&format!("yt_segments_dead {dead}\n\n"));
 
@@ -2779,29 +3291,47 @@ impl WriteCoordinator {
         let (disk, current) = Self::check_format(&dir);
         match disk.cmp(&current) {
             std::cmp::Ordering::Equal => {
-                olog::log(olog::Level::Info, "migrate", &[("status", &"already current"), ("ver", &disk)]);
+                olog::log(
+                    olog::Level::Info,
+                    "migrate",
+                    &[("status", &"already current"), ("ver", &disk)],
+                );
                 Ok(())
             }
             std::cmp::Ordering::Less => {
-                olog::log(olog::Level::Error, "migrate", &[
-                    ("status", &"old version not yet supported"),
-                    ("disk", &disk),
-                    ("engine", &current),
-                ]);
+                olog::log(
+                    olog::Level::Error,
+                    "migrate",
+                    &[
+                        ("status", &"old version not yet supported"),
+                        ("disk", &disk),
+                        ("engine", &current),
+                    ],
+                );
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    format!("从格式版本 {} 迁移到 {} 尚未实现（当前引擎无历史老版本数据）", disk, current),
+                    format!(
+                        "从格式版本 {} 迁移到 {} 尚未实现（当前引擎无历史老版本数据）",
+                        disk, current
+                    ),
                 ))
             }
             std::cmp::Ordering::Greater => {
-                olog::log(olog::Level::Error, "migrate", &[
-                    ("status", &"data newer than engine"),
-                    ("disk", &disk),
-                    ("engine", &current),
-                ]);
+                olog::log(
+                    olog::Level::Error,
+                    "migrate",
+                    &[
+                        ("status", &"data newer than engine"),
+                        ("disk", &disk),
+                        ("engine", &current),
+                    ],
+                );
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    format!("数据格式版本 {} 比引擎支持的 {} 新，需升级引擎", disk, current),
+                    format!(
+                        "数据格式版本 {} 比引擎支持的 {} 新，需升级引擎",
+                        disk, current
+                    ),
                 ))
             }
         }
@@ -2866,33 +3396,64 @@ mod tests {
     }
     impl SegmentStore for PushdownStore {
         fn flush_to_segment(&self, seg: SegmentId, records: &[WalRecord]) {
-            self.rows.lock().unwrap().insert(seg.get(), records.to_vec());
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(seg.get(), records.to_vec());
         }
         fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)> {
             self.rows
                 .lock()
                 .unwrap()
                 .get(&seg.get())
-                .map(|rs| rs.iter().enumerate().map(|(i, r)| (i as u32, r.to_fold_input())).collect())
+                .map(|rs| {
+                    rs.iter()
+                        .enumerate()
+                        .map(|(i, r)| (i as u32, r.to_fold_input()))
+                        .collect()
+                })
                 .unwrap_or_default()
         }
         fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
-            self.rows.lock().unwrap().get(&seg.get()).cloned().unwrap_or_default()
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&seg.get())
+                .cloned()
+                .unwrap_or_default()
         }
         fn unlink_segment(&self, seg: SegmentId) {
             self.rows.lock().unwrap().remove(&seg.get());
         }
-        fn scan_fold_inputs_projected(&self, seg: SegmentId, proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
-            self.last_proj.store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
+        fn scan_fold_inputs_projected(
+            &self,
+            seg: SegmentId,
+            proj: Projection,
+        ) -> Option<Vec<(u32, FoldInput)>> {
+            self.last_proj
+                .store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
             Some(self.scan_fold_inputs(seg))
         }
-        fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Option<Vec<FoldInput>> {
-            self.pushdowns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.last_proj.store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
+        fn scan_fold_inputs_in_time(
+            &self,
+            seg: SegmentId,
+            from: i64,
+            to: i64,
+            proj: Projection,
+        ) -> Option<Vec<FoldInput>> {
+            self.pushdowns
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_proj
+                .store(proj.bits(), std::sync::atomic::Ordering::Relaxed);
             let g = self.rows.lock().unwrap();
             Some(
                 g.get(&seg.get())
-                    .map(|rs| rs.iter().filter(|r| r.ts >= from && r.ts <= to).map(|r| r.to_fold_input()).collect())
+                    .map(|rs| {
+                        rs.iter()
+                            .filter(|r| r.ts >= from && r.ts <= to)
+                            .map(|r| r.to_fold_input())
+                            .collect()
+                    })
                     .unwrap_or_default(),
             )
         }
@@ -2906,23 +3467,46 @@ mod tests {
             trace_id: 1,
             span_id: seq,
             ts: seq as i64,
-            identity: EventIdentity { ext_span_id: span.into(), seq, event_type: EventType::SpanEnd },
+            identity: EventIdentity {
+                ext_span_id: span.into(),
+                seq,
+                event_type: EventType::SpanEnd,
+            },
             fields: SpanFields::default(),
         }
     }
 
     /// 带可折叠字段的事件构造器（ts 默认 = seq）。
-    fn ev(trace: u64, span: u64, seq: u64, status: Option<u8>, dur: Option<u64>, logs: &[&str]) -> WalRecord {
+    fn ev(
+        trace: u64,
+        span: u64,
+        seq: u64,
+        status: Option<u8>,
+        dur: Option<u64>,
+        logs: &[&str],
+    ) -> WalRecord {
         ev_at(trace, span, seq, seq as i64, status, dur, logs)
     }
 
     /// 指定时间戳的事件构造器。
-    fn ev_at(trace: u64, span: u64, seq: u64, ts: i64, status: Option<u8>, dur: Option<u64>, logs: &[&str]) -> WalRecord {
+    fn ev_at(
+        trace: u64,
+        span: u64,
+        seq: u64,
+        ts: i64,
+        status: Option<u8>,
+        dur: Option<u64>,
+        logs: &[&str],
+    ) -> WalRecord {
         WalRecord {
             trace_id: trace,
             span_id: span,
             ts,
-            identity: EventIdentity { ext_span_id: format!("{trace}-{span}"), seq, event_type: EventType::Attr },
+            identity: EventIdentity {
+                ext_span_id: format!("{trace}-{span}"),
+                seq,
+                event_type: EventType::Attr,
+            },
             fields: SpanFields {
                 status,
                 duration_ns: dur,
@@ -2930,6 +3514,38 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn log_events_round_trip_from_memtable_and_segment() {
+        let wc = WriteCoordinator::new(Arc::new(CapturingStore::default()));
+        let batch = r#"[
+          {"trace_id":42,"span_id":7,"ts":100,"seq":1,"event_type":1,"ext_span_id":"42-7","agent_name":"builder"},
+          {"trace_id":42,"span_id":7,"ts":120,"seq":2,"event_type":4,"ext_span_id":"42-7","logs":["npm test failed"],"attrs":{"call_site":"package"}},
+          {"trace_id":42,"span_id":7,"ts":150,"seq":3,"event_type":2,"ext_span_id":"42-7","status":0,"duration_ns":50}
+        ]"#;
+        wc.ingest_wire(parse_wire_batch(batch).unwrap());
+
+        let assert_events = |wc: &WriteCoordinator| {
+            let snap = wc.pin_snapshot();
+            let (spans, _) = wc.read_spans_query(&snap, &TraceQuery::trace(42, i64::MIN, i64::MAX));
+            let keys: std::collections::HashSet<(u64, u64)> =
+                spans.iter().map(|s| (s.trace_id, s.span_id)).collect();
+            let events = wc.log_events_for_trace_keys(&snap, 42, &keys);
+            let span_events = events.get(&7).expect("span log events");
+            assert_eq!(span_events.len(), 1);
+            assert_eq!(span_events[0].seq, 2);
+            assert_eq!(span_events[0].event_type, 4);
+            assert_eq!(span_events[0].messages, vec!["npm test failed"]);
+            assert_eq!(
+                span_events[0].attrs.get("call_site").map(String::as_str),
+                Some("\"package\"")
+            );
+        };
+
+        assert_events(&wc);
+        wc.flush_memtable();
+        assert_events(&wc);
     }
 
     #[test]
@@ -3062,7 +3678,11 @@ mod tests {
 
         let snap = wc.pin_snapshot();
         let spans = wc.read_spans(&snap);
-        assert_eq!(spans.len(), 1, "段里的 start + 内存里的 end 折叠成一条 span");
+        assert_eq!(
+            spans.len(),
+            1,
+            "段里的 start + 内存里的 end 折叠成一条 span"
+        );
         let s = &spans[0];
         assert_eq!((s.trace_id, s.span_id), (1, 10));
         assert_eq!(s.status, Some(0), "来自段里的 start");
@@ -3077,7 +3697,10 @@ mod tests {
         let store = Arc::new(CapturingStore::default());
         let wc = WriteCoordinator::new(store.clone());
 
-        let rows = vec![ev(1, 10, 1, Some(0), None, &[]), ev(1, 20, 1, Some(1), None, &[])];
+        let rows = vec![
+            ev(1, 10, 1, Some(0), None, &[]),
+            ev(1, 20, 1, Some(1), None, &[]),
+        ];
         wc.ingest(rows.clone());
         wc.commit_flush(&rows, WalLsn::new(2)); // seg 1，行 0 = span10，行 1 = span20
 
@@ -3093,7 +3716,11 @@ mod tests {
         let after_spans = wc.read_spans(&after);
         assert_eq!(after_spans.len(), 1);
         assert_eq!(after_spans[0].span_id, 10);
-        assert_eq!(wc.read_spans(&before).len(), 2, "老读者快照不受后来的删除影响");
+        assert_eq!(
+            wc.read_spans(&before).len(),
+            2,
+            "老读者快照不受后来的删除影响"
+        );
     }
 
     #[test]
@@ -3113,7 +3740,10 @@ mod tests {
         let snap0 = wc.pin_snapshot();
         let before = wc.read_spans(&snap0);
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].event_count, 2, "段+内存已重叠，event_id 去重 → 仍是 2");
+        assert_eq!(
+            before[0].event_count, 2,
+            "段+内存已重叠，event_id 去重 → 仍是 2"
+        );
         drop(snap0);
 
         // 崩溃：丢内存表
@@ -3125,7 +3755,10 @@ mod tests {
         let snap1 = wc.pin_snapshot();
         let after = wc.read_spans(&snap1);
         assert_eq!(after, before, "崩溃恢复前后折叠结果逐字段一致（重放幂等）");
-        assert_eq!(after[0].event_count, 2, "没有因为重放把事件算两遍 → token/cost 不翻倍");
+        assert_eq!(
+            after[0].event_count, 2,
+            "没有因为重放把事件算两遍 → token/cost 不翻倍"
+        );
     }
 
     #[test]
@@ -3166,9 +3799,16 @@ mod tests {
         wc.recover();
 
         let after = wc.read_spans(&wc.pin_snapshot());
-        assert_eq!(after, before, "崩溃重放前后逐字段一致 —— 补写字段没因重叠去重而丢");
+        assert_eq!(
+            after, before,
+            "崩溃重放前后逐字段一致 —— 补写字段没因重叠去重而丢"
+        );
         assert_eq!(after[0].event_count, 2, "base 事件没被算两遍");
-        assert_eq!(after[0].eval_score, Some(900), "补写的 eval_score 重放后仍在");
+        assert_eq!(
+            after[0].eval_score,
+            Some(900),
+            "补写的 eval_score 重放后仍在"
+        );
     }
 
     #[test]
@@ -3191,18 +3831,31 @@ mod tests {
             SegmentId::new(1),
             1,
             10,
-            SpanFields { status: None, duration_ns: Some(999), logs: vec!["late".into()], ..Default::default() },
+            SpanFields {
+                status: None,
+                duration_ns: Some(999),
+                logs: vec!["late".into()],
+                ..Default::default()
+            },
         );
 
         // 升级后新读者：duration 来自补写，status 仍是原值，日志并集
         let after = wc.pin_snapshot();
         let s = wc.read_spans(&after);
-        assert_eq!(s[0].status, Some(0), "status 没被补写动（补写 status=None）");
+        assert_eq!(
+            s[0].status,
+            Some(0),
+            "status 没被补写动（补写 status=None）"
+        );
         assert_eq!(s[0].duration_ns, Some(999), "duration 来自晚到补写");
         assert_eq!(s[0].logs, vec!["start", "late"]);
 
         // 快照隔离：升级前 pin 的读者仍看到未升级的值
-        assert_eq!(wc.read_spans(&before)[0].duration_ns, None, "老读者不受后来补写影响");
+        assert_eq!(
+            wc.read_spans(&before)[0].duration_ns,
+            None,
+            "老读者不受后来补写影响"
+        );
     }
 
     #[test]
@@ -3220,13 +3873,25 @@ mod tests {
             SegmentId::new(1),
             1,
             10,
-            SpanFields { model: Some("qwen3".into()), output_tokens: Some(42), ..Default::default() },
+            SpanFields {
+                model: Some("qwen3".into()),
+                output_tokens: Some(42),
+                ..Default::default()
+            },
         );
 
         let snap = wc.pin_snapshot();
         let s = &wc.read_spans(&snap)[0];
-        assert_eq!(s.model.as_deref(), Some("qwen3"), "upgrade 补的 model 必须读得到");
-        assert_eq!(s.output_tokens, Some(42), "upgrade 补的 output_tokens 必须读得到");
+        assert_eq!(
+            s.model.as_deref(),
+            Some("qwen3"),
+            "upgrade 补的 model 必须读得到"
+        );
+        assert_eq!(
+            s.output_tokens,
+            Some(42),
+            "upgrade 补的 output_tokens 必须读得到"
+        );
     }
 
     #[test]
@@ -3280,11 +3945,26 @@ mod tests {
         let n0 = store.pushdowns.load(Ordering::Relaxed);
         let (all, _) = wc.read_spans_query(&snap, &TraceQuery::all());
         assert_eq!(all.len(), 3);
-        assert_eq!(store.pushdowns.load(Ordering::Relaxed), n0, "全开窗不触发下推");
+        assert_eq!(
+            store.pushdowns.load(Ordering::Relaxed),
+            n0,
+            "全开窗不触发下推"
+        );
 
         // 时间窗 [150,250] → 触发下推,行级过滤只剩 span20(ts=200)。
-        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250, tenant_id: None });
-        assert!(store.pushdowns.load(Ordering::Relaxed) > n0, "有时间窗 → 走下推");
+        let (hit, _) = wc.read_spans_query(
+            &snap,
+            &TraceQuery {
+                trace_id: None,
+                time_from: 150,
+                time_to: 250,
+                tenant_id: None,
+            },
+        );
+        assert!(
+            store.pushdowns.load(Ordering::Relaxed) > n0,
+            "有时间窗 → 走下推"
+        );
         assert_eq!(hit.len(), 1, "下推做了段内行级时间过滤");
         assert_eq!(hit[0].span_id, 20);
     }
@@ -3311,7 +3991,10 @@ mod tests {
         assert_eq!(cost.len(), 1);
         assert_eq!(cost[0].input_tokens, 100);
         let p = store.last_proj();
-        assert!(p.has(Projection::AGENT_NAME) && p.has(Projection::INPUT_TOKENS), "聚合要的列在投影里");
+        assert!(
+            p.has(Projection::AGENT_NAME) && p.has(Projection::INPUT_TOKENS),
+            "聚合要的列在投影里"
+        );
         assert!(
             !p.has(Projection::INPUT_TEXT) && !p.has(Projection::OUTPUT_TEXT),
             "聚合不读原文 → 投影不含大文本列(列式段据此跳过解码)"
@@ -3319,7 +4002,11 @@ mod tests {
 
         // trace 详情:读全列,原文必须读得到。
         let detail = &wc.read_spans(&snap)[0];
-        assert_eq!(detail.output_text.as_deref(), Some("一大段研判正文……"), "详情读全列、原文在");
+        assert_eq!(
+            detail.output_text.as_deref(),
+            Some("一大段研判正文……"),
+            "详情读全列、原文在"
+        );
         assert!(store.last_proj().is_all(), "详情下推的是全列投影");
         let _ = store.pushdowns.load(Ordering::Relaxed); // 触达字段,消除未读告警
     }
@@ -3348,7 +4035,11 @@ mod tests {
         let hits = wc.search_text(&snap, "盗刷", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (2, 20));
-        assert_eq!(hits[0].0.duration_ns, Some(200), "返回的是折叠出的完整 span，不只是命中行");
+        assert_eq!(
+            hits[0].0.duration_ns,
+            Some(200),
+            "返回的是折叠出的完整 span，不只是命中行"
+        );
 
         // 向量找相似：查 [0.9,0.0] 最近的是 span(2,20) 的 [1,0]，其次 span(1,10) 的 [0,0]
         let sim = wc.search_similar(&snap, &[0.9, 0.0], 2);
@@ -3396,7 +4087,7 @@ mod tests {
         let a = ev(1, 10, 1, Some(0), Some(100), &["疑似盗刷 已拦截"]);
         wc.ingest(vec![a.clone()]);
         wc.flush_memtable(); // → 段 A，建 bloom（含 (1,10)）
-        // 段 B：trace 2 不含"盗刷"，且 key 不同
+                             // 段 B：trace 2 不含"盗刷"，且 key 不同
         let b = ev(2, 20, 1, Some(0), Some(200), &["正常转账"]);
         wc.ingest(vec![b.clone()]);
         wc.flush_memtable(); // → 段 B，建 bloom（含 (2,20)，不含 (1,10)）
@@ -3408,11 +4099,19 @@ mod tests {
         let hits = wc.search_text(&snap, "盗刷", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (1, 10));
-        assert_eq!(hits[0].0.duration_ns, Some(100), "折叠出完整 span（跨段定位正确）");
+        assert_eq!(
+            hits[0].0.duration_ns,
+            Some(100),
+            "折叠出完整 span（跨段定位正确）"
+        );
         // 直接验证 bloom 语义：段 B 的 bloom 对 (1,10) 说"肯定没有"。
         let blooms = wc.seg_key_bloom.lock().unwrap();
         let seg_ids: Vec<u64> = snap.manifest.segments.keys().copied().collect();
-        let any_rejects_a = seg_ids.iter().any(|sid| blooms.get(sid).map_or(false, |bl| !bl.maybe_contains((1, 10))));
+        let any_rejects_a = seg_ids.iter().any(|sid| {
+            blooms
+                .get(sid)
+                .map_or(false, |bl| !bl.maybe_contains((1, 10)))
+        });
         assert!(any_rejects_a, "应有段的 bloom 对 (1,10) 判定肯定没有");
     }
 
@@ -3438,9 +4137,15 @@ mod tests {
         assert_eq!(s1[0].trace_id, 1);
         // 列表也隔离。
         let l1 = wc.list_traces(&snap, &TraceQuery::all().for_tenant(1));
-        assert!(l1.iter().all(|t| t.trace_id == 1) && !l1.is_empty(), "列表只见租户1");
+        assert!(
+            l1.iter().all(|t| t.trace_id == 1) && !l1.is_empty(),
+            "列表只见租户1"
+        );
         let l2 = wc.list_traces(&snap, &TraceQuery::all().for_tenant(2));
-        assert!(l2.iter().all(|t| t.trace_id == 2) && !l2.is_empty(), "列表只见租户2");
+        assert!(
+            l2.iter().all(|t| t.trace_id == 2) && !l2.is_empty(),
+            "列表只见租户2"
+        );
     }
 
     #[test]
@@ -3461,22 +4166,40 @@ mod tests {
         wc.index_embedding(2, 20, vec![0.01, 0.0]); // 和租户1的几乎重合
         let snap = wc.pin_snapshot();
 
-        let t1 = SearchFilter { tenant_id: Some(1), ..Default::default() };
-        let t2 = SearchFilter { tenant_id: Some(2), ..Default::default() };
+        let t1 = SearchFilter {
+            tenant_id: Some(1),
+            ..Default::default()
+        };
+        let t2 = SearchFilter {
+            tenant_id: Some(2),
+            ..Default::default()
+        };
 
         // BM25 文本检索：查"盗刷"，scope 租户1 → 只回 (1,10)，不漏租户2。
         let txt1 = wc.search_text_attr(&snap, "盗刷", 10, &t1);
-        assert!(txt1.iter().all(|(s, _)| s.trace_id == 1), "租户1 文本检索不漏租户2");
+        assert!(
+            txt1.iter().all(|(s, _)| s.trace_id == 1),
+            "租户1 文本检索不漏租户2"
+        );
         assert!(txt1.iter().any(|(s, _)| s.span_id == 10));
         let txt2 = wc.search_text_attr(&snap, "盗刷", 10, &t2);
-        assert!(txt2.iter().all(|(s, _)| s.trace_id == 2), "租户2 文本检索不漏租户1");
+        assert!(
+            txt2.iter().all(|(s, _)| s.trace_id == 2),
+            "租户2 文本检索不漏租户1"
+        );
 
         // 向量找相似：scope 租户1 → 即便租户2的向量更近也不返回（进图过滤隔离）。
         let sim1 = wc.search_similar_attr(&snap, &[0.0, 0.0], 10, &t1);
         assert!(!sim1.is_empty());
-        assert!(sim1.iter().all(|(s, _)| s.trace_id == 1), "租户1 找相似不漏租户2（向量更近也挡）");
+        assert!(
+            sim1.iter().all(|(s, _)| s.trace_id == 1),
+            "租户1 找相似不漏租户2（向量更近也挡）"
+        );
         let sim2 = wc.search_similar_attr(&snap, &[0.0, 0.0], 10, &t2);
-        assert!(sim2.iter().all(|(s, _)| s.trace_id == 2), "租户2 找相似不漏租户1");
+        assert!(
+            sim2.iter().all(|(s, _)| s.trace_id == 2),
+            "租户2 找相似不漏租户1"
+        );
     }
 
     #[test]
@@ -3486,13 +4209,20 @@ mod tests {
         struct StubGraph; // 无视查询向量，永远只返回 (7,99) —— 默认 L2 ANN 不会这么选
         impl GraphIndex for StubGraph {
             fn index_embedding(&self, _t: u64, _s: u64, _e: Vec<f32>) {}
-            fn search(&self, _q: &[f32], _k: usize, _f: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+            fn search(
+                &self,
+                _q: &[f32],
+                _k: usize,
+                _f: &dyn Fn(u64, u64) -> bool,
+            ) -> Vec<(u64, u64, f32)> {
                 vec![(7, 99, 0.0)]
             }
         }
 
         let store = Arc::new(CapturingStore::default());
-        let wc = CoordinatorBuilder::new().with_graph(Arc::new(StubGraph)).build(store);
+        let wc = CoordinatorBuilder::new()
+            .with_graph(Arc::new(StubGraph))
+            .build(store);
 
         // 两个 span 都摄入（才能被折叠出来）；查询向量明显更靠近 (1,10)。
         let e1 = ev(1, 10, 1, Some(0), Some(100), &["a"]);
@@ -3504,7 +4234,11 @@ mod tests {
 
         let sim = wc.search_similar(&snap, &[0.0, 0.0], 5);
         assert_eq!(sim.len(), 1, "注入的图索引决定返回什么");
-        assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (7, 99), "走的是 StubGraph，不是默认 L2");
+        assert_eq!(
+            (sim[0].0.trace_id, sim[0].0.span_id),
+            (7, 99),
+            "走的是 StubGraph，不是默认 L2"
+        );
         assert_eq!(sim[0].0.duration_ns, Some(700), "返回折叠出的完整 span");
     }
 
@@ -3529,7 +4263,11 @@ mod tests {
         // 混合「盗刷」+ 同一个向量：span(2,20) 被关键词和语义双命中 → 融合后反超到第一,
         // 这是单走向量给不出的排序。
         let hy = wc.search_hybrid(&snap, "盗刷", &[0.1, 0.0], 3);
-        assert_eq!((hy[0].0.trace_id, hy[0].0.span_id), (2, 20), "双命中的 span 经 RRF 融合居首");
+        assert_eq!(
+            (hy[0].0.trace_id, hy[0].0.span_id),
+            (2, 20),
+            "双命中的 span 经 RRF 融合居首"
+        );
         assert_eq!(hy[1].0.trace_id, 1, "向量单命中的次之");
     }
 
@@ -3542,8 +4280,11 @@ mod tests {
         wc.ingest(vec![start.clone()]);
         wc.commit_flush(&[start], WalLsn::new(1));
         wc.ingest(vec![ev(2, 20, 2, None, Some(500), &["已拦截"])]); // 内存
-        // 噪声 span(别的 trace),不该被折进检索结果。
-        wc.ingest(vec![ev(1, 10, 1, Some(0), Some(9), &["登录"]), ev(3, 30, 1, Some(0), Some(9), &["转账"])]);
+                                                                     // 噪声 span(别的 trace),不该被折进检索结果。
+        wc.ingest(vec![
+            ev(1, 10, 1, Some(0), Some(9), &["登录"]),
+            ev(3, 30, 1, Some(0), Some(9), &["转账"]),
+        ]);
 
         let snap = wc.pin_snapshot();
         let hits = wc.search_text(&snap, "盗刷", 10);
@@ -3578,9 +4319,19 @@ mod tests {
 
         // 只搜 trace1:谓词下推进图,trace2 的最近点被排除,仍能召回 trace1 里最近的 span10。
         let only1 = wc.search_similar_filtered(&snap, &[0.0, 0.0], 3, &|t, _| t == 1);
-        assert!(only1.iter().all(|(s, _)| s.trace_id == 1), "过滤后只剩 trace1");
-        assert!(!only1.iter().any(|(s, _)| s.span_id == 20), "trace2 的最近点被进图过滤排除");
-        assert_eq!((only1[0].0.trace_id, only1[0].0.span_id), (1, 10), "trace1 里离 query 最近的是 span10");
+        assert!(
+            only1.iter().all(|(s, _)| s.trace_id == 1),
+            "过滤后只剩 trace1"
+        );
+        assert!(
+            !only1.iter().any(|(s, _)| s.span_id == 20),
+            "trace2 的最近点被进图过滤排除"
+        );
+        assert_eq!(
+            (only1[0].0.trace_id, only1[0].0.span_id),
+            (1, 10),
+            "trace1 里离 query 最近的是 span10"
+        );
     }
 
     #[test]
@@ -3601,18 +4352,39 @@ mod tests {
 
         let snap = wc.pin_snapshot();
         // 找 agent=风控 且 报错(status=1) 的相似:最近的 span10 是风控但正常 → 排除;命中 span20。
-        let f = SearchFilter { agent_name: Some("风控".into()), status: Some(1), ..Default::default() };
+        let f = SearchFilter {
+            agent_name: Some("风控".into()),
+            status: Some(1),
+            ..Default::default()
+        };
         let hits = wc.search_similar_attr(&snap, &[0.0, 0.0], 5, &f);
         assert!(!hits.is_empty(), "应召回风控+报错的 span");
-        assert!(hits.iter().all(|(s, _)| s.agent_name.as_deref() == Some("风控") && s.status == Some(1)));
-        assert!(hits.iter().any(|(s, _)| s.span_id == 20), "命中风控+报错的 span20");
-        assert!(!hits.iter().any(|(s, _)| s.span_id == 10), "最近但 status=0 被排除");
-        assert!(!hits.iter().any(|(s, _)| s.span_id == 11), "agent 不符被排除");
+        assert!(hits
+            .iter()
+            .all(|(s, _)| s.agent_name.as_deref() == Some("风控") && s.status == Some(1)));
+        assert!(
+            hits.iter().any(|(s, _)| s.span_id == 20),
+            "命中风控+报错的 span20"
+        );
+        assert!(
+            !hits.iter().any(|(s, _)| s.span_id == 10),
+            "最近但 status=0 被排除"
+        );
+        assert!(
+            !hits.iter().any(|(s, _)| s.span_id == 11),
+            "agent 不符被排除"
+        );
 
         // 时间窗:只要 ts ≤ 150 → 只 span10(ts=100)。
-        let ft = SearchFilter { time_to: Some(150), ..Default::default() };
+        let ft = SearchFilter {
+            time_to: Some(150),
+            ..Default::default()
+        };
         let timed = wc.search_similar_attr(&snap, &[0.0, 0.0], 5, &ft);
-        assert!(!timed.is_empty() && timed.iter().all(|(s, _)| s.span_id == 10), "只剩时间窗内的 span10");
+        assert!(
+            !timed.is_empty() && timed.iter().all(|(s, _)| s.span_id == 10),
+            "只剩时间窗内的 span10"
+        );
     }
 
     #[test]
@@ -3631,7 +4403,16 @@ mod tests {
 
         // 选段之后、提交之前：并发删除 span20（行1），并发给 span10 补 duration=999
         wc.commit_delete(SegmentId::new(1), 1);
-        wc.commit_upgrade(SegmentId::new(1), 1, 10, SpanFields { status: None, duration_ns: Some(999), ..Default::default() });
+        wc.commit_upgrade(
+            SegmentId::new(1),
+            1,
+            10,
+            SpanFields {
+                status: None,
+                duration_ns: Some(999),
+                ..Default::default()
+            },
+        );
 
         // 提交：重读合并,删除和补写都不能丢
         let reconciled = wc.compaction_finish(&plan);
@@ -3641,7 +4422,11 @@ mod tests {
         let spans = wc.read_spans(&snap);
         assert_eq!(spans.len(), 1, "span20 的删除没丢 → 只剩 span10");
         assert_eq!(spans[0].span_id, 10);
-        assert_eq!(spans[0].duration_ns, Some(999), "span10 的晚到补写没丢 → 来自 upgrade");
+        assert_eq!(
+            spans[0].duration_ns,
+            Some(999),
+            "span10 的晚到补写没丢 → 来自 upgrade"
+        );
     }
 
     #[test]
@@ -3702,7 +4487,8 @@ mod tests {
         }
 
         for h in handles {
-            h.join().expect("线程不应 panic（无 use-after-free / 无断言失败）");
+            h.join()
+                .expect("线程不应 panic（无 use-after-free / 无断言失败）");
         }
 
         // 跑完仍能正常读,种子 span 还在
@@ -3725,7 +4511,10 @@ mod tests {
             wc.ingest(vec![ev_at(1, i, i, i as i64, Some(0), Some(i), &[])]);
         }
         // 自动刷盘把内存表压在阈值附近,远小于 20
-        assert!(wc.memtable_len() < 20, "内存表应被自动刷盘限制,而不是涨到 20");
+        assert!(
+            wc.memtable_len() < 20,
+            "内存表应被自动刷盘限制,而不是涨到 20"
+        );
 
         // 数据一条不丢:20 个 span 都能读出来
         let snap = wc.pin_snapshot();
@@ -3811,7 +4600,11 @@ mod tests {
         assert_eq!(spans[0].duration_ns, Some(50), "来自 end");
         assert_eq!(spans[0].logs, vec!["交易风控 开始", "疑似盗刷 已拦截"]);
         assert_eq!(spans[0].event_count, 2);
-        assert_eq!(spans[0].input_tokens, Some(900), "token 从线格式透传 + 折叠");
+        assert_eq!(
+            spans[0].input_tokens,
+            Some(900),
+            "token 从线格式透传 + 折叠"
+        );
         assert_eq!(spans[0].output_tokens, Some(150));
     }
 
@@ -3912,16 +4705,26 @@ mod tests {
         let names: Vec<&str> = g.nodes.iter().map(|n| n.actor.as_str()).collect();
         assert_eq!(names, vec!["calc", "kb_lookup", "执行", "规划"]);
         let exec = g.nodes.iter().find(|n| n.actor == "执行").unwrap();
-        assert_eq!((exec.kind, exec.span_count, exec.input_tokens), (ActorKind::Agent, 2, 100));
+        assert_eq!(
+            (exec.kind, exec.span_count, exec.input_tokens),
+            (ActorKind::Agent, 2, 100)
+        );
         let kb = g.nodes.iter().find(|n| n.actor == "kb_lookup").unwrap();
         assert_eq!(kb.kind, ActorKind::Tool);
 
         // 边:规划→kb_lookup、规划→执行、执行→calc;执行→执行 自环被剔除。
-        let edges: Vec<(&str, &str, usize)> =
-            g.edges.iter().map(|e| (e.from.as_str(), e.to.as_str(), e.count)).collect();
+        let edges: Vec<(&str, &str, usize)> = g
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str(), e.count))
+            .collect();
         assert_eq!(
             edges,
-            vec![("执行", "calc", 1), ("规划", "kb_lookup", 1), ("规划", "执行", 1)],
+            vec![
+                ("执行", "calc", 1),
+                ("规划", "kb_lookup", 1),
+                ("规划", "执行", 1)
+            ],
             "跨角色调用/移交,自环已剔除,按 (from,to) 升序"
         );
     }
@@ -3979,11 +4782,15 @@ mod tests {
         // 数据从盘上 WAL 重放回来。(段/manifest 仍在内存丢了,全靠 WAL 全量重放恢复进 MemTable。)
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!("yt_engine_{}_{}.wal", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "yt_engine_{}_{}.wal",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
 
         {
-            let wc = WriteCoordinator::open(Arc::new(InMemorySegmentStore::default()), &path).unwrap();
+            let wc =
+                WriteCoordinator::open(Arc::new(InMemorySegmentStore::default()), &path).unwrap();
             wc.ingest(vec![
                 ev(1, 10, 1, Some(0), Some(100), &["反洗钱"]),
                 ev(1, 20, 1, Some(1), Some(50), &["盗刷"]),
@@ -4010,8 +4817,11 @@ mod tests {
         // 这正是 WAL-only 持久化补不上的洞:flush 过的数据只活在段里,段/manifest 不落盘就丢。
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir()
-            .join(format!("yt_durable_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "yt_durable_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
 
         {
@@ -4023,7 +4833,7 @@ mod tests {
             wc.flush_memtable(); // 封段(写盘)+ 推进水位 + 落 manifest;内存表被回收
             assert_eq!(wc.memtable_len(), 0, "flush 后内存表清空(数据只在持久段里)");
             wc.commit_delete(SegmentId::new(1), 1); // 删 span20(行1),验证删除也持久
-            // drop wc：内存全没。盘上有 段文件 + manifest + WAL。
+                                                    // drop wc：内存全没。盘上有 段文件 + manifest + WAL。
         }
 
         // 重启:同一目录。recover 重放 WAL 水位之后(此处为空,数据都在段里)。
@@ -4031,7 +4841,11 @@ mod tests {
         wc2.recover();
         let snap = wc2.pin_snapshot();
         let spans = wc2.read_spans(&snap);
-        assert_eq!(spans.len(), 1, "flush 过的数据从持久段读回;被删的 span20 不出现(删除持久)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "flush 过的数据从持久段读回;被删的 span20 不出现(删除持久)"
+        );
         assert_eq!(spans[0].span_id, 10);
         assert_eq!(spans[0].logs, vec!["反洗钱"]);
         assert_eq!(spans[0].status, Some(0));
@@ -4040,7 +4854,11 @@ mod tests {
         wc2.ingest(vec![ev(2, 30, 1, Some(0), Some(10), &["转账"])]);
         wc2.flush_memtable();
         let snap2 = wc2.pin_snapshot();
-        assert_eq!(wc2.read_spans(&snap2).len(), 2, "老段(span10)+新段(span30)都在");
+        assert_eq!(
+            wc2.read_spans(&snap2).len(),
+            2,
+            "老段(span10)+新段(span30)都在"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4050,8 +4868,11 @@ mod tests {
         // 检索索引(BM25/向量/属性边车)重启后从持久段 + 向量文件重建 —— 不再是"重启后搜啥都空"。
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir()
-            .join(format!("yt_idx_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "yt_idx_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
 
         {
@@ -4073,7 +4894,10 @@ mod tests {
 
         // 按内容搜:BM25 从段重建,"盗刷" 命中 span10。
         let hits = wc2.search_text(&snap, "盗刷", 10);
-        assert!(hits.iter().any(|(s, _)| s.span_id == 10), "重启后按内容搜还能命中");
+        assert!(
+            hits.iter().any(|(s, _)| s.span_id == 10),
+            "重启后按内容搜还能命中"
+        );
 
         // 找相似:向量从文件重载,查 [0.1,0.1] 最近的是 span10[0,0]。
         let sim = wc2.search_similar(&snap, &[0.1, 0.1], 10);
@@ -4081,9 +4905,15 @@ mod tests {
         assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (1, 10));
 
         // 带过滤:属性边车重建,按 agent 过滤还生效。
-        let f = SearchFilter { agent_name: Some("风控".into()), ..Default::default() };
+        let f = SearchFilter {
+            agent_name: Some("风控".into()),
+            ..Default::default()
+        };
         let filtered = wc2.search_similar_attr(&snap, &[0.1, 0.1], 10, &f);
-        assert!(filtered.iter().all(|(s, _)| s.span_id == 10), "重启后按 agent 过滤还生效");
+        assert!(
+            filtered.iter().all(|(s, _)| s.span_id == 10),
+            "重启后按 agent 过滤还生效"
+        );
         assert!(!filtered.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4095,8 +4925,11 @@ mod tests {
         // 重启从盘恢复、不全量 rebuild。append 多删除少场景：插入只写、提交点批量刷。
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir()
-            .join(format!("yt_diskvec_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "yt_diskvec_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
 
         {
@@ -4112,7 +4945,10 @@ mod tests {
         }
 
         // 默认走磁盘图索引：vecindex 目录在、旧 vecstore 文件不在。
-        assert!(dir.join("vecindex").join("meta").exists(), "磁盘图索引已落盘");
+        assert!(
+            dir.join("vecindex").join("meta").exists(),
+            "磁盘图索引已落盘"
+        );
         assert!(!dir.join("vectors.dat").exists(), "不再用 vecstore");
 
         // 重启：不 rebuild（recover 不重放向量，磁盘图索引自带持久），找相似照常。
@@ -4120,7 +4956,11 @@ mod tests {
         wc2.recover();
         let snap = wc2.pin_snapshot();
         let sim = wc2.search_similar(&snap, &[0.9, 0.0, 0.0], 2);
-        assert_eq!((sim[0].0.trace_id, sim[0].0.span_id), (2, 20), "重启后磁盘图搜索：最近的排第一");
+        assert_eq!(
+            (sim[0].0.trace_id, sim[0].0.span_id),
+            (2, 20),
+            "重启后磁盘图搜索：最近的排第一"
+        );
         assert_eq!(sim[0].0.duration_ns, Some(200), "折叠出完整 span");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4239,7 +5079,10 @@ mod tests {
         // 按 trace_id 升序定序：trace 10 是第 0 轮、trace 20 是第 1 轮（即便乱序灌入）。
         assert_eq!(tl.turns[0].turn_index, 0);
         assert_eq!(tl.turns[0].trace_id, 10);
-        assert_eq!(tl.turns[0].user_input.as_deref(), Some("如何修改预留手机号"));
+        assert_eq!(
+            tl.turns[0].user_input.as_deref(),
+            Some("如何修改预留手机号")
+        );
         assert_eq!(tl.turns[0].agent_output.as_deref(), Some("到安全中心修改"));
         assert_eq!(tl.turns[0].error_count, 0);
         assert_eq!(tl.turns[1].trace_id, 20);
@@ -4298,7 +5141,10 @@ mod tests {
         let snap = wc.pin_snapshot();
         let r = wc.console_sessions(&snap);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].input_tokens, 800, "500(span1) + 300(span2)，end 不重复加 in");
+        assert_eq!(
+            r[0].input_tokens, 800,
+            "500(span1) + 300(span2)，end 不重复加 in"
+        );
         assert_eq!(r[0].output_tokens, 120, "只 end 的 out");
         assert_eq!(r[0].turn_count, 2, "两条 trace = 两轮");
         assert_eq!(r[0].title, "风控研判");
@@ -4349,7 +5195,10 @@ mod tests {
         assert_eq!(find(20).eval_score, Some(0), "span20 零分");
         assert_eq!(find(20).eval_label.as_deref(), Some("未通过"));
         // 身份/原字段没被评测动:span20 的输出文本还在
-        assert_eq!(find(20).output_text.as_deref(), Some("抱歉,我无法判断该交易"));
+        assert_eq!(
+            find(20).output_text.as_deref(),
+            Some("抱歉,我无法判断该交易")
+        );
     }
 
     #[test]
@@ -4375,16 +5224,26 @@ mod tests {
 
         let snap = wc.pin_snapshot();
         let sum = wc.eval_summary(&snap, &TraceQuery::all(), 1000); // 满分才算通过
-        // 第 0 行整体:3 条有分,2 条通过
+                                                                    // 第 0 行整体:3 条有分,2 条通过
         assert_eq!(sum[0].agent_name, None);
         assert_eq!(sum[0].scored_spans, 3);
         assert_eq!(sum[0].pass_count, 2);
         assert!((sum[0].pass_rate() - 2.0 / 3.0).abs() < 1e-6);
         // per-agent:规划 1/2 通过,执行 1/1 通过
-        let plan = sum.iter().find(|r| r.agent_name.as_deref() == Some("规划")).unwrap();
-        assert_eq!((plan.scored_spans, plan.pass_count), (2, 1), "规划 agent 半数通过");
+        let plan = sum
+            .iter()
+            .find(|r| r.agent_name.as_deref() == Some("规划"))
+            .unwrap();
+        assert_eq!(
+            (plan.scored_spans, plan.pass_count),
+            (2, 1),
+            "规划 agent 半数通过"
+        );
         assert_eq!(plan.avg_score, 500, "规划均分 = (1000+0)/2");
-        let exec = sum.iter().find(|r| r.agent_name.as_deref() == Some("执行")).unwrap();
+        let exec = sum
+            .iter()
+            .find(|r| r.agent_name.as_deref() == Some("执行"))
+            .unwrap();
         assert_eq!((exec.scored_spans, exec.pass_count), (1, 1));
         assert_eq!(exec.avg_score, 1000);
     }
@@ -4411,10 +5270,14 @@ mod tests {
 
         // 把失败样本(eval_score==0)收集进数据集。
         let snap = wc.pin_snapshot();
-        let added = wc.collect_into_dataset("失败集", &snap, &TraceQuery::all(), &|s| s.eval_score == Some(0));
+        let added = wc.collect_into_dataset("失败集", &snap, &TraceQuery::all(), &|s| {
+            s.eval_score == Some(0)
+        });
         assert_eq!(added, 2, "两条失败样本入集");
         // 去重:再收集一次不重复加。
-        let again = wc.collect_into_dataset("失败集", &snap, &TraceQuery::all(), &|s| s.eval_score == Some(0));
+        let again = wc.collect_into_dataset("失败集", &snap, &TraceQuery::all(), &|s| {
+            s.eval_score == Some(0)
+        });
         assert_eq!(again, 0, "已在集里的不重复加");
 
         let ds = wc.dataset("失败集").unwrap();
@@ -4474,7 +5337,7 @@ mod tests {
             wc.flush_memtable(); // → seg1
             wc.ingest(vec![ev(1, 10, 2, None, Some(200), &["b"])]);
             wc.flush_memtable(); // → seg2
-            // compaction：把 seg1 + seg2 合成 seg3，seg1/seg2 进 dead_set
+                                 // compaction：把 seg1 + seg2 合成 seg3，seg1/seg2 进 dead_set
             wc.commit_compaction(&[SegmentId::new(1), SegmentId::new(2)]);
             // reclaim：正常走完 MARK + unlink + DONE。seg1/seg2 文件应已删、gc.log 有完整 MARK/DONE。
             let freed = wc.reclaim();
@@ -4488,11 +5351,17 @@ mod tests {
         std::fs::write(seg_dir.join("seg-1.dat"), b"fake-leftover-seg1").unwrap();
         // gc.log 改成只有 MARK 1（没有 DONE 1）
         std::fs::write(dir.join("gc.log"), b"MARK 1\n").unwrap();
-        assert!(seg_dir.join("seg-1.dat").exists(), "模拟：段文件还在（unlink 前崩）");
+        assert!(
+            seg_dir.join("seg-1.dat").exists(),
+            "模拟：段文件还在（unlink 前崩）"
+        );
 
         // 3) 重启：open_durable 应扫 gc.log → 发 seg1 "MARK 没 DONE" → 补删。
         let _wc2 = WriteCoordinator::open_durable(&dir).unwrap();
-        assert!(!seg_dir.join("seg-1.dat").exists(), "重启后补删了残留段文件（崩溃安全）");
+        assert!(
+            !seg_dir.join("seg-1.dat").exists(),
+            "重启后补删了残留段文件（崩溃安全）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4535,12 +5404,16 @@ mod tests {
     fn fuzz_fold_semantics_across_random_op_sequences() {
         // 确定性 LCG（可复现、不依赖系统 rand）。
         let mut rng = |s: &mut u64| {
-            *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (*s >> 33) as usize
         };
 
         // 跑多个种子，每个种子一个独立序列。
-        for seed_orig in [0xA11C, 0xB22D, 0xC33E, 0xD44F, 0xE550, 0xF661, 0x1234, 0x5678] {
+        for seed_orig in [
+            0xA11C, 0xB22D, 0xC33E, 0xD44F, 0xE550, 0xF661, 0x1234, 0x5678,
+        ] {
             let mut seed = seed_orig;
             let store = Arc::new(InMemorySegmentStore::default());
             let wc = WriteCoordinator::new(store.clone());
@@ -4570,10 +5443,22 @@ mod tests {
                             o.next_seq += 1;
                             o.next_seq
                         };
-                        let status = if rng(&mut seed) % 3 == 0 { Some(rng(&mut seed) as u8) } else { None };
-                        let dur = if rng(&mut seed) % 2 == 0 { Some(100 * (1 + rng(&mut seed) as u64 % 5)) } else { None };
+                        let status = if rng(&mut seed) % 3 == 0 {
+                            Some(rng(&mut seed) as u8)
+                        } else {
+                            None
+                        };
+                        let dur = if rng(&mut seed) % 2 == 0 {
+                            Some(100 * (1 + rng(&mut seed) as u64 % 5))
+                        } else {
+                            None
+                        };
                         let logs_idx = rng(&mut seed) % 3;
-                        let logs_str: &[&str] = match logs_idx { 0 => &["a"], 1 => &["b", "c"], _ => &["盗刷"] };
+                        let logs_str: &[&str] = match logs_idx {
+                            0 => &["a"],
+                            1 => &["b", "c"],
+                            _ => &["盗刷"],
+                        };
                         let r = ev(t, sp, seq, status, dur, logs_str);
                         wc.ingest(vec![r.clone()]);
                         // oracle：last-non-null 累积
@@ -4600,7 +5485,11 @@ mod tests {
                     2 => {
                         // compaction：合并前两个活跃段（若 ≥2）
                         if live_segs.len() >= 2 {
-                            let inputs: Vec<SegmentId> = live_segs.iter().take(2).map(|(s, _)| SegmentId(*s)).collect();
+                            let inputs: Vec<SegmentId> = live_segs
+                                .iter()
+                                .take(2)
+                                .map(|(s, _)| SegmentId(*s))
+                                .collect();
                             wc.commit_compaction(&inputs);
                             // compaction 不改折叠结果（只重组段），oracle 不变。移掉被合并的旧段。
                             let removed: Vec<u64> = inputs.iter().map(|s| s.get()).collect();
@@ -4619,8 +5508,10 @@ mod tests {
             // 序列结束：对比引擎 read_spans 与 oracle。
             let snap = wc.pin_snapshot();
             let actual = wc.read_spans(&snap);
-            let actual_map: BTreeMap<(u64, u64), &FoldedSpan> =
-                actual.iter().map(|s| ((s.trace_id, s.span_id), s)).collect();
+            let actual_map: BTreeMap<(u64, u64), &FoldedSpan> = actual
+                .iter()
+                .map(|s| ((s.trace_id, s.span_id), s))
+                .collect();
 
             // oracle 里每个 span,引擎必须有且 status/duration 一致（last-non-null 语义）。
             for (key, o) in &oracle {
@@ -4651,7 +5542,8 @@ mod tests {
     fn backup_snapshot_restores_consistent_data() {
         // §3.3：在线快照备份 → 从备份恢复 → 数据一致。
         let dir = std::env::temp_dir().join(format!("yt_backup_{}", std::process::id()));
-        let backup_dir = std::env::temp_dir().join(format!("yt_backup_copy_{}", std::process::id()));
+        let backup_dir =
+            std::env::temp_dir().join(format!("yt_backup_copy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&backup_dir);
 

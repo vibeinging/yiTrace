@@ -115,7 +115,7 @@ npm run build:release -- --target x86_64-unknown-linux-gnu
 npm run release:artifacts
 npm run release:prepublish  # 使用 --skip-optional-publish，避免本地脚本直接发包
 npm run pack:check
-npm run pack:local          # 生成 root + 当前已有平台包 tarball，供内部 file:/源锁版本
+npm run pack:verify         # 生成带 commit/label 后缀的 tarball，并用干净 consumer 验证
 ```
 
 ### 阶段 3：Electron 模板
@@ -166,7 +166,7 @@ npm run pack:local          # 生成 root + 当前已有平台包 tarball，供�
 
 | 需求 | 处理结果 |
 |---|---|
-| P0：稳定安装来源 | 已补 `npm run pack:local`，可生成 root `@yitrace/db` 和本机已有平台 optional package 的 versioned tarball。AgenticData 可把 tarball 放进仓库 `vendor/` 后用 `file:` 锁版本，或上传内部 npm 源。正式公开发布仍要求平台包先发布、root 包后发布。 |
+| P0：稳定安装来源 | 已补 `npm run pack:local`，可生成 root `@yitrace/db` 和本机已有平台 optional package 的不可变 tarball。文件名追加 commit/label，例如 `yitrace-db-0.0.1-g1a2b3c4d5e6f.tgz`，并写入 `dist/pack-manifest.json`。AgenticData 可把 tarball 放进仓库 `vendor/` 后用 `file:` 锁版本，或上传内部 npm 源。正式公开发布仍要求平台包先发布、root 包后发布。 |
 | P0：补齐 `SpanEvent` 类型声明 | 已在 `index.d.ts` 显式声明 `duration_ns`、`tool_name`、`model`、`input_text`、`output_text`，并保留 camelCase builder 输入如 `durationNs`、`toolName`、`inputText`。 |
 | P1：轻量 event builder/helper | 已新增 `SpanEventBuilder` / `createSpanEventBuilder`，隐藏 `seq`、`event_type`、start/end 双事件和 `ext_span_id`。AgenticData 只需要调用 `startSpan` / `log` / `endSpan` / `ingest`。 |
 | P1：attrs 过滤 | 已在 engine sidecar 中加入 `project_id`、`skill`、`mode`、`call_site` 精确过滤；HTTP 和 Node search 均支持 top-level filter 与 `filter.attrs` 两种写法。 |
@@ -177,12 +177,13 @@ npm run pack:local          # 生成 root + 当前已有平台包 tarball，供�
 - `attrs` 会完整持久化并返回，但只有 `project_id`、`skill`、`mode`、`call_site` 四个 key 承诺过滤。
 - attrs filter 是精确匹配，不做 contains / prefix / numeric range。
 - `pack:local` 只会打包当前构建机已有的 native `.node` 平台包。多平台 tarball 仍需要 CI 或对应平台机器先产出 artifacts。
+- 本地交付包不允许长期覆盖复用 `0.0.1.tgz`；payload 变化时必须换文件名、commit label 或 registry version。
 
 ## 2026-07-02 安装产物与 consumer 验收
 
 新增 `npm run pack:verify`，它会：
 
-1. 运行 `pack:local` 生成 root tarball + 当前平台 optional package tarball。
+1. 运行 `pack:local` 生成带 commit/label 后缀的 root tarball + 当前平台 optional package tarball，并写 `dist/pack-manifest.json`。
 2. 创建干净临时 consumer 项目。
 3. 用 npm 安装 tarball，而不是从源码目录加载。
 4. 验证 ESM `import`、CommonJS `require`、当前平台 optional package 内的 native `.node` 文件可解析。
@@ -190,13 +191,27 @@ npm run pack:local          # 生成 root + 当前已有平台包 tarball，供�
 
 平台策略已明确：
 
-- AgenticData 当前开发版先锁 macOS arm64：`yitrace-db-0.0.1.tgz` + `yitrace-db-darwin-arm64-0.0.1.tgz`。
+- AgenticData server 当前默认 x64：Node、DuckDB、yiTrace native、sqlite native 必须全部保持 x64。
+- 不允许混用 x64/arm64 native 依赖。若 AgenticData server 切 arm64，必须先把 DuckDB 和 sqlite 也切成 arm64，或给它们建立和 `@yitrace/db` 一样的 per-platform optional package 策略。
+- AgenticData 本地开发可以继续锁 macOS arm64：`yitrace-db-0.0.1-g<commit>.tgz` + `yitrace-db-darwin-arm64-0.0.1-g<commit>.tgz`；这不代表 server 架构已切 arm64。
 - `pack:local` 会同时打包构建机上已有的其他平台 native 包；当前机器也可产出 macOS x64 tarball。
 - 正式 npm/CI 发版仍保留 optional platform package 矩阵：macOS x64/arm64、Linux x64/arm64 glibc、Windows x64 MSVC；必须先发布平台包，再发布 root 包。
 
 sessions attrs filter 已补：`GET /v1/sessions?attrs=...`、`GET /v1/sessions?project_id=...&skill=...` 和 Node `db.sessions({ attrs })` 都可用。语义是“会话内至少一个 span 命中所有 attrs 条件，则返回完整 session 聚合行”。
 
 仍未做的是“真正 read-only open”：它需要 engine 提供不创建/不锁写入路径、不打开 append WAL、不触发 flush/manifest 写入的只读 coordinator。这不应由 Node 层伪装。
+
+## 2026-07-02 logEvents 详情返回
+
+新增 trace/span 详情里的原始日志事件返回，避免接入方把日志镜像进 `attrs.event_logs`：
+
+- `GET /v1/traces/:id` 的每个 span item 新增 `logEvents`。
+- `GET /v1/traces/:id/spans/:spanId` 新增 `logEvents`。
+- `logEvents[]` 字段包含 `eventId`、`ts`、`seq`、`eventType`、`messages`、`attrs`。
+- 读取时按可见 span key 过滤，继承 trace/span 详情已有的 tenant 隔离和删除过滤。
+- 事件来源覆盖热 MemTable 和 flush 后 segment，按 `ts, seq, eventId` 排序，并按 deterministic `eventId` 去重。
+
+边界：当前只返回携带 `logs` 的原始事件；复杂事件搜索、按日志全文过滤和单独 `/events` 分页接口后续再做。
 
 ## 对外说法
 

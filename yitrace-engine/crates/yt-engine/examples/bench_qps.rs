@@ -9,11 +9,16 @@ use yt_engine::{WireRecord, WriteCoordinator};
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 16
     }
     fn vec(&mut self, dim: usize) -> Vec<f32> {
-        (0..dim).map(|_| (self.next() % 1000) as f32 / 1000.0).collect()
+        (0..dim)
+            .map(|_| (self.next() % 1000) as f32 / 1000.0)
+            .collect()
     }
 }
 
@@ -29,8 +34,21 @@ fn main() {
 
     // 真实中文短语，拼出有词可分的文本（BM25 走全量词典分词）。
     let phrases = [
-        "用户登录", "风控系统", "实时拦截", "疑似盗刷", "转账成功", "账户异常", "大模型调用", "工具超时",
-        "会话重试", "余额不足", "反欺诈研判", "可疑交易", "智能体规划", "提示词注入", "调用链追踪",
+        "用户登录",
+        "风控系统",
+        "实时拦截",
+        "疑似盗刷",
+        "转账成功",
+        "账户异常",
+        "大模型调用",
+        "工具超时",
+        "会话重试",
+        "余额不足",
+        "反欺诈研判",
+        "可疑交易",
+        "智能体规划",
+        "提示词注入",
+        "调用链追踪",
     ];
     let mut rng = Rng(0x9E3779B97F4A7C15);
 
@@ -111,10 +129,28 @@ fn main() {
     println!("\n=== 真实 QPS 基准（落盘引擎 / 全量词典 BM25 / 磁盘多层 HNSW）===");
     println!("规模: {n} span, 向量 {dim} 维, 各 {queries} 次查询  | 本机单机, release");
     println!("---");
-    println!("摄入吞吐:   {:>10.0} span/s   ({n} span / {:.2}s, 含 WAL 落盘 + BM25 全量词典索引)", n as f64 / ingest_s, ingest_s);
-    println!("向量建图:   {:>10.0} 点/s     ({n} 点 / {:.2}s, 磁盘多层 HNSW 插入)", n as f64 / vbuild_s, vbuild_s);
-    println!("BM25 QPS:   {:>10.0} q/s      (avg {:.3} ms/q, 命中 {} )", queries as f64 / bm_s, bm_s * 1000.0 / queries as f64, bm_hits);
-    println!("向量 QPS:   {:>10.0} q/s      (avg {:.3} ms/q, 命中 {} )", queries as f64 / vs_s, vs_s * 1000.0 / queries as f64, v_hits);
+    println!(
+        "摄入吞吐:   {:>10.0} span/s   ({n} span / {:.2}s, 含 WAL 落盘 + BM25 全量词典索引)",
+        n as f64 / ingest_s,
+        ingest_s
+    );
+    println!(
+        "向量建图:   {:>10.0} 点/s     ({n} 点 / {:.2}s, 磁盘多层 HNSW 插入)",
+        n as f64 / vbuild_s,
+        vbuild_s
+    );
+    println!(
+        "BM25 QPS:   {:>10.0} q/s      (avg {:.3} ms/q, 命中 {} )",
+        queries as f64 / bm_s,
+        bm_s * 1000.0 / queries as f64,
+        bm_hits
+    );
+    println!(
+        "向量 QPS:   {:>10.0} q/s      (avg {:.3} ms/q, 命中 {} )",
+        queries as f64 / vs_s,
+        vs_s * 1000.0 / queries as f64,
+        v_hits
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

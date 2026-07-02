@@ -162,6 +162,7 @@ const hits = await db.search({
   filter: { attrs: { project_id: "agentic-data", skill: "review" } },
 });
 const trace = await db.trace("run-uuid");
+const logEvents = trace?.spans?.flatMap((span) => span.logEvents ?? []) ?? [];
 await db.close();
 ```
 
@@ -175,7 +176,9 @@ IDs are hashed into stable internal `u64` keys for indexing while the original
 values are returned as `external_*` fields. `attrs` is persisted and returned on
 search, trace, and span detail responses. Exact attrs filtering is supported for
 `project_id`, `skill`, `mode`, and `call_site`. `OpenOptions.readOnly` is not
-exposed until the engine has a true read-only open path.
+exposed until the engine has a true read-only open path. Trace and span detail
+responses also return `logEvents`, so apps can render span-level process logs
+without copying them into `attrs.event_logs`.
 
 `@yitrace/db` is distributed as a small JavaScript entry package plus optional
 native platform packages (`@yitrace/db-darwin-arm64`,

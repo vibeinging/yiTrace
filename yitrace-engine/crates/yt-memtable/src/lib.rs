@@ -53,23 +53,33 @@ pub struct MemTable {
 
 impl MemTable {
     pub fn new() -> Self {
-        Self { rows: VecDeque::new() }
+        Self {
+            rows: VecDeque::new(),
+        }
     }
 
     /// 单写者 append。要求 commit_lsn 严格递增（由 WAL 的 LSN 保证）。
     pub fn append(&mut self, row: MemRow) {
         debug_assert!(
-            self.rows.back().map_or(true, |b| b.commit_lsn < row.commit_lsn),
+            self.rows
+                .back()
+                .map_or(true, |b| b.commit_lsn < row.commit_lsn),
             "commit_lsn 必须严格递增"
         );
         self.rows.push_back(row);
     }
 
     /// 读某快照的半开区间 `(retained_watermark, live_lsn]`，与段源不重叠。
-    pub fn read_range(&self, retained_watermark: WalLsn, live_lsn: WalLsn) -> impl Iterator<Item = &MemRow> {
+    pub fn read_range(
+        &self,
+        retained_watermark: WalLsn,
+        live_lsn: WalLsn,
+    ) -> impl Iterator<Item = &MemRow> {
         let lo = retained_watermark.get();
         let hi = live_lsn.get();
-        self.rows.iter().filter(move |r| r.commit_lsn > lo && r.commit_lsn <= hi)
+        self.rows
+            .iter()
+            .filter(move |r| r.commit_lsn > lo && r.commit_lsn <= hi)
     }
 
     /// 物理回收：丢掉 `commit_lsn ≤ gate` 的队头行。
@@ -134,7 +144,9 @@ mod tests {
     }
 
     fn seqs(mt: &MemTable, lo: u64, hi: u64) -> Vec<u64> {
-        mt.read_range(WalLsn::new(lo), WalLsn::new(hi)).map(|r| r.commit_lsn).collect()
+        mt.read_range(WalLsn::new(lo), WalLsn::new(hi))
+            .map(|r| r.commit_lsn)
+            .collect()
     }
 
     #[test]
@@ -160,7 +172,11 @@ mod tests {
         }
         let evicted = mt.evict_up_to(WalLsn::new(0)); // gate = min over readers = 0
         assert_eq!(evicted, 0, "有下界=0 的旧读者在，任何行都不该被删");
-        assert_eq!(seqs(&mt, 0, 3), vec![1, 2, 3], "旧读者必须仍看到行 1（不能漏读）");
+        assert_eq!(
+            seqs(&mt, 0, 3),
+            vec![1, 2, 3],
+            "旧读者必须仍看到行 1（不能漏读）"
+        );
 
         // 旧读者走了，新读者下界=1 → gate 升到 1 → 行 1 可回收
         let evicted = mt.evict_up_to(WalLsn::new(1));

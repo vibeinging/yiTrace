@@ -13,8 +13,8 @@
 //! 关键路径发日志：ingest / flush / compaction / reclaim / recover / 崩溃 / search(慢查询)。
 
 use std::io::Write;
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// 日志级别。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,11 @@ pub fn set_file(path: &std::path::Path) {
     if SINK.get().is_some() {
         return;
     }
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = SINK.set(Sink::File(Mutex::new(f)));
     }
 }

@@ -26,7 +26,9 @@ pub fn parse_otlp_traces(s: &str) -> Result<Vec<WireRecord>, String> {
         .ok_or("缺 resourceSpans")?;
     let mut out = Vec::new();
     for rs in resource_spans {
-        let scope_spans = get2(rs, "scopeSpans", "scope_spans").map(Json::as_array).unwrap_or(&[]);
+        let scope_spans = get2(rs, "scopeSpans", "scope_spans")
+            .map(Json::as_array)
+            .unwrap_or(&[]);
         for ss in scope_spans {
             let spans = ss.get("spans").map(Json::as_array).unwrap_or(&[]);
             for sp in spans {
@@ -39,36 +41,80 @@ pub fn parse_otlp_traces(s: &str) -> Result<Vec<WireRecord>, String> {
 
 /// 一条 OTLP span → SpanStart + SpanEnd 两个 WireRecord，推进 out。
 fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
-    let trace_hex = get2(sp, "traceId", "trace_id").and_then(Json::as_str).ok_or("span 缺 traceId")?;
-    let span_hex = get2(sp, "spanId", "span_id").and_then(Json::as_str).ok_or("span 缺 spanId")?;
+    let trace_hex = get2(sp, "traceId", "trace_id")
+        .and_then(Json::as_str)
+        .ok_or("span 缺 traceId")?;
+    let span_hex = get2(sp, "spanId", "span_id")
+        .and_then(Json::as_str)
+        .ok_or("span 缺 spanId")?;
     let trace_id = hex_low_u64(trace_hex);
     let span_id = hex_low_u64(span_hex);
-    let parent_hex = get2(sp, "parentSpanId", "parent_span_id").and_then(Json::as_str).unwrap_or("");
-    let parent_span_id = if parent_hex.is_empty() { None } else { Some(hex_low_u64(parent_hex)) };
-    let name = sp.get("name").and_then(Json::as_str).unwrap_or("").to_string();
-    let ts_start = get2(sp, "startTimeUnixNano", "start_time_unix_nano").and_then(Json::as_i64).unwrap_or(0);
-    let ts_end = get2(sp, "endTimeUnixNano", "end_time_unix_nano").and_then(Json::as_i64).unwrap_or(ts_start);
+    let parent_hex = get2(sp, "parentSpanId", "parent_span_id")
+        .and_then(Json::as_str)
+        .unwrap_or("");
+    let parent_span_id = if parent_hex.is_empty() {
+        None
+    } else {
+        Some(hex_low_u64(parent_hex))
+    };
+    let name = sp
+        .get("name")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ts_start = get2(sp, "startTimeUnixNano", "start_time_unix_nano")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let ts_end = get2(sp, "endTimeUnixNano", "end_time_unix_nano")
+        .and_then(Json::as_i64)
+        .unwrap_or(ts_start);
     let duration_ns = (ts_end - ts_start).max(0) as u64;
 
     // status.code：2=Error → 本引擎 status=1（非0=异常）；1=Ok → 0；0/缺失=Unset → None。
-    let status = sp.get("status").and_then(|st| get2(st, "code", "code").and_then(Json::as_u64)).and_then(|c| match c {
-        2 => Some(1u8),
-        1 => Some(0u8),
-        _ => None,
-    });
+    let status = sp
+        .get("status")
+        .and_then(|st| get2(st, "code", "code").and_then(Json::as_u64))
+        .and_then(|c| match c {
+            2 => Some(1u8),
+            1 => Some(0u8),
+            _ => None,
+        });
 
     let attrs = sp.get("attributes").map(Json::as_array).unwrap_or(&[]);
-    let model = first_str(attrs, &["gen_ai.request.model", "gen_ai.response.model", "llm.model_name"]);
-    let input_tokens = first_u64(attrs, &["gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens", "llm.token_count.prompt"]);
-    let output_tokens = first_u64(attrs, &["gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens", "llm.token_count.completion"]);
+    let model = first_str(
+        attrs,
+        &[
+            "gen_ai.request.model",
+            "gen_ai.response.model",
+            "llm.model_name",
+        ],
+    );
+    let input_tokens = first_u64(
+        attrs,
+        &[
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.prompt_tokens",
+            "llm.token_count.prompt",
+        ],
+    );
+    let output_tokens = first_u64(
+        attrs,
+        &[
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.completion_tokens",
+            "llm.token_count.completion",
+        ],
+    );
     let agent_name = first_str(attrs, &["gen_ai.agent.name", "agent.name"]);
     let tool_name = first_str(attrs, &["gen_ai.tool.name", "tool.name"]);
     // 大文本：OTel GenAI 的 gen_ai.prompt/completion 常是 **JSON 消息数组串**（[{role,content}]），
     // 不是人读的纯文本——直接存会把 eval 的输入/输出污染成 JSON。这里拍平成纯文本；OpenInference 的
     // input.value/output.value 是扁平串，flatten_messages 原样返回。再不行就从 span events 里捞
     //（新版 GenAI 约定把内容放在 span 事件里，不在属性上）。
-    let mut input_text = first_str(attrs, &["input.value", "gen_ai.prompt"]).map(|s| flatten_messages(&s));
-    let mut output_text = first_str(attrs, &["output.value", "gen_ai.completion"]).map(|s| flatten_messages(&s));
+    let mut input_text =
+        first_str(attrs, &["input.value", "gen_ai.prompt"]).map(|s| flatten_messages(&s));
+    let mut output_text =
+        first_str(attrs, &["output.value", "gen_ai.completion"]).map(|s| flatten_messages(&s));
     if input_text.is_none() || output_text.is_none() {
         let (ev_in, ev_out) = texts_from_events(sp);
         input_text = input_text.or(ev_in);
@@ -76,7 +122,15 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
     }
     // 会话 id：OTLP 里常是字符串（session.id / yitrace.session_id）。本引擎要 u64 →
     // 数字直接解析，否则确定性哈希，确保同一外部会话稳定落到同一 session_id。
-    let session_id = first_session_id(attrs, &["yitrace.session_id", "session.id", "gen_ai.conversation.id", "session_id"]);
+    let session_id = first_session_id(
+        attrs,
+        &[
+            "yitrace.session_id",
+            "session.id",
+            "gen_ai.conversation.id",
+            "session_id",
+        ],
+    );
     // 租户 id：只接受数字。HTTP 网关会用 X-Tenant-Id 统一覆盖这里的值；解析出的 tenant
     // 只服务于直接调用 `ingest_otlp` 的本地/开发路径，不能作为 HTTP 安全边界。
     let tenant_id = first_numeric_u64(attrs, &["yitrace.tenant_id", "tenant.id", "tenant_id"]);
@@ -98,14 +152,30 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         tenant_id,
         external_trace_id: Some(trace_hex.to_string()),
         external_span_id: Some(span_hex.to_string()),
-        external_parent_span_id: if parent_hex.is_empty() { None } else { Some(parent_hex.to_string()) },
-        external_session_id: first_str(attrs, &["yitrace.session_id", "session.id", "gen_ai.conversation.id", "session_id"]),
+        external_parent_span_id: if parent_hex.is_empty() {
+            None
+        } else {
+            Some(parent_hex.to_string())
+        },
+        external_session_id: first_str(
+            attrs,
+            &[
+                "yitrace.session_id",
+                "session.id",
+                "gen_ai.conversation.id",
+                "session_id",
+            ],
+        ),
         agent_name,
         tool_name,
         model,
         input_text,
         output_text,
-        logs: if name.is_empty() { Vec::new() } else { vec![name] },
+        logs: if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name]
+        },
         attrs: Default::default(),
     });
     // SpanEnd：状态 + 耗时。
@@ -125,7 +195,11 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         tenant_id: None,
         external_trace_id: Some(trace_hex.to_string()),
         external_span_id: Some(span_hex.to_string()),
-        external_parent_span_id: if parent_hex.is_empty() { None } else { Some(parent_hex.to_string()) },
+        external_parent_span_id: if parent_hex.is_empty() {
+            None
+        } else {
+            Some(parent_hex.to_string())
+        },
         external_session_id: None,
         agent_name: None,
         tool_name: None,
@@ -154,7 +228,9 @@ fn hex_low_u64(hex: &str) -> u64 {
 
 /// OTLP 属性值取字符串：`{"stringValue":"..."}`。
 fn val_str(v: &Json) -> Option<String> {
-    v.get("stringValue").and_then(Json::as_str).map(|s| s.to_string())
+    v.get("stringValue")
+        .and_then(Json::as_str)
+        .map(|s| s.to_string())
 }
 
 /// OTLP 属性值取整数：`{"intValue":"123"}`（OTLP/JSON 里 int64 编码成字符串）或 `{"doubleValue":1.2}`。
@@ -185,7 +261,8 @@ fn first_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
 /// 多个候选 key 取第一个命中的整数值；接受 OTLP `intValue` 和 `stringValue:"123"`。
 fn first_numeric_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| {
-        attr(attrs, k).and_then(|v| val_u64(v).or_else(|| val_str(v).and_then(|s| s.parse::<u64>().ok())))
+        attr(attrs, k)
+            .and_then(|v| val_u64(v).or_else(|| val_str(v).and_then(|s| s.parse::<u64>().ok())))
     })
 }
 
@@ -198,7 +275,8 @@ fn first_session_id(attrs: &[Json], keys: &[&str]) -> Option<u64> {
 
 /// 字符串会话 id → u64：纯数字直接解析，否则用 yt-core 的确定性 FNV-1a 64（不再自己抄一份哈希常量）。
 fn str_to_u64(s: &str) -> u64 {
-    s.parse::<u64>().unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes()))
+    s.parse::<u64>()
+        .unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes()))
 }
 
 /// 把"可能是 JSON 消息数组"的文本拍平成纯文本。GenAI 的 gen_ai.prompt/completion 常是
@@ -209,10 +287,16 @@ fn flatten_messages(s: &str) -> String {
     if !t.starts_with('[') && !t.starts_with('{') {
         return s.to_string(); // 扁平串,原样
     }
-    let Ok(j) = parse(s) else { return s.to_string() };
+    let Ok(j) = parse(s) else {
+        return s.to_string();
+    };
     let arr = j.as_array();
     // 数组 → 逐条消息；单对象 → 当一条消息。
-    let msgs: &[Json] = if arr.is_empty() { std::slice::from_ref(&j) } else { arr };
+    let msgs: &[Json] = if arr.is_empty() {
+        std::slice::from_ref(&j)
+    } else {
+        arr
+    };
     let mut texts: Vec<String> = Vec::new();
     for m in msgs {
         let Some(c) = m.get("content") else { continue };
@@ -243,20 +327,41 @@ fn texts_from_events(sp: &Json) -> (Option<String>, Option<String>) {
     let mut out: Vec<String> = Vec::new();
     for ev in events {
         let attrs = ev.get("attributes").map(Json::as_array).unwrap_or(&[]);
-        let Some(body) =
-            first_str(attrs, &["gen_ai.prompt", "gen_ai.completion", "gen_ai.event.content", "content", "message"])
-        else {
+        let Some(body) = first_str(
+            attrs,
+            &[
+                "gen_ai.prompt",
+                "gen_ai.completion",
+                "gen_ai.event.content",
+                "content",
+                "message",
+            ],
+        ) else {
             continue;
         };
         let text = flatten_messages(&body);
-        let n = ev.get("name").and_then(Json::as_str).unwrap_or("").to_ascii_lowercase();
+        let n = ev
+            .get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if n.contains("completion") || n.contains("assistant") || n.contains("choice") {
             out.push(text);
-        } else if n.contains("prompt") || n.contains("user") || n.contains("system") || n.contains("message") {
+        } else if n.contains("prompt")
+            || n.contains("user")
+            || n.contains("system")
+            || n.contains("message")
+        {
             inp.push(text);
         }
     }
-    let join = |v: Vec<String>| if v.is_empty() { None } else { Some(v.join("\n")) };
+    let join = |v: Vec<String>| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.join("\n"))
+        }
+    };
     (join(inp), join(out))
 }
 
@@ -292,7 +397,11 @@ mod tests {
     #[test]
     fn maps_genai_otlp_span_to_two_events() {
         let recs = parse_otlp_traces(GENAI).unwrap();
-        assert_eq!(recs.len(), 2, "一条 OTLP span → SpanStart + SpanEnd 两个事件");
+        assert_eq!(
+            recs.len(),
+            2,
+            "一条 OTLP span → SpanStart + SpanEnd 两个事件"
+        );
 
         let start = &recs[0];
         let end = &recs[1];
@@ -304,7 +413,10 @@ mod tests {
         assert_eq!((start.seq, end.seq), (1, 2));
         // span_id 低 64 位
         assert_eq!(start.span_id, 0xeee1_9b7e_c3c1_b174);
-        assert_eq!(start.trace_id, hex_low_u64("5b8efff798038103d269b633813fc60c"));
+        assert_eq!(
+            start.trace_id,
+            hex_low_u64("5b8efff798038103d269b633813fc60c")
+        );
         assert_eq!(start.parent_span_id, None, "空 parentSpanId → 根");
         // GenAI 属性映射
         assert_eq!(start.model.as_deref(), Some("qwen3"));
@@ -340,7 +452,11 @@ mod tests {
         assert_eq!(start.model.as_deref(), Some("gpt-4"));
         assert_eq!(start.input_tokens, Some(900));
         assert_eq!(start.output_tokens, Some(150));
-        assert_eq!(start.input_text.as_deref(), Some("请研判"), "OpenInference input.value → input_text");
+        assert_eq!(
+            start.input_text.as_deref(),
+            Some("请研判"),
+            "OpenInference input.value → input_text"
+        );
         assert_eq!(start.output_text.as_deref(), Some("疑似盗刷"));
         assert_eq!(recs[1].status, Some(0), "OTLP Ok(1) → status=0");
         assert_eq!(recs[1].duration_ns, Some(60));
@@ -360,7 +476,10 @@ mod tests {
     #[test]
     fn rejects_non_otlp() {
         assert!(parse_otlp_traces("not json").is_err());
-        assert!(parse_otlp_traces(r#"{"foo":1}"#).is_err(), "缺 resourceSpans 应报错");
+        assert!(
+            parse_otlp_traces(r#"{"foo":1}"#).is_err(),
+            "缺 resourceSpans 应报错"
+        );
     }
 
     #[test]
@@ -395,7 +514,11 @@ mod tests {
             ]
         }]}]}]}"#;
         let recs = parse_otlp_traces(j).unwrap();
-        assert_eq!(recs[0].input_text.as_deref(), Some("看这张图"), "多模态分片只取 text 部分");
+        assert_eq!(
+            recs[0].input_text.as_deref(),
+            Some("看这张图"),
+            "多模态分片只取 text 部分"
+        );
     }
 
     #[test]
@@ -411,8 +534,16 @@ mod tests {
             ]
         }]}]}]}"#;
         let recs = parse_otlp_traces(j).unwrap();
-        assert_eq!(recs[0].input_text.as_deref(), Some("这笔交易可疑吗"), "user.message 事件 → 输入");
-        assert_eq!(recs[0].output_text.as_deref(), Some("疑似盗刷"), "choice 事件 → 输出");
+        assert_eq!(
+            recs[0].input_text.as_deref(),
+            Some("这笔交易可疑吗"),
+            "user.message 事件 → 输入"
+        );
+        assert_eq!(
+            recs[0].output_text.as_deref(),
+            Some("疑似盗刷"),
+            "choice 事件 → 输出"
+        );
     }
 
     #[test]
@@ -428,7 +559,10 @@ mod tests {
         let recs = parse_otlp_traces(j).unwrap();
         assert_eq!(recs[0].session_id, Some(str_to_u64("tenant-a-session-1")));
         assert_eq!(recs[0].tenant_id, Some(42));
-        assert_eq!(recs[1].session_id, None, "session 只需挂在 start,折叠时合并");
+        assert_eq!(
+            recs[1].session_id, None,
+            "session 只需挂在 start,折叠时合并"
+        );
         assert_eq!(recs[1].tenant_id, None, "tenant 只需挂在 start,折叠时合并");
     }
 

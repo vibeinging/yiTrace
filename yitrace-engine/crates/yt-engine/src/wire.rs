@@ -63,7 +63,10 @@ impl Json {
     }
     fn as_str_array(&self) -> Vec<String> {
         match self {
-            Json::Arr(items) => items.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+            Json::Arr(items) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -82,7 +85,11 @@ impl Json {
             Json::Str(s) => format!("\"{}\"", json_escape(s)),
             Json::Arr(items) => format!(
                 "[{}]",
-                items.iter().map(Json::to_compact_json).collect::<Vec<_>>().join(",")
+                items
+                    .iter()
+                    .map(Json::to_compact_json)
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             Json::Obj(kvs) => format!(
                 "{{{}}}",
@@ -145,7 +152,10 @@ fn parse_opt_id(obj: &Json, key: &str) -> (Option<u64>, Option<String>) {
 
 fn attrs_map(v: Option<&Json>) -> BTreeMap<String, String> {
     match v {
-        Some(Json::Obj(kvs)) => kvs.iter().map(|(k, v)| (k.clone(), v.to_compact_json())).collect(),
+        Some(Json::Obj(kvs)) => kvs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_compact_json()))
+            .collect(),
         _ => BTreeMap::new(),
     }
 }
@@ -159,8 +169,16 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
     };
     let mut out = Vec::with_capacity(arr.len());
     for (i, obj) in arr.iter().enumerate() {
-        let req_u64 = |k: &str| field(obj, k).and_then(Json::as_u64).ok_or_else(|| format!("第{i}条缺/坏字段 {k}"));
-        let req_i64 = |k: &str| field(obj, k).and_then(Json::as_i64).ok_or_else(|| format!("第{i}条缺/坏字段 {k}"));
+        let req_u64 = |k: &str| {
+            field(obj, k)
+                .and_then(Json::as_u64)
+                .ok_or_else(|| format!("第{i}条缺/坏字段 {k}"))
+        };
+        let req_i64 = |k: &str| {
+            field(obj, k)
+                .and_then(Json::as_i64)
+                .ok_or_else(|| format!("第{i}条缺/坏字段 {k}"))
+        };
         let opt_u64 = |k: &str| field(obj, k).and_then(Json::as_u64);
         let opt_str = |k: &str| field(obj, k).and_then(Json::as_str).map(|s| s.to_string());
         let (trace_id, trace_ext_from_id) = parse_req_id(obj, "trace_id", i)?;
@@ -333,7 +351,11 @@ fn parse_number(it: &mut Peekable<Chars>) -> Result<Json, String> {
 }
 
 fn parse_bool(it: &mut Peekable<Chars>) -> Result<Json, String> {
-    let want = if it.peek() == Some(&'t') { "true" } else { "false" };
+    let want = if it.peek() == Some(&'t') {
+        "true"
+    } else {
+        "false"
+    };
     for c in want.chars() {
         if it.next() != Some(c) {
             return Err("非法 bool".into());
@@ -368,7 +390,7 @@ mod tests {
         assert_eq!(recs[0].ts, 1781769466402119000);
         assert_eq!(recs[0].event_type_tag, 1);
         assert_eq!(recs[0].logs, vec!["LLM研判"]); // 中文
-        // 转义引号 + 中文
+                                                   // 转义引号 + 中文
         assert_eq!(recs[1].logs, vec!["结论: \"需复核\""]);
         // null → None；token 整数
         assert_eq!(recs[0].parent_span_id, None);
@@ -401,9 +423,15 @@ mod tests {
         assert_eq!(r.external_span_id.as_deref(), Some("span-uuid"));
         assert_eq!(r.external_parent_span_id.as_deref(), Some("parent-uuid"));
         assert_eq!(r.external_session_id.as_deref(), Some("session-uuid"));
-        assert_eq!(r.attrs.get("external_run_id").map(String::as_str), Some("\"run-uuid\""));
+        assert_eq!(
+            r.attrs.get("external_run_id").map(String::as_str),
+            Some("\"run-uuid\"")
+        );
         assert_eq!(r.attrs.get("project_id").map(String::as_str), Some("7"));
-        assert_eq!(r.attrs.get("nested").map(String::as_str), Some("{\"ok\":true}"));
+        assert_eq!(
+            r.attrs.get("nested").map(String::as_str),
+            Some("{\"ok\":true}")
+        );
     }
 
     #[test]

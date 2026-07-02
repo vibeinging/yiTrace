@@ -11,12 +11,25 @@ use yt_engine::{InMemorySegmentStore, TraceQuery, WriteCoordinator};
 use yt_wal::WalRecord;
 
 /// 造一个事件。`et` 区分同一 span 的不同上报（start/end/attr），seq 定先后。
-fn ev(trace: u64, span: u64, seq: u64, ts: i64, et: EventType, status: Option<u8>, dur: Option<u64>, logs: &[&str]) -> WalRecord {
+fn ev(
+    trace: u64,
+    span: u64,
+    seq: u64,
+    ts: i64,
+    et: EventType,
+    status: Option<u8>,
+    dur: Option<u64>,
+    logs: &[&str],
+) -> WalRecord {
     WalRecord {
         trace_id: trace,
         span_id: span,
         ts,
-        identity: EventIdentity { ext_span_id: format!("{trace}-{span}"), seq, event_type: et },
+        identity: EventIdentity {
+            ext_span_id: format!("{trace}-{span}"),
+            seq,
+            event_type: et,
+        },
         fields: SpanFields {
             status,
             duration_ns: dur,
@@ -39,7 +52,10 @@ fn print_spans(title: &str, spans: &[FoldedSpan]) {
 fn print_hits(title: &str, hits: &[(FoldedSpan, f32)]) {
     println!("  {title}");
     for (s, score) in hits {
-        println!("    [分{score:.4}] trace={} span={} 日志={:?}", s.trace_id, s.span_id, s.logs);
+        println!(
+            "    [分{score:.4}] trace={} span={} 日志={:?}",
+            s.trace_id, s.span_id, s.logs
+        );
     }
 }
 
@@ -49,18 +65,108 @@ fn main() {
     // 三条 trace。每个 span 拆成 start（给 status）和 end（给耗时+日志）两个事件，模拟真实上报。
     let events = vec![
         // trace 1001：反洗钱筛查
-        ev(1001, 1, 1, 100, EventType::SpanStart, Some(0), None, &["反洗钱筛查 开始"]),
-        ev(1001, 1, 2, 180, EventType::SpanEnd, None, Some(80), &["命中规则 大额可疑 已上报"]),
-        ev(1001, 2, 1, 110, EventType::SpanStart, Some(0), None, &["调用 LLM 研判"]),
-        ev(1001, 2, 2, 160, EventType::SpanEnd, None, Some(50), &["研判结论 需人工复核"]),
+        ev(
+            1001,
+            1,
+            1,
+            100,
+            EventType::SpanStart,
+            Some(0),
+            None,
+            &["反洗钱筛查 开始"],
+        ),
+        ev(
+            1001,
+            1,
+            2,
+            180,
+            EventType::SpanEnd,
+            None,
+            Some(80),
+            &["命中规则 大额可疑 已上报"],
+        ),
+        ev(
+            1001,
+            2,
+            1,
+            110,
+            EventType::SpanStart,
+            Some(0),
+            None,
+            &["调用 LLM 研判"],
+        ),
+        ev(
+            1001,
+            2,
+            2,
+            160,
+            EventType::SpanEnd,
+            None,
+            Some(50),
+            &["研判结论 需人工复核"],
+        ),
         // trace 1002：疑似盗刷拦截
-        ev(1002, 1, 1, 200, EventType::SpanStart, Some(0), None, &["交易风控 开始"]),
-        ev(1002, 1, 2, 240, EventType::SpanEnd, None, Some(40), &["疑似盗刷 异地登录+大额", "已拦截"]),
-        ev(1002, 2, 1, 210, EventType::SpanStart, Some(1), None, &["短信验证 失败"]),
-        ev(1002, 2, 2, 230, EventType::SpanEnd, None, Some(20), &["二次验证未通过 冻结交易"]),
+        ev(
+            1002,
+            1,
+            1,
+            200,
+            EventType::SpanStart,
+            Some(0),
+            None,
+            &["交易风控 开始"],
+        ),
+        ev(
+            1002,
+            1,
+            2,
+            240,
+            EventType::SpanEnd,
+            None,
+            Some(40),
+            &["疑似盗刷 异地登录+大额", "已拦截"],
+        ),
+        ev(
+            1002,
+            2,
+            1,
+            210,
+            EventType::SpanStart,
+            Some(1),
+            None,
+            &["短信验证 失败"],
+        ),
+        ev(
+            1002,
+            2,
+            2,
+            230,
+            EventType::SpanEnd,
+            None,
+            Some(20),
+            &["二次验证未通过 冻结交易"],
+        ),
         // trace 1003：转账合规检查
-        ev(1003, 1, 1, 300, EventType::SpanStart, Some(0), None, &["转账合规检查 开始"]),
-        ev(1003, 1, 2, 350, EventType::SpanEnd, None, Some(50), &["合规通过 转账成功"]),
+        ev(
+            1003,
+            1,
+            1,
+            300,
+            EventType::SpanStart,
+            Some(0),
+            None,
+            &["转账合规检查 开始"],
+        ),
+        ev(
+            1003,
+            1,
+            2,
+            350,
+            EventType::SpanEnd,
+            None,
+            Some(50),
+            &["合规通过 转账成功"],
+        ),
     ];
 
     // 给 LLM span 标上 token 用量（agent 可观测性的成本核心）。
@@ -94,13 +200,21 @@ fn main() {
 
     println!("\n== 4) 混合召回：「盗刷」关键词 + 向量 [0.0,1.0]（语义偏反洗钱）==");
     println!("  （关键词指向盗刷、向量指向反洗钱，看 RRF 怎么融）");
-    print_hits("融合排序：", &wc.search_hybrid(&snap, "盗刷", &[0.0, 1.0], 5));
+    print_hits(
+        "融合排序：",
+        &wc.search_hybrid(&snap, "盗刷", &[0.0, 1.0], 5),
+    );
 
     println!("\n== 5) trace 列表（控制台主视图）==");
     for t in wc.list_traces(&snap, &TraceQuery::all()) {
         println!(
             "    trace={} span数={} 总耗时={}ns 报错={} token(入/出)={}/{}",
-            t.trace_id, t.span_count, t.total_duration_ns, t.error_count, t.total_input_tokens, t.total_output_tokens
+            t.trace_id,
+            t.span_count,
+            t.total_duration_ns,
+            t.error_count,
+            t.total_input_tokens,
+            t.total_output_tokens
         );
     }
 }

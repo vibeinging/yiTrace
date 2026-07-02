@@ -153,7 +153,11 @@ impl Bm25State {
                     max_tf = max_tf.max(tf);
                     min_dl = min_dl.min(self.doc_len[&d]);
                 }
-                blocks.push(BlockMeta { end, max_tf, min_dl });
+                blocks.push(BlockMeta {
+                    end,
+                    max_tf,
+                    min_dl,
+                });
                 i = end;
             }
             self.sorted.insert(tok.clone(), Postings { docs, blocks });
@@ -188,7 +192,10 @@ impl Bm25TextIndex {
 
     /// 注入自定义分词器（如团队 jieba 词级分词的 FFI 实现）。倒排与 BM25 评分不变。
     pub fn with_tokenizer(tokenizer: Box<dyn Tokenizer>) -> Self {
-        Self { state: Mutex::new(Bm25State::default()), tokenizer }
+        Self {
+            state: Mutex::new(Bm25State::default()),
+            tokenizer,
+        }
     }
 }
 
@@ -241,7 +248,13 @@ impl Bm25Index for Bm25TextIndex {
 
         let mut topk: BinaryHeap<Reverse<OrdF32>> = BinaryHeap::new();
         let mut scored: Vec<(u64, u64, f32)> = Vec::new();
-        let theta = |h: &BinaryHeap<Reverse<OrdF32>>| if h.len() >= k { h.peek().unwrap().0 .0 } else { f32::NEG_INFINITY };
+        let theta = |h: &BinaryHeap<Reverse<OrdF32>>| {
+            if h.len() >= k {
+                h.peek().unwrap().0 .0
+            } else {
+                f32::NEG_INFINITY
+            }
+        };
 
         if hits.len() == 1 {
             // 单词：block-max 块跳过。块上界 < θ → 整块不打分。
@@ -272,8 +285,15 @@ impl Bm25Index for Bm25TextIndex {
                 maxi: f32,
                 pos: usize,
             }
-            let mut curs: Vec<Cur> =
-                hits.iter().map(|&(idf, pp)| Cur { docs: &pp.docs, idf, maxi: idf * (K1 + 1.0), pos: 0 }).collect();
+            let mut curs: Vec<Cur> = hits
+                .iter()
+                .map(|&(idf, pp)| Cur {
+                    docs: &pp.docs,
+                    idf,
+                    maxi: idf * (K1 + 1.0),
+                    pos: 0,
+                })
+                .collect();
             loop {
                 curs.retain(|c| c.pos < c.docs.len());
                 if curs.is_empty() {
@@ -327,7 +347,11 @@ impl Bm25Index for Bm25TextIndex {
         }
 
         // 候选全量打分完 → 终排取 top-k（与暴力一致）。
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then((a.0, a.1).cmp(&(b.0, b.1))));
+        scored.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap()
+                .then((a.0, a.1).cmp(&(b.0, b.1)))
+        });
         scored.truncate(k);
         scored
     }
@@ -359,8 +383,13 @@ impl Bm25TextIndex {
                 }
             }
         }
-        let mut scored: Vec<(u64, u64, f32)> = scores.into_iter().map(|((t, s), sc)| (t, s, sc)).collect();
-        scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap().then((a.0, a.1).cmp(&(b.0, b.1))));
+        let mut scored: Vec<(u64, u64, f32)> =
+            scores.into_iter().map(|((t, s), sc)| (t, s, sc)).collect();
+        scored.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap()
+                .then((a.0, a.1).cmp(&(b.0, b.1)))
+        });
         scored.truncate(k);
         scored
     }
@@ -375,7 +404,7 @@ mod tests {
     fn cjk_bigram_tokenizer() {
         assert_eq!(tokenize("疑似盗刷"), vec!["疑似", "似盗", "盗刷"]);
         assert_eq!(tokenize("好"), vec!["好"]); // 单字保留
-        // 中英混排 + 标点切分
+                                                // 中英混排 + 标点切分
         assert_eq!(tokenize("风控 GPT4"), vec!["风控", "gpt4"]);
         assert_eq!(tokenize("盗刷,转账"), vec!["盗刷", "转账"]);
     }
@@ -402,7 +431,10 @@ mod tests {
         sub.index_text(1, 1, "风控系统实时拦截了一笔疑似盗刷的交易");
         sub.index_text(3, 3, "这是一笔疑似盗刷");
         sub.index_text(4, 4, "风控规则已更新");
-        assert!(sub.search("盗刷风控", 10).is_empty(), "子串匹配召不回非连续多概念查询");
+        assert!(
+            sub.search("盗刷风控", 10).is_empty(),
+            "子串匹配召不回非连续多概念查询"
+        );
     }
 
     #[test]
@@ -421,10 +453,14 @@ mod tests {
     fn wand_matches_exhaustive_on_random_corpus() {
         // WAND 必须与暴力全量打分**逐位一致**（剪枝只跳掉绝不进 top-k 的文档）。
         // 随机语料 + 多词查询，扫多个 k 对比。确定性 LCG，不依赖 rand。
-        let words = ["盗刷", "风控", "交易", "转账", "登录", "异常", "拦截", "模型", "会话", "超时"];
+        let words = [
+            "盗刷", "风控", "交易", "转账", "登录", "异常", "拦截", "模型", "会话", "超时",
+        ];
         let mut seed = 0x1234_5678u64;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         let bm = Bm25TextIndex::new();
@@ -471,7 +507,11 @@ mod tests {
         // 查 "风控"：只有 (1,1) 把它切成独立词 → 命中；(2,2) 整串是一个词，不含 "风控" 这个 token。
         let hits = bm.search("风控", 10);
         assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].0, hits[0].1), (1, 1), "分词器决定切分，索引只认 token");
+        assert_eq!(
+            (hits[0].0, hits[0].1),
+            (1, 1),
+            "分词器决定切分，索引只认 token"
+        );
 
         // 同一份数据走默认 bigram：两条都把 风控 切出来 → 都召回（对照，证明只有分词层变了）。
         let bg = Bm25TextIndex::new();

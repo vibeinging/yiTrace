@@ -19,7 +19,11 @@ fn eval_recovers_injected_failures_per_scenario() {
     assert_eq!(report.scenarios.len(), 4);
     for s in &report.scenarios {
         let overall = &s.summary[0];
-        assert_eq!(overall.scored_spans, s.traces, "场景[{}]：每条 trace 应恰好一个被评 span", s.key);
+        assert_eq!(
+            overall.scored_spans, s.traces,
+            "场景[{}]：每条 trace 应恰好一个被评 span",
+            s.key
+        );
         assert_eq!(
             overall.pass_count,
             s.traces - s.injected_failures,
@@ -28,7 +32,11 @@ fn eval_recovers_injected_failures_per_scenario() {
         );
         // 既有通过也有失败，eval 才有意义（注入比例都在 (0,1) 内）。
         assert!(s.injected_failures > 0, "场景[{}]：应注入了一些失败", s.key);
-        assert!(s.injected_failures < s.traces, "场景[{}]：不应全失败", s.key);
+        assert!(
+            s.injected_failures < s.traces,
+            "场景[{}]：不应全失败",
+            s.key
+        );
     }
 }
 
@@ -38,7 +46,11 @@ fn eval_recovers_injected_failures_per_scenario() {
 fn per_agent_pass_rate_differs_in_multi_agent_scenario() {
     let coord = fresh();
     let report = evalkit::run_harness(&coord, 80, 42);
-    let risk = report.scenarios.iter().find(|s| s.key == "风控研判").expect("有风控场景");
+    let risk = report
+        .scenarios
+        .iter()
+        .find(|s| s.key == "风控研判")
+        .expect("有风控场景");
 
     let rate_of = |agent: &str| -> f32 {
         risk.summary
@@ -63,7 +75,10 @@ fn dataset_regression_drops_under_stricter_scorer() {
     assert!(report.dataset_size > 0, "应采集到回归样本");
     let base = report.dataset_baseline[0].pass_rate();
     let strict = report.dataset_stricter[0].pass_rate();
-    assert!(strict < base, "更严评判通过率应低于基准：基准={base:.2} 更严={strict:.2}");
+    assert!(
+        strict < base,
+        "更严评判通过率应低于基准：基准={base:.2} 更严={strict:.2}"
+    );
 }
 
 /// 数据是**真灌进引擎**的：摄入后能从 trace 列表读出来。
@@ -75,10 +90,20 @@ fn ingested_data_is_visible_in_trace_list() {
 
     let snap = coord.pin_snapshot();
     let traces = coord.list_traces(&snap, &TraceQuery::all());
-    assert_eq!(traces.len(), total_traces, "trace 列表条数应等于灌入的 trace 总数");
+    assert_eq!(
+        traces.len(),
+        total_traces,
+        "trace 列表条数应等于灌入的 trace 总数"
+    );
     // 每条 trace 三个 span（root/tool/answer），且有 token 成本。
-    assert!(traces.iter().all(|t| t.span_count == 3), "每条 trace 应有 3 个 span");
-    assert!(traces.iter().any(|t| t.total_input_tokens > 0), "应有输入 token 成本");
+    assert!(
+        traces.iter().all(|t| t.span_count == 3),
+        "每条 trace 应有 3 个 span"
+    );
+    assert!(
+        traces.iter().any(|t| t.total_input_tokens > 0),
+        "应有输入 token 成本"
+    );
 }
 
 // ───────────────────────── 会话级（多轮）评测 ─────────────────────────
@@ -90,13 +115,23 @@ fn session_eval_classifies_multi_turn_conversations() {
     let coord = fresh();
     let r = evalkit::run_session_harness(&coord, 60, 99);
     // 三类是一个划分（互斥且周全）。
-    assert_eq!(r.efficient + r.looped_resolved + r.unresolved, r.evals.len());
+    assert_eq!(
+        r.efficient + r.looped_resolved + r.unresolved,
+        r.evals.len()
+    );
     // 与生成弧线对账：一次到位=resolved_fast；绕圈后解决=重试+重复问；未解决=始终失败。
     assert_eq!(r.efficient, r.gen.resolved_fast, "一次到位");
-    assert_eq!(r.looped_resolved, r.gen.resolved_after_retry + r.gen.repeat_question, "绕圈后解决");
+    assert_eq!(
+        r.looped_resolved,
+        r.gen.resolved_after_retry + r.gen.repeat_question,
+        "绕圈后解决"
+    );
     assert_eq!(r.unresolved, r.gen.unresolved, "未解决");
     // 各类都得有样本，演示才立得住。
-    assert!(r.efficient > 0 && r.looped_resolved > 0 && r.unresolved > 0, "三类应都有样本");
+    assert!(
+        r.efficient > 0 && r.looped_resolved > 0 && r.unresolved > 0,
+        "三类应都有样本"
+    );
     // 确实是多轮（平均 > 1 轮）。
     assert!(r.avg_turns > 1.0, "应是多轮会话");
 }
@@ -108,9 +143,19 @@ fn looping_is_detected_for_both_retry_and_repeat() {
     let r = evalkit::run_session_harness(&coord, 80, 7);
     // 被判 looped 的会话数应 ≥ 重试类（连续失败必触发 looped）。
     let looped = r.evals.iter().filter(|e| e.looped).count();
-    assert!(looped >= r.gen.resolved_after_retry, "连续失败的重试会话都应被判绕圈");
+    assert!(
+        looped >= r.gen.resolved_after_retry,
+        "连续失败的重试会话都应被判绕圈"
+    );
     // 「绕圈后解决」的会话：既 resolved 又 looped。
-    assert!(r.evals.iter().any(|e| e.resolved && e.looped), "应有绕圈后解决的会话");
+    assert!(
+        r.evals.iter().any(|e| e.resolved && e.looped),
+        "应有绕圈后解决的会话"
+    );
     // 未解决的会话最后一轮一定是失败的。
-    assert!(r.evals.iter().filter(|e| !e.resolved).all(|e| e.failed_turns > 0));
+    assert!(r
+        .evals
+        .iter()
+        .filter(|e| !e.resolved)
+        .all(|e| e.failed_turns > 0));
 }

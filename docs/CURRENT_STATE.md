@@ -12,7 +12,7 @@
 
 | 目录 | 是什么 | 状态 |
 |---|---|---|
-| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，90+6 测试绿 |
+| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，yt-core 9 + yt-engine 130 + eval_harness 6 + manifest 4 + memtable 2 + wal 5 测试绿 |
 | `yitrace-segstore-vortex/` | **列式段存储（Vortex）**，实现引擎的 `SegmentStore`。独立 crate、工作区外，**不污染零依赖骨架**。 | 已落地：写读 + 谓词下推 + 投影下推 + 默认压缩，7 测试绿 |
 | `yitrace-tokenizer-jieba/` | **团队 jieba 词级分词接入**（FFI），实现引擎的 `Tokenizer`。Vortex 同款隔离、工作区外。 | 接缝 + ABI 契约 + 离线 mock 测试绿（3 测）；真库在构建机 `--features link` 接 |
 | `yitrace-vecindex-graph/` | **团队 graph_index 向量 ANN 接入**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 接缝 + ABI 契约（带过滤回调）+ 离线 mock 测试绿（4 测）；真库在构建机 `--features link` 接 |

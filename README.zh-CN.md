@@ -155,6 +155,7 @@ const hits = await db.search({
   filter: { attrs: { project_id: "agentic-data", skill: "review" } },
 });
 const trace = await db.trace("run-uuid");
+const logEvents = trace?.spans?.flatMap((span) => span.logEvents ?? []) ?? [];
 await db.close();
 ```
 
@@ -164,7 +165,8 @@ ESM `import` 和 CommonJS `require` 都支持。
 direct ingest 支持数字 ID，也支持 UUID 这类外部字符串 ID。字符串 ID 会稳定 hash 成内部
 `u64` key 用于索引，原文会以 `external_*` 字段返回。`attrs` 会真实持久化，并在 search、trace
 和 span detail 响应里返回。`project_id`、`skill`、`mode`、`call_site` 支持精确 attrs 过滤。
-`OpenOptions.readOnly` 暂不暴露；等 engine 有真正只读打开路径后再加。
+trace 和 span detail 也会返回 `logEvents`，业务侧可以直接渲染 span 内过程日志，不需要把日志复制到
+`attrs.event_logs`。`OpenOptions.readOnly` 暂不暴露；等 engine 有真正只读打开路径后再加。
 
 `@yitrace/db` 对外是一个很小的 JS 入口包，native 二进制按平台拆成 optional packages
 （例如 `@yitrace/db-darwin-arm64`、`@yitrace/db-linux-x64-gnu`）。用户只需要安装

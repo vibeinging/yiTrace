@@ -9,7 +9,28 @@
     "yitrace-db.darwin-x64.node"
   ],
   "description": "Embedded yiTrace database for Node.js and Electron",
+  "keywords": [
+    "ai",
+    "agent",
+    "observability",
+    "trace",
+    "database",
+    "electron",
+    "node-api"
+  ],
+  "homepage": "https://github.com/vibeinging/yiTrace#readme",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vibeinging/yiTrace.git",
+    "directory": "yitrace-node"
+  },
+  "bugs": {
+    "url": "https://github.com/vibeinging/yiTrace/issues"
+  },
   "os": [
     "darwin"
   ]

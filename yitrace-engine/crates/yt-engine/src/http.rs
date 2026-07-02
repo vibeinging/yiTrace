@@ -454,10 +454,12 @@ impl EngineJsonApi {
                         attr_filter.insert(k.to_string(), json_string_value(&url_decode(v)));
                     }
                     "projectId" => {
-                        attr_filter.insert("project_id".to_string(), json_string_value(&url_decode(v)));
+                        attr_filter
+                            .insert("project_id".to_string(), json_string_value(&url_decode(v)));
                     }
                     "callSite" => {
-                        attr_filter.insert("call_site".to_string(), json_string_value(&url_decode(v)));
+                        attr_filter
+                            .insert("call_site".to_string(), json_string_value(&url_decode(v)));
                     }
                     _ => {}
                 }
@@ -578,11 +580,20 @@ impl EngineJsonApi {
         });
         let any_err = spans.iter().any(|s| s.has_error);
         let name = spans.first().map(|s| s.name.clone()).unwrap_or_default();
+        let visible_keys: std::collections::HashSet<(u64, u64)> =
+            spans.iter().map(|s| (tid, s.span_id)).collect();
+        let log_events_by_span = self
+            .coord
+            .log_events_for_trace_keys(&snap, tid, &visible_keys);
         let span_items: Vec<String> = spans
             .iter()
             .map(|s| {
+                let log_events = log_events_by_span
+                    .get(&s.span_id)
+                    .map(|events| json_log_events(events))
+                    .unwrap_or_else(|| "[]".to_string());
                 format!(
-                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{}}}"#,
+                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{},"logEvents":{}}}"#,
                     s.span_id,
                     s.parent_span_id.map_or("null".to_string(), |p| format!("\"{p}\"")),
                     json_opt_str(s.external_trace_id.as_deref()),
@@ -600,6 +611,7 @@ impl EngineJsonApi {
                     s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
                     depth_of(s.span_id),
                     json_attrs(&s.attrs),
+                    log_events,
                 )
             })
             .collect();
@@ -670,24 +682,34 @@ impl EngineJsonApi {
             .coord
             .console_trace_spans_for_tenant(&snap, tid, tenant);
         match spans.into_iter().find(|s| s.span_id == sid) {
-            Some(s) => (
-                200,
-                format!(
-                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"input":{},"output":{},"attrs":{}}}"#,
-                    sid,
-                    json_opt_str(s.external_trace_id.as_deref()),
-                    json_opt_str(s.external_span_id.as_deref()),
-                    json_opt_str(s.external_parent_span_id.as_deref()),
-                    json_opt_str(s.external_session_id.as_deref()),
-                    s.input_text
-                        .as_ref()
-                        .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
-                    s.output_text
-                        .as_ref()
-                        .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
-                    json_attrs(&s.attrs),
-                ),
-            ),
+            Some(s) => {
+                let mut keys = std::collections::HashSet::new();
+                keys.insert((tid, sid));
+                let log_events_by_span = self.coord.log_events_for_trace_keys(&snap, tid, &keys);
+                let log_events = log_events_by_span
+                    .get(&sid)
+                    .map(|events| json_log_events(events))
+                    .unwrap_or_else(|| "[]".to_string());
+                (
+                    200,
+                    format!(
+                        r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"input":{},"output":{},"attrs":{},"logEvents":{}}}"#,
+                        sid,
+                        json_opt_str(s.external_trace_id.as_deref()),
+                        json_opt_str(s.external_span_id.as_deref()),
+                        json_opt_str(s.external_parent_span_id.as_deref()),
+                        json_opt_str(s.external_session_id.as_deref()),
+                        s.input_text
+                            .as_ref()
+                            .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                        s.output_text
+                            .as_ref()
+                            .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                        json_attrs(&s.attrs),
+                        log_events,
+                    ),
+                )
+            }
             None => (404, r#"{"error":"span not found"}"#.to_string()),
         }
     }
@@ -733,7 +755,10 @@ fn parse_id_or_hash(s: &str) -> Option<u64> {
     if s.is_empty() {
         None
     } else {
-        Some(s.parse::<u64>().unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes())))
+        Some(
+            s.parse::<u64>()
+                .unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes())),
+        )
     }
 }
 
@@ -755,6 +780,36 @@ fn json_attrs(attrs: &std::collections::BTreeMap<String, String>) -> String {
         attrs
             .iter()
             .map(|(k, v)| format!("\"{}\":{}", json_escape(k), v))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn json_log_events(events: &[crate::SpanLogEvent]) -> String {
+    if events.is_empty() {
+        return "[]".to_string();
+    }
+    format!(
+        "[{}]",
+        events
+            .iter()
+            .map(|ev| {
+                let messages = ev
+                    .messages
+                    .iter()
+                    .map(|m| json_string_value(m))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    r#"{{"eventId":"{}","ts":{},"seq":{},"eventType":{},"messages":[{}],"attrs":{}}}"#,
+                    ev.event_id,
+                    ev.ts,
+                    ev.seq,
+                    ev.event_type,
+                    messages,
+                    json_attrs(&ev.attrs),
+                )
+            })
             .collect::<Vec<_>>()
             .join(",")
     )
@@ -884,16 +939,28 @@ mod tests {
         assert!(body.contains(r#""externalSpanId":"span-uuid""#), "{body}");
         assert!(body.contains(r#""call_site":"worker.ts:10""#), "{body}");
 
-        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"trace_id":"run-uuid"}}"#);
+        let (status, body) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"text":"盗刷","filter":{"trace_id":"run-uuid"}}"#,
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains(r#""external_trace_id":"run-uuid""#), "{body}");
         assert!(body.contains(r#""skill":"review""#), "{body}");
 
-        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"attrs":{"project_id":"agentic-data","skill":"review"}}}"#);
+        let (status, body) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"text":"盗刷","filter":{"attrs":{"project_id":"agentic-data","skill":"review"}}}"#,
+        );
         assert_eq!(status, 200, "{body}");
         assert!(body.contains(r#""external_trace_id":"run-uuid""#), "{body}");
 
-        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"project_id":"agentic-data","skill":"other"}}"#);
+        let (status, body) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"text":"盗刷","filter":{"project_id":"agentic-data","skill":"other"}}"#,
+        );
         assert_eq!(status, 200, "{body}");
         assert_eq!(body, "[]");
     }
@@ -1124,7 +1191,8 @@ mod tests {
         let s = server();
         let batch = r#"[
           {"trace_id":11,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"11-1","session_id":900,"agent_name":"风控研判","input_tokens":500,"input_text":"对账户A做研判","attrs":{"project_id":"agentic-data","skill":"review","mode":"auto"}},
-          {"trace_id":11,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"11-1","session_id":900,"status":0,"duration_ns":2000000,"output_tokens":120,"output_text":"触发规则R12"},
+          {"trace_id":11,"span_id":1,"ts":2,"seq":2,"event_type":4,"ext_span_id":"11-1","session_id":900,"logs":["读取 package.json"],"attrs":{"call_site":"package-json"}},
+          {"trace_id":11,"span_id":1,"ts":3,"seq":3,"event_type":2,"ext_span_id":"11-1","session_id":900,"status":0,"duration_ns":2000000,"output_tokens":120,"output_text":"触发规则R12"},
           {"trace_id":12,"span_id":1,"ts":3,"seq":1,"event_type":1,"ext_span_id":"12-1","session_id":900,"agent_name":"风控研判","input_tokens":300,"input_text":"继续核查"},
           {"trace_id":12,"span_id":1,"ts":4,"seq":2,"event_type":2,"ext_span_id":"12-1","session_id":900,"status":0,"duration_ns":1000000,"output_tokens":80}
         ]"#;
@@ -1148,7 +1216,11 @@ mod tests {
         assert!(body_attr.contains("\"sessionId\":\"900\""), "{body_attr}");
         assert!(body_attr.contains("\"total\":1"), "{body_attr}");
 
-        let (st_miss, body_miss) = s.route("GET", "/v1/sessions?project_id=agentic-data&skill=other", "");
+        let (st_miss, body_miss) = s.route(
+            "GET",
+            "/v1/sessions?project_id=agentic-data&skill=other",
+            "",
+        );
         assert_eq!(st_miss, 200, "{body_miss}");
         assert!(body_miss.contains("\"items\":[]"), "{body_miss}");
         assert!(body_miss.contains("\"total\":0"), "{body_miss}");
@@ -1171,11 +1243,22 @@ mod tests {
             "{trace}"
         );
         assert!(trace.contains("\"summary\""), "{trace}");
+        assert!(
+            trace.contains("\"logEvents\"")
+                && trace.contains("读取 package.json")
+                && trace.contains("\"eventType\":4")
+                && trace.contains("\"call_site\":\"package-json\""),
+            "{trace}"
+        );
 
         // span 详情：晚物化大字段。
         let (st4, detail) = s.route("GET", "/v1/traces/11/spans/1", "");
         assert_eq!(st4, 200, "{detail}");
         assert!(detail.contains("触发规则R12"), "{detail}");
+        assert!(
+            detail.contains("\"logEvents\"") && detail.contains("读取 package.json"),
+            "{detail}"
+        );
 
         // 步骤流：带输入/输出文本一次给全。
         let (st5, steps) = s.route("GET", "/v1/traces/11/steps", "");

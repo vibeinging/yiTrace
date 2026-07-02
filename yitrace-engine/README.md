@@ -1,13 +1,13 @@
 # yiTrace Engine
 
-> ⚠️ **状态:验证级骨架,不是生产就绪。** 技术前提用代码 + 会失败的测试钉死(129 测试),但分词/向量索引/安全合规未到生产级。**不要未经评估直接上生产。** 详见文末["距离开源还剩什么"](#距离开源还剩什么)。
+> ⚠️ **状态:验证级骨架,不是生产就绪。** 技术前提用代码 + 会失败的测试钉死(156 测试),但分词/向量索引/安全合规未到生产级。**不要未经评估直接上生产。** 详见文末["距离开源还剩什么"](#距离开源还剩什么)。
 >
 > 许可证:**MIT**(见根目录 [LICENSE](../LICENSE))。内嵌 jieba 词典为 MIT(见 `data/JIEBA_DICT_NOTICE.md`),Vortex 为 Apache-2.0。
 
 单机、私有部署的 AI Agent 可观测性数据库。自研 Rust 引擎,刻意只用标准库、**零外部依赖**(`cargo test --offline` 离线可过)。面向中国金融/政企气隙机房,对标 Langfuse / LangSmith,但**数据不出内网、中文检索/语义向量是一等公民、自有索引 IP**。
 
 ```bash
-cargo test --offline                              # 129 测试(引擎 9+105+6+3+2+4)
+cargo test --offline                              # 156 测试(yt-core 9 + yt-engine 130 + eval_harness 6 + manifest 4 + memtable 2 + wal 5)
 cargo run -p yt-engine --example demo --offline  # 灌几条银行风控假 trace,跑写入→折叠→中文搜→找相似→混合召回
 cargo run -p yt-engine --example server          # 起 HTTP 摄入服务(8 线程池),curl 即可灌/查
 YT_TOKEN=secret cargo run ... --example server   # 开 Bearer token 鉴权
@@ -166,7 +166,7 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | **CI(GitHub Actions)** | 多 Rust 版本矩阵 + clippy + fmt + SDK 多版本 + Vortex crate;现在零 CI |
 | **示例完整化** | `demo`/`server` 有,但缺"端到端:SDK 打点 → server → 查询 → eval"一条龙示例 |
 | **架构图** | 五 crate + 外部 crate + 数据流图,文字 README 说不清;需要一张图 |
-| **测试矩阵明示** | "129 测试验什么"现在堆在一段里,需要表格化(功能清单已部分解决) |
+| **测试矩阵明示** | "156 测试验什么"现在堆在一段里,需要表格化(功能清单已部分解决) |
 | **竞品对比页** | 会反复被问"跟 Langfuse/ClickHouse 比怎样";产品说明里有但 README 没指 |
 
 ### 🟢 功能性缺口(不影响开源,但 README 要标"未实现")

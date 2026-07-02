@@ -58,7 +58,13 @@ pub struct GraphAnnIndex {
 impl GraphAnnIndex {
     /// `m` = 每点邻居数（建议 8~16）；`ef` = 搜索 beam 宽度（越大越准越慢）。
     pub fn new(m: usize, ef: usize) -> Self {
-        Self { state: Mutex::new(GraphState { nodes: Vec::new(), m: m.max(2) }), ef: ef.max(1) }
+        Self {
+            state: Mutex::new(GraphState {
+                nodes: Vec::new(),
+                m: m.max(2),
+            }),
+            ef: ef.max(1),
+        }
     }
 }
 
@@ -77,12 +83,20 @@ impl GraphState {
     fn insert(&mut self, key: (u64, u64), vec: Vec<f32>) {
         let new_idx = self.nodes.len();
         // 找已有点里最近的 m 个。
-        let mut near: Vec<(OrdF32, usize)> =
-            self.nodes.iter().enumerate().map(|(i, n)| (OrdF32(l2_sq(&vec, &n.vec)), i)).collect();
+        let mut near: Vec<(OrdF32, usize)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (OrdF32(l2_sq(&vec, &n.vec)), i))
+            .collect();
         near.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         near.truncate(self.m);
 
-        self.nodes.push(Node { key, vec, adj: near.iter().map(|&(_, i)| i).collect() });
+        self.nodes.push(Node {
+            key,
+            vec,
+            adj: near.iter().map(|&(_, i)| i).collect(),
+        });
 
         // 反向连边，并把每个被连点的度数剪到 2*m（保留最近的）。
         let m2 = self.m * 2;
@@ -92,7 +106,8 @@ impl GraphState {
                 let base = self.nodes[i].vec.clone();
                 let mut neigh = std::mem::take(&mut self.nodes[i].adj);
                 neigh.sort_unstable_by(|&a, &b| {
-                    OrdF32(l2_sq(&base, &self.nodes[a].vec)).cmp(&OrdF32(l2_sq(&base, &self.nodes[b].vec)))
+                    OrdF32(l2_sq(&base, &self.nodes[a].vec))
+                        .cmp(&OrdF32(l2_sq(&base, &self.nodes[b].vec)))
                 });
                 neigh.truncate(m2);
                 self.nodes[i].adj = neigh;
@@ -150,7 +165,10 @@ impl GraphState {
         v.into_iter().map(|(_, i)| i).collect()
     }
 
-    fn key_filter<'a>(&'a self, filter: &'a dyn Fn(u64, u64) -> bool) -> impl Fn(usize) -> bool + 'a {
+    fn key_filter<'a>(
+        &'a self,
+        filter: &'a dyn Fn(u64, u64) -> bool,
+    ) -> impl Fn(usize) -> bool + 'a {
         move |idx: usize| {
             let (t, s) = self.nodes[idx].key;
             filter(t, s)
@@ -160,20 +178,38 @@ impl GraphState {
 
 impl GraphAnnIndex {
     /// 进图过滤搜索（导航穿过不满足谓词的点，只收满足的）。返回 (trace, span, L2 距离)，距离升序、取前 k。
-    pub fn search_ingraph(&self, query: &[f32], k: usize, ef: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    pub fn search_ingraph(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         let st = self.state.lock().unwrap();
         let pred = st.key_filter(filter);
         let mut out: Vec<(u64, u64, f32)> = st
             .beam(query, ef.max(k), &pred)
             .into_iter()
-            .map(|i| (st.nodes[i].key.0, st.nodes[i].key.1, l2_sq(query, &st.nodes[i].vec).sqrt()))
+            .map(|i| {
+                (
+                    st.nodes[i].key.0,
+                    st.nodes[i].key.1,
+                    l2_sq(query, &st.nodes[i].vec).sqrt(),
+                )
+            })
             .collect();
         out.truncate(k);
         out
     }
 
     /// 事后过滤搜索（先按向量搜 ef 个近邻，再用谓词筛）。选择性谓词下召回会崩 —— 用来做对照。
-    pub fn search_postfilter(&self, query: &[f32], k: usize, ef: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    pub fn search_postfilter(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         let st = self.state.lock().unwrap();
         let all = st.beam(query, ef.max(k), &|_| true); // 先不带过滤搜近邻
         let mut out: Vec<(u64, u64, f32)> = all
@@ -182,14 +218,25 @@ impl GraphAnnIndex {
                 let (t, s) = st.nodes[i].key;
                 filter(t, s)
             })
-            .map(|i| (st.nodes[i].key.0, st.nodes[i].key.1, l2_sq(query, &st.nodes[i].vec).sqrt()))
+            .map(|i| {
+                (
+                    st.nodes[i].key.0,
+                    st.nodes[i].key.1,
+                    l2_sq(query, &st.nodes[i].vec).sqrt(),
+                )
+            })
             .collect();
         out.truncate(k);
         out
     }
 
     /// 暴力精确 top-k（满足谓词的点里），给测试算召回 ground-truth。
-    pub fn exact_filtered_topk(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64)> {
+    pub fn exact_filtered_topk(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64)> {
         let st = self.state.lock().unwrap();
         let mut scored: Vec<(OrdF32, (u64, u64))> = st
             .nodes
@@ -205,11 +252,19 @@ impl GraphAnnIndex {
 
 impl GraphIndex for GraphAnnIndex {
     fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
-        self.state.lock().unwrap().insert((trace_id, span_id), embedding);
+        self.state
+            .lock()
+            .unwrap()
+            .insert((trace_id, span_id), embedding);
     }
 
     /// 引擎默认走 **in-graph** 过滤（好的那条）。
-    fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         self.search_ingraph(query, k, self.ef, filter)
     }
 }
@@ -223,7 +278,10 @@ mod tests {
     impl Lcg {
         fn next_f32(&mut self) -> f32 {
             // 经典 LCG 常数
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 33) as f32) / (1u64 << 31) as f32
         }
         fn vec(&mut self, dim: usize) -> Vec<f32> {
@@ -235,7 +293,10 @@ mod tests {
         if truth.is_empty() {
             return 1.0;
         }
-        let hit = got.iter().filter(|(t, s, _)| truth.contains(&(*t, *s))).count();
+        let hit = got
+            .iter()
+            .filter(|(t, s, _)| truth.contains(&(*t, *s)))
+            .count();
         hit as f32 / truth.len() as f32
     }
 
@@ -276,7 +337,12 @@ mod tests {
             let probe_key = matching[(matching.len() - 1) * p / probes.max(1)];
             let probe_vec = {
                 let st = idx.state.lock().unwrap();
-                st.nodes.iter().find(|node| node.key == probe_key).unwrap().vec.clone()
+                st.nodes
+                    .iter()
+                    .find(|node| node.key == probe_key)
+                    .unwrap()
+                    .vec
+                    .clone()
             };
             let truth = idx.exact_filtered_topk(&probe_vec, k, &filter);
             let r_post = recall(&idx.search_postfilter(&probe_vec, k, 48, &filter), &truth);
@@ -322,7 +388,12 @@ mod tests {
                 s.post_mean
             );
             // 每组：in-graph 均值够用（留余量,不卡死单点）。
-            assert!(s.in_mean >= 0.75, "选择性 {:.0}%: in-graph 均值应 ≥0.75,实测 {:.2}", s.selectivity * 100.0, s.in_mean);
+            assert!(
+                s.in_mean >= 0.75,
+                "选择性 {:.0}%: in-graph 均值应 ≥0.75,实测 {:.2}",
+                s.selectivity * 100.0,
+                s.in_mean
+            );
             stats.push(s);
         }
         // 招牌结论的可复现版:在最稀疏那组（1%）,post-filter 明显崩,in-graph 明显高。

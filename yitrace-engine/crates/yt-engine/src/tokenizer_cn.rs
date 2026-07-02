@@ -42,7 +42,12 @@ pub struct Dict {
 impl Dict {
     /// 空词典（退化成单字切分；一般用 `full` 或 `load_str`）。
     pub fn new() -> Self {
-        Self { freq: HashMap::new(), total: 0, log_total: 0.0, max_word_len: 0 }
+        Self {
+            freq: HashMap::new(),
+            total: 0,
+            log_total: 0.0,
+            max_word_len: 0,
+        }
     }
 
     /// 加一个词。重复加同词**覆盖**频次（用户词典可借此提权某词）。
@@ -138,7 +143,9 @@ impl ChineseTokenizer {
 
     /// 用完全自定义词典（不含 jieba 全量；多用于测试或特殊场景）。
     pub fn with_dict(dict: Dict) -> Self {
-        Self { dict: Arc::new(dict) }
+        Self {
+            dict: Arc::new(dict),
+        }
     }
 
     /// 对一段**纯中文**做词典 DAG + 最大概率路径切分。
@@ -262,7 +269,10 @@ mod tests {
     fn segments_known_words_at_word_level() {
         let t = ChineseTokenizer::full();
         // 词级切分：四个词，不是 bigram 的 用户/户登/登录…
-        assert_eq!(t.tokenize("用户登录风控系统"), vec!["用户", "登录", "风控", "系统"]);
+        assert_eq!(
+            t.tokenize("用户登录风控系统"),
+            vec!["用户", "登录", "风控", "系统"]
+        );
     }
 
     #[test]
@@ -280,7 +290,9 @@ mod tests {
         // 整句带功能词
         assert_eq!(
             t.tokenize("风控系统实时拦截了一笔疑似盗刷的交易"),
-            vec!["风控", "系统", "实时", "拦截", "了", "一笔", "疑似", "盗刷", "的", "交易"]
+            vec![
+                "风控", "系统", "实时", "拦截", "了", "一笔", "疑似", "盗刷", "的", "交易"
+            ]
         );
     }
 
@@ -322,7 +334,10 @@ mod tests {
     fn user_dict_overlays_on_full_dict() {
         // 自有词典导入：在全量词典之上加一个 jieba 不认的专名，分词随之把它当整词。
         let t = ChineseTokenizer::with_user_dict("玄武风控引擎 100000 nz\n");
-        assert_eq!(t.tokenize("玄武风控引擎拦截了请求"), vec!["玄武风控引擎", "拦截", "了", "请求"]);
+        assert_eq!(
+            t.tokenize("玄武风控引擎拦截了请求"),
+            vec!["玄武风控引擎", "拦截", "了", "请求"]
+        );
         // 不加用户词时，这个生造专名会被切碎（证明确实是用户词起的作用）。
         let base = ChineseTokenizer::full();
         assert!(base.tokenize("玄武风控引擎").len() > 1);

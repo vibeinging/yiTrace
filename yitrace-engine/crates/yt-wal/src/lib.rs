@@ -70,7 +70,10 @@ impl Default for Wal {
 impl Wal {
     /// 内存模式（测试用，不落盘）。
     pub fn new() -> Self {
-        Self { next_lsn: 1, backing: Backing::Mem(Vec::new()) }
+        Self {
+            next_lsn: 1,
+            backing: Backing::Mem(Vec::new()),
+        }
     }
 
     /// 文件模式：真落盘。打开已有文件并扫描出 next_lsn（恢复用），之后 append+fsync。
@@ -83,8 +86,15 @@ impl Wal {
             .last()
             .map(|(first, recs)| first + (recs.len() as u64).max(1))
             .unwrap_or(1);
-        let file = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
-        Ok(Self { next_lsn, backing: Backing::File { file, path } })
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        Ok(Self {
+            next_lsn,
+            backing: Backing::File { file, path },
+        })
     }
 
     /// 追加一批并提交（组提交）。文件模式 fsync 后才返回 → 之后调用方才回 ack。
@@ -94,7 +104,12 @@ impl Wal {
         match &mut self.backing {
             Backing::Mem(batches) => {
                 let crc = crc32_bytes(&encode_batch(&records));
-                batches.push(MemBatch { first_lsn: first, records, crc32: crc, committed: true });
+                batches.push(MemBatch {
+                    first_lsn: first,
+                    records,
+                    crc32: crc,
+                    committed: true,
+                });
             }
             Backing::File { file, .. } => {
                 let payload = encode_batch(&records);
@@ -492,7 +507,11 @@ fn decode_batch_v2(c: &mut Cur) -> Option<Vec<WalRecord>> {
             trace_id,
             span_id,
             ts,
-            identity: EventIdentity { ext_span_id: ext, seq, event_type },
+            identity: EventIdentity {
+                ext_span_id: ext,
+                seq,
+                event_type,
+            },
             fields,
         });
     }
@@ -513,7 +532,11 @@ fn decode_batch_legacy(c: &mut Cur, n: usize) -> Option<Vec<WalRecord>> {
             trace_id,
             span_id,
             ts,
-            identity: EventIdentity { ext_span_id: ext, seq, event_type },
+            identity: EventIdentity {
+                ext_span_id: ext,
+                seq,
+                event_type,
+            },
             fields,
         });
     }
@@ -563,14 +586,25 @@ mod tests {
             trace_id: 1,
             span_id: seq,
             ts: seq as i64,
-            identity: EventIdentity { ext_span_id: span.into(), seq, event_type: EventType::SpanEnd },
-            fields: SpanFields { logs: vec![format!("日志{seq}")], ..Default::default() },
+            identity: EventIdentity {
+                ext_span_id: span.into(),
+                seq,
+                event_type: EventType::SpanEnd,
+            },
+            fields: SpanFields {
+                logs: vec![format!("日志{seq}")],
+                ..Default::default()
+            },
         }
     }
 
     fn temp_path() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!("yt_wal_{}_{}.wal", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+        std::env::temp_dir().join(format!(
+            "yt_wal_{}_{}.wal",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     #[test]
@@ -578,7 +612,10 @@ mod tests {
         // 查表实现必须与 IEEE CRC32 标准逐字节一致（换实现不能改校验和,否则老 WAL/段 全部读不回）。
         assert_eq!(crc32_bytes(b""), 0x0000_0000);
         assert_eq!(crc32_bytes(b"123456789"), 0xCBF4_3926, "标准测试向量");
-        assert_eq!(crc32_bytes(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
+        assert_eq!(
+            crc32_bytes(b"The quick brown fox jumps over the lazy dog"),
+            0x414F_A339
+        );
     }
 
     #[test]
@@ -587,9 +624,17 @@ mod tests {
         wal.append_committed(vec![rec("a", 1)]);
         let l2 = wal.append_committed(vec![rec("b", 2), rec("c", 3)]);
         assert_eq!(wal.committed_tail(), l2);
-        let all: Vec<_> = wal.replay_after(WalLsn::new(0)).into_iter().map(|(l, _)| l).collect();
+        let all: Vec<_> = wal
+            .replay_after(WalLsn::new(0))
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
         assert_eq!(all, vec![1, 2, 3]);
-        let after: Vec<_> = wal.replay_after(WalLsn::new(1)).into_iter().map(|(_, r)| r.identity.seq).collect();
+        let after: Vec<_> = wal
+            .replay_after(WalLsn::new(1))
+            .into_iter()
+            .map(|(_, r)| r.identity.seq)
+            .collect();
         assert_eq!(after, vec![2, 3]);
     }
 
@@ -606,7 +651,11 @@ mod tests {
         }
         // 重开（相当于重启进程）
         let wal2 = Wal::open(&path).unwrap();
-        assert_eq!(wal2.committed_tail(), WalLsn::new(3), "重开后 next_lsn 从盘上恢复");
+        assert_eq!(
+            wal2.committed_tail(),
+            WalLsn::new(3),
+            "重开后 next_lsn 从盘上恢复"
+        );
         let recs = wal2.replay_after(WalLsn::new(0));
         let seqs: Vec<u64> = recs.iter().map(|(l, _)| *l).collect();
         assert_eq!(seqs, vec![1, 2, 3], "三条记录从磁盘重放回来");
@@ -634,7 +683,10 @@ mod tests {
         assert_eq!(decoded.external_trace_id.as_deref(), Some("run-uuid"));
         assert_eq!(decoded.external_span_id.as_deref(), Some("span-uuid"));
         assert_eq!(decoded.external_session_id.as_deref(), Some("session-uuid"));
-        assert_eq!(decoded.attrs.get("project_id").map(String::as_str), Some("\"agentic-data\""));
+        assert_eq!(
+            decoded.attrs.get("project_id").map(String::as_str),
+            Some("\"agentic-data\"")
+        );
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
     }
@@ -654,7 +706,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let wal = Wal::open(&path).unwrap();
-        let seqs: Vec<u64> = wal.replay_after(WalLsn::new(0)).iter().map(|(l, _)| *l).collect();
+        let seqs: Vec<u64> = wal
+            .replay_after(WalLsn::new(0))
+            .iter()
+            .map(|(l, _)| *l)
+            .collect();
         assert_eq!(seqs, vec![1], "撕裂的第二帧被丢弃,第一帧完好");
         let _ = std::fs::remove_file(&path);
     }

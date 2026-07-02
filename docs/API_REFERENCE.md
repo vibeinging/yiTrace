@@ -371,7 +371,19 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
       "inTok": null,
       "outTok": null,
       "model": null,
-      "depth": 0
+      "depth": 0,
+      "logEvents": [
+        {
+          "eventId": "5031140639032392837",
+          "ts": 120,
+          "seq": 2,
+          "eventType": 4,
+          "messages": ["读取 package.json"],
+          "attrs": {
+            "call_site": "package-json"
+          }
+        }
+      ]
     }
   ]
 }
@@ -392,8 +404,22 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `inTok`/`outTok` | u64? | token（仅 llm） |
 | `model` | string? | 模型名（仅 llm） |
 | `depth` | u32 | 调用深度（缩进/树层级） |
+| `logEvents` | object[] | span 内携带 `logs` 的原始事件，按 `ts, seq, eventId` 排序 |
 
 > **晚物化**：本端点**不含** input/output 大文本（瀑布图不需要）。要大文本见下面的 span 详情。`startMs` 是逻辑瀑布（按 span 顺序累加，不保留真实起始时刻）。
+
+**`logEvents[]` 字段**：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `eventId` | string | 确定性事件 id，来自 `hash(ext_span_id, seq, event_type)` |
+| `ts` | i64 | 事件时间戳 |
+| `seq` | u64 | span 内事件序号 |
+| `eventType` | u8 | 事件类型，`4` 表示 Log |
+| `messages` | string[] | 该事件携带的日志行 |
+| `attrs` | object | 该事件携带的 attrs，保持 JSON 形态 |
+
+`logEvents` 是给 UI 和业务接入看的原始日志事件明细。不要把日志镜像进 `attrs.event_logs`；`attrs` 只放 project / skill / mode / call_site 这类元数据和过滤标签。
 
 ### GET /v1/traces/:id/steps  —— 步骤流（每步含输入/输出）
 
@@ -424,7 +450,19 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 {
   "id": "400035-s0",
   "input": "...",
-  "output": "..."
+  "output": "...",
+  "logEvents": [
+    {
+      "eventId": "5031140639032392837",
+      "ts": 120,
+      "seq": 2,
+      "eventType": 4,
+      "messages": ["读取 package.json"],
+      "attrs": {
+        "call_site": "package-json"
+      }
+    }
+  ]
 }
 ```
 
@@ -433,6 +471,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `id` | string | span id |
 | `input` | string? | 输入文本（null=无） |
 | `output` | string? | 输出文本（null=无） |
+| `logEvents` | object[] | span 内携带 `logs` 的原始事件，字段同 `GET /v1/traces/:id` |
 
 找不到返回 `404 {"error":"span not found"}`。
 
@@ -445,7 +484,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 1. **左栏会话列表**：`GET /v1/sessions?cursor=0&limit=50` → 滚到底用 `nextCursor` 翻页。`filter` 做标题搜索。
 2. **选中会话**：`GET /v1/sessions/:id/turns` → 渲染多轮时间线（每轮一个节点）。
 3. **选中某轮**：`GET /v1/traces/:traceId` → 拿 `spans[]` 渲染瀑布（`startMs`/`durMs` 定位，`depth` 缩进，`kind` 着色）。
-4. **点某个 span**：`GET /v1/traces/:traceId/spans/:spanId` → 拉大文本渲染输入/输出。
+4. **点某个 span**：`GET /v1/traces/:traceId/spans/:spanId` → 拉大文本渲染输入/输出和 `logEvents`。
 5. **全局检索**：`POST /v1/search` → 命中跳到对应 trace。
 
 ---

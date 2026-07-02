@@ -19,7 +19,10 @@ use std::sync::Arc;
 
 use yt_core::fold::FoldedSpan;
 
-use crate::{AgentCost, EvalSummary, KeywordScorer, SessionTimeline, SessionTurn, TraceQuery, WireRecord, WriteCoordinator};
+use crate::{
+    AgentCost, EvalSummary, KeywordScorer, SessionTimeline, SessionTurn, TraceQuery, WireRecord,
+    WriteCoordinator,
+};
 
 // ───────────────────────── 确定性伪随机（std-only） ─────────────────────────
 
@@ -91,13 +94,22 @@ pub fn builtin_scenarios() -> Vec<Scenario> {
             agents: &["客服助手"],
             tools: &["知识库检索"],
             model: "qwen-max",
-            prompts: &["如何修改预留手机号", "信用卡额度怎么提升", "账户被冻结了怎么办", "怎么查询交易明细"],
+            prompts: &[
+                "如何修改预留手机号",
+                "信用卡额度怎么提升",
+                "账户被冻结了怎么办",
+                "怎么查询交易明细",
+            ],
             good: &[
                 "您可以在手机银行『我的-安全中心』修改预留手机号，需短信验证码确认。",
                 "额度提升可在App信用卡页发起申请，系统将根据您的用信与还款情况评估。",
                 "账户冻结通常因风控触发，请携带身份证到柜面或联系客服核实解冻。",
             ],
-            bad: &["抱歉，我无法回答这个问题。", "这个问题我不确定，请联系人工客服。", "查询失败，请稍后再试。"],
+            bad: &[
+                "抱歉，我无法回答这个问题。",
+                "这个问题我不确定，请联系人工客服。",
+                "查询失败，请稍后再试。",
+            ],
             fail_ratio: 0.25,
         },
         Scenario {
@@ -105,13 +117,20 @@ pub fn builtin_scenarios() -> Vec<Scenario> {
             agents: &["风控研判", "反洗钱核查"],
             tools: &["规则引擎", "交易查询"],
             model: "qwen-max",
-            prompts: &["对账户A近30天大额交易做风险研判", "核查该笔交易是否涉及可疑资金往来", "评估这笔跨境汇款的洗钱风险"],
+            prompts: &[
+                "对账户A近30天大额交易做风险研判",
+                "核查该笔交易是否涉及可疑资金往来",
+                "评估这笔跨境汇款的洗钱风险",
+            ],
             // 第一条含「暂缓」，会被更严 scorer 判掉 → 用于回归演示。
             good: &[
                 "研判结论：交易触发规则R12，存在盗刷风险，建议人工复核并暂缓放款。",
                 "经核查未发现可疑资金链路，交易模式正常，可予以放行。",
             ],
-            bad: &["抱歉，规则引擎调用失败，无法给出研判结论。", "数据缺失，本次核查无法完成。"],
+            bad: &[
+                "抱歉，规则引擎调用失败，无法给出研判结论。",
+                "数据缺失，本次核查无法完成。",
+            ],
             fail_ratio: 0.40,
         },
         Scenario {
@@ -119,12 +138,19 @@ pub fn builtin_scenarios() -> Vec<Scenario> {
             agents: &["代码助手"],
             tools: &["代码执行", "单元测试"],
             model: "qwen-coder",
-            prompts: &["实现一个快速排序函数", "修复这段空指针异常", "给登录接口加上限流"],
+            prompts: &[
+                "实现一个快速排序函数",
+                "修复这段空指针异常",
+                "给登录接口加上限流",
+            ],
             good: &[
                 "已生成快速排序实现并通过全部单元测试，平均时间复杂度O(nlogn)。",
                 "已定位空指针来源并加上判空保护，回归测试全部通过。",
             ],
-            bad: &["生成的代码运行报错，无法通过测试。", "抱歉，未能理解你的需求。"],
+            bad: &[
+                "生成的代码运行报错，无法通过测试。",
+                "抱歉，未能理解你的需求。",
+            ],
             fail_ratio: 0.50,
         },
         Scenario {
@@ -270,20 +296,76 @@ pub fn generate_scenario(
 
         let prompt = *rng.pick(sc.prompts);
         let tool = *rng.pick(sc.tools);
-        let answer = if is_fail { *rng.pick(sc.bad) } else { *rng.pick(sc.good) };
+        let answer = if is_fail {
+            *rng.pick(sc.bad)
+        } else {
+            *rng.pick(sc.good)
+        };
         let in_tok = rng.range(200, 1500);
         let out_tok = rng.range(50, 600);
         let st = if is_fail { 1 } else { 0 };
 
         // root：编排 span，无 output_text → scorer 跳过。
-        emit_span(&mut recs, trace, 1, None, ts, session, Some(agent), None, sc.model, prompt, None, in_tok, 0, 0, rng.range(1_000_000, 5_000_000));
+        emit_span(
+            &mut recs,
+            trace,
+            1,
+            None,
+            ts,
+            session,
+            Some(agent),
+            None,
+            sc.model,
+            prompt,
+            None,
+            in_tok,
+            0,
+            0,
+            rng.range(1_000_000, 5_000_000),
+        );
         // tool：工具调用 span，无 agent、无 output_text → scorer 跳过。
-        emit_span(&mut recs, trace, 2, Some(1), ts + 1, session, None, Some(tool), sc.model, prompt, None, 0, 0, st, rng.range(500_000, 3_000_000));
+        emit_span(
+            &mut recs,
+            trace,
+            2,
+            Some(1),
+            ts + 1,
+            session,
+            None,
+            Some(tool),
+            sc.model,
+            prompt,
+            None,
+            0,
+            0,
+            st,
+            rng.range(500_000, 3_000_000),
+        );
         // answer：作答 span，有 output_text → 被 scorer 打分。
-        emit_span(&mut recs, trace, 3, Some(1), ts + 2, session, Some(agent), None, sc.model, prompt, Some(answer), in_tok, out_tok, st, rng.range(800_000, 4_000_000));
+        emit_span(
+            &mut recs,
+            trace,
+            3,
+            Some(1),
+            ts + 2,
+            session,
+            Some(agent),
+            None,
+            sc.model,
+            prompt,
+            Some(answer),
+            in_tok,
+            out_tok,
+            st,
+            rng.range(800_000, 4_000_000),
+        );
     }
     coord.ingest_wire(recs);
-    GenStats { traces: n_traces, spans: n_traces * 3, injected_failures }
+    GenStats {
+        traces: n_traces,
+        spans: n_traces * 3,
+        injected_failures,
+    }
 }
 
 // ───────────────────────── 端到端 harness ─────────────────────────
@@ -337,7 +419,12 @@ pub fn run_harness(coord: &Arc<WriteCoordinator>, n_per: usize, seed: u64) -> Ha
         let (from, to) = scenario_window(i);
         let gen = generate_scenario(coord, sc, n_per, base_trace, from, &mut rng);
 
-        let q = TraceQuery { trace_id: None, time_from: from, time_to: to, tenant_id: None };
+        let q = TraceQuery {
+            trace_id: None,
+            time_from: from,
+            time_to: to,
+            tenant_id: None,
+        };
         // 打分写回（内部会先 flush，把 answer span 落段、upgrade 有落点）。
         coord.eval_and_writeback(&base_scorer, &q);
 
@@ -348,7 +435,9 @@ pub fn run_harness(coord: &Arc<WriteCoordinator>, n_per: usize, seed: u64) -> Ha
 
         // 风控场景：把全部 answer span（无论通过与否）冻成回归数据集。
         if sc.key == "风控研判" {
-            coord.collect_into_dataset(&dataset_name, &snap, &q, &|s: &FoldedSpan| s.output_text.is_some());
+            coord.collect_into_dataset(&dataset_name, &snap, &q, &|s: &FoldedSpan| {
+                s.output_text.is_some()
+            });
         }
         drop(snap);
 
@@ -363,15 +452,28 @@ pub fn run_harness(coord: &Arc<WriteCoordinator>, n_per: usize, seed: u64) -> Ha
     }
 
     // 回归：同一数据集，基准 scorer vs 更严 scorer，看通过率怎么掉。
-    let dataset_size = coord.dataset(&dataset_name).map(|d| d.examples.len()).unwrap_or(0);
-    let dataset_baseline = coord.eval_dataset(&dataset_name, &base_scorer, 1000).unwrap_or_default();
+    let dataset_size = coord
+        .dataset(&dataset_name)
+        .map(|d| d.examples.len())
+        .unwrap_or(0);
+    let dataset_baseline = coord
+        .eval_dataset(&dataset_name, &base_scorer, 1000)
+        .unwrap_or_default();
 
     let mut strict_words: Vec<&str> = BAD_WORDS.to_vec();
     strict_words.extend_from_slice(STRICTER_EXTRA);
     let strict_scorer = KeywordScorer::new(&strict_words);
-    let dataset_stricter = coord.eval_dataset(&dataset_name, &strict_scorer, 1000).unwrap_or_default();
+    let dataset_stricter = coord
+        .eval_dataset(&dataset_name, &strict_scorer, 1000)
+        .unwrap_or_default();
 
-    HarnessReport { scenarios, dataset_name, dataset_size, dataset_baseline, dataset_stricter }
+    HarnessReport {
+        scenarios,
+        dataset_name,
+        dataset_size,
+        dataset_baseline,
+        dataset_stricter,
+    }
 }
 
 /// 把 harness 报告打印成人看的看板（example 用）。
@@ -379,7 +481,10 @@ pub fn print_report(r: &HarnessReport) {
     println!("\n══════════════ eval 场景模拟报告 ══════════════\n");
     for s in &r.scenarios {
         let overall = &s.summary[0];
-        println!("▶ 场景【{}】 trace={} span={} 注入失败={}", s.key, s.traces, s.spans, s.injected_failures);
+        println!(
+            "▶ 场景【{}】 trace={} span={} 注入失败={}",
+            s.key, s.traces, s.spans, s.injected_failures
+        );
         println!(
             "    整体：打分 {} 条，通过率 {:.0}%（通过 {}），均分 {}",
             overall.scored_spans,
@@ -400,17 +505,31 @@ pub fn print_report(r: &HarnessReport) {
             }
         }
         for c in &s.cost {
-            println!("      成本『{}』：span {} · 输入 {} tok · 输出 {} tok", c.agent_name, c.span_count, c.input_tokens, c.output_tokens);
+            println!(
+                "      成本『{}』：span {} · 输入 {} tok · 输出 {} tok",
+                c.agent_name, c.span_count, c.input_tokens, c.output_tokens
+            );
         }
         println!();
     }
 
     println!("══════════════ 回归数据集复跑 ══════════════");
-    let base = r.dataset_baseline.first().map(|s| s.pass_rate()).unwrap_or(0.0);
-    let strict = r.dataset_stricter.first().map(|s| s.pass_rate()).unwrap_or(0.0);
+    let base = r
+        .dataset_baseline
+        .first()
+        .map(|s| s.pass_rate())
+        .unwrap_or(0.0);
+    let strict = r
+        .dataset_stricter
+        .first()
+        .map(|s| s.pass_rate())
+        .unwrap_or(0.0);
     println!("数据集【{}】 样本 {} 条", r.dataset_name, r.dataset_size);
     println!("  基准评判通过率：{:.0}%", base * 100.0);
-    println!("  更严评判通过率：{:.0}%   （评判标准收紧 → 通过率下降 = 回归被检出）", strict * 100.0);
+    println!(
+        "  更严评判通过率：{:.0}%   （评判标准收紧 → 通过率下降 = 回归被检出）",
+        strict * 100.0
+    );
     println!();
 }
 
@@ -483,20 +602,90 @@ pub fn score_session(tl: &SessionTimeline) -> SessionEval {
     } else {
         (1000, "一次到位")
     };
-    SessionEval { session_id: tl.session_id, turns, failed_turns, resolved, looped, score, label: label.to_string() }
+    SessionEval {
+        session_id: tl.session_id,
+        turns,
+        failed_turns,
+        resolved,
+        looped,
+        score,
+        label: label.to_string(),
+    }
 }
 
 // ───────────────────────── 连贯多轮会话生成 ─────────────────────────
 
 /// 造一轮（= 一条 trace：root 编排 + tool 工具 + answer 作答），good=false 时埋坏词+置错。
-fn emit_turn(out: &mut Vec<WireRecord>, sc: &Scenario, agent: &str, trace: u64, ts: i64, session: u64, prompt: &str, good: bool, rng: &mut Rng) {
-    let answer = if good { *rng.pick(sc.good) } else { *rng.pick(sc.bad) };
+fn emit_turn(
+    out: &mut Vec<WireRecord>,
+    sc: &Scenario,
+    agent: &str,
+    trace: u64,
+    ts: i64,
+    session: u64,
+    prompt: &str,
+    good: bool,
+    rng: &mut Rng,
+) {
+    let answer = if good {
+        *rng.pick(sc.good)
+    } else {
+        *rng.pick(sc.bad)
+    };
     let st = if good { 0 } else { 1 };
     let in_tok = rng.range(200, 1500);
     let out_tok = rng.range(50, 600);
-    emit_span(out, trace, 1, None, ts, session, Some(agent), None, sc.model, prompt, None, in_tok, 0, 0, rng.range(1_000_000, 5_000_000));
-    emit_span(out, trace, 2, Some(1), ts + 1, session, None, Some(*rng.pick(sc.tools)), sc.model, prompt, None, 0, 0, st, rng.range(500_000, 3_000_000));
-    emit_span(out, trace, 3, Some(1), ts + 2, session, Some(agent), None, sc.model, prompt, Some(answer), in_tok, out_tok, st, rng.range(800_000, 4_000_000));
+    emit_span(
+        out,
+        trace,
+        1,
+        None,
+        ts,
+        session,
+        Some(agent),
+        None,
+        sc.model,
+        prompt,
+        None,
+        in_tok,
+        0,
+        0,
+        rng.range(1_000_000, 5_000_000),
+    );
+    emit_span(
+        out,
+        trace,
+        2,
+        Some(1),
+        ts + 1,
+        session,
+        None,
+        Some(*rng.pick(sc.tools)),
+        sc.model,
+        prompt,
+        None,
+        0,
+        0,
+        st,
+        rng.range(500_000, 3_000_000),
+    );
+    emit_span(
+        out,
+        trace,
+        3,
+        Some(1),
+        ts + 2,
+        session,
+        Some(agent),
+        None,
+        sc.model,
+        prompt,
+        Some(answer),
+        in_tok,
+        out_tok,
+        st,
+        rng.range(800_000, 4_000_000),
+    );
 }
 
 /// 连贯多轮会话的生成统计（每类会话各多少个，用于和评测分类对账）。
@@ -516,7 +705,15 @@ pub struct ConvStats {
 
 /// 造 `n_sessions` 个**连贯多轮会话**并真实摄入：一个会话 = 一个用户围绕一个任务的多轮交互，
 /// 质量有四种弧线（一次到位 / 重试后成功 / 重复问后成功 / 始终失败），让会话级评测有各类样本。
-pub fn generate_conversations(coord: &WriteCoordinator, sc: &Scenario, n_sessions: usize, base_trace: u64, ts_base: i64, base_session: u64, rng: &mut Rng) -> ConvStats {
+pub fn generate_conversations(
+    coord: &WriteCoordinator,
+    sc: &Scenario,
+    n_sessions: usize,
+    base_trace: u64,
+    ts_base: i64,
+    base_session: u64,
+    rng: &mut Rng,
+) -> ConvStats {
     let mut recs = Vec::new();
     let mut stats = ConvStats::default();
     let agent = sc.agents[0];
@@ -590,7 +787,11 @@ pub struct SessionHarnessReport {
 
 /// 端到端会话级评测：造连贯多轮会话 → 真实摄入 → 逐会话装对话流 → 会话级打分 → 聚合分类。
 /// 用「客服问答」场景（天然多轮）。
-pub fn run_session_harness(coord: &Arc<WriteCoordinator>, n_sessions: usize, seed: u64) -> SessionHarnessReport {
+pub fn run_session_harness(
+    coord: &Arc<WriteCoordinator>,
+    n_sessions: usize,
+    seed: u64,
+) -> SessionHarnessReport {
     let mut rng = Rng::new(seed);
     let scs = builtin_scenarios();
     let sc = &scs[0]; // 客服问答
@@ -613,9 +814,21 @@ pub fn run_session_harness(coord: &Arc<WriteCoordinator>, n_sessions: usize, see
     let efficient = evals.iter().filter(|e| e.resolved && !e.looped).count();
     let looped_resolved = evals.iter().filter(|e| e.resolved && e.looped).count();
     let unresolved = evals.iter().filter(|e| !e.resolved).count();
-    let avg_turns = if evals.is_empty() { 0.0 } else { evals.iter().map(|e| e.turns).sum::<usize>() as f32 / evals.len() as f32 };
+    let avg_turns = if evals.is_empty() {
+        0.0
+    } else {
+        evals.iter().map(|e| e.turns).sum::<usize>() as f32 / evals.len() as f32
+    };
 
-    SessionHarnessReport { gen, evals, efficient, looped_resolved, unresolved, avg_turns, sample }
+    SessionHarnessReport {
+        gen,
+        evals,
+        efficient,
+        looped_resolved,
+        unresolved,
+        avg_turns,
+        sample,
+    }
 }
 
 /// 打印会话级评测报告（example 用）。
@@ -626,12 +839,28 @@ pub fn print_session_report(r: &SessionHarnessReport) {
         r.gen.sessions, r.gen.turns, r.avg_turns
     );
     let total = r.evals.len().max(1);
-    println!("  一次到位  ：{:>3} （{:.0}%）", r.efficient, r.efficient as f32 / total as f32 * 100.0);
-    println!("  绕圈后解决：{:>3} （{:.0}%）  ← 连续失败或重复问后才成功", r.looped_resolved, r.looped_resolved as f32 / total as f32 * 100.0);
-    println!("  未解决    ：{:>3} （{:.0}%）", r.unresolved, r.unresolved as f32 / total as f32 * 100.0);
+    println!(
+        "  一次到位  ：{:>3} （{:.0}%）",
+        r.efficient,
+        r.efficient as f32 / total as f32 * 100.0
+    );
+    println!(
+        "  绕圈后解决：{:>3} （{:.0}%）  ← 连续失败或重复问后才成功",
+        r.looped_resolved,
+        r.looped_resolved as f32 / total as f32 * 100.0
+    );
+    println!(
+        "  未解决    ：{:>3} （{:.0}%）",
+        r.unresolved,
+        r.unresolved as f32 / total as f32 * 100.0
+    );
 
     if let Some(tl) = &r.sample {
-        println!("\n  ── 对话流样本（会话 {}，{} 轮，绕圈后解决）──", tl.session_id, tl.turns.len());
+        println!(
+            "\n  ── 对话流样本（会话 {}，{} 轮，绕圈后解决）──",
+            tl.session_id,
+            tl.turns.len()
+        );
         for t in &tl.turns {
             let q = t.user_input.as_deref().unwrap_or("");
             let a = t.agent_output.as_deref().unwrap_or("");

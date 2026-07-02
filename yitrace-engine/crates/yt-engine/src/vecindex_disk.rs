@@ -88,10 +88,10 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 // 其余退化标量。横向求和顺序与标量不同，故有 ~1e-5 级浮点误差（测试用容差断言）。
 // unsafe 仅在各 #[target_feature] 实现内部；intrinsic 名在 Rust 1.9x 不自动可见，故各 fn 内 `use`。
 mod simd {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64 as sx;
     #[cfg(target_arch = "aarch64")]
     use std::arch::aarch64 as sx;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as sx;
 
     /// L2 平方距离的主入口：运行时派发。
     #[cfg(target_arch = "x86_64")]
@@ -158,7 +158,10 @@ mod simd {
 
     // ───── 标量实现（所有平台的兜底 + 横向求和收尾 + 测试参照） ─────
     fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(&x, &y)| (x - y) * (x - y)).sum()
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y) * (x - y))
+            .sum()
     }
     fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
@@ -346,7 +349,10 @@ mod simd {
                 let b = rand_vec(2, n);
                 let sim = l2_sq(&a, &b);
                 let sca = l2_sq_scalar(&a, &b);
-                assert!((sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5, "dim={n}: simd={sim} scalar={sca}");
+                assert!(
+                    (sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5,
+                    "dim={n}: simd={sim} scalar={sca}"
+                );
             }
         }
 
@@ -357,7 +363,10 @@ mod simd {
                 let b = rand_vec(4, n);
                 let sim = dot(&a, &b);
                 let sca = dot_scalar(&a, &b);
-                assert!((sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5, "dim={n}: simd={sim} scalar={sca}");
+                assert!(
+                    (sim - sca).abs() <= sca.abs() * 1e-4 + 1e-5,
+                    "dim={n}: simd={sim} scalar={sca}"
+                );
             }
         }
 
@@ -366,7 +375,10 @@ mod simd {
             let v = rand_vec(5, 128);
             let (unit, norm) = normalize(&v);
             let unit_norm_sq = dot(&unit, &unit);
-            assert!((unit_norm_sq - 1.0).abs() < 1e-4, "归一化后范数²应=1，实={unit_norm_sq}");
+            assert!(
+                (unit_norm_sq - 1.0).abs() < 1e-4,
+                "归一化后范数²应=1，实={unit_norm_sq}"
+            );
             assert!((norm - dot(&v, &v).sqrt()).abs() < 1e-3);
         }
 
@@ -382,7 +394,12 @@ mod simd {
         #[test]
         #[ignore]
         fn bench_l2_sq_simd_vs_scalar() {
-            fn bench<F: Fn(&[f32], &[f32]) -> f32>(f: F, a: &[Vec<f32>], b: &[Vec<f32>], iters: usize) -> (f64, f32) {
+            fn bench<F: Fn(&[f32], &[f32]) -> f32>(
+                f: F,
+                a: &[Vec<f32>],
+                b: &[Vec<f32>],
+                iters: usize,
+            ) -> (f64, f32) {
                 let mut acc = 0f32;
                 let t = std::time::Instant::now();
                 for _ in 0..iters {
@@ -430,7 +447,14 @@ struct VecCache {
 
 impl VecCache {
     fn new(budget_bytes: usize) -> Self {
-        Self { budget_bytes, cur_bytes: 0, map: FastMap::default(), tick: 0, hits: 0, misses: 0 }
+        Self {
+            budget_bytes,
+            cur_bytes: 0,
+            map: FastMap::default(),
+            tick: 0,
+            hits: 0,
+            misses: 0,
+        }
     }
 
     fn get(&mut self, id: u64) -> Option<Arc<[f32]>> {
@@ -461,8 +485,11 @@ impl VecCache {
     /// 超预算时批量淘汰最久未用的，腾到 ~90% 预算（一次腾够、不是每 put 都淘）。
     fn evict(&mut self) {
         let target = (self.budget_bytes * 9 / 10).max(1);
-        let mut by_tick: Vec<(u64, u64, usize)> =
-            self.map.iter().map(|(&id, (v, t))| (*t, id, v.len() * 4)).collect();
+        let mut by_tick: Vec<(u64, u64, usize)> = self
+            .map
+            .iter()
+            .map(|(&id, (v, t))| (*t, id, v.len() * 4))
+            .collect();
         by_tick.sort_unstable_by_key(|x| x.0);
         for (_, id, bytes) in by_tick {
             if self.cur_bytes <= target || self.map.len() <= 1 {
@@ -484,7 +511,11 @@ struct NodeCache {
 
 impl NodeCache {
     fn new(cap: usize) -> Self {
-        Self { cap: cap.max(1), map: FastMap::default(), tick: 0 }
+        Self {
+            cap: cap.max(1),
+            map: FastMap::default(),
+            tick: 0,
+        }
     }
     fn get(&mut self, id: u32) -> Option<Arc<NodeRec>> {
         self.tick += 1;
@@ -501,7 +532,8 @@ impl NodeCache {
         self.map.insert(id, (rec, self.tick));
         if self.map.len() > self.cap {
             let target = self.cap * 9 / 10;
-            let mut by_tick: Vec<(u64, u32)> = self.map.iter().map(|(&id, (_, t))| (*t, id)).collect();
+            let mut by_tick: Vec<(u64, u32)> =
+                self.map.iter().map(|(&id, (_, t))| (*t, id)).collect();
             by_tick.sort_unstable_by_key(|x| x.0);
             for (_, id) in by_tick {
                 if self.map.len() <= target {
@@ -531,7 +563,13 @@ pub struct DiskGraphConfig {
 
 impl Default for DiskGraphConfig {
     fn default() -> Self {
-        Self { m: 16, vector_cache_bytes: 256 << 20, ef_construction: 64, ef_search: 100, metric: Metric::L2 }
+        Self {
+            m: 16,
+            vector_cache_bytes: 256 << 20,
+            ef_construction: 64,
+            ef_search: 100,
+            metric: Metric::L2,
+        }
     }
 }
 
@@ -617,7 +655,12 @@ impl DiskGraphStore {
         let (dim, m, metric) = match Meta::load(&meta_path) {
             Some(meta) => (meta.dim, meta.m, meta.metric),
             None => {
-                Meta { dim, m: cfg.m, metric: cfg.metric }.store(&meta_path)?;
+                Meta {
+                    dim,
+                    m: cfg.m,
+                    metric: cfg.metric,
+                }
+                .store(&meta_path)?;
                 (dim, cfg.m, cfg.metric)
             }
         };
@@ -625,8 +668,16 @@ impl DiskGraphStore {
         let max_deg = (2 * m).max(2);
         let node_rec_size = NODE_HEADER + 4 * max_deg;
 
-        let nodes = OpenOptions::new().read(true).write(true).create(true).open(dir.join("nodes"))?;
-        let vectors = OpenOptions::new().read(true).write(true).create(true).open(dir.join("vectors"))?;
+        let nodes = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(dir.join("nodes"))?;
+        let vectors = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(dir.join("vectors"))?;
 
         // 节点数从 nodes 文件长度恢复（撕裂的尾部不足一条则忽略）。
         let count = nodes.metadata()?.len() / node_rec_size as u64;
@@ -668,7 +719,13 @@ impl DiskGraphStore {
 
     /// 加一个节点：先写向量、再写节点记录（崩在两者之间则该槽未计数、下次复用），返回 node_id。
     /// 维度不符（≠ dim）拒绝。`level` = HNSW 层级。
-    pub fn add_node(&self, trace_id: u64, span_id: u64, vector: &[f32], level: u8) -> std::io::Result<Option<u32>> {
+    pub fn add_node(
+        &self,
+        trace_id: u64,
+        span_id: u64,
+        vector: &[f32],
+        level: u8,
+    ) -> std::io::Result<Option<u32>> {
         if vector.len() != self.dim {
             return Ok(None);
         }
@@ -677,26 +734,50 @@ impl DiskGraphStore {
         self.write_node(id, trace_id, span_id, false, level, &[])?;
         // 两个文件都落盘后才提交计数（读者据此判可见）。
         self.count.store(id + 1, Ordering::Release);
-        self.cache.lock().unwrap().put(id, Arc::from(vector.to_vec()));
+        self.cache
+            .lock()
+            .unwrap()
+            .put(id, Arc::from(vector.to_vec()));
         Ok(Some(id as u32))
     }
 
     /// 原地改写某节点的**底层邻边**（保留 level/软删）。截到 `max_deg`。
     pub fn set_neighbors(&self, id: u32, neighbors: &[u32]) -> std::io::Result<()> {
         let rec = self.read_node(id)?;
-        self.write_node(id as u64, rec.trace_id, rec.span_id, rec.deleted, rec.level, neighbors)
+        self.write_node(
+            id as u64,
+            rec.trace_id,
+            rec.span_id,
+            rec.deleted,
+            rec.level,
+            neighbors,
+        )
     }
 
     /// 标记软删（保留 level/邻边）。
     pub fn mark_deleted(&self, id: u32) -> std::io::Result<()> {
         let rec = self.read_node(id)?;
-        self.write_node(id as u64, rec.trace_id, rec.span_id, true, rec.level, &rec.neighbors)
+        self.write_node(
+            id as u64,
+            rec.trace_id,
+            rec.span_id,
+            true,
+            rec.level,
+            &rec.neighbors,
+        )
     }
 
     /// 改某节点的 HNSW 层级（保留邻边/软删）。
     pub fn set_level(&self, id: u32, level: u8) -> std::io::Result<()> {
         let rec = self.read_node(id)?;
-        self.write_node(id as u64, rec.trace_id, rec.span_id, rec.deleted, level, &rec.neighbors)
+        self.write_node(
+            id as u64,
+            rec.trace_id,
+            rec.span_id,
+            rec.deleted,
+            level,
+            &rec.neighbors,
+        )
     }
 
     /// 读节点记录（拷贝出 `NodeRec`，给需要拥有所有权的调用方）。
@@ -710,7 +791,8 @@ impl DiskGraphStore {
             return Ok(a);
         }
         let mut buf = vec![0u8; self.node_rec_size];
-        self.nodes.read_exact_at(&mut buf, id as u64 * self.node_rec_size as u64)?;
+        self.nodes
+            .read_exact_at(&mut buf, id as u64 * self.node_rec_size as u64)?;
         let a = Arc::new(decode_node(&buf));
         self.node_cache.lock().unwrap().put(id, a.clone());
         Ok(a)
@@ -722,8 +804,12 @@ impl DiskGraphStore {
             return Ok(v);
         }
         let mut buf = vec![0u8; self.dim * 4];
-        self.vectors.read_exact_at(&mut buf, id as u64 * self.dim as u64 * 4)?;
-        let v: Arc<[f32]> = buf.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        self.vectors
+            .read_exact_at(&mut buf, id as u64 * self.dim as u64 * 4)?;
+        let v: Arc<[f32]> = buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         self.cache.lock().unwrap().put(id as u64, v.clone());
         Ok(v)
     }
@@ -760,19 +846,53 @@ impl DiskGraphStore {
         self.vectors.write_all_at(&buf, id * self.dim as u64 * 4)
     }
 
-    fn write_node(&self, id: u64, trace_id: u64, span_id: u64, deleted: bool, level: u8, neighbors: &[u32]) -> std::io::Result<()> {
+    fn write_node(
+        &self,
+        id: u64,
+        trace_id: u64,
+        span_id: u64,
+        deleted: bool,
+        level: u8,
+        neighbors: &[u32],
+    ) -> std::io::Result<()> {
         let nb: Vec<u32> = neighbors.iter().take(self.max_deg).copied().collect();
-        let buf = encode_node(self.node_rec_size, self.max_deg, trace_id, span_id, deleted, level, &nb);
-        self.nodes.write_all_at(&buf, id * self.node_rec_size as u64)?;
+        let buf = encode_node(
+            self.node_rec_size,
+            self.max_deg,
+            trace_id,
+            span_id,
+            deleted,
+            level,
+            &nb,
+        );
+        self.nodes
+            .write_all_at(&buf, id * self.node_rec_size as u64)?;
         // 写穿：节点缓存同步更新，读路径直接命中、不回盘。
-        self.node_cache.lock().unwrap().put(id as u32, Arc::new(NodeRec { trace_id, span_id, deleted, level, neighbors: nb }));
+        self.node_cache.lock().unwrap().put(
+            id as u32,
+            Arc::new(NodeRec {
+                trace_id,
+                span_id,
+                deleted,
+                level,
+                neighbors: nb,
+            }),
+        );
         Ok(())
     }
 }
 
 const NODE_HEADER: usize = 8 + 8 + 1 + 1 + 2; // trace + span + deleted + level + neighbor_count
 
-fn encode_node(rec_size: usize, max_deg: usize, trace_id: u64, span_id: u64, deleted: bool, level: u8, neighbors: &[u32]) -> Vec<u8> {
+fn encode_node(
+    rec_size: usize,
+    max_deg: usize,
+    trace_id: u64,
+    span_id: u64,
+    deleted: bool,
+    level: u8,
+    neighbors: &[u32],
+) -> Vec<u8> {
     let mut b = vec![0u8; rec_size];
     b[0..8].copy_from_slice(&trace_id.to_le_bytes());
     b[8..16].copy_from_slice(&span_id.to_le_bytes());
@@ -801,7 +921,13 @@ fn decode_node(b: &[u8]) -> NodeRec {
         }
         neighbors.push(u32::from_le_bytes(b[o..o + 4].try_into().unwrap()));
     }
-    NodeRec { trace_id, span_id, deleted, level, neighbors }
+    NodeRec {
+        trace_id,
+        span_id,
+        deleted,
+        level,
+        neighbors,
+    }
 }
 
 // ───────────────────────── 元页 ─────────────────────────
@@ -945,9 +1071,17 @@ impl DiskGraphIndex {
 
     fn neighbors_at(&self, id: u32, level: u8) -> Vec<u32> {
         if level == 0 {
-            self.store.read_node(id).map(|r| r.neighbors).unwrap_or_default()
+            self.store
+                .read_node(id)
+                .map(|r| r.neighbors)
+                .unwrap_or_default()
         } else {
-            self.upper.lock().unwrap().get(&(id, level)).cloned().unwrap_or_default()
+            self.upper
+                .lock()
+                .unwrap()
+                .get(&(id, level))
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -955,7 +1089,10 @@ impl DiskGraphIndex {
         if level == 0 {
             self.store.set_neighbors(id, neighbors)
         } else {
-            self.upper.lock().unwrap().insert((id, level), neighbors.to_vec());
+            self.upper
+                .lock()
+                .unwrap()
+                .insert((id, level), neighbors.to_vec());
             Ok(())
         }
     }
@@ -983,7 +1120,13 @@ impl DiskGraphIndex {
             // e 与所有已选点 r 比：只要有一个 r 挡住 e（dist(e,r) < dist(query,e)），丢 e。
             let dominated = kept.iter().any(|&(r, dr)| {
                 // dist(query, e) = de；dist(query, r) = dr；这里算 dist(e, r)。
-                let er = dist(&self.store.read_vector_arc(e).unwrap_or_else(|_| Arc::from(Vec::new())), r);
+                let er = dist(
+                    &self
+                        .store
+                        .read_vector_arc(e)
+                        .unwrap_or_else(|_| Arc::from(Vec::new())),
+                    r,
+                );
                 er < de.max(dr)
             });
             if !dominated {
@@ -995,7 +1138,14 @@ impl DiskGraphIndex {
 
     /// HNSW search-layer：在某一层从 `entries` 出发 beam 扩展。`admit` 决定收点 + 驱动停止，
     /// 导航穿过所有未访问邻居（含 admit=false 的）⇒ 进图过滤。返回 (id, 距离) 升序。
-    fn search_layer(&self, query: &[f32], entries: &[u32], ef: usize, level: u8, admit: &dyn Fn(u32) -> bool) -> Vec<(u32, f32)> {
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entries: &[u32],
+        ef: usize,
+        level: u8,
+        admit: &dyn Fn(u32) -> bool,
+    ) -> Vec<(u32, f32)> {
         let mut visited: FastSet<u32> = FastSet::default();
         let mut frontier: BinaryHeap<Reverse<(OrdF32, u32)>> = BinaryHeap::new();
         let mut result: BinaryHeap<(OrdF32, u32)> = BinaryHeap::new();
@@ -1019,14 +1169,24 @@ impl DiskGraphIndex {
                 }
             }
             // 取 cur 在该层的邻居：level 0（热）借 Arc 不克隆；上层取稀疏小表。
-            let arc0 = if level == 0 { self.store.node_arc(cur).ok() } else { None };
+            let arc0 = if level == 0 {
+                self.store.node_arc(cur).ok()
+            } else {
+                None
+            };
             let upper_v: Vec<u32>;
             let nbrs: &[u32] = if let Some(n) = &arc0 {
                 &n.neighbors
             } else if level == 0 {
                 &[]
             } else {
-                upper_v = self.upper.lock().unwrap().get(&(cur, level)).cloned().unwrap_or_default();
+                upper_v = self
+                    .upper
+                    .lock()
+                    .unwrap()
+                    .get(&(cur, level))
+                    .cloned()
+                    .unwrap_or_default();
                 &upper_v
             };
             for &nb in nbrs {
@@ -1084,7 +1244,8 @@ impl DiskGraphIndex {
             let cap = if lc == 0 { self.max_deg } else { self.m };
             let cands = self.search_layer(vector, &entries, self.ef_construction, lc, &alive);
             // 启发式选 m 个分散邻居（候选已升序、排除自身 id）。
-            let cands_clean: Vec<(u32, f32)> = cands.into_iter().filter(|&(c, _)| c != id).collect();
+            let cands_clean: Vec<(u32, f32)> =
+                cands.into_iter().filter(|&(c, _)| c != id).collect();
             let dist = |q: &[f32], x: u32| self.dist(q, x);
             let chosen = self.select_neighbors(vector, &cands_clean, self.m, &dist);
             self.set_neighbors_at(id, lc, &chosen)?;
@@ -1096,8 +1257,12 @@ impl DiskGraphIndex {
                 }
                 if adj.len() > cap {
                     // 反向边也用启发式：以 nb 为查询点，从它的邻边里选 cap 个分散的。
-                    let base = self.store.read_vector_arc(nb).unwrap_or_else(|_| Arc::from(Vec::new()));
-                    let mut scored: Vec<(u32, f32)> = adj.iter().map(|&x| (x, self.dist(&base, x))).collect();
+                    let base = self
+                        .store
+                        .read_vector_arc(nb)
+                        .unwrap_or_else(|_| Arc::from(Vec::new()));
+                    let mut scored: Vec<(u32, f32)> =
+                        adj.iter().map(|&x| (x, self.dist(&base, x))).collect();
                     scored.sort_by(|a, b| a.1.total_cmp(&b.1));
                     let dist2 = |q: &[f32], x: u32| self.dist(q, x);
                     adj = self.select_neighbors(&base, &scored, cap, &dist2);
@@ -1105,7 +1270,11 @@ impl DiskGraphIndex {
                 self.set_neighbors_at(nb, lc, &adj)?;
             }
             // 下一层的入口 = 这一层找到的近邻。
-            entries = if cands_clean.is_empty() { vec![ep] } else { cands_clean.iter().map(|&(c, _)| c).collect() };
+            entries = if cands_clean.is_empty() {
+                vec![ep]
+            } else {
+                cands_clean.iter().map(|&(c, _)| c).collect()
+            };
         }
 
         // 3) 新点层级更高 → 成为新入口。
@@ -1116,15 +1285,30 @@ impl DiskGraphIndex {
     }
 
     /// 暴力精确搜索（测试用 ground-truth；带过滤、跳软删）。
-    pub fn brute_force(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    pub fn brute_force(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         // Cosine：归一化查询（与索引时的归一化对齐）。IP：不归一化、不取 sqrt（距离已是 -dot）。
-        let q: Vec<f32> = if self.metric == Metric::Cosine { simd::normalize(query).0 } else { query.to_vec() };
+        let q: Vec<f32> = if self.metric == Metric::Cosine {
+            simd::normalize(query).0
+        } else {
+            query.to_vec()
+        };
         let finalize = |d: f32| -> f32 {
-            if self.metric == Metric::InnerProduct { d } else { d.max(0.0).sqrt() }
+            if self.metric == Metric::InnerProduct {
+                d
+            } else {
+                d.max(0.0).sqrt()
+            }
         };
         let mut scored: Vec<(f32, u64, u64)> = Vec::new();
         for id in 0..self.store.len() as u32 {
-            let Ok(node) = self.store.read_node(id) else { continue };
+            let Ok(node) = self.store.read_node(id) else {
+                continue;
+            };
             if node.deleted || !filter(node.trace_id, node.span_id) {
                 continue;
             }
@@ -1152,12 +1336,21 @@ impl GraphIndex for DiskGraphIndex {
         let _ = self.insert(trace_id, span_id, &v);
     }
 
-    fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         if k == 0 || query.len() != self.store.dim {
             return Vec::new();
         }
         // Cosine：归一化查询（与索引时的归一化对齐）。
-        let q: Vec<f32> = if self.metric == Metric::Cosine { simd::normalize(query).0 } else { query.to_vec() };
+        let q: Vec<f32> = if self.metric == Metric::Cosine {
+            simd::normalize(query).0
+        } else {
+            query.to_vec()
+        };
         let query: &[f32] = &q;
         let Some((mut ep, top)) = *self.entry.lock().unwrap() else {
             return Vec::new();
@@ -1182,12 +1375,21 @@ impl GraphIndex for DiskGraphIndex {
         let ef = self.ef_search.max(k);
         // IP：距离已是 -dot，不取 sqrt；L2/Cosine 取 sqrt 还原真实距离。
         let finalize = |d: f32| -> f32 {
-            if self.metric == Metric::InnerProduct { d } else { d.max(0.0).sqrt() }
+            if self.metric == Metric::InnerProduct {
+                d
+            } else {
+                d.max(0.0).sqrt()
+            }
         };
         let mut out: Vec<(u64, u64, f32)> = self
             .search_layer(query, &[ep], ef, 0, &admit)
             .into_iter()
-            .filter_map(|(id, d)| self.store.read_node(id).ok().map(|r| (r.trace_id, r.span_id, finalize(d))))
+            .filter_map(|(id, d)| {
+                self.store
+                    .read_node(id)
+                    .ok()
+                    .map(|r| (r.trace_id, r.span_id, finalize(d)))
+            })
             .collect();
         out.truncate(k);
         out
@@ -1202,7 +1404,11 @@ impl GraphIndex for DiskGraphIndex {
 }
 
 /// 上层图快照编解码：entry(flag+node+level) + upper 条目(node,level,n,邻居)，crc + 原子写。
-fn save_upper(path: &Path, upper: &HashMap<(u32, u8), Vec<u32>>, entry: Option<(u32, u8)>) -> std::io::Result<()> {
+fn save_upper(
+    path: &Path,
+    upper: &HashMap<(u32, u8), Vec<u32>>,
+    entry: Option<(u32, u8)>,
+) -> std::io::Result<()> {
     let mut b = Vec::new();
     match entry {
         Some((n, l)) => {
@@ -1292,11 +1498,17 @@ impl DurableGraphIndex {
     pub fn open(dir: impl AsRef<Path>, cfg: DiskGraphConfig) -> Self {
         let dir = dir.as_ref().to_path_buf();
         let inner = if dir.join("meta").exists() {
-            DiskGraphIndex::open(&dir, 0, cfg).ok().map(std::sync::Arc::new)
+            DiskGraphIndex::open(&dir, 0, cfg)
+                .ok()
+                .map(std::sync::Arc::new)
         } else {
             None
         };
-        Self { dir, cfg, inner: Mutex::new(inner) }
+        Self {
+            dir,
+            cfg,
+            inner: Mutex::new(inner),
+        }
     }
 
     fn handle(&self) -> Option<std::sync::Arc<DiskGraphIndex>> {
@@ -1322,7 +1534,12 @@ impl GraphIndex for DurableGraphIndex {
         }
     }
 
-    fn search(&self, query: &[f32], k: usize, filter: &dyn Fn(u64, u64) -> bool) -> Vec<(u64, u64, f32)> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         match self.handle() {
             Some(i) => i.search(query, k, filter),
             None => Vec::new(),
@@ -1343,12 +1560,20 @@ mod tests {
 
     fn tmpdir() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!("yt_diskgraph_{}_{}", std::process::id(), N.fetch_add(1, O::Relaxed)))
+        std::env::temp_dir().join(format!(
+            "yt_diskgraph_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, O::Relaxed)
+        ))
     }
 
     /// 测试用配置：大缓冲（不淘汰），按需指定 m。
     fn cfg(m: usize) -> DiskGraphConfig {
-        DiskGraphConfig { m, vector_cache_bytes: 1 << 20, ..Default::default() }
+        DiskGraphConfig {
+            m,
+            vector_cache_bytes: 1 << 20,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1382,7 +1607,7 @@ mod tests {
         idx.index_embedding(1, 10, vec![0.0, 0.0]);
         idx.index_embedding(1, 11, vec![0.1, 0.0]);
         idx.index_embedding(2, 20, vec![0.0, 0.1]); // 不满足谓词
-        // 谓词只要 trace==1
+                                                    // 谓词只要 trace==1
         let hits = idx.search(&[0.0, 0.0], 5, &|t, _| t == 1);
         assert!(hits.iter().all(|&(t, _, _)| t == 1));
         assert_eq!(hits.len(), 2);
@@ -1416,8 +1641,12 @@ mod tests {
         let dir = tmpdir();
         let dim = 4usize;
         let vec_bytes = dim * 4; // 每条向量 16 字节
-        // 预算 = 刚好 2 条向量。
-        let cfg = DiskGraphConfig { m: 6, vector_cache_bytes: 2 * vec_bytes, ..Default::default() };
+                                 // 预算 = 刚好 2 条向量。
+        let cfg = DiskGraphConfig {
+            m: 6,
+            vector_cache_bytes: 2 * vec_bytes,
+            ..Default::default()
+        };
         let idx = DiskGraphIndex::open(&dir, dim, cfg).unwrap();
         // 灌 40 条（远超预算）。
         for i in 0..40u64 {
@@ -1431,10 +1660,17 @@ mod tests {
         // 扫全部 40 条：预算只容 2 条 → 大量回磁盘（冷数据去磁盘找），且值都正确。
         let (_, miss_before) = idx.store().cache_stats();
         for i in 0..40u32 {
-            assert_eq!(idx.store().read_vector(i).unwrap(), vec![i as f32; dim], "冷向量从磁盘读回值正确");
+            assert_eq!(
+                idx.store().read_vector(i).unwrap(),
+                vec![i as f32; dim],
+                "冷向量从磁盘读回值正确"
+            );
         }
         let (_, miss_after) = idx.store().cache_stats();
-        assert!(miss_after - miss_before >= 38, "预算只容 2 条，扫 40 条几乎全回磁盘");
+        assert!(
+            miss_after - miss_before >= 38,
+            "预算只容 2 条，扫 40 条几乎全回磁盘"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1442,7 +1678,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_f32(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 33) as f32) / (1u64 << 31) as f32
         }
         fn vec(&mut self, dim: usize) -> Vec<f32> {
@@ -1455,7 +1694,18 @@ mod tests {
         // 图导航的核心：beam search 召回 ≈ 暴力 ground-truth（证明"按需读页的图遍历"找得到近邻）。
         let dir = tmpdir();
         let dim = 8usize;
-        let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 64, ef_search: 64, vector_cache_bytes: 1 << 20, metric: Metric::L2 }).unwrap();
+        let idx = DiskGraphIndex::open(
+            &dir,
+            dim,
+            DiskGraphConfig {
+                m: 8,
+                ef_construction: 64,
+                ef_search: 64,
+                vector_cache_bytes: 1 << 20,
+                metric: Metric::L2,
+            },
+        )
+        .unwrap();
         let mut rng = Lcg(0x51A6_3D11);
         for i in 0..150u64 {
             idx.index_embedding(1, i, rng.vec(dim));
@@ -1467,10 +1717,16 @@ mod tests {
         let mut q = Lcg(0xBEEF);
         for _ in 0..8 {
             let query = q.vec(dim);
-            let truth: std::collections::HashSet<(u64, u64)> =
-                idx.brute_force(&query, k, &|_, _| true).into_iter().map(|(t, s, _)| (t, s)).collect();
+            let truth: std::collections::HashSet<(u64, u64)> = idx
+                .brute_force(&query, k, &|_, _| true)
+                .into_iter()
+                .map(|(t, s, _)| (t, s))
+                .collect();
             let got = idx.search(&query, k, &|_, _| true);
-            hit_sum += got.iter().filter(|(t, s, _)| truth.contains(&(*t, *s))).count();
+            hit_sum += got
+                .iter()
+                .filter(|(t, s, _)| truth.contains(&(*t, *s)))
+                .count();
             probes += 1;
         }
         let recall = hit_sum as f32 / (k * probes) as f32;
@@ -1487,12 +1743,26 @@ mod tests {
         let mut rng = Lcg(0x7A5E);
         let top_level;
         {
-            let idx = DiskGraphIndex::open(&dir, dim, DiskGraphConfig { m: 8, ef_construction: 48, ef_search: 48, vector_cache_bytes: 1 << 20, metric: Metric::L2 }).unwrap();
+            let idx = DiskGraphIndex::open(
+                &dir,
+                dim,
+                DiskGraphConfig {
+                    m: 8,
+                    ef_construction: 48,
+                    ef_search: 48,
+                    vector_cache_bytes: 1 << 20,
+                    metric: Metric::L2,
+                },
+            )
+            .unwrap();
             for i in 0..300u64 {
                 idx.index_embedding(1, i, rng.vec(dim));
             }
             top_level = idx.entry_level();
-            assert!(top_level >= 1, "300 点应建出多层（入口层级≥1），实测 {top_level}");
+            assert!(
+                top_level >= 1,
+                "300 点应建出多层（入口层级≥1），实测 {top_level}"
+            );
             idx.flush(); // 持久上层图 + 入口
         }
         // 重开：upper 快照在 → 入口/上层图从快照恢复（入口层级一致），搜索照常。
@@ -1500,7 +1770,11 @@ mod tests {
         assert_eq!(idx.entry_level(), top_level, "重启后入口层级从快照恢复一致");
         let probe = idx.store().read_vector(42).unwrap();
         let hits = idx.search(&probe, 5, &|_, _| true);
-        assert_eq!((hits[0].0, hits[0].1), (1, 42), "多层重启后搜索查询点自身排第一");
+        assert_eq!(
+            (hits[0].0, hits[0].1),
+            (1, 42),
+            "多层重启后搜索查询点自身排第一"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1522,7 +1796,11 @@ mod tests {
         let idx = DiskGraphIndex::open(&dir, dim, cfg(8)).unwrap();
         // 不重放、不 rebuild：查 node 7 自身 → 应排第一（距离 ~0）。
         let hits = idx.search(&probe, 5, &|_, _| true);
-        assert_eq!((hits[0].0, hits[0].1), (1, 7), "重启后图搜索照常，查询点自身排第一");
+        assert_eq!(
+            (hits[0].0, hits[0].1),
+            (1, 7),
+            "重启后图搜索照常，查询点自身排第一"
+        );
         assert!(hits[0].2 < 1e-3);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1551,7 +1829,13 @@ mod tests {
         // Cosine 模式：图检索召回应 ≈ 同一索引的暴力精确搜索（与 L2 同款断言，验证归一化路径对齐）。
         let dir = tmpdir();
         let dim = 8usize;
-        let cfg = DiskGraphConfig { m: 8, ef_construction: 64, ef_search: 64, vector_cache_bytes: 1 << 20, metric: Metric::Cosine };
+        let cfg = DiskGraphConfig {
+            m: 8,
+            ef_construction: 64,
+            ef_search: 64,
+            vector_cache_bytes: 1 << 20,
+            metric: Metric::Cosine,
+        };
         let idx = DiskGraphIndex::open(&dir, dim, cfg).unwrap();
         let mut rng = Lcg(0xC05E);
         for _ in 0..150u64 {
@@ -1562,10 +1846,16 @@ mod tests {
         let mut probes = 0usize;
         for _ in 0..8 {
             let query = rng.vec(dim);
-            let truth: std::collections::HashSet<(u64, u64)> =
-                idx.brute_force(&query, k, &|_, _| true).into_iter().map(|(t, s, _)| (t, s)).collect();
+            let truth: std::collections::HashSet<(u64, u64)> = idx
+                .brute_force(&query, k, &|_, _| true)
+                .into_iter()
+                .map(|(t, s, _)| (t, s))
+                .collect();
             let got = idx.search(&query, k, &|_, _| true);
-            hit_sum += got.iter().filter(|(t, s, _)| truth.contains(&(*t, *s))).count();
+            hit_sum += got
+                .iter()
+                .filter(|(t, s, _)| truth.contains(&(*t, *s)))
+                .count();
             probes += 1;
         }
         let recall = hit_sum as f32 / (k * probes) as f32;

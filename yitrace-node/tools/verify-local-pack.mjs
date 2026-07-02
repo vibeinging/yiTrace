@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const { version } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const platformPackage =
   {
     "darwin:arm64": "darwin-arm64",
@@ -19,8 +18,26 @@ if (!platformPackage) {
   throw new Error(`Unsupported verify platform: ${process.platform}/${process.arch}`);
 }
 
-const rootTarball = join(root, "dist", `yitrace-db-${version}.tgz`);
-const platformTarball = join(root, "dist", `yitrace-db-${platformPackage}-${version}.tgz`);
+const manifestPath = join(root, "dist", "pack-manifest.json");
+if (!existsSync(manifestPath)) {
+  throw new Error(`Missing local package manifest: ${manifestPath}. Run npm run pack:local first.`);
+}
+
+const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+const rootArtifact = manifest.artifacts.find((artifact) => artifact.kind === "root");
+const platformArtifact = manifest.artifacts.find(
+  (artifact) => artifact.kind === "platform" && artifact.platform === platformPackage,
+);
+
+if (!rootArtifact) {
+  throw new Error(`Missing root package artifact in ${manifestPath}`);
+}
+if (!platformArtifact) {
+  throw new Error(`Missing platform package artifact for ${platformPackage} in ${manifestPath}`);
+}
+
+const rootTarball = join(root, "dist", rootArtifact.file);
+const platformTarball = join(root, "dist", platformArtifact.file);
 
 for (const file of [rootTarball, platformTarball]) {
   if (!existsSync(file)) {

@@ -69,7 +69,11 @@ mod tests {
 
     fn temp() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
-        std::env::temp_dir().join(format!("yt_vec_{}_{}.dat", std::process::id(), N.fetch_add(1, Ordering::Relaxed)))
+        std::env::temp_dir().join(format!(
+            "yt_vec_{}_{}.dat",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     #[test]

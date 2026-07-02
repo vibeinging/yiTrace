@@ -13,11 +13,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::olog;
+use std::collections::BTreeMap;
 use yt_core::chunk::{DeletionVec, UpgradeColChunk};
 use yt_core::fold::SpanFields;
 use yt_core::ids::{ChunkId, ManifestVersion, SegmentId, WalLsn};
 use yt_core::manifest::{Manifest, SegState, SegmentEntry};
-use std::collections::BTreeMap;
 
 const MAGIC: u32 = 0x5654_4D46; // "VTMF"
 pub const FORMAT_VER: u32 = 1;
@@ -144,25 +144,37 @@ pub fn decode(bytes: &[u8]) -> Option<PersistedState> {
     let magic = c.u32()?;
     let ver = c.u32()?;
     if magic != MAGIC {
-        olog::log(olog::Level::Error, "manifest_decode", &[("reason", &"bad magic")]);
+        olog::log(
+            olog::Level::Error,
+            "manifest_decode",
+            &[("reason", &"bad magic")],
+        );
         return None;
     }
     if ver > FORMAT_VER {
         // 未来版本：需要新引擎。明确报错而非静默当损坏。
-        olog::log(olog::Level::Error, "manifest_decode", &[
-            ("reason", &"future version needs newer engine"),
-            ("found", &ver),
-            ("supported", &FORMAT_VER),
-        ]);
+        olog::log(
+            olog::Level::Error,
+            "manifest_decode",
+            &[
+                ("reason", &"future version needs newer engine"),
+                ("found", &ver),
+                ("supported", &FORMAT_VER),
+            ],
+        );
         return None;
     }
     if ver < FORMAT_VER {
         // 老版本：需迁移。骨架阶段直接 None（无旧版本数据）；真实迁移工具见 migrate_manifest。
-        olog::log(olog::Level::Warn, "manifest_decode", &[
-            ("reason", &"old version needs migration"),
-            ("found", &ver),
-            ("current", &FORMAT_VER),
-        ]);
+        olog::log(
+            olog::Level::Warn,
+            "manifest_decode",
+            &[
+                ("reason", &"old version needs migration"),
+                ("found", &ver),
+                ("current", &FORMAT_VER),
+            ],
+        );
         return None;
     }
     let version = ManifestVersion::new(c.u64()?);
@@ -223,7 +235,12 @@ pub fn decode(bytes: &[u8]) -> Option<PersistedState> {
         );
     }
     Some(PersistedState {
-        manifest: Manifest { version, segments, memtable_watermark, epoch },
+        manifest: Manifest {
+            version,
+            segments,
+            memtable_watermark,
+            epoch,
+        },
         next_segment_id,
         next_chunk_id,
     })
@@ -242,7 +259,11 @@ pub fn save(path: impl AsRef<Path>, state: &PersistedState) -> std::io::Result<(
     let path = path.as_ref();
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?; // ★ fsync 后才 rename
     }
@@ -271,11 +292,17 @@ mod tests {
     fn manifest_roundtrip_with_deletion_and_upgrade() {
         // 造一个带删除位图 + upgrade 补写的 manifest,编码→解码逐字段还原。
         let chunk = ChunkId::new(9);
-        let dv = DeletionVec::empty().with_deleted(3, chunk).with_deleted(70, ChunkId::new(10));
+        let dv = DeletionVec::empty()
+            .with_deleted(3, chunk)
+            .with_deleted(70, ChunkId::new(10));
         let up = UpgradeColChunk::empty().with_patch(
             1,
             10,
-            SpanFields { eval_score: Some(800), model: Some("qwen3".into()), ..Default::default() },
+            SpanFields {
+                eval_score: Some(800),
+                model: Some("qwen3".into()),
+                ..Default::default()
+            },
             ChunkId::new(11),
         );
         let mut segments = BTreeMap::new();
@@ -294,7 +321,12 @@ mod tests {
             },
         );
         let state = PersistedState {
-            manifest: Manifest { version: ManifestVersion::new(7), segments, memtable_watermark: WalLsn::new(42), epoch: 3 },
+            manifest: Manifest {
+                version: ManifestVersion::new(7),
+                segments,
+                memtable_watermark: WalLsn::new(42),
+                epoch: 3,
+            },
             next_segment_id: 6,
             next_chunk_id: 12,
         };
@@ -307,7 +339,10 @@ mod tests {
         assert_eq!(m.memtable_watermark.get(), 42);
         assert_eq!(m.epoch, 3);
         let e = &m.segments[&5];
-        assert_eq!((e.level, e.min_ts, e.max_ts, e.deletion_seq, e.upgrade_seq), (1, -3, 999, 2, 1));
+        assert_eq!(
+            (e.level, e.min_ts, e.max_ts, e.deletion_seq, e.upgrade_seq),
+            (1, -3, 999, 2, 1)
+        );
         // 删除位图还原:行 3、70 仍删,别的没删
         assert!(e.deletion_vec.is_deleted(3) && e.deletion_vec.is_deleted(70));
         assert!(!e.deletion_vec.is_deleted(4));
@@ -321,8 +356,11 @@ mod tests {
     fn corrupt_or_missing_manifest_loads_none() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir()
-            .join(format!("yt_manifest_{}_{}.dat", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "yt_manifest_{}_{}.dat",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         assert!(load(&path).is_none(), "缺文件 → None");
 
         let state = PersistedState {

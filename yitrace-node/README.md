@@ -20,30 +20,36 @@ Supported targets for the first npm release:
 - Windows x64 with MSVC
 
 For AgenticData or another internal consumer that needs a stable install source
-before the public npm release, build versioned tarballs and lock them in the
-consumer repo:
+before the public npm release, build immutable tarballs and lock those exact
+files in the consumer repo:
 
 ```bash
 npm ci
 npm run build
 npm run release:artifacts
 npm run release:prepublish
-npm run pack:local
-npm run pack:verify
+npm run pack:verify  # runs pack:local first
 ```
 
 This writes `@yitrace/db` plus any locally available platform packages to
-`yitrace-node/dist/*.tgz`. Put those tarballs in the consuming repo or an
-internal package registry, then depend on exact `file:` tarballs:
+`yitrace-node/dist/*.tgz`. `pack:local` appends a commit label such as
+`g1a2b3c4d5e6f` to each tarball name and writes `dist/pack-manifest.json` with
+the exact files. Set `YITRACE_PACK_LABEL=<release-id>` when the consuming repo
+needs a human-chosen immutable label. Put those tarballs in the consuming repo
+or an internal package registry, then depend on exact `file:` tarballs:
 
 ```json
 {
   "dependencies": {
-    "@yitrace/db": "file:vendor/yitrace-db-0.0.1.tgz",
-    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.0.1.tgz"
+    "@yitrace/db": "file:vendor/yitrace-db-0.0.1-g1a2b3c4d5e6f.tgz",
+    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.0.1-g1a2b3c4d5e6f.tgz"
   }
 }
 ```
+
+Do not keep overwriting a shared `yitrace-db-0.0.1.tgz`. If the payload changes,
+the filename or registry version must change too, so lockfiles and rollbacks can
+identify the exact native binary.
 
 For a registry publish, publish platform packages first and the root package
 last. Do not publish a root package that contains only the current machine's
@@ -51,8 +57,16 @@ native binary.
 
 Current platform policy:
 
-- AgenticData development build: macOS arm64 is the first supported locked
-  artifact (`@yitrace/db` root tarball + `@yitrace/db-darwin-arm64` tarball).
+- AgenticData server builds stay on one native architecture at a time. The
+  current server baseline is x64: Node, DuckDB, yiTrace native, and sqlite native
+  must all be x64.
+- Do not mix an arm64 yiTrace native package with x64 DuckDB/sqlite, or the
+  inverse. If AgenticData switches the server to arm64, first move DuckDB and
+  sqlite to arm64 too, or adopt the same per-platform optional package strategy
+  for those dependencies.
+- AgenticData local development may still use macOS arm64 artifacts
+  (`@yitrace/db` root tarball + `@yitrace/db-darwin-arm64` tarball), but that is
+  not the server architecture decision.
 - Local tarballs may also include any other native packages already present on
   the build machine, such as macOS x64.
 - Public npm / CI release target set remains macOS x64/arm64, Linux x64/arm64
@@ -110,6 +124,8 @@ const hits = await db.search({
   },
 });
 const trace = await db.trace("run-uuid");
+const span = await db.span("run-uuid", "span-uuid");
+const logMessages = span?.logEvents?.flatMap((event) => event.messages) ?? [];
 const traces = await db.traces();
 
 await db.close();
@@ -160,6 +176,18 @@ stable `u64` hash for indexing and stores the original values in
 `external_session_id`. You can query with either numeric IDs or the original
 string IDs. `attrs` is persisted through the engine and returned as JSON on
 search, trace, and span detail responses.
+
+Trace and span detail responses also return raw `logEvents`, so applications do
+not need to mirror log lines into `attrs.event_logs`. Each event keeps its
+`ts`, `seq`, `eventType`, stable `eventId`, `messages`, and event-level
+`attrs`:
+
+```ts
+const span = await db.span("run-uuid", "tool-call-1");
+for (const event of span?.logEvents ?? []) {
+  console.log(event.seq, event.messages);
+}
+```
 
 The event builder hides `seq`, `event_type`, start/end event pairing, and
 `ext_span_id`. It emits the same wire format as direct `db.ingest()`, so callers
@@ -272,8 +300,7 @@ npm run build:release -- --target x86_64-unknown-linux-gnu
 npm run release:artifacts
 npm run release:prepublish  # metadata only; this script skips automatic optional package publish
 npm run pack:check
-npm run pack:local          # optional: write root + local platform tarballs into ./dist
-npm run pack:verify         # install tarballs into a clean consumer and test ESM/CJS/native
+npm run pack:verify         # write commit-labeled tarballs and verify them in a clean consumer
 ```
 
 Then publish each platform package first, followed by the root package:

@@ -46,7 +46,12 @@ impl FileSegmentStore {
     /// 原子写：写 tmp + fsync + rename。失败静默（与 InMemory 行为对齐；真实实现应上报）。
     fn write_atomic(&self, seg: SegmentId, bytes: &[u8]) {
         let tmp = self.tmp_path(seg);
-        if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+        {
             if f.write_all(bytes).is_ok() {
                 let _ = f.sync_all(); // ★ fsync：落盘后才 rename
                 let _ = fs::rename(&tmp, self.seg_path(seg));
@@ -120,8 +125,15 @@ mod tests {
             trace_id: 1,
             span_id: seq,
             ts: seq as i64,
-            identity: EventIdentity { ext_span_id: span.into(), seq, event_type: EventType::SpanEnd },
-            fields: SpanFields { logs: vec![log.into()], ..Default::default() },
+            identity: EventIdentity {
+                ext_span_id: span.into(),
+                seq,
+                event_type: EventType::SpanEnd,
+            },
+            fields: SpanFields {
+                logs: vec![log.into()],
+                ..Default::default()
+            },
         }
     }
 
@@ -165,7 +177,10 @@ mod tests {
         bytes[last] ^= 0xff;
         fs::write(&path, &bytes).unwrap();
 
-        assert!(store.scan_records(seg).is_empty(), "损坏段读成空,不返回脏数据");
+        assert!(
+            store.scan_records(seg).is_empty(),
+            "损坏段读成空,不返回脏数据"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -186,7 +201,10 @@ mod tests {
     fn missing_segment_scans_empty() {
         let dir = temp_dir();
         let store = FileSegmentStore::open(&dir).unwrap();
-        assert!(store.scan_records(SegmentId::new(999)).is_empty(), "不存在的段读成空,不 panic");
+        assert!(
+            store.scan_records(SegmentId::new(999)).is_empty(),
+            "不存在的段读成空,不 panic"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

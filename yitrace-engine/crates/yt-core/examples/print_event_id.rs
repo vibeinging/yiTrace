@@ -9,7 +9,12 @@ fn main() {
         ("反洗钱-1", 3, EventType::Attr),
     ];
     for (ext, seq, et) in cases {
-        let id = EventIdentity { ext_span_id: ext.to_string(), seq, event_type: et }.event_id();
+        let id = EventIdentity {
+            ext_span_id: ext.to_string(),
+            seq,
+            event_type: et,
+        }
+        .event_id();
         println!("{ext}|{seq}|{et:?} -> {}", id.0);
     }
 }

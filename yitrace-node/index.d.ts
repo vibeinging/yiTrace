@@ -94,6 +94,32 @@ export interface TraceSummary {
   [key: string]: unknown;
 }
 
+export interface SpanLogEvent {
+  eventId: string;
+  ts: WireNumber;
+  seq: number;
+  eventType: number;
+  messages: string[];
+  attrs?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface TraceSpan {
+  id?: TenantId;
+  spanId?: TenantId;
+  span_id?: TenantId;
+  parentId?: TenantId | null;
+  externalTraceId?: string | null;
+  externalSpanId?: string | null;
+  externalParentSpanId?: string | null;
+  externalSessionId?: string | null;
+  kind?: string;
+  name?: string;
+  attrs?: Record<string, unknown>;
+  logEvents?: SpanLogEvent[];
+  [key: string]: unknown;
+}
+
 export interface SessionsOptions extends TenantOptions {
   cursor?: number;
   limit?: number;
@@ -119,7 +145,7 @@ export interface TraceDetail {
   trace_id?: TenantId;
   externalTraceId?: string | null;
   external_trace_id?: string | null;
-  spans?: unknown[];
+  spans?: TraceSpan[];
   [key: string]: unknown;
 }
 
@@ -133,6 +159,7 @@ export interface SpanDetail {
   externalParentSpanId?: string | null;
   externalSessionId?: string | null;
   attrs?: Record<string, unknown>;
+  logEvents?: SpanLogEvent[];
   [key: string]: unknown;
 }
 

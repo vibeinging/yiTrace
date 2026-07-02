@@ -47,9 +47,15 @@ pub mod ids {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ManifestVersion(pub u64);
     impl ManifestVersion {
-        pub const fn new(v: u64) -> Self { Self(v) }
-        pub const fn next(self) -> Self { Self(self.0 + 1) }
-        pub const fn get(self) -> u64 { self.0 }
+        pub const fn new(v: u64) -> Self {
+            Self(v)
+        }
+        pub const fn next(self) -> Self {
+            Self(self.0 + 1)
+        }
+        pub const fn get(self) -> u64 {
+            self.0
+        }
     }
 
     /// 读者 pin 的版本状态。
@@ -148,14 +154,18 @@ pub mod event {
     impl Fnv64 {
         const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
-        fn new() -> Self { Self(Self::OFFSET) }
+        fn new() -> Self {
+            Self(Self::OFFSET)
+        }
         fn write(&mut self, bytes: &[u8]) {
             for &b in bytes {
                 self.0 ^= b as u64;
                 self.0 = self.0.wrapping_mul(Self::PRIME);
             }
         }
-        fn finish(&self) -> u64 { self.0 }
+        fn finish(&self) -> u64 {
+            self.0
+        }
     }
 
     #[cfg(test)]
@@ -164,15 +174,25 @@ pub mod event {
 
         #[test]
         fn event_id_is_deterministic_and_seq_sensitive() {
-            let a = EventIdentity { ext_span_id: "span-1".into(), seq: 7, event_type: EventType::SpanEnd };
+            let a = EventIdentity {
+                ext_span_id: "span-1".into(),
+                seq: 7,
+                event_type: EventType::SpanEnd,
+            };
             let b = a.clone();
             // 同一身份 → 同一 id（这正是重放幂等依赖的性质）
             assert_eq!(a.event_id(), b.event_id());
             // seq 不同 → id 不同（防同 span 不同上报被折成一条）
-            let c = EventIdentity { seq: 8, ..a.clone() };
+            let c = EventIdentity {
+                seq: 8,
+                ..a.clone()
+            };
             assert_ne!(a.event_id(), c.event_id());
             // event_type 不同 → id 不同
-            let d = EventIdentity { event_type: EventType::SpanStart, ..a.clone() };
+            let d = EventIdentity {
+                event_type: EventType::SpanStart,
+                ..a.clone()
+            };
             assert_ne!(a.event_id(), d.event_id());
         }
 
@@ -198,10 +218,14 @@ pub mod chunk {
         bits: Vec<u64>,
     }
     impl DeletionVec {
-        pub fn empty() -> Self { Self::default() }
+        pub fn empty() -> Self {
+            Self::default()
+        }
 
         /// 原始位字（manifest 持久化用）。
-        pub fn bits(&self) -> &[u64] { &self.bits }
+        pub fn bits(&self) -> &[u64] {
+            &self.bits
+        }
 
         /// 从持久化的位字重建（manifest 恢复用）。
         pub fn from_bits(chunk_id: Option<ChunkId>, bits: Vec<u64>) -> Self {
@@ -216,12 +240,17 @@ pub mod chunk {
                 bits.resize(word + 1, 0);
             }
             bits[word] |= 1u64 << (row % 64);
-            Self { chunk_id: Some(new_chunk_id), bits }
+            Self {
+                chunk_id: Some(new_chunk_id),
+                bits,
+            }
         }
 
         pub fn is_deleted(&self, row: u32) -> bool {
             let word = (row / 64) as usize;
-            self.bits.get(word).map_or(false, |w| (w >> (row % 64)) & 1 == 1)
+            self.bits
+                .get(word)
+                .map_or(false, |w| (w >> (row % 64)) & 1 == 1)
         }
 
         pub fn count(&self) -> u32 {
@@ -245,16 +274,31 @@ pub mod chunk {
         }
 
         /// 从持久化的补写表重建（manifest 恢复用）。
-        pub fn from_patches(chunk_id: Option<ChunkId>, patches: BTreeMap<(u64, u64), SpanFields>) -> Self {
+        pub fn from_patches(
+            chunk_id: Option<ChunkId>,
+            patches: BTreeMap<(u64, u64), SpanFields>,
+        ) -> Self {
             Self { chunk_id, patches }
         }
 
         /// 写时复制地加一条补写，返回新块（绝不原地改 self）。同一 span 多次补写按非空覆盖 + 日志并集。
         /// 覆盖逻辑统一走 `SpanFields::merge_from`（含 eval 分数/标签等所有可补写字段，不再各列子集）。
-        pub fn with_patch(&self, trace_id: u64, span_id: u64, fields: SpanFields, new_chunk_id: ChunkId) -> Self {
+        pub fn with_patch(
+            &self,
+            trace_id: u64,
+            span_id: u64,
+            fields: SpanFields,
+            new_chunk_id: ChunkId,
+        ) -> Self {
             let mut patches = self.patches.clone();
-            patches.entry((trace_id, span_id)).or_default().merge_from(&fields);
-            Self { chunk_id: Some(new_chunk_id), patches }
+            patches
+                .entry((trace_id, span_id))
+                .or_default()
+                .merge_from(&fields);
+            Self {
+                chunk_id: Some(new_chunk_id),
+                patches,
+            }
         }
 
         /// 某 span 的补写（若有）。
@@ -708,7 +752,14 @@ pub mod fold {
         use super::super::event::{EventIdentity, EventType};
         use super::*;
 
-        fn ev(trace: u64, span: u64, seq: u64, status: Option<u8>, dur: Option<u64>, logs: &[&str]) -> FoldInput {
+        fn ev(
+            trace: u64,
+            span: u64,
+            seq: u64,
+            status: Option<u8>,
+            dur: Option<u64>,
+            logs: &[&str],
+        ) -> FoldInput {
             FoldInput {
                 trace_id: trace,
                 span_id: span,
@@ -747,7 +798,11 @@ pub mod fold {
                 ev(1, 10, 5, Some(2), None, &[]), // 后发生（seq 大）
                 ev(1, 10, 1, Some(0), None, &[]), // 先发生（seq 小）
             ]);
-            assert_eq!(folded[0].status, Some(2), "seq 大的（后发生的）非空值应胜出");
+            assert_eq!(
+                folded[0].status,
+                Some(2),
+                "seq 大的（后发生的）非空值应胜出"
+            );
         }
 
         #[test]
@@ -783,7 +838,11 @@ pub mod fold {
                 ev(1, 2, 1, None, None, &[]),
             ]);
             let keys: Vec<(u64, u64)> = folded.iter().map(|s| (s.trace_id, s.span_id)).collect();
-            assert_eq!(keys, vec![(1, 2), (1, 9), (2, 1)], "输出按 (trace_id, span_id) 升序，确定可复算");
+            assert_eq!(
+                keys,
+                vec![(1, 2), (1, 9), (2, 1)],
+                "输出按 (trace_id, span_id) 升序，确定可复算"
+            );
         }
     }
 }

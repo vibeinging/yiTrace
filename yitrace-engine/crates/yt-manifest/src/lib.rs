@@ -126,7 +126,8 @@ impl Current {
             // (c) 公开 slot 之后才解引用 current
             let m = self.inner.read().unwrap().clone();
             // (d) 落定 pin 版本 + 下界保留点
-            slot.pinned_version.store(m.version.get(), Ordering::Release);
+            slot.pinned_version
+                .store(m.version.get(), Ordering::Release);
             slot.retained_watermark
                 .store(m.memtable_watermark.get(), Ordering::Release);
 
@@ -223,7 +224,12 @@ impl Current {
     ///   (1) v_dead ≤ safe_version
     ///   (2) ∧ 无未释放的 buffer pin（字节级最后保险）
     ///   (3) ∧ metastore 中不被任何已提交 manifest 引用（防崩溃竞态）
-    pub fn can_reclaim(&self, v_dead: u64, no_buffer_pin: bool, not_referenced_in_metastore: bool) -> bool {
+    pub fn can_reclaim(
+        &self,
+        v_dead: u64,
+        no_buffer_pin: bool,
+        not_referenced_in_metastore: bool,
+    ) -> bool {
         v_dead <= self.safe_version() && no_buffer_pin && not_referenced_in_metastore
     }
 
@@ -360,9 +366,16 @@ mod tests {
         c.readers.lock().unwrap().push(tentative.clone());
 
         // ★ 精确下限：safe_version = 3（Tentative 贡献 observed_min_version），不是 0。
-        assert_eq!(c.safe_version(), 3, "Tentative 读者用 observed_min_version 当下限，不卡到 0");
+        assert_eq!(
+            c.safe_version(),
+            3,
+            "Tentative 读者用 observed_min_version 当下限，不卡到 0"
+        );
         // v≤3 的 dead 资源可回收（旧代码这里 can_reclaim 全 false）
-        assert!(c.can_reclaim(3, true, true), "v3 可回收（≤ Tentative 的 observed_min_version）");
+        assert!(
+            c.can_reclaim(3, true, true),
+            "v3 可回收（≤ Tentative 的 observed_min_version）"
+        );
         // v>3 的不可回收
         assert!(!c.can_reclaim(4, true, true));
 

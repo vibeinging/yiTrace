@@ -15,7 +15,8 @@ fn main() {
         walk(root, root, &mut entries);
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut code = String::from("// 自动生成，勿改。\npub static ASSETS: &[(&str, &str, &[u8])] = &[\n");
+    let mut code =
+        String::from("// 自动生成，勿改。\npub static ASSETS: &[(&str, &str, &[u8])] = &[\n");
     for (url, ct, relpath) in &entries {
         code.push_str(&format!(
             "    ({url:?}, {ct:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/\", {relpath:?}))),\n"
@@ -32,7 +33,11 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, &'static str, String)>) 
         if p.is_dir() {
             walk(root, &p, out);
         } else {
-            let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+            let rel = p
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             let url = format!("/{rel}");
             let relpath = p.to_string_lossy().replace('\\', "/");
             out.push((url, content_type(&p), relpath));
