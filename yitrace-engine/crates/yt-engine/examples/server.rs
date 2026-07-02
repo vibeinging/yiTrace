@@ -15,7 +15,10 @@ fn main() {
 
     // 种子数据：多轮会话（客服问答四种弧线）+ 四类 agent 场景，控制台开箱有料。
     let s = evalkit::run_session_harness(&coord, 60, 20_260_623);
-    println!("已灌 {} 个多轮会话（共 {} 轮）", s.gen.sessions, s.gen.turns);
+    println!(
+        "已灌 {} 个多轮会话（共 {} 轮）",
+        s.gen.sessions, s.gen.turns
+    );
     let r = evalkit::run_harness(&coord, 40, 7);
     let traces: usize = r.scenarios.iter().map(|x| x.traces).sum();
     println!("已灌 {} 条场景 trace", traces);
@@ -26,8 +29,8 @@ fn main() {
         println!("（已开启 Bearer token 鉴权）");
     }
     let server = Arc::new(server);
-    let addr = "127.0.0.1:7878";
-    let listener = TcpListener::bind(addr).expect("bind");
+    let addr = std::env::var("YT_BIND").unwrap_or_else(|_| "127.0.0.1:7878".to_string());
+    let listener = TcpListener::bind(&addr).expect("bind");
     println!("yiTrace 控制台 → http://{addr}/  （前端需先 build 并拷到 console_dist/）");
     server.serve_pool(listener, 8);
 }

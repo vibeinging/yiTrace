@@ -35,6 +35,25 @@ yiTrace 适合正在做私有化 Agent 的团队：
 
 需要 Rust 1.80+。
 
+一键本地 demo：
+
+```bash
+./scripts/demo_all.sh
+```
+
+这条命令会构建控制台、启动引擎、灌入一条样例 trace，并打印可直接复制的搜索命令。
+设置 `YT_DEMO_OPEN=1` 会自动打开控制台。
+
+Docker：
+
+```bash
+docker compose up --build
+```
+
+然后打开 `http://127.0.0.1:7878`。
+
+手动路径：
+
 ```bash
 cd yitrace-engine
 cargo run -p yt-engine --example server
@@ -99,6 +118,63 @@ cargo run -p yt-engine --example server
 
 ---
 
+## Node / Electron 嵌入式 DB
+
+对 Node 后端和 Electron 应用，yiTrace 也可以作为进程内嵌入式数据库使用。这不是直接读数据文件；
+它通过 Node-API 加载 Rust engine，仍然复用同一套 WAL、manifest、折叠、检索和租户过滤逻辑。
+
+```bash
+npm install @yitrace/db
+```
+
+```ts
+import { YiTraceDB, createSpanEventBuilder } from "@yitrace/db";
+
+const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
+
+const events = createSpanEventBuilder({
+  traceId: "run-uuid",
+  sessionId: "session-uuid",
+  attrs: {
+    project_id: "agentic-data",
+    skill: "review",
+    mode: "auto",
+    call_site: "worker.ts:10",
+  },
+});
+
+events.startSpan({ spanId: "span-uuid", name: "风控研判", agentName: "风控 Agent" });
+events.log({ spanId: "span-uuid", message: "疑似盗刷" });
+events.endSpan({ spanId: "span-uuid", status: 0, durationNs: 12_000_000 });
+
+await events.ingest(db);
+
+const hits = await db.search({
+  text: "盗刷",
+  k: 10,
+  filter: { attrs: { project_id: "agentic-data", skill: "review" } },
+});
+const trace = await db.trace("run-uuid");
+await db.close();
+```
+
+包目录是 `yitrace-node/`。Electron 应用建议在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用。
+ESM `import` 和 CommonJS `require` 都支持。
+内部调用的是引擎的进程内 `EngineJsonApi`，不会启动本地 HTTP server，也不会走 TCP socket。
+direct ingest 支持数字 ID，也支持 UUID 这类外部字符串 ID。字符串 ID 会稳定 hash 成内部
+`u64` key 用于索引，原文会以 `external_*` 字段返回。`attrs` 会真实持久化，并在 search、trace
+和 span detail 响应里返回。`project_id`、`skill`、`mode`、`call_site` 支持精确 attrs 过滤。
+`OpenOptions.readOnly` 暂不暴露；等 engine 有真正只读打开路径后再加。
+
+`@yitrace/db` 对外是一个很小的 JS 入口包，native 二进制按平台拆成 optional packages
+（例如 `@yitrace/db-darwin-arm64`、`@yitrace/db-linux-x64-gnu`）。用户只需要安装
+`@yitrace/db`，npm 会按 OS/CPU 拉取匹配的二进制包，不要求用户机器安装 Rust toolchain。
+维护者打包和发布步骤见 [`yitrace-node/README.md`](yitrace-node/README.md)。
+公开 npm 发布前，可在 `yitrace-node/` 运行 `npm run pack:local` 生成可锁版本的 tarball，
+放进 AgenticData 仓库或内部 npm 源。
+
+---
+
 ## 从 Agent 摄入
 
 Python：
@@ -142,7 +218,7 @@ tracer.trace("反洗钱筛查", (t) => {
   });
 }, undefined, 1);
 
-await (tracer.exporter as HttpExporter).flush();
+await tracer.close();
 ```
 
 已经接了 OpenTelemetry 或 OpenInference？把 OTLP/HTTP JSON POST 到 `/v1/traces` 即可。

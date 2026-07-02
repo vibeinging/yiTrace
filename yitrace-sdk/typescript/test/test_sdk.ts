@@ -137,7 +137,7 @@ async function asyncTests(): Promise<void> {
       return Promise.resolve(new Response("", { status: 200 }));
     }) as typeof fetch;
     await exp.flush();
-    check(postedHeaders !== undefined && errs === 1, "恢复后重试成功,不再报错（trace 没被静默丢）");
+    check(postedHeaders !== undefined && errs === 1 && exp.bufferedCount() === 0 && exp.sentCount() === 1, "恢复后重试成功,不再报错（trace 没被静默丢）");
 
     const authed = new HttpExporter({ url: "http://x", token: "secret", tenantId: 7n });
     await authed.exportBatch([ev]);
@@ -160,6 +160,17 @@ async function asyncTests(): Promise<void> {
     batch.export(ev);
     await batch.close();
     check(sent === 1 && closeSawSent, "BatchExporter.close 等待在途异步 exportBatch 完成");
+
+    let tracerClosed = false;
+    const tracer = new Tracer({
+      export: () => {},
+      close: async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        tracerClosed = true;
+      },
+    }, 1);
+    await tracer.close();
+    check(tracerClosed, "Tracer.close 等待底层 exporter.close");
 
     passed++;
     console.log("OK  HttpExporter 失败退回缓冲 + headers; BatchExporter async close");

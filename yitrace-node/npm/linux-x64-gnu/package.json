@@ -1,0 +1,19 @@
+{
+  "name": "@yitrace/db-linux-x64-gnu",
+  "version": "0.0.1",
+  "cpu": [
+    "x64"
+  ],
+  "main": "yitrace-db.linux-x64-gnu.node",
+  "files": [
+    "yitrace-db.linux-x64-gnu.node"
+  ],
+  "description": "Embedded yiTrace database for Node.js and Electron",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

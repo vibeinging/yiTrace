@@ -1,0 +1,16 @@
+{
+  "name": "@yitrace/db-win32-x64-msvc",
+  "version": "0.0.1",
+  "cpu": [
+    "x64"
+  ],
+  "main": "yitrace-db.win32-x64-msvc.node",
+  "files": [
+    "yitrace-db.win32-x64-msvc.node"
+  ],
+  "description": "Embedded yiTrace database for Node.js and Electron",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ]
+}

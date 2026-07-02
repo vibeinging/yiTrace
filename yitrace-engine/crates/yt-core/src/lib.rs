@@ -363,6 +363,14 @@ pub mod fold {
         /// 租户 id（**逻辑隔离维度**）：多租户共享一套索引，靠每个查询强制带 tenant 过滤隔离。
         /// span 创建时定，folded 取 last-non-null。服务层须按鉴权身份给每个查询注入它（见检索路径）。
         pub tenant_id: Option<u64>,
+        /// 外部 trace id 原文。内部 trace_id 仍是 u64（数字直用、字符串稳定 hash），这里用于展示和回查。
+        pub external_trace_id: Option<String>,
+        /// 外部 span id 原文。内部 span_id 用于索引和折叠，外部 id 用于跨系统关联。
+        pub external_span_id: Option<String>,
+        /// 外部父 span id 原文。与 parent_span_id 的关系同上。
+        pub external_parent_span_id: Option<String>,
+        /// 外部 session id 原文。AgenticData 等系统使用 UUID 时不会只剩 hash。
+        pub external_session_id: Option<String>,
         /// agent 名（成本/可观测按 agent 下钻）。last-non-null。
         pub agent_name: Option<String>,
         /// 工具名（tool/function call span）。last-non-null。
@@ -380,6 +388,8 @@ pub mod fold {
         pub eval_label: Option<String>,
         /// union（保序去重）。
         pub logs: Vec<String>,
+        /// 原始/扩展属性。key 为属性名，value 是已校验的 JSON 字面量；折叠时同 key 后到覆盖。
+        pub attrs: BTreeMap<String, String>,
     }
 
     impl SpanFields {
@@ -408,6 +418,18 @@ pub mod fold {
             if other.tenant_id.is_some() {
                 self.tenant_id = other.tenant_id;
             }
+            if other.external_trace_id.is_some() {
+                self.external_trace_id = other.external_trace_id.clone();
+            }
+            if other.external_span_id.is_some() {
+                self.external_span_id = other.external_span_id.clone();
+            }
+            if other.external_parent_span_id.is_some() {
+                self.external_parent_span_id = other.external_parent_span_id.clone();
+            }
+            if other.external_session_id.is_some() {
+                self.external_session_id = other.external_session_id.clone();
+            }
             if other.agent_name.is_some() {
                 self.agent_name = other.agent_name.clone();
             }
@@ -434,6 +456,9 @@ pub mod fold {
                     self.logs.push(l.clone());
                 }
             }
+            for (k, v) in &other.attrs {
+                self.attrs.insert(k.clone(), v.clone());
+            }
         }
     }
 
@@ -459,6 +484,10 @@ pub mod fold {
         pub output_tokens: Option<u64>,
         pub session_id: Option<u64>,
         pub tenant_id: Option<u64>,
+        pub external_trace_id: Option<String>,
+        pub external_span_id: Option<String>,
+        pub external_parent_span_id: Option<String>,
+        pub external_session_id: Option<String>,
         pub agent_name: Option<String>,
         pub tool_name: Option<String>,
         pub model: Option<String>,
@@ -467,6 +496,7 @@ pub mod fold {
         pub eval_score: Option<u32>,
         pub eval_label: Option<String>,
         pub logs: Vec<String>,
+        pub attrs: BTreeMap<String, String>,
         /// 去重后真正纳入折叠的事件数。
         pub event_count: usize,
     }
@@ -496,6 +526,18 @@ pub mod fold {
             if p.tenant_id.is_some() {
                 self.tenant_id = p.tenant_id;
             }
+            if p.external_trace_id.is_some() {
+                self.external_trace_id = p.external_trace_id.clone();
+            }
+            if p.external_span_id.is_some() {
+                self.external_span_id = p.external_span_id.clone();
+            }
+            if p.external_parent_span_id.is_some() {
+                self.external_parent_span_id = p.external_parent_span_id.clone();
+            }
+            if p.external_session_id.is_some() {
+                self.external_session_id = p.external_session_id.clone();
+            }
             if p.agent_name.is_some() {
                 self.agent_name = p.agent_name.clone();
             }
@@ -521,6 +563,9 @@ pub mod fold {
                 if !self.logs.contains(l) {
                     self.logs.push(l.clone());
                 }
+            }
+            for (k, v) in &p.attrs {
+                self.attrs.insert(k.clone(), v.clone());
             }
         }
     }
@@ -551,6 +596,10 @@ pub mod fold {
             let mut output_tokens = None;
             let mut session_id = None;
             let mut tenant_id = None;
+            let mut external_trace_id: Option<String> = None;
+            let mut external_span_id: Option<String> = None;
+            let mut external_parent_span_id: Option<String> = None;
+            let mut external_session_id: Option<String> = None;
             let mut agent_name: Option<String> = None;
             let mut tool_name: Option<String> = None;
             let mut model: Option<String> = None;
@@ -560,6 +609,7 @@ pub mod fold {
             let mut eval_label: Option<String> = None;
             let mut logs: Vec<String> = Vec::new();
             let mut logset: HashSet<&str> = HashSet::new();
+            let mut attrs: BTreeMap<String, String> = BTreeMap::new();
             for e in &evs {
                 if e.fields.status.is_some() {
                     status = e.fields.status; // 非空才覆盖 → 后到的非空值胜出，null 不抹掉已有值
@@ -581,6 +631,18 @@ pub mod fold {
                 }
                 if e.fields.tenant_id.is_some() {
                     tenant_id = e.fields.tenant_id;
+                }
+                if e.fields.external_trace_id.is_some() {
+                    external_trace_id = e.fields.external_trace_id.clone();
+                }
+                if e.fields.external_span_id.is_some() {
+                    external_span_id = e.fields.external_span_id.clone();
+                }
+                if e.fields.external_parent_span_id.is_some() {
+                    external_parent_span_id = e.fields.external_parent_span_id.clone();
+                }
+                if e.fields.external_session_id.is_some() {
+                    external_session_id = e.fields.external_session_id.clone();
                 }
                 if e.fields.agent_name.is_some() {
                     agent_name = e.fields.agent_name.clone();
@@ -608,6 +670,9 @@ pub mod fold {
                         logs.push(l.clone()); // 保序去重
                     }
                 }
+                for (k, v) in &e.fields.attrs {
+                    attrs.insert(k.clone(), v.clone());
+                }
             }
             out.push(FoldedSpan {
                 trace_id,
@@ -619,6 +684,10 @@ pub mod fold {
                 output_tokens,
                 session_id,
                 tenant_id,
+                external_trace_id,
+                external_span_id,
+                external_parent_span_id,
+                external_session_id,
                 agent_name,
                 tool_name,
                 model,
@@ -627,6 +696,7 @@ pub mod fold {
                 eval_score,
                 eval_label,
                 logs,
+                attrs,
                 event_count,
             });
         }

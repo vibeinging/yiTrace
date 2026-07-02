@@ -1,0 +1,81 @@
+{
+  "name": "@yitrace/db",
+  "version": "0.0.1",
+  "description": "Embedded yiTrace database for Node.js and Electron",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "agent",
+    "observability",
+    "trace",
+    "database",
+    "electron",
+    "node-api"
+  ],
+  "homepage": "https://github.com/vibeinging/yiTrace#readme",
+  "bugs": {
+    "url": "https://github.com/vibeinging/yiTrace/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vibeinging/yiTrace.git",
+    "directory": "yitrace-node"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "main": "index.cjs",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.cjs"
+    }
+  },
+  "files": [
+    "index.cjs",
+    "index.js",
+    "index.d.ts",
+    "native.cjs",
+    "native.js",
+    "native.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "npm run build:esm && npm run build:cjs",
+    "build:esm": "node tools/build-local.mjs --esm --js native.js --dts native.d.ts",
+    "build:cjs": "node tools/build-local.mjs --js native.cjs --dts native.d.ts",
+    "build:release": "napi build --release --platform --esm --js native.js --dts native.d.ts --output-dir artifacts",
+    "npm:dirs": "napi create-npm-dirs",
+    "release:artifacts": "napi artifacts --output-dir ./artifacts --npm-dir ./npm",
+    "release:prepublish": "napi pre-publish --npm-dir ./npm --skip-optional-publish",
+    "pack:check": "npm pack --dry-run",
+    "pack:local": "node tools/pack-local.mjs",
+    "pack:verify": "npm run pack:local && node tools/verify-local-pack.mjs",
+    "test": "node test/test.mjs && node test/test.cjs",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "napi": {
+    "binaryName": "yitrace-db",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.2"
+  },
+  "optionalDependencies": {
+    "@yitrace/db-darwin-x64": "0.0.1",
+    "@yitrace/db-darwin-arm64": "0.0.1",
+    "@yitrace/db-linux-x64-gnu": "0.0.1",
+    "@yitrace/db-linux-arm64-gnu": "0.0.1",
+    "@yitrace/db-win32-x64-msvc": "0.0.1"
+  }
+}

@@ -1,0 +1,6 @@
+.git
+**/target
+**/node_modules
+**/dist
+**/.DS_Store
+docs/reports/2026-07-02_bandwidth-investigation.md

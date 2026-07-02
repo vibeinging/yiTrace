@@ -5,7 +5,7 @@
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②的 TS 半边）。
 
 ```
-node test/test_sdk.ts     # 4 个测试,含与引擎逐字节一致的 event_id 校验(Node 23+ 原生跑 .ts)
+npm test     # 含与引擎逐字节一致的 event_id、失败缓冲、close flush 校验
 ```
 
 ## 用法
@@ -51,9 +51,16 @@ const tr = new Tracer(new HttpExporter("http://127.0.0.1:7878/v1/ingest"), 2);
 tr.trace("盗刷拦截", (t) => {
   t.span("调用LLM研判", (s) => s.setTokens(800, 150));
 });
-await (tr.exporter as HttpExporter).flush();  // POST 到引擎摄入服务
+await tr.close();  // flush → POST 到引擎摄入服务
 ```
+
+## 可靠上报语义
+
+- `HttpExporter` 失败时把整批退回缓冲队首，下次 `flush/close` 重试；`onError(err, dropped)` 会暴露错误和超上限丢弃数。
+- `bufferedCount()` / `sentCount()` / `droppedCount()` 可接监控。
+- 语义是 at-least-once：网络“已送达但响应丢失”会重发，同一事件由引擎按确定性 `event_id` 去重，token/成本不会翻倍。
+- `Tracer.close()` 返回 `Promise<void>`，会等待底层 exporter 的异步 close/flush 完成；Node 进程退出前应 `await tr.close()`。
 
 ## 还没做
 
-- 后台异步批量发送 / 失败重试；打包发布（tsup/tsc 出 dist）；采样；上下文跨进程传播。
+- 采样；上下文跨进程传播；可选落盘缓冲；更完整的发布自动化。

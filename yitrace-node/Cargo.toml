@@ -1,0 +1,17 @@
+[package]
+name = "yitrace-db-node"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.10.0", default-features = false, features = ["napi4"] }
+napi-derive = "3.5.8"
+yt-engine = { path = "../yitrace-engine/crates/yt-engine" }
+
+[build-dependencies]
+napi-build = "2.3.2"

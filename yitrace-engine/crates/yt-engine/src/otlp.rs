@@ -74,8 +74,12 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         input_text = input_text.or(ev_in);
         output_text = output_text.or(ev_out);
     }
-    // 会话 id：OTLP 里是字符串（session.id / 会话 id）。本引擎要 u64 → 数字直接解析，否则确定性哈希。
-    let session_id = first_str(attrs, &["session.id", "gen_ai.conversation.id", "session_id"]).map(|s| str_to_u64(&s));
+    // 会话 id：OTLP 里常是字符串（session.id / yitrace.session_id）。本引擎要 u64 →
+    // 数字直接解析，否则确定性哈希，确保同一外部会话稳定落到同一 session_id。
+    let session_id = first_session_id(attrs, &["yitrace.session_id", "session.id", "gen_ai.conversation.id", "session_id"]);
+    // 租户 id：只接受数字。HTTP 网关会用 X-Tenant-Id 统一覆盖这里的值；解析出的 tenant
+    // 只服务于直接调用 `ingest_otlp` 的本地/开发路径，不能作为 HTTP 安全边界。
+    let tenant_id = first_numeric_u64(attrs, &["yitrace.tenant_id", "tenant.id", "tenant_id"]);
 
     // SpanStart：携带所有属性派生字段（model/tokens/agent/tool/session/文本），name 进 logs。
     out.push(WireRecord {
@@ -91,13 +95,18 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         input_tokens,
         output_tokens,
         session_id,
-        tenant_id: None, // OTLP 的 tenant 透传作后续（标准格式扩展属性映射）
+        tenant_id,
+        external_trace_id: Some(trace_hex.to_string()),
+        external_span_id: Some(span_hex.to_string()),
+        external_parent_span_id: if parent_hex.is_empty() { None } else { Some(parent_hex.to_string()) },
+        external_session_id: first_str(attrs, &["yitrace.session_id", "session.id", "gen_ai.conversation.id", "session_id"]),
         agent_name,
         tool_name,
         model,
         input_text,
         output_text,
         logs: if name.is_empty() { Vec::new() } else { vec![name] },
+        attrs: Default::default(),
     });
     // SpanEnd：状态 + 耗时。
     out.push(WireRecord {
@@ -114,12 +123,17 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         output_tokens: None,
         session_id: None,
         tenant_id: None,
+        external_trace_id: Some(trace_hex.to_string()),
+        external_span_id: Some(span_hex.to_string()),
+        external_parent_span_id: if parent_hex.is_empty() { None } else { Some(parent_hex.to_string()) },
+        external_session_id: None,
         agent_name: None,
         tool_name: None,
         model: None,
         input_text: None,
         output_text: None,
         logs: Vec::new(),
+        attrs: Default::default(),
     });
     Ok(())
 }
@@ -166,6 +180,20 @@ fn first_str(attrs: &[Json], keys: &[&str]) -> Option<String> {
 /// 多个候选 key 取第一个命中的整数值。
 fn first_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| attr(attrs, k).and_then(val_u64))
+}
+
+/// 多个候选 key 取第一个命中的整数值；接受 OTLP `intValue` 和 `stringValue:"123"`。
+fn first_numeric_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        attr(attrs, k).and_then(|v| val_u64(v).or_else(|| val_str(v).and_then(|s| s.parse::<u64>().ok())))
+    })
+}
+
+/// 会话 id 可以是 OTLP intValue，也可以是任意 stringValue；非数字字符串哈希成稳定 u64。
+fn first_session_id(attrs: &[Json], keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        attr(attrs, k).and_then(|v| val_u64(v).or_else(|| val_str(v).map(|s| str_to_u64(&s))))
+    })
 }
 
 /// 字符串会话 id → u64：纯数字直接解析，否则用 yt-core 的确定性 FNV-1a 64（不再自己抄一份哈希常量）。
@@ -385,6 +413,23 @@ mod tests {
         let recs = parse_otlp_traces(j).unwrap();
         assert_eq!(recs[0].input_text.as_deref(), Some("这笔交易可疑吗"), "user.message 事件 → 输入");
         assert_eq!(recs[0].output_text.as_deref(), Some("疑似盗刷"), "choice 事件 → 输出");
+    }
+
+    #[test]
+    fn maps_yitrace_session_and_numeric_tenant_attrs() {
+        let j = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "traceId":"abc","spanId":"00000000000000aa",
+            "name":"chat","startTimeUnixNano":"1","endTimeUnixNano":"2",
+            "attributes":[
+              {"key":"yitrace.session_id","value":{"stringValue":"tenant-a-session-1"}},
+              {"key":"yitrace.tenant_id","value":{"stringValue":"42"}}
+            ]
+        }]}]}]}"#;
+        let recs = parse_otlp_traces(j).unwrap();
+        assert_eq!(recs[0].session_id, Some(str_to_u64("tenant-a-session-1")));
+        assert_eq!(recs[0].tenant_id, Some(42));
+        assert_eq!(recs[1].session_id, None, "session 只需挂在 start,折叠时合并");
+        assert_eq!(recs[1].tenant_id, None, "tenant 只需挂在 start,折叠时合并");
     }
 
     #[test]

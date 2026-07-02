@@ -38,6 +38,26 @@ yiTrace is for teams building agents that need private, inspectable traces:
 
 Requires Rust 1.80+.
 
+One-command local demo:
+
+```bash
+./scripts/demo_all.sh
+```
+
+This builds the console, starts the engine, ingests a sample trace, and prints
+ready-to-run search commands. Set `YT_DEMO_OPEN=1` to open the console
+automatically.
+
+Docker:
+
+```bash
+docker compose up --build
+```
+
+Then open `http://127.0.0.1:7878`.
+
+Manual path:
+
 ```bash
 cd yitrace-engine
 cargo run -p yt-engine --example server
@@ -103,6 +123,72 @@ any other UI. See [HTTP API Reference](docs/API_REFERENCE.md).
 
 ---
 
+## Embedded Node / Electron
+
+For Node backends and Electron apps, yiTrace can also run in-process as an
+embedded database. This does not read data files directly; it loads the Rust
+engine through Node-API and uses the same WAL, manifest, folding, search, and
+tenant filtering code as the server.
+
+```bash
+npm install @yitrace/db
+```
+
+```ts
+import { YiTraceDB, createSpanEventBuilder } from "@yitrace/db";
+
+const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
+
+const events = createSpanEventBuilder({
+  traceId: "run-uuid",
+  sessionId: "session-uuid",
+  attrs: {
+    project_id: "agentic-data",
+    skill: "review",
+    mode: "auto",
+    call_site: "worker.ts:10",
+  },
+});
+
+events.startSpan({ spanId: "span-uuid", name: "risk review", agentName: "risk-agent" });
+events.log({ spanId: "span-uuid", message: "possible card fraud" });
+events.endSpan({ spanId: "span-uuid", status: 0, durationNs: 12_000_000 });
+
+await events.ingest(db);
+
+const hits = await db.search({
+  text: "fraud",
+  k: 10,
+  filter: { attrs: { project_id: "agentic-data", skill: "review" } },
+});
+const trace = await db.trace("run-uuid");
+await db.close();
+```
+
+The package lives in `yitrace-node/` while it is being stabilized. Electron
+apps should open `YiTraceDB` in the main process and expose narrow IPC methods
+to renderers. Both ESM `import` and CommonJS `require` are supported.
+Internally this path calls the engine's in-process `EngineJsonApi`; it does not
+start a local HTTP server or use TCP sockets.
+Direct ingest accepts numeric IDs or external string IDs such as UUIDs. String
+IDs are hashed into stable internal `u64` keys for indexing while the original
+values are returned as `external_*` fields. `attrs` is persisted and returned on
+search, trace, and span detail responses. Exact attrs filtering is supported for
+`project_id`, `skill`, `mode`, and `call_site`. `OpenOptions.readOnly` is not
+exposed until the engine has a true read-only open path.
+
+`@yitrace/db` is distributed as a small JavaScript entry package plus optional
+native platform packages (`@yitrace/db-darwin-arm64`,
+`@yitrace/db-linux-x64-gnu`, and so on). This keeps the user-facing install to a
+single command while avoiding a Rust toolchain requirement on the user's
+machine. Maintainer packaging and publish steps are documented in
+[`yitrace-node/README.md`](yitrace-node/README.md).
+Before the public npm release, teams can use `npm run pack:local` in
+`yitrace-node/` to produce versioned tarballs and lock those tarballs in a
+consumer repository or internal npm registry.
+
+---
+
 ## Ingest From Your Agent
 
 Python:
@@ -146,7 +232,7 @@ tracer.trace("AML screening", (t) => {
   });
 }, undefined, 1);
 
-await (tracer.exporter as HttpExporter).flush();
+await tracer.close();
 ```
 
 Already have OpenTelemetry or OpenInference spans? POST OTLP/HTTP JSON to

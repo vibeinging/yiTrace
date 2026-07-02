@@ -180,12 +180,17 @@ fn emit_span(
         output_tokens: None,
         session_id: Some(session),
         tenant_id: None,
+        external_trace_id: None,
+        external_span_id: None,
+        external_parent_span_id: None,
+        external_session_id: None,
         agent_name: agent.map(str::to_string),
         tool_name: tool.map(str::to_string),
         model: Some(model.to_string()),
         input_text: Some(input.to_string()),
         output_text: None,
         logs: Vec::new(),
+        attrs: Default::default(),
     });
     // SPAN_END：输出文本 + 状态 + 耗时 + 输出 token。
     out.push(WireRecord {
@@ -202,12 +207,17 @@ fn emit_span(
         output_tokens: if out_tok > 0 { Some(out_tok) } else { None },
         session_id: Some(session),
         tenant_id: None,
+        external_trace_id: None,
+        external_span_id: None,
+        external_parent_span_id: None,
+        external_session_id: None,
         agent_name: agent.map(str::to_string),
         tool_name: tool.map(str::to_string),
         model: Some(model.to_string()),
         input_text: None,
         output_text: output.map(str::to_string),
         logs: Vec::new(),
+        attrs: Default::default(),
     });
 }
 

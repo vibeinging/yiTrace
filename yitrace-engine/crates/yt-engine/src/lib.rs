@@ -54,7 +54,7 @@ mod vecindex_disk;
 pub use vecindex_disk::{DiskGraphConfig, DiskGraphIndex, DiskGraphStore, DurableGraphIndex};
 
 mod http;
-pub use http::HttpIngestServer;
+pub use http::{EngineJsonApi, HttpIngestServer};
 
 /// 编译期嵌入的控制台静态资源（build.rs 生成；console_dist/ 不存在则为空表）。
 pub mod assets {
@@ -85,37 +85,39 @@ pub enum SegLifecycle {
 ///
 /// 行式/内存源忽略投影（数据本就全在手边、没有列 I/O 可省）；只有列式段从中受益。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Projection(u16);
+pub struct Projection(u32);
 
 impl Projection {
-    pub const STATUS: u16 = 1 << 0;
-    pub const DURATION_NS: u16 = 1 << 1;
-    pub const PARENT_SPAN_ID: u16 = 1 << 2;
-    pub const INPUT_TOKENS: u16 = 1 << 3;
-    pub const OUTPUT_TOKENS: u16 = 1 << 4;
-    pub const SESSION_ID: u16 = 1 << 5;
-    pub const AGENT_NAME: u16 = 1 << 6;
-    pub const TOOL_NAME: u16 = 1 << 7;
-    pub const MODEL: u16 = 1 << 8;
-    pub const INPUT_TEXT: u16 = 1 << 9;
-    pub const OUTPUT_TEXT: u16 = 1 << 10;
-    pub const EVAL_SCORE: u16 = 1 << 11;
-    pub const EVAL_LABEL: u16 = 1 << 12;
-    pub const LOGS: u16 = 1 << 13;
-    pub const TENANT_ID: u16 = 1 << 14;
+    pub const STATUS: u32 = 1 << 0;
+    pub const DURATION_NS: u32 = 1 << 1;
+    pub const PARENT_SPAN_ID: u32 = 1 << 2;
+    pub const INPUT_TOKENS: u32 = 1 << 3;
+    pub const OUTPUT_TOKENS: u32 = 1 << 4;
+    pub const SESSION_ID: u32 = 1 << 5;
+    pub const AGENT_NAME: u32 = 1 << 6;
+    pub const TOOL_NAME: u32 = 1 << 7;
+    pub const MODEL: u32 = 1 << 8;
+    pub const INPUT_TEXT: u32 = 1 << 9;
+    pub const OUTPUT_TEXT: u32 = 1 << 10;
+    pub const EVAL_SCORE: u32 = 1 << 11;
+    pub const EVAL_LABEL: u32 = 1 << 12;
+    pub const LOGS: u32 = 1 << 13;
+    pub const TENANT_ID: u32 = 1 << 14;
+    pub const EXTERNAL_IDS: u32 = 1 << 15;
+    pub const ATTRS: u32 = 1 << 16;
 
-    const MASK: u16 = (1 << 15) - 1;
+    const MASK: u32 = (1 << 17) - 1;
 
     /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
     pub const ALL: Projection = Projection(Self::MASK);
 
     /// 选定若干列（位或）。如 `Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS)`。
-    pub const fn of(cols: u16) -> Self {
+    pub const fn of(cols: u32) -> Self {
         Projection(cols & Self::MASK)
     }
 
     /// 该投影是否要某列（传列常量）。
-    pub const fn has(self, col: u16) -> bool {
+    pub const fn has(self, col: u32) -> bool {
         self.0 & col != 0
     }
 
@@ -125,7 +127,7 @@ impl Projection {
     }
 
     /// 原始位（列式存储据此判断每列读不读）。
-    pub const fn bits(self) -> u16 {
+    pub const fn bits(self) -> u32 {
         self.0
     }
 }
@@ -346,6 +348,7 @@ impl TraceQuery {
 struct FilterAttrs {
     status: Option<u8>,
     agent_name: Option<String>,
+    attrs: BTreeMap<String, String>,
     min_ts: i64,
     max_ts: i64,
     /// 租户隔离维度（last-non-null）。
@@ -361,6 +364,8 @@ pub struct SearchFilter {
     pub status: Option<u8>,
     pub time_from: Option<i64>,
     pub time_to: Option<i64>,
+    /// attrs 精确过滤。当前只承诺 project_id / skill / mode / call_site 这组高频维度。
+    pub attrs: BTreeMap<String, String>,
     /// **租户隔离**：设了它，只返回该租户的 span。服务层须按鉴权身份对每个查询注入它。
     pub tenant_id: Option<u64>,
 }
@@ -372,6 +377,7 @@ impl SearchFilter {
             || self.status.is_some()
             || self.time_from.is_some()
             || self.time_to.is_some()
+            || !self.attrs.is_empty()
             || self.tenant_id.is_some()
     }
 
@@ -404,14 +410,24 @@ impl SearchFilter {
                 return false;
             }
         }
+        for (k, v) in &self.attrs {
+            if a.attrs.get(k) != Some(v) {
+                return false;
+            }
+        }
         true
     }
+}
+
+fn is_filter_attr_key(k: &str) -> bool {
+    matches!(k, "project_id" | "skill" | "mode" | "call_site")
 }
 
 /// 一条 trace 的摘要（web 控制台列表视图用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceSummary {
     pub trace_id: u64,
+    pub external_trace_id: Option<String>,
     pub span_count: usize,
     pub total_duration_ns: u64,
     pub max_duration_ns: u64,
@@ -531,6 +547,7 @@ pub struct SessionTimeline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleSession {
     pub session_id: u64,
+    pub external_session_id: Option<String>,
     pub title: String,
     pub turn_count: usize,
     pub input_tokens: u64,
@@ -544,6 +561,10 @@ pub struct ConsoleSession {
 pub struct ConsoleSpan {
     pub span_id: u64,
     pub parent_span_id: Option<u64>,
+    pub external_trace_id: Option<String>,
+    pub external_span_id: Option<String>,
+    pub external_parent_span_id: Option<String>,
+    pub external_session_id: Option<String>,
     pub kind: &'static str,
     pub name: String,
     pub start_ns: u64,
@@ -554,6 +575,7 @@ pub struct ConsoleSpan {
     pub model: Option<String>,
     pub input_text: Option<String>,
     pub output_text: Option<String>,
+    pub attrs: BTreeMap<String, String>,
 }
 
 /// 一个会话的摘要（多轮对话/agent 会话视图）。
@@ -731,12 +753,17 @@ pub struct WireRecord {
     pub output_tokens: Option<u64>,
     pub session_id: Option<u64>,
     pub tenant_id: Option<u64>,
+    pub external_trace_id: Option<String>,
+    pub external_span_id: Option<String>,
+    pub external_parent_span_id: Option<String>,
+    pub external_session_id: Option<String>,
     pub agent_name: Option<String>,
     pub tool_name: Option<String>,
     pub model: Option<String>,
     pub input_text: Option<String>,
     pub output_text: Option<String>,
     pub logs: Vec<String>,
+    pub attrs: BTreeMap<String, String>,
 }
 
 impl WireRecord {
@@ -758,6 +785,10 @@ impl WireRecord {
                 output_tokens: self.output_tokens,
                 session_id: self.session_id,
                 tenant_id: self.tenant_id,
+                external_trace_id: self.external_trace_id,
+                external_span_id: self.external_span_id,
+                external_parent_span_id: self.external_parent_span_id,
+                external_session_id: self.external_session_id,
                 agent_name: self.agent_name,
                 tool_name: self.tool_name,
                 model: self.model,
@@ -766,6 +797,7 @@ impl WireRecord {
                 eval_score: None,  // 分数由 scorer 事后算、走 upgrade 补写，不从线上摄入
                 eval_label: None,
                 logs: self.logs,
+                attrs: self.attrs,
             },
         }
     }
@@ -925,6 +957,7 @@ impl SegFoldCache {
 #[derive(Default, Clone)]
 struct SpanAgg {
     session: Option<u64>,
+    external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
     error: bool,
@@ -936,6 +969,7 @@ struct SpanAgg {
 #[derive(Default, Clone)]
 struct SessionAgg {
     traces: std::collections::HashSet<u64>,
+    external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
     error_spans: usize,
@@ -970,6 +1004,9 @@ impl SessionIndex {
         } else if let Some(s) = new.session {
             // 同会话：只动 token / error 差量。
             let e = self.sess.entry(s).or_default();
+            if e.external_session.is_none() {
+                e.external_session = new.external_session.clone();
+            }
             e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
             e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
             e.error_spans = (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
@@ -990,6 +1027,9 @@ impl SessionIndex {
         e.out_tok += s.out_tok;
         e.error_spans += s.error as usize;
         e.traces.insert(s.trace);
+        if e.external_session.is_none() {
+            e.external_session = s.external_session.clone();
+        }
         if !e.first_trace_set || s.trace < e.first_trace {
             e.first_trace = s.trace;
             e.first_trace_set = true;
@@ -1017,6 +1057,7 @@ impl SessionIndex {
         for s in spans {
             let sa = SpanAgg {
                 session: s.session_id,
+                external_session: s.external_session_id.clone(),
                 in_tok: s.input_tokens.unwrap_or(0),
                 out_tok: s.output_tokens.unwrap_or(0),
                 error: s.status.unwrap_or(0) != 0,
@@ -1045,6 +1086,7 @@ impl SessionIndex {
             .iter()
             .map(|(sid, a)| ConsoleSession {
                 session_id: *sid,
+                external_session_id: a.external_session.clone(),
                 title: if a.title.is_empty() { format!("会话 {sid}") } else { a.title.clone() },
                 turn_count: a.traces.len(),
                 input_tokens: a.in_tok,
@@ -1311,6 +1353,11 @@ impl WriteCoordinator {
         if r.fields.tenant_id.is_some() {
             a.tenant_id = r.fields.tenant_id;
         }
+        for (k, v) in &r.fields.attrs {
+            if is_filter_attr_key(k) {
+                a.attrs.insert(k.clone(), v.clone());
+            }
+        }
         a.min_ts = a.min_ts.min(r.ts);
         a.max_ts = a.max_ts.max(r.ts);
         drop(fa);
@@ -1322,6 +1369,9 @@ impl WriteCoordinator {
         new.trace = r.trace_id;
         if let Some(s) = r.fields.session_id {
             new.session = Some(s);
+        }
+        if let Some(s) = &r.fields.external_session_id {
+            new.external_session = Some(s.clone());
         }
         if let Some(t) = r.fields.input_tokens {
             new.in_tok = t;
@@ -1679,13 +1729,18 @@ impl WriteCoordinator {
     pub fn list_traces(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<TraceSummary> {
         // 只读 status/耗时/token —— 不碰大文本列。
         let proj = Projection::of(
-            Projection::STATUS | Projection::DURATION_NS | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+            Projection::STATUS
+                | Projection::DURATION_NS
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::EXTERNAL_IDS,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         let mut by_trace: BTreeMap<u64, TraceSummary> = BTreeMap::new();
         for s in spans {
             let e = by_trace.entry(s.trace_id).or_insert(TraceSummary {
                 trace_id: s.trace_id,
+                external_trace_id: s.external_trace_id.clone(),
                 span_count: 0,
                 total_duration_ns: 0,
                 max_duration_ns: 0,
@@ -1693,6 +1748,9 @@ impl WriteCoordinator {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
             });
+            if e.external_trace_id.is_none() {
+                e.external_trace_id = s.external_trace_id.clone();
+            }
             e.span_count += 1;
             if let Some(d) = s.duration_ns {
                 e.total_duration_ns += d;
@@ -1813,6 +1871,46 @@ impl WriteCoordinator {
         idx.rows()
     }
 
+    /// 控制台用：按租户和 attrs 过滤会话。
+    ///
+    /// 语义是“会话内至少一个 span 命中所有 attrs 条件”，返回该会话的完整聚合行。它不走
+    /// session_idx 快路径，因为 attrs 是 span 级属性；初版只给控制台/AgenticData 的精确筛选使用。
+    pub fn console_sessions_for_tenant_and_attrs(
+        &self,
+        snap: &Snapshot,
+        tenant: Option<u64>,
+        attrs: &BTreeMap<String, String>,
+    ) -> Vec<ConsoleSession> {
+        if attrs.is_empty() {
+            return self.console_sessions_for_tenant(snap, tenant);
+        }
+        let q = match tenant {
+            Some(t) => TraceQuery::all().for_tenant(t),
+            None => TraceQuery::all(),
+        };
+        let (spans, _) = self.read_spans_query(snap, &q);
+        let mut matching_sessions = std::collections::HashSet::new();
+        for s in &spans {
+            let Some(session_id) = s.session_id else {
+                continue;
+            };
+            if attrs.iter().all(|(k, v)| s.attrs.get(k) == Some(v)) {
+                matching_sessions.insert(session_id);
+            }
+        }
+        let filtered: Vec<FoldedSpan> = spans
+            .into_iter()
+            .filter(|s| {
+                s.session_id
+                    .map(|session_id| matching_sessions.contains(&session_id))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let mut idx = SessionIndex::default();
+        idx.rebuild(&filtered);
+        idx.rows()
+    }
+
     /// 控制台用：一条 trace 的折叠 span（瀑布）。引擎不存 span 的 kind/name/起始时刻，这里**派生**：
     /// kind = agent>tool>model>other；name = 同源；起始时刻按 span_id 升序累加 duration 顺排（逻辑瀑布）。
     pub fn console_trace_spans(&self, snap: &Snapshot, trace_id: u64) -> Vec<ConsoleSpan> {
@@ -1847,6 +1945,10 @@ impl WriteCoordinator {
                 let cs = ConsoleSpan {
                     span_id: s.span_id,
                     parent_span_id: s.parent_span_id,
+                    external_trace_id: s.external_trace_id.clone(),
+                    external_span_id: s.external_span_id.clone(),
+                    external_parent_span_id: s.external_parent_span_id.clone(),
+                    external_session_id: s.external_session_id.clone(),
                     kind,
                     name,
                     start_ns: start,
@@ -1857,6 +1959,7 @@ impl WriteCoordinator {
                     model: s.model.clone(),
                     input_text: s.input_text.clone(),
                     output_text: s.output_text.clone(),
+                    attrs: s.attrs.clone(),
                 };
                 start += dur;
                 cs
@@ -2754,7 +2857,7 @@ mod tests {
         rows: Mutex<std::collections::HashMap<u64, Vec<WalRecord>>>,
         pushdowns: std::sync::atomic::AtomicUsize,
         /// 最近一次任意下推（时间/投影）收到的投影位，供断言"聚合查询不要文本列"。
-        last_proj: std::sync::atomic::AtomicU16,
+        last_proj: std::sync::atomic::AtomicU32,
     }
     impl PushdownStore {
         fn last_proj(&self) -> Projection {
@@ -3659,12 +3762,17 @@ mod tests {
                 output_tokens: None,
                 session_id: None,
                 tenant_id: None,
+                external_trace_id: None,
+                external_span_id: None,
+                external_parent_span_id: None,
+                external_session_id: None,
                 agent_name: None,
                 tool_name: None,
                 model: None,
                 input_text: None,
                 output_text: None,
                 logs: vec!["交易风控 开始".into()],
+                attrs: Default::default(),
             },
             WireRecord {
                 trace_id: 1002,
@@ -3680,12 +3788,17 @@ mod tests {
                 output_tokens: Some(150),
                 session_id: None,
                 tenant_id: None,
+                external_trace_id: None,
+                external_span_id: None,
+                external_parent_span_id: None,
+                external_session_id: None,
                 agent_name: None,
                 tool_name: None,
                 model: None,
                 input_text: None,
                 output_text: None,
                 logs: vec!["疑似盗刷 已拦截".into()],
+                attrs: Default::default(),
             },
         ];
         wc.ingest_wire(wires);

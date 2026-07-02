@@ -19,6 +19,9 @@ use yt_core::event::{EventIdentity, EventType};
 use yt_core::fold::{FoldInput, SpanFields};
 use yt_core::ids::WalLsn;
 
+const BATCH_MAGIC_V2: u64 = 0x3254_4259_5741_4C59; // Versioned batch sentinel, distinct from realistic record counts.
+const SPAN_FIELDS_MAGIC_V2: u64 = 0x3244_4C46_5459_5954; // Versioned SpanFields sentinel for standalone upgrade payloads.
+
 /// 一条 WAL 记录 = 一个事件。
 #[derive(Clone)]
 pub struct WalRecord {
@@ -216,6 +219,10 @@ fn put_opt_str(b: &mut Vec<u8>, v: &Option<String>) {
         None => b.push(0),
     }
 }
+fn put_bytes(b: &mut Vec<u8>, bytes: &[u8]) {
+    put_u64(b, bytes.len() as u64);
+    b.extend_from_slice(bytes);
+}
 
 /// 把一批记录编码成自研二进制（定长 LE + 长度前缀字符串）。WAL 用它，**段落盘也复用同一套编码**
 /// （`FileSegmentStore`），避免两处各写一份记录序列化。
@@ -235,6 +242,8 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
 fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
+    put_u64(b, SPAN_FIELDS_MAGIC_V2);
+    put_u64(b, 2);
     put_opt_u8(b, f.status);
     put_opt_u64(b, f.duration_ns);
     put_opt_u64(b, f.parent_span_id);
@@ -242,6 +251,10 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_opt_u64(b, f.output_tokens);
     put_opt_u64(b, f.session_id);
     put_opt_u64(b, f.tenant_id);
+    put_opt_str(b, &f.external_trace_id);
+    put_opt_str(b, &f.external_span_id);
+    put_opt_str(b, &f.external_parent_span_id);
+    put_opt_str(b, &f.external_session_id);
     put_opt_str(b, &f.agent_name);
     put_opt_str(b, &f.tool_name);
     put_opt_str(b, &f.model);
@@ -253,9 +266,71 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     for l in &f.logs {
         put_str(b, l);
     }
+    put_u64(b, f.attrs.len() as u64);
+    for (k, v) in &f.attrs {
+        put_str(b, k);
+        put_str(b, v);
+    }
 }
 
-fn decode_span_fields_from(c: &mut Cur) -> Option<SpanFields> {
+fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
+    let ver = c.u64()?;
+    if ver != 2 {
+        return None;
+    }
+    let status = c.opt_u8()?;
+    let duration_ns = c.opt_u64()?;
+    let parent_span_id = c.opt_u64()?;
+    let input_tokens = c.opt_u64()?;
+    let output_tokens = c.opt_u64()?;
+    let session_id = c.opt_u64()?;
+    let tenant_id = c.opt_u64()?;
+    let external_trace_id = c.opt_str()?;
+    let external_span_id = c.opt_str()?;
+    let external_parent_span_id = c.opt_str()?;
+    let external_session_id = c.opt_str()?;
+    let agent_name = c.opt_str()?;
+    let tool_name = c.opt_str()?;
+    let model = c.opt_str()?;
+    let input_text = c.opt_str()?;
+    let output_text = c.opt_str()?;
+    let eval_score = c.opt_u64()?.map(|v| v as u32);
+    let eval_label = c.opt_str()?;
+    let log_n = c.u64()? as usize;
+    let mut logs = Vec::with_capacity(log_n);
+    for _ in 0..log_n {
+        logs.push(c.string()?);
+    }
+    let attr_n = c.u64()? as usize;
+    let mut attrs = std::collections::BTreeMap::new();
+    for _ in 0..attr_n {
+        attrs.insert(c.string()?, c.string()?);
+    }
+    Some(SpanFields {
+        status,
+        duration_ns,
+        parent_span_id,
+        input_tokens,
+        output_tokens,
+        session_id,
+        tenant_id,
+        external_trace_id,
+        external_span_id,
+        external_parent_span_id,
+        external_session_id,
+        agent_name,
+        tool_name,
+        model,
+        input_text,
+        output_text,
+        eval_score,
+        eval_label,
+        logs,
+        attrs,
+    })
+}
+
+fn decode_span_fields_legacy_from(c: &mut Cur) -> Option<SpanFields> {
     let status = c.opt_u8()?;
     let duration_ns = c.opt_u64()?;
     let parent_span_id = c.opt_u64()?;
@@ -291,6 +366,7 @@ fn decode_span_fields_from(c: &mut Cur) -> Option<SpanFields> {
         eval_score,
         eval_label,
         logs,
+        ..Default::default()
     })
 }
 
@@ -303,11 +379,19 @@ pub fn encode_span_fields(f: &SpanFields) -> Vec<u8> {
 
 /// `encode_span_fields` 的逆。
 pub fn decode_span_fields(bytes: &[u8]) -> Option<SpanFields> {
-    decode_span_fields_from(&mut Cur { b: bytes, i: 0 })
+    let mut c = Cur { b: bytes, i: 0 };
+    if c.peek_u64() == Some(SPAN_FIELDS_MAGIC_V2) {
+        c.u64()?;
+        decode_span_fields_v2_from(&mut c)
+    } else {
+        decode_span_fields_legacy_from(&mut c)
+    }
 }
 
 fn encode_batch(records: &[WalRecord]) -> Vec<u8> {
     let mut b = Vec::new();
+    put_u64(&mut b, BATCH_MAGIC_V2);
+    put_u64(&mut b, 2);
     put_u64(&mut b, records.len() as u64);
     for r in records {
         put_u64(&mut b, r.trace_id);
@@ -316,7 +400,8 @@ fn encode_batch(records: &[WalRecord]) -> Vec<u8> {
         put_str(&mut b, &r.identity.ext_span_id);
         put_u64(&mut b, r.identity.seq);
         b.push(r.identity.event_type.tag());
-        encode_span_fields_into(&mut b, &r.fields);
+        let fields = encode_span_fields(&r.fields);
+        put_bytes(&mut b, &fields);
     }
     b
 }
@@ -326,6 +411,11 @@ struct Cur<'a> {
     i: usize,
 }
 impl<'a> Cur<'a> {
+    fn peek_u64(&self) -> Option<u64> {
+        let e = self.i + 8;
+        let s = self.b.get(self.i..e)?;
+        Some(u64::from_le_bytes(s.try_into().ok()?))
+    }
     fn u64(&mut self) -> Option<u64> {
         let e = self.i + 8;
         let s = self.b.get(self.i..e)?;
@@ -343,6 +433,13 @@ impl<'a> Cur<'a> {
         let s = self.b.get(self.i..e)?;
         self.i = e;
         Some(String::from_utf8_lossy(s).into_owned())
+    }
+    fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u64()? as usize;
+        let e = self.i + n;
+        let s = self.b.get(self.i..e)?;
+        self.i = e;
+        Some(s)
     }
     fn opt_u64(&mut self) -> Option<Option<u64>> {
         if self.u8()? == 1 {
@@ -369,6 +466,18 @@ impl<'a> Cur<'a> {
 
 fn decode_batch(payload: &[u8]) -> Option<Vec<WalRecord>> {
     let mut c = Cur { b: payload, i: 0 };
+    let first = c.u64()?;
+    if first == BATCH_MAGIC_V2 {
+        return decode_batch_v2(&mut c);
+    }
+    decode_batch_legacy(&mut c, first as usize)
+}
+
+fn decode_batch_v2(c: &mut Cur) -> Option<Vec<WalRecord>> {
+    let ver = c.u64()?;
+    if ver != 2 {
+        return None;
+    }
     let n = c.u64()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -378,7 +487,28 @@ fn decode_batch(payload: &[u8]) -> Option<Vec<WalRecord>> {
         let ext = c.string()?;
         let seq = c.u64()?;
         let event_type = EventType::from_tag(c.u8()?);
-        let fields = decode_span_fields_from(&mut c)?;
+        let fields = decode_span_fields(c.bytes()?)?;
+        out.push(WalRecord {
+            trace_id,
+            span_id,
+            ts,
+            identity: EventIdentity { ext_span_id: ext, seq, event_type },
+            fields,
+        });
+    }
+    Some(out)
+}
+
+fn decode_batch_legacy(c: &mut Cur, n: usize) -> Option<Vec<WalRecord>> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let trace_id = c.u64()?;
+        let span_id = c.u64()?;
+        let ts = c.u64()? as i64;
+        let ext = c.string()?;
+        let seq = c.u64()?;
+        let event_type = EventType::from_tag(c.u8()?);
+        let fields = decode_span_fields_legacy_from(c)?;
         out.push(WalRecord {
             trace_id,
             span_id,
@@ -485,6 +615,28 @@ mod tests {
         assert_eq!(recs[0].1.fields.logs, vec!["日志1"]);
         assert_eq!(recs[1].1.identity.ext_span_id, "盗刷");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn span_fields_v2_roundtrips_external_ids_and_attrs() {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("project_id".to_string(), "\"agentic-data\"".to_string());
+        attrs.insert("retry".to_string(), "true".to_string());
+        let fields = SpanFields {
+            external_trace_id: Some("run-uuid".into()),
+            external_span_id: Some("span-uuid".into()),
+            external_session_id: Some("session-uuid".into()),
+            attrs,
+            logs: vec!["ok".into()],
+            ..Default::default()
+        };
+        let decoded = decode_span_fields(&encode_span_fields(&fields)).unwrap();
+        assert_eq!(decoded.external_trace_id.as_deref(), Some("run-uuid"));
+        assert_eq!(decoded.external_span_id.as_deref(), Some("span-uuid"));
+        assert_eq!(decoded.external_session_id.as_deref(), Some("session-uuid"));
+        assert_eq!(decoded.attrs.get("project_id").map(String::as_str), Some("\"agentic-data\""));
+        assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
+        assert_eq!(decoded.logs, vec!["ok"]);
     }
 
     #[test]

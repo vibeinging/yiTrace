@@ -80,6 +80,8 @@ export class HttpExporter implements Exporter {
   private headers: Record<string, string>;
   private onError: (err: unknown, dropped: number) => void;
   private buf: SpanEvent[] = [];
+  private sentEvents = 0;
+  private droppedEvents = 0;
 
   // 兼容老用法：传字符串当 url；或传选项对象配 max/maxBuffered/onError。
   constructor(
@@ -112,6 +114,18 @@ export class HttpExporter implements Exporter {
     return this.post(events);
   }
 
+  bufferedCount(): number {
+    return this.buf.length;
+  }
+
+  sentCount(): number {
+    return this.sentEvents;
+  }
+
+  droppedCount(): number {
+    return this.droppedEvents;
+  }
+
   flush(): Promise<void> {
     if (this.buf.length === 0) return Promise.resolve();
     const batch = this.buf;
@@ -128,6 +142,7 @@ export class HttpExporter implements Exporter {
         body: JSON.stringify(events.map(toWire)),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      this.sentEvents += events.length;
     } catch (err) {
       // 退回队首重试；超上限丢最老的并上报丢了多少。
       this.buf = events.concat(this.buf);
@@ -135,6 +150,7 @@ export class HttpExporter implements Exporter {
       if (this.buf.length > this.maxBuffered) {
         dropped = this.buf.length - this.maxBuffered;
         this.buf = this.buf.slice(dropped);
+        this.droppedEvents += dropped;
       }
       this.onError(err, dropped);
     }

@@ -14,11 +14,13 @@ venv/
 node_modules/
 dist/
 *.tsbuildinfo
+yitrace-node/artifacts/
 
 # C / 扩展构建产物（tracevault-extension）
 *.o
 *.so
 *.a
+*.node
 
 # 运行时/测试落盘产物（WAL / 段 / manifest / 向量文件，正常写在 temp_dir，这里兜底）
 *.wal

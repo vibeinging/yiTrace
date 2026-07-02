@@ -206,7 +206,7 @@ export class Tracer {
     this.exporter.export(e);
   }
 
-  close(): void {
-    this.exporter.close?.();
+  async close(): Promise<void> {
+    await this.exporter.close?.();
   }
 }

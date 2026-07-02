@@ -9,10 +9,12 @@
 //! 2. **Python 发数字、TS 发字符串**（BigInt.toString 避免 JS 精度丢失）→ 整数字段两种都接。
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::iter::Peekable;
 use std::str::Chars;
 
 use crate::WireRecord;
+use yt_core::event::fnv1a64;
 
 /// JSON 值。数字存原始字面量字符串（避免 f64 精度问题）。
 /// `pub(crate)` 是给 OTLP 适配器（`otlp.rs`）复用这套零依赖解析器。
@@ -72,6 +74,25 @@ impl Json {
             _ => &[],
         }
     }
+    pub(crate) fn to_compact_json(&self) -> String {
+        match self {
+            Json::Null => "null".to_string(),
+            Json::Bool(v) => v.to_string(),
+            Json::Num(s) => s.clone(),
+            Json::Str(s) => format!("\"{}\"", json_escape(s)),
+            Json::Arr(items) => format!(
+                "[{}]",
+                items.iter().map(Json::to_compact_json).collect::<Vec<_>>().join(",")
+            ),
+            Json::Obj(kvs) => format!(
+                "{{{}}}",
+                kvs.iter()
+                    .map(|(k, v)| format!("\"{}\":{}", json_escape(k), v.to_compact_json()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
 }
 
 /// 取字段（缺失或 null 都算 None）。
@@ -79,6 +100,53 @@ pub(crate) fn field<'a>(obj: &'a Json, key: &str) -> Option<&'a Json> {
     match obj.get(key) {
         Some(Json::Null) | None => None,
         Some(v) => Some(v),
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse_id_value(v: &Json) -> Option<(u64, Option<String>)> {
+    match v {
+        Json::Num(s) => s.parse::<u64>().ok().map(|id| (id, None)),
+        Json::Str(s) => match s.parse::<u64>() {
+            Ok(id) => Some((id, None)),
+            Err(_) => Some((fnv1a64(s.as_bytes()), Some(s.clone()))),
+        },
+        _ => None,
+    }
+}
+
+fn parse_req_id(obj: &Json, key: &str, i: usize) -> Result<(u64, Option<String>), String> {
+    field(obj, key)
+        .and_then(parse_id_value)
+        .ok_or_else(|| format!("第{i}条缺/坏字段 {key}"))
+}
+
+fn parse_opt_id(obj: &Json, key: &str) -> (Option<u64>, Option<String>) {
+    field(obj, key)
+        .and_then(parse_id_value)
+        .map(|(id, ext)| (Some(id), ext))
+        .unwrap_or((None, None))
+}
+
+fn attrs_map(v: Option<&Json>) -> BTreeMap<String, String> {
+    match v {
+        Some(Json::Obj(kvs)) => kvs.iter().map(|(k, v)| (k.clone(), v.to_compact_json())).collect(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -95,9 +163,13 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
         let req_i64 = |k: &str| field(obj, k).and_then(Json::as_i64).ok_or_else(|| format!("第{i}条缺/坏字段 {k}"));
         let opt_u64 = |k: &str| field(obj, k).and_then(Json::as_u64);
         let opt_str = |k: &str| field(obj, k).and_then(Json::as_str).map(|s| s.to_string());
+        let (trace_id, trace_ext_from_id) = parse_req_id(obj, "trace_id", i)?;
+        let (span_id, span_ext_from_id) = parse_req_id(obj, "span_id", i)?;
+        let (parent_span_id, parent_ext_from_id) = parse_opt_id(obj, "parent_span_id");
+        let (session_id, session_ext_from_id) = parse_opt_id(obj, "session_id");
         out.push(WireRecord {
-            trace_id: req_u64("trace_id")?,
-            span_id: req_u64("span_id")?,
+            trace_id,
+            span_id,
             ts: req_i64("ts")?,
             seq: req_u64("seq")?,
             event_type_tag: req_u64("event_type")? as u8,
@@ -105,19 +177,24 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
                 .and_then(Json::as_str)
                 .ok_or_else(|| format!("第{i}条缺 ext_span_id"))?
                 .to_string(),
-            parent_span_id: opt_u64("parent_span_id"),
+            parent_span_id,
             status: opt_u64("status").map(|v| v as u8),
             duration_ns: opt_u64("duration_ns"),
             input_tokens: opt_u64("input_tokens"),
             output_tokens: opt_u64("output_tokens"),
-            session_id: opt_u64("session_id"),
+            session_id,
             tenant_id: opt_u64("tenant_id"),
+            external_trace_id: opt_str("external_trace_id").or(trace_ext_from_id),
+            external_span_id: opt_str("external_span_id").or(span_ext_from_id),
+            external_parent_span_id: opt_str("external_parent_span_id").or(parent_ext_from_id),
+            external_session_id: opt_str("external_session_id").or(session_ext_from_id),
             agent_name: opt_str("agent_name"),
             tool_name: opt_str("tool_name"),
             model: opt_str("model"),
             input_text: opt_str("input_text"),
             output_text: opt_str("output_text"),
             logs: obj.get("logs").map(Json::as_str_array).unwrap_or_default(),
+            attrs: attrs_map(field(obj, "attrs")),
         });
     }
     Ok(out)
@@ -309,6 +386,24 @@ mod tests {
         assert_eq!(recs[0].parent_span_id, Some(5));
         assert_eq!(recs[0].duration_ns, Some(9000));
         assert_eq!(recs[0].input_tokens, Some(1200));
+    }
+
+    #[test]
+    fn hashes_external_ids_and_preserves_attrs() {
+        let body = r#"[{"trace_id":"run-uuid","span_id":"span-uuid","parent_span_id":"parent-uuid","session_id":"session-uuid","ts":100,"seq":1,"event_type":1,"ext_span_id":"span-uuid","attrs":{"external_run_id":"run-uuid","project_id":7,"nested":{"ok":true},"skill":"review"}}]"#;
+        let recs = parse_wire_batch(body).unwrap();
+        let r = &recs[0];
+        assert_eq!(r.trace_id, fnv1a64(b"run-uuid"));
+        assert_eq!(r.span_id, fnv1a64(b"span-uuid"));
+        assert_eq!(r.parent_span_id, Some(fnv1a64(b"parent-uuid")));
+        assert_eq!(r.session_id, Some(fnv1a64(b"session-uuid")));
+        assert_eq!(r.external_trace_id.as_deref(), Some("run-uuid"));
+        assert_eq!(r.external_span_id.as_deref(), Some("span-uuid"));
+        assert_eq!(r.external_parent_span_id.as_deref(), Some("parent-uuid"));
+        assert_eq!(r.external_session_id.as_deref(), Some("session-uuid"));
+        assert_eq!(r.attrs.get("external_run_id").map(String::as_str), Some("\"run-uuid\""));
+        assert_eq!(r.attrs.get("project_id").map(String::as_str), Some("7"));
+        assert_eq!(r.attrs.get("nested").map(String::as_str), Some("{\"ok\":true}"));
     }
 
     #[test]

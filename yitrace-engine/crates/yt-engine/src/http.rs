@@ -17,8 +17,17 @@ use std::thread;
 
 use crate::{parse_wire_batch, TraceQuery, WriteCoordinator};
 
-pub struct HttpIngestServer {
+/// 进程内 JSON API 边界。
+///
+/// 它复用 HTTP 的 path/body JSON 契约，但不负责 socket、鉴权头解析、body limit、gzip
+/// 或静态资源。HTTP server 和 Node/Electron N-API 都走这里，从而共享同一套路由语义。
+#[derive(Clone)]
+pub struct EngineJsonApi {
     coord: Arc<WriteCoordinator>,
+}
+
+pub struct HttpIngestServer {
+    api: EngineJsonApi,
     /// 鉴权 token。None = 不鉴权（仅限本机开发）。Some = 要求 `Authorization: Bearer <token>`。
     auth_token: Option<String>,
     /// 请求体上限（字节）。超了直接 413，**绝不按 Content-Length 预分配** —— 堵 OOM 拒绝服务。
@@ -27,7 +36,11 @@ pub struct HttpIngestServer {
 
 impl HttpIngestServer {
     pub fn new(coord: Arc<WriteCoordinator>) -> Self {
-        Self { coord, auth_token: None, max_body: 16 << 20 } // 默认 16 MiB
+        Self {
+            api: EngineJsonApi::new(coord),
+            auth_token: None,
+            max_body: 16 << 20,
+        } // 默认 16 MiB
     }
 
     /// 要求 Bearer token 鉴权（金融政企私有化最低门槛）。
@@ -91,7 +104,9 @@ impl HttpIngestServer {
     }
 
     fn handle(&self, mut stream: TcpStream) {
-        let Ok(clone) = stream.try_clone() else { return };
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
         let mut reader = BufReader::new(clone);
 
         let mut line = String::new();
@@ -159,14 +174,18 @@ impl HttpIngestServer {
         let body_bytes = match self.decode_body(encoding.as_deref(), body_buf) {
             Ok(b) => b,
             Err(code) => {
-                self.respond(&mut stream, code, r#"{"error":"bad or unsupported body encoding"}"#);
+                self.respond(
+                    &mut stream,
+                    code,
+                    r#"{"error":"bad or unsupported body encoding"}"#,
+                );
                 self.audit(&method, &path, code, content_length);
                 return;
             }
         };
         let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-        let (status, resp_body) = self.route_with_tenant(&method, &path, &body, tenant);
+        let (status, resp_body) = self.api.route_with_tenant(&method, &path, &body, tenant);
         self.respond(&mut stream, status, &resp_body);
         self.audit(&method, &path, status, content_length);
     }
@@ -256,13 +275,41 @@ impl HttpIngestServer {
         eprintln!("[AUDIT] {method} {path} -> {status} ({body_len}B)");
     }
 
-    /// 纯路由（无 socket，便于单测）。返回 (status, json_body)。
+    /// 兼容旧测试/调用方的路由入口。真实进程内 API 请优先使用 `EngineJsonApi`。
+    pub fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+        self.api.route(method, path, body)
+    }
+
+    /// 兼容旧测试/调用方的带租户路由入口。真实进程内 API 请优先使用 `EngineJsonApi`。
+    pub fn route_with_tenant(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        tenant: Option<u64>,
+    ) -> (u16, String) {
+        self.api.route_with_tenant(method, path, body, tenant)
+    }
+}
+
+impl EngineJsonApi {
+    pub fn new(coord: Arc<WriteCoordinator>) -> Self {
+        Self { coord }
+    }
+
+    /// 纯路由（无 socket，便于单测和嵌入式调用）。返回 (status, json_body)。
     pub fn route(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         self.route_with_tenant(method, path, body, None)
     }
 
-    /// 带租户上下文的路由（`tenant` 来自 X-Tenant-Id 头）：检索/列表端点据此强制隔离。
-    pub fn route_with_tenant(&self, method: &str, path: &str, body: &str, tenant: Option<u64>) -> (u16, String) {
+    /// 带租户上下文的进程内路由：检索/列表端点据此强制隔离。
+    pub fn route_with_tenant(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        tenant: Option<u64>,
+    ) -> (u16, String) {
         // 切掉查询串：精确路由按 base 匹配，查询参数（分页 cursor/limit）单独解析。
         let (base, query) = path.split_once('?').unwrap_or((path, ""));
         match (method, base) {
@@ -282,6 +329,8 @@ impl HttpIngestServer {
             ("GET", "/v1/traces") => (200, self.traces_json(tenant)),
             // 检索端点（产品差异化的出口）：中文 BM25 + 可选属性过滤(agent/状态/时间/trace) + 租户隔离。
             ("POST", "/v1/search") => self.search_json(body, tenant),
+            // 容器/编排系统探针：只表明进程和路由可用，不做深度数据一致性检查。
+            ("GET", "/v1/healthz") | ("GET", "/v1/readyz") => (200, r#"{"ok":true}"#.to_string()),
             // 生产可观测（§3.1）：Prometheus 文本格式，无需租户隔离（全局指标）。
             ("GET", "/v1/metrics") => (200, self.coord.metrics()),
             // 控制台数据端点（前端 yitrace-console 对接）：会话游标分页 / 轮次 / trace span / span 详情。
@@ -292,7 +341,11 @@ impl HttpIngestServer {
 
     /// 带路径参数的控制台路由（/v1/sessions/:id/turns 等）。
     fn route_console(&self, method: &str, base: &str, tenant: Option<u64>) -> (u16, String) {
-        let segs: Vec<&str> = base.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        let segs: Vec<&str> = base
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         match (method, segs.as_slice()) {
             ("GET", ["v1", "sessions", id, "turns"]) => self.turns_json(id, tenant),
             ("GET", ["v1", "traces", id]) => self.trace_json(id, tenant),
@@ -317,34 +370,42 @@ impl HttpIngestServer {
             .unwrap_or_default();
         let mut filter = crate::SearchFilter::default();
         if let Some(f) = field(&v, "filter") {
-            filter.trace_id = field(f, "trace_id").and_then(Json::as_u64);
-            filter.agent_name = field(f, "agent_name").and_then(Json::as_str).map(|s| s.to_string());
+            filter.trace_id = field(f, "trace_id").and_then(json_id_or_hash);
+            filter.agent_name = field(f, "agent_name")
+                .and_then(Json::as_str)
+                .map(|s| s.to_string());
             filter.status = field(f, "status").and_then(Json::as_u64).map(|x| x as u8);
             filter.time_from = field(f, "time_from").and_then(Json::as_i64);
             filter.time_to = field(f, "time_to").and_then(Json::as_i64);
+            collect_attr_filters(f, &mut filter);
         }
         // 租户来自鉴权头（X-Tenant-Id），覆盖请求体——客户端不能越权查别的租户。
         filter.tenant_id = tenant;
 
         let snap = self.coord.pin_snapshot();
         let hits = match (!text.is_empty(), !vector.is_empty()) {
-            (true, true) => self.coord.search_hybrid_attr(&snap, text, &vector, k, &filter), // 混合
-            (false, true) => self.coord.search_similar_attr(&snap, &vector, k, &filter),     // 找相似
-            _ => self.coord.search_text_attr(&snap, text, k, &filter),                       // 中文检索
+            (true, true) => self
+                .coord
+                .search_hybrid_attr(&snap, text, &vector, k, &filter), // 混合
+            (false, true) => self.coord.search_similar_attr(&snap, &vector, k, &filter), // 找相似
+            _ => self.coord.search_text_attr(&snap, text, k, &filter),                   // 中文检索
         };
         let items: Vec<String> = hits
             .iter()
             .map(|(s, score)| {
                 let logs: Vec<String> = s.logs.iter().map(|l| format!("\"{}\"", json_escape(l))).collect();
                 format!(
-                    r#"{{"trace_id":{},"span_id":{},"score":{:.4},"status":{},"duration_ns":{},"agent_name":{},"logs":[{}]}}"#,
+                    r#"{{"trace_id":{},"span_id":{},"external_trace_id":{},"external_span_id":{},"score":{:.4},"status":{},"duration_ns":{},"agent_name":{},"logs":[{}],"attrs":{}}}"#,
                     s.trace_id,
                     s.span_id,
+                    json_opt_str(s.external_trace_id.as_deref()),
+                    json_opt_str(s.external_span_id.as_deref()),
                     score,
                     s.status.map_or("null".to_string(), |x| x.to_string()),
                     s.duration_ns.map_or("null".to_string(), |x| x.to_string()),
                     s.agent_name.as_ref().map_or("null".to_string(), |a| format!("\"{}\"", json_escape(a))),
-                    logs.join(",")
+                    logs.join(","),
+                    json_attrs(&s.attrs),
                 )
             })
             .collect();
@@ -360,8 +421,9 @@ impl HttpIngestServer {
             .iter()
             .map(|t| {
                 format!(
-                    r#"{{"trace_id":{},"span_count":{},"total_duration_ns":{},"max_duration_ns":{},"error_count":{},"total_input_tokens":{},"total_output_tokens":{}}}"#,
+                    r#"{{"trace_id":{},"external_trace_id":{},"span_count":{},"total_duration_ns":{},"max_duration_ns":{},"error_count":{},"total_input_tokens":{},"total_output_tokens":{}}}"#,
                     t.trace_id,
+                    json_opt_str(t.external_trace_id.as_deref()),
                     t.span_count,
                     t.total_duration_ns,
                     t.max_duration_ns,
@@ -380,30 +442,51 @@ impl HttpIngestServer {
     /// `console_sessions` 走增量边车索引（摄入时 O(1) 维护），分页不全扫（见引擎实现）。
     fn sessions_page_json(&self, query: &str, tenant: Option<u64>) -> String {
         let (mut offset, mut limit, mut filter) = (0usize, 50usize, String::new());
+        let mut attr_filter = std::collections::BTreeMap::new();
         for kv in query.split('&') {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
                     "cursor" => offset = v.parse().unwrap_or(0),
                     "limit" => limit = v.parse().unwrap_or(50).clamp(1, 500),
                     "filter" => filter = url_decode(v),
+                    "attrs" => collect_attr_query_json(&url_decode(v), &mut attr_filter),
+                    "project_id" | "skill" | "mode" | "call_site" => {
+                        attr_filter.insert(k.to_string(), json_string_value(&url_decode(v)));
+                    }
+                    "projectId" => {
+                        attr_filter.insert("project_id".to_string(), json_string_value(&url_decode(v)));
+                    }
+                    "callSite" => {
+                        attr_filter.insert("call_site".to_string(), json_string_value(&url_decode(v)));
+                    }
                     _ => {}
                 }
             }
         }
         let snap = self.coord.pin_snapshot();
-        let mut all = self.coord.console_sessions_for_tenant(&snap, tenant);
+        let mut all = if attr_filter.is_empty() {
+            self.coord.console_sessions_for_tenant(&snap, tenant)
+        } else {
+            self.coord
+                .console_sessions_for_tenant_and_attrs(&snap, tenant, &attr_filter)
+        };
         if !filter.is_empty() {
             all.retain(|s| s.title.contains(&filter) || s.session_id.to_string().contains(&filter));
         }
         let total = all.len();
         let end = (offset + limit).min(total);
-        let page = if offset < total { &all[offset..end] } else { &[][..] };
+        let page = if offset < total {
+            &all[offset..end]
+        } else {
+            &[][..]
+        };
         let items: Vec<String> = page
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"sessionId":"{}","title":"{}","turnCount":{},"totalCost":{},"status":"{}","startedAt":{},"firstTraceId":"{}"}}"#,
+                    r#"{{"sessionId":"{}","externalSessionId":{},"title":"{}","turnCount":{},"totalCost":{},"status":"{}","startedAt":{},"firstTraceId":"{}"}}"#,
                     s.session_id,
+                    json_opt_str(s.external_session_id.as_deref()),
                     json_escape(&s.title),
                     s.turn_count,
                     cost_num(s.input_tokens, s.output_tokens),
@@ -413,13 +496,24 @@ impl HttpIngestServer {
                 )
             })
             .collect();
-        let next = if end < total { end.to_string() } else { "null".to_string() };
-        format!(r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#, items.join(","), next, total)
+        let next = if end < total {
+            end.to_string()
+        } else {
+            "null".to_string()
+        };
+        format!(
+            r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#,
+            items.join(","),
+            next,
+            total
+        )
     }
 
     /// GET /v1/sessions/:id/turns：一个会话的轮次（按时序）。
     fn turns_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
-        let Ok(sid) = id.parse::<u64>() else { return (400, r#"{"error":"bad session id"}"#.to_string()) };
+        let Some(sid) = parse_id_or_hash(id) else {
+            return (400, r#"{"error":"bad session id"}"#.to_string());
+        };
         let snap = self.coord.pin_snapshot();
         let mut q = TraceQuery::all();
         q.tenant_id = tenant;
@@ -452,14 +546,21 @@ impl HttpIngestServer {
 
     /// GET /v1/traces/:id：一条 trace 的折叠 span（瀑布）+ 摘要。
     fn trace_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
-        let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
+        let Some(tid) = parse_id_or_hash(id) else {
+            return (400, r#"{"error":"bad trace id"}"#.to_string());
+        };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
+        let spans = self
+            .coord
+            .console_trace_spans_for_tenant(&snap, tid, tenant);
         if spans.is_empty() {
             return (404, r#"{"error":"trace not found"}"#.to_string());
         }
         // 深度：顺父指针数（用 span_id→parent 映射 + 记忆化）。
-        let parent: std::collections::HashMap<u64, Option<u64>> = spans.iter().map(|s| (s.span_id, s.parent_span_id)).collect();
+        let parent: std::collections::HashMap<u64, Option<u64>> = spans
+            .iter()
+            .map(|s| (s.span_id, s.parent_span_id))
+            .collect();
         let depth_of = |mut id: u64| -> usize {
             let mut d = 0;
             while let Some(Some(p)) = parent.get(&id) {
@@ -472,16 +573,22 @@ impl HttpIngestServer {
             d
         };
         let total_dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
-        let (in_tok, out_tok): (u64, u64) = spans.iter().fold((0, 0), |(i, o), s| (i + s.input_tokens, o + s.output_tokens));
+        let (in_tok, out_tok): (u64, u64) = spans.iter().fold((0, 0), |(i, o), s| {
+            (i + s.input_tokens, o + s.output_tokens)
+        });
         let any_err = spans.iter().any(|s| s.has_error);
         let name = spans.first().map(|s| s.name.clone()).unwrap_or_default();
         let span_items: Vec<String> = spans
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"id":"{}","parentId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{}}}"#,
+                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{}}}"#,
                     s.span_id,
                     s.parent_span_id.map_or("null".to_string(), |p| format!("\"{p}\"")),
+                    json_opt_str(s.external_trace_id.as_deref()),
+                    json_opt_str(s.external_span_id.as_deref()),
+                    json_opt_str(s.external_parent_span_id.as_deref()),
+                    json_opt_str(s.external_session_id.as_deref()),
                     s.kind,
                     json_escape(&s.name),
                     s.start_ns / 1_000_000,
@@ -492,27 +599,40 @@ impl HttpIngestServer {
                     s.output_tokens,
                     s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
                     depth_of(s.span_id),
+                    json_attrs(&s.attrs),
                 )
             })
             .collect();
         let summary = format!(
-            r#"{{"traceId":"{}","name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
+            r#"{{"traceId":"{}","externalTraceId":{},"name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
             tid,
+            json_opt_str(spans.iter().find_map(|s| s.external_trace_id.as_deref())),
             json_escape(&name),
             total_dur_ms,
             cost_num(in_tok, out_tok),
             spans.len(),
             if any_err { "error" } else { "ok" },
         );
-        (200, format!(r#"{{"summary":{},"spans":[{}]}}"#, summary, span_items.join(",")))
+        (
+            200,
+            format!(
+                r#"{{"summary":{},"spans":[{}]}}"#,
+                summary,
+                span_items.join(",")
+            ),
+        )
     }
 
     /// GET /v1/traces/:id/steps：步骤流视图 —— 每个 span 连同输入/输出大文本一次给全。
     /// 与瀑布的晚物化相反：步骤流的本意就是看每一步的输入→输出，故在此端点物化。
     fn steps_json(&self, id: &str, tenant: Option<u64>) -> (u16, String) {
-        let Ok(tid) = id.parse::<u64>() else { return (400, r#"{"error":"bad trace id"}"#.to_string()) };
+        let Some(tid) = parse_id_or_hash(id) else {
+            return (400, r#"{"error":"bad trace id"}"#.to_string());
+        };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
+        let spans = self
+            .coord
+            .console_trace_spans_for_tenant(&snap, tid, tenant);
         if spans.is_empty() {
             return (404, r#"{"error":"trace not found"}"#.to_string());
         }
@@ -520,8 +640,10 @@ impl HttpIngestServer {
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"id":"{}","kind":"{}","name":"{}","status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{}}}"#,
+                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"kind":"{}","name":"{}","status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{},"attrs":{}}}"#,
                     s.span_id,
+                    json_opt_str(s.external_trace_id.as_deref()),
+                    json_opt_str(s.external_span_id.as_deref()),
                     s.kind,
                     json_escape(&s.name),
                     if s.has_error { "error" } else { "ok" },
@@ -531,6 +653,7 @@ impl HttpIngestServer {
                     s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
                     s.input_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
                     s.output_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    json_attrs(&s.attrs),
                 )
             })
             .collect();
@@ -539,19 +662,30 @@ impl HttpIngestServer {
 
     /// GET /v1/traces/:id/spans/:spanId：单个 span 的大字段（晚物化）。
     fn span_detail_json(&self, id: &str, span_id: &str, tenant: Option<u64>) -> (u16, String) {
-        let (Ok(tid), Ok(sid)) = (id.parse::<u64>(), span_id.parse::<u64>()) else {
+        let (Some(tid), Some(sid)) = (parse_id_or_hash(id), parse_id_or_hash(span_id)) else {
             return (400, r#"{"error":"bad id"}"#.to_string());
         };
         let snap = self.coord.pin_snapshot();
-        let spans = self.coord.console_trace_spans_for_tenant(&snap, tid, tenant);
+        let spans = self
+            .coord
+            .console_trace_spans_for_tenant(&snap, tid, tenant);
         match spans.into_iter().find(|s| s.span_id == sid) {
             Some(s) => (
                 200,
                 format!(
-                    r#"{{"id":"{}","input":{},"output":{}}}"#,
+                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"input":{},"output":{},"attrs":{}}}"#,
                     sid,
-                    s.input_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
-                    s.output_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    json_opt_str(s.external_trace_id.as_deref()),
+                    json_opt_str(s.external_span_id.as_deref()),
+                    json_opt_str(s.external_parent_span_id.as_deref()),
+                    json_opt_str(s.external_session_id.as_deref()),
+                    s.input_text
+                        .as_ref()
+                        .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    s.output_text
+                        .as_ref()
+                        .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
+                    json_attrs(&s.attrs),
                 ),
             ),
             None => (404, r#"{"error":"span not found"}"#.to_string()),
@@ -594,6 +728,75 @@ fn cost_num(in_tok: u64, out_tok: u64) -> String {
     format!("{:.3}", in_tok as f64 * 8e-7 + out_tok as f64 * 4e-6)
 }
 
+fn parse_id_or_hash(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.parse::<u64>().unwrap_or_else(|_| yt_core::event::fnv1a64(s.as_bytes())))
+    }
+}
+
+fn json_id_or_hash(v: &crate::wire::Json) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().map(|s| yt_core::event::fnv1a64(s.as_bytes())))
+}
+
+fn json_opt_str(s: Option<&str>) -> String {
+    s.map_or("null".to_string(), |v| format!("\"{}\"", json_escape(v)))
+}
+
+fn json_attrs(attrs: &std::collections::BTreeMap<String, String>) -> String {
+    if attrs.is_empty() {
+        return "{}".to_string();
+    }
+    format!(
+        "{{{}}}",
+        attrs
+            .iter()
+            .map(|(k, v)| format!("\"{}\":{}", json_escape(k), v))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn json_string_value(s: &str) -> String {
+    format!("\"{}\"", json_escape(s))
+}
+
+fn collect_attr_filters(f: &crate::wire::Json, filter: &mut crate::SearchFilter) {
+    use crate::wire::{field, Json};
+    for key in ["project_id", "skill", "mode", "call_site"] {
+        if let Some(v) = field(f, key) {
+            filter.attrs.insert(key.to_string(), v.to_compact_json());
+        }
+    }
+    for (alias, key) in [("projectId", "project_id"), ("callSite", "call_site")] {
+        if let Some(v) = field(f, alias) {
+            filter.attrs.insert(key.to_string(), v.to_compact_json());
+        }
+    }
+    if let Some(Json::Obj(kvs)) = field(f, "attrs") {
+        for (k, v) in kvs {
+            if matches!(k.as_str(), "project_id" | "skill" | "mode" | "call_site") {
+                filter.attrs.insert(k.clone(), v.to_compact_json());
+            }
+        }
+    }
+}
+
+fn collect_attr_query_json(s: &str, attrs: &mut std::collections::BTreeMap<String, String>) {
+    use crate::wire::Json;
+    let Ok(Json::Obj(kvs)) = crate::wire::parse(s) else {
+        return;
+    };
+    for (k, v) in kvs {
+        if matches!(k.as_str(), "project_id" | "skill" | "mode" | "call_site") {
+            attrs.insert(k, v.to_compact_json());
+        }
+    }
+}
+
 /// 截断长文本当标题（按字符，不切坏 UTF-8）。
 fn trunc(s: &str) -> String {
     let max = 40;
@@ -627,7 +830,9 @@ mod tests {
     use crate::InMemorySegmentStore;
 
     fn server() -> HttpIngestServer {
-        HttpIngestServer::new(WriteCoordinator::new(Arc::new(InMemorySegmentStore::default())))
+        HttpIngestServer::new(WriteCoordinator::new(Arc::new(
+            InMemorySegmentStore::default(),
+        )))
     }
 
     const BATCH: &str = r#"[
@@ -649,6 +854,51 @@ mod tests {
     }
 
     #[test]
+    fn route_ingest_accepts_external_ids_and_attrs() {
+        let s = server();
+        let batch = r#"[{
+          "trace_id":"run-uuid",
+          "span_id":"span-uuid",
+          "session_id":"session-uuid",
+          "ts":100,
+          "seq":1,
+          "event_type":2,
+          "ext_span_id":"span-uuid",
+          "status":0,
+          "duration_ns":50,
+          "agent_name":"risk",
+          "input_text":"疑似盗刷",
+          "attrs":{"external_run_id":"run-uuid","project_id":"agentic-data","skill":"review","mode":"auto","call_site":"worker.ts:10"}
+        }]"#;
+        let (status, body) = s.route("POST", "/v1/ingest", batch);
+        assert_eq!(status, 200, "{body}");
+
+        let (status, body) = s.route("GET", "/v1/traces/run-uuid", "");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""externalTraceId":"run-uuid""#), "{body}");
+        assert!(body.contains(r#""externalSpanId":"span-uuid""#), "{body}");
+        assert!(body.contains(r#""project_id":"agentic-data""#), "{body}");
+
+        let (status, body) = s.route("GET", "/v1/traces/run-uuid/spans/span-uuid", "");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""externalSpanId":"span-uuid""#), "{body}");
+        assert!(body.contains(r#""call_site":"worker.ts:10""#), "{body}");
+
+        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"trace_id":"run-uuid"}}"#);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""external_trace_id":"run-uuid""#), "{body}");
+        assert!(body.contains(r#""skill":"review""#), "{body}");
+
+        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"attrs":{"project_id":"agentic-data","skill":"review"}}}"#);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""external_trace_id":"run-uuid""#), "{body}");
+
+        let (status, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","filter":{"project_id":"agentic-data","skill":"other"}}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "[]");
+    }
+
+    #[test]
     fn route_metrics_reports_prometheus_format() {
         // §3.1：/v1/metrics 输出 Prometheus 文本格式，含关键运行态指标。
         let s = server();
@@ -660,16 +910,27 @@ mod tests {
         assert!(body.contains("# HELP "), "应有 HELP 注释:\n{body}");
         assert!(body.contains("# TYPE "), "应有 TYPE 注释:\n{body}");
         // 关键指标都在。
-        assert!(body.contains("yt_manifest_version"), "缺 manifest 版本:\n{body}");
+        assert!(
+            body.contains("yt_manifest_version"),
+            "缺 manifest 版本:\n{body}"
+        );
         assert!(body.contains("yt_memtable_rows"), "缺内存表行数:\n{body}");
         assert!(body.contains("yt_wal_committed_tail"), "缺 WAL 尾:\n{body}");
         assert!(body.contains("yt_segments_live"), "缺活跃段数:\n{body}");
         assert!(body.contains("yt_readers_active"), "缺活跃读者:\n{body}");
         // 灌过数据 → committed_tail > 0。
         assert!(
-            body.lines().any(|l| l.starts_with("yt_wal_committed_tail ") && !l.ends_with(" 0")),
+            body.lines()
+                .any(|l| l.starts_with("yt_wal_committed_tail ") && !l.ends_with(" 0")),
             "灌数据后 committed_tail 应 > 0:\n{body}"
         );
+    }
+
+    #[test]
+    fn route_health_and_ready_are_ok() {
+        let s = server();
+        assert_eq!(s.route("GET", "/v1/healthz", "").1, r#"{"ok":true}"#);
+        assert_eq!(s.route("GET", "/v1/readyz", "").1, r#"{"ok":true}"#);
     }
 
     #[test]
@@ -683,20 +944,37 @@ mod tests {
         let batch2 = r#"[
           {"trace_id":2,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"2-1","tenant_id":999,"duration_ns":20,"logs":["盗刷"]}
         ]"#;
-        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", batch1, Some(1)).0, 200);
-        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", batch2, Some(2)).0, 200);
+        assert_eq!(
+            s.route_with_tenant("POST", "/v1/ingest", batch1, Some(1)).0,
+            200
+        );
+        assert_eq!(
+            s.route_with_tenant("POST", "/v1/ingest", batch2, Some(2)).0,
+            200
+        );
 
         // 不带租户：两条都列。
         let all = s.route("GET", "/v1/traces", "").1;
         assert!(all.contains("\"trace_id\":1") && all.contains("\"trace_id\":2"));
         // 带租户 1：只见 trace 1。
         let t1 = s.route_with_tenant("GET", "/v1/traces", "", Some(1)).1;
-        assert!(t1.contains("\"trace_id\":1") && !t1.contains("\"trace_id\":2"), "列表按租户头隔离: {t1}");
+        assert!(
+            t1.contains("\"trace_id\":1") && !t1.contains("\"trace_id\":2"),
+            "列表按租户头隔离: {t1}"
+        );
         // 检索同样隔离：查"盗刷"租户 1 只回 trace 1。
-        let r1 = s.route_with_tenant("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#, Some(1)).1;
-        assert!(r1.contains("\"trace_id\":1") && !r1.contains("\"trace_id\":2"), "检索按租户头隔离: {r1}");
+        let r1 = s
+            .route_with_tenant("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#, Some(1))
+            .1;
+        assert!(
+            r1.contains("\"trace_id\":1") && !r1.contains("\"trace_id\":2"),
+            "检索按租户头隔离: {r1}"
+        );
         let spoofed = s.route_with_tenant("GET", "/v1/traces", "", Some(999)).1;
-        assert!(!spoofed.contains("\"trace_id\":"), "body tenant_id 不应生效: {spoofed}");
+        assert!(
+            !spoofed.contains("\"trace_id\":"),
+            "body tenant_id 不应生效: {spoofed}"
+        );
     }
 
     #[test]
@@ -715,8 +993,49 @@ mod tests {
 
         let (status, body) = s.route("GET", "/v1/traces", "");
         assert_eq!(status, 200);
-        assert!(body.contains("\"trace_id\":99"), "traceId 0x63=99 低位 {body}");
+        assert!(
+            body.contains("\"trace_id\":99"),
+            "traceId 0x63=99 低位 {body}"
+        );
         assert!(body.contains("\"total_input_tokens\":900"));
+    }
+
+    #[test]
+    fn route_otlp_tenant_header_overrides_body_tenant_attr() {
+        // OTLP body 里的 yitrace.tenant_id 只是普通输入属性；HTTP 安全边界仍是 X-Tenant-Id。
+        let s = server();
+        let otlp = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+            "traceId":"00000000000000000000000000000064","spanId":"0000000000000001",
+            "name":"chat","startTimeUnixNano":"100","endTimeUnixNano":"150",
+            "attributes":[
+              {"key":"yitrace.tenant_id","value":{"stringValue":"999"}},
+              {"key":"yitrace.session_id","value":{"stringValue":"777"}},
+              {"key":"input.value","value":{"stringValue":"租户隔离测试"}}
+            ]
+        }]}]}]}"#;
+        assert_eq!(
+            s.route_with_tenant("POST", "/v1/traces", otlp, Some(1)).0,
+            200
+        );
+
+        let t1 = s.route_with_tenant("GET", "/v1/traces", "", Some(1)).1;
+        assert!(
+            t1.contains("\"trace_id\":100"),
+            "租户头 1 应能看到 trace: {t1}"
+        );
+        let spoofed = s.route_with_tenant("GET", "/v1/traces", "", Some(999)).1;
+        assert!(
+            !spoofed.contains("\"trace_id\":100"),
+            "body tenant_id 不能越权: {spoofed}"
+        );
+
+        let sessions = s
+            .route_with_tenant("GET", "/v1/sessions?cursor=0&limit=50", "", Some(1))
+            .1;
+        assert!(
+            sessions.contains("\"sessionId\":\"777\""),
+            "yitrace.session_id 应进入控制台会话: {sessions}"
+        );
     }
 
     // 两条带 agent 的中文 span(走 wire 摄入 → 自动喂 BM25 + 属性边车)。
@@ -734,13 +1053,23 @@ mod tests {
         // 纯文本搜"盗刷":两条都命中。
         let (st, body) = s.route("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#);
         assert_eq!(st, 200, "{body}");
-        assert!(body.contains("\"trace_id\":1") && body.contains("\"trace_id\":2"), "{body}");
+        assert!(
+            body.contains("\"trace_id\":1") && body.contains("\"trace_id\":2"),
+            "{body}"
+        );
 
         // 加 agent 过滤:只剩风控那条。
-        let (st2, body2) = s.route("POST", "/v1/search", r#"{"text":"盗刷","k":10,"filter":{"agent_name":"风控"}}"#);
+        let (st2, body2) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"text":"盗刷","k":10,"filter":{"agent_name":"风控"}}"#,
+        );
         assert_eq!(st2, 200);
         assert!(body2.contains("\"trace_id\":1"), "{body2}");
-        assert!(!body2.contains("\"trace_id\":2"), "agent 过滤掉人工那条: {body2}");
+        assert!(
+            !body2.contains("\"trace_id\":2"),
+            "agent 过滤掉人工那条: {body2}"
+        );
         assert!(body2.contains("风控"), "响应带 agent 名");
 
         // 坏 body → 400。
@@ -750,25 +1079,43 @@ mod tests {
     #[test]
     fn route_search_vector_and_hybrid() {
         // 检索端点的向量 / 混合路:body 带 vector 走找相似,text+vector 走混合。
-        let s = server();
+        let coord = WriteCoordinator::new(Arc::new(InMemorySegmentStore::default()));
+        let s = HttpIngestServer::new(Arc::clone(&coord));
         assert_eq!(s.route("POST", "/v1/ingest", SEARCH_BATCH).0, 200);
-        s.coord.index_embedding(1, 10, vec![0.0, 0.0]); // 风控/盗刷,离 query 近
-        s.coord.index_embedding(2, 20, vec![5.0, 5.0]); // 人工,远
+        coord.index_embedding(1, 10, vec![0.0, 0.0]); // 风控/盗刷,离 query 近
+        coord.index_embedding(2, 20, vec![5.0, 5.0]); // 人工,远
 
         // 只给 vector → 找相似,最近的是 span(1,10)。
         let (st, body) = s.route("POST", "/v1/search", r#"{"vector":[0.1,0.1],"k":5}"#);
         assert_eq!(st, 200, "{body}");
-        assert!(body.contains("\"trace_id\":1"), "向量找相似命中近邻: {body}");
+        assert!(
+            body.contains("\"trace_id\":1"),
+            "向量找相似命中近邻: {body}"
+        );
 
         // text + vector → 混合(RRF):盗刷两条都关键词命中,(1,10) 又被向量命中 → 排更前。
-        let (st2, body2) = s.route("POST", "/v1/search", r#"{"text":"盗刷","vector":[0.1,0.1],"k":5}"#);
+        let (st2, body2) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"text":"盗刷","vector":[0.1,0.1],"k":5}"#,
+        );
         assert_eq!(st2, 200);
-        assert!(body2.starts_with("[{\"trace_id\":1"), "混合里双命中的 (1,10) 居首: {body2}");
+        assert!(
+            body2.starts_with("[{\"trace_id\":1"),
+            "混合里双命中的 (1,10) 居首: {body2}"
+        );
 
         // 向量 + agent 过滤:只剩风控那条。
-        let (st3, body3) = s.route("POST", "/v1/search", r#"{"vector":[0.1,0.1],"k":5,"filter":{"agent_name":"风控"}}"#);
+        let (st3, body3) = s.route(
+            "POST",
+            "/v1/search",
+            r#"{"vector":[0.1,0.1],"k":5,"filter":{"agent_name":"风控"}}"#,
+        );
         assert_eq!(st3, 200);
-        assert!(body3.contains("\"trace_id\":1") && !body3.contains("\"trace_id\":2"), "{body3}");
+        assert!(
+            body3.contains("\"trace_id\":1") && !body3.contains("\"trace_id\":2"),
+            "{body3}"
+        );
     }
 
     #[test]
@@ -776,7 +1123,7 @@ mod tests {
         // 控制台数据端点端到端：灌 1 个会话(2 轮) → 会话分页 → 轮次 → trace span → span 详情。
         let s = server();
         let batch = r#"[
-          {"trace_id":11,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"11-1","session_id":900,"agent_name":"风控研判","input_tokens":500,"input_text":"对账户A做研判"},
+          {"trace_id":11,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"11-1","session_id":900,"agent_name":"风控研判","input_tokens":500,"input_text":"对账户A做研判","attrs":{"project_id":"agentic-data","skill":"review","mode":"auto"}},
           {"trace_id":11,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"11-1","session_id":900,"status":0,"duration_ns":2000000,"output_tokens":120,"output_text":"触发规则R12"},
           {"trace_id":12,"span_id":1,"ts":3,"seq":1,"event_type":1,"ext_span_id":"12-1","session_id":900,"agent_name":"风控研判","input_tokens":300,"input_text":"继续核查"},
           {"trace_id":12,"span_id":1,"ts":4,"seq":2,"event_type":2,"ext_span_id":"12-1","session_id":900,"status":0,"duration_ns":1000000,"output_tokens":80}
@@ -792,17 +1139,37 @@ mod tests {
         assert!(body.contains("\"total\":1"), "{body}");
         assert!(body.contains("\"nextCursor\":null"), "{body}");
 
+        let (st_attr, body_attr) = s.route(
+            "GET",
+            "/v1/sessions?attrs=%7B%22project_id%22%3A%22agentic-data%22%2C%22skill%22%3A%22review%22%7D",
+            "",
+        );
+        assert_eq!(st_attr, 200, "{body_attr}");
+        assert!(body_attr.contains("\"sessionId\":\"900\""), "{body_attr}");
+        assert!(body_attr.contains("\"total\":1"), "{body_attr}");
+
+        let (st_miss, body_miss) = s.route("GET", "/v1/sessions?project_id=agentic-data&skill=other", "");
+        assert_eq!(st_miss, 200, "{body_miss}");
+        assert!(body_miss.contains("\"items\":[]"), "{body_miss}");
+        assert!(body_miss.contains("\"total\":0"), "{body_miss}");
+
         // 轮次：2 轮，首轮名取 input_text。
         let (st2, turns) = s.route("GET", "/v1/sessions/900/turns", "");
         assert_eq!(st2, 200, "{turns}");
-        assert!(turns.contains("\"turnIndex\":0") && turns.contains("\"turnIndex\":1"), "{turns}");
+        assert!(
+            turns.contains("\"turnIndex\":0") && turns.contains("\"turnIndex\":1"),
+            "{turns}"
+        );
         assert!(turns.contains("对账户A做研判"), "{turns}");
         assert!(turns.contains("\"durMs\":2"), "首轮 2ms: {turns}");
 
         // trace span：trace 11 有 span，kind=agent。
         let (st3, trace) = s.route("GET", "/v1/traces/11", "");
         assert_eq!(st3, 200, "{trace}");
-        assert!(trace.contains("\"kind\":\"agent\"") && trace.contains("风控研判"), "{trace}");
+        assert!(
+            trace.contains("\"kind\":\"agent\"") && trace.contains("风控研判"),
+            "{trace}"
+        );
         assert!(trace.contains("\"summary\""), "{trace}");
 
         // span 详情：晚物化大字段。
@@ -813,7 +1180,10 @@ mod tests {
         // 步骤流：带输入/输出文本一次给全。
         let (st5, steps) = s.route("GET", "/v1/traces/11/steps", "");
         assert_eq!(st5, 200, "{steps}");
-        assert!(steps.contains("对账户A做研判") && steps.contains("触发规则R12"), "{steps}");
+        assert!(
+            steps.contains("对账户A做研判") && steps.contains("触发规则R12"),
+            "{steps}"
+        );
 
         // 不存在的 trace → 404。
         assert_eq!(s.route("GET", "/v1/traces/999", "").0, 404);
@@ -831,33 +1201,66 @@ mod tests {
           {"trace_id":22,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"22-1","session_id":900,"tenant_id":999,"agent_name":"租户二","input_text":"租户二机密"},
           {"trace_id":22,"span_id":1,"ts":2,"seq":2,"event_type":2,"ext_span_id":"22-1","session_id":900,"tenant_id":999,"status":0,"duration_ns":2000000,"output_text":"租户二答案"}
         ]"#;
-        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", t1, Some(1)).0, 200);
-        assert_eq!(s.route_with_tenant("POST", "/v1/ingest", t2, Some(2)).0, 200);
+        assert_eq!(
+            s.route_with_tenant("POST", "/v1/ingest", t1, Some(1)).0,
+            200
+        );
+        assert_eq!(
+            s.route_with_tenant("POST", "/v1/ingest", t2, Some(2)).0,
+            200
+        );
 
-        let sessions1 = s.route_with_tenant("GET", "/v1/sessions?cursor=0&limit=50", "", Some(1)).1;
+        let sessions1 = s
+            .route_with_tenant("GET", "/v1/sessions?cursor=0&limit=50", "", Some(1))
+            .1;
         assert!(sessions1.contains("\"firstTraceId\":\"11\""), "{sessions1}");
-        assert!(!sessions1.contains("\"firstTraceId\":\"22\""), "{sessions1}");
+        assert!(
+            !sessions1.contains("\"firstTraceId\":\"22\""),
+            "{sessions1}"
+        );
 
-        let turns1 = s.route_with_tenant("GET", "/v1/sessions/900/turns", "", Some(1)).1;
-        assert!(turns1.contains("\"traceId\":\"11\"") && turns1.contains("租户一问题"), "{turns1}");
+        let turns1 = s
+            .route_with_tenant("GET", "/v1/sessions/900/turns", "", Some(1))
+            .1;
+        assert!(
+            turns1.contains("\"traceId\":\"11\"") && turns1.contains("租户一问题"),
+            "{turns1}"
+        );
         assert!(!turns1.contains("租户二机密"), "{turns1}");
 
         let (st_cross, body_cross) = s.route_with_tenant("GET", "/v1/traces/22", "", Some(1));
         assert_eq!(st_cross, 404, "tenant1 不能读 tenant2 trace: {body_cross}");
-        assert_eq!(s.route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(1)).0, 404);
-        assert_eq!(s.route_with_tenant("GET", "/v1/traces/22/steps", "", Some(1)).0, 404);
+        assert_eq!(
+            s.route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(1))
+                .0,
+            404
+        );
+        assert_eq!(
+            s.route_with_tenant("GET", "/v1/traces/22/steps", "", Some(1))
+                .0,
+            404
+        );
 
         let (st2, trace2) = s.route_with_tenant("GET", "/v1/traces/22", "", Some(2));
         assert_eq!(st2, 200, "{trace2}");
-        let detail2 = s.route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(2)).1;
-        assert!(detail2.contains("租户二答案") && !detail2.contains("租户一答案"), "{detail2}");
+        let detail2 = s
+            .route_with_tenant("GET", "/v1/traces/22/spans/1", "", Some(2))
+            .1;
+        assert!(
+            detail2.contains("租户二答案") && !detail2.contains("租户一答案"),
+            "{detail2}"
+        );
     }
 
     #[test]
     fn route_otlp_rejects_bad_body() {
         let s = server();
         assert_eq!(s.route("POST", "/v1/traces", "garbage").0, 400);
-        assert_eq!(s.route("POST", "/v1/traces", r#"{"foo":1}"#).0, 400, "缺 resourceSpans → 400");
+        assert_eq!(
+            s.route("POST", "/v1/traces", r#"{"foo":1}"#).0,
+            400,
+            "缺 resourceSpans → 400"
+        );
     }
 
     #[test]
@@ -900,7 +1303,8 @@ mod tests {
         let h = std::thread::spawn(move || s.serve_n(&listener, 2));
         // 无 token → 401
         let mut c = TcpStream::connect(addr).unwrap();
-        c.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        c.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let mut r = String::new();
         c.read_to_string(&mut r).unwrap();
         assert!(r.contains("401"), "{r}");
@@ -952,7 +1356,8 @@ mod tests {
         for _ in 0..8 {
             handles.push(std::thread::spawn(move || {
                 let mut c = TcpStream::connect(addr).unwrap();
-                c.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+                c.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
                 let mut r = String::new();
                 c.read_to_string(&mut r).unwrap();
                 assert!(r.contains("200 OK"), "{r}");
@@ -981,11 +1386,15 @@ mod tests {
         c.write_all(req.as_bytes()).unwrap();
         let mut resp = String::new();
         c.read_to_string(&mut resp).unwrap();
-        assert!(resp.contains("200 OK") && resp.contains("\"ingested\":2"), "{resp}");
+        assert!(
+            resp.contains("200 OK") && resp.contains("\"ingested\":2"),
+            "{resp}"
+        );
 
         // GET
         let mut c2 = TcpStream::connect(addr).unwrap();
-        c2.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        c2.write_all(b"GET /v1/traces HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let mut resp2 = String::new();
         c2.read_to_string(&mut resp2).unwrap();
         assert!(resp2.contains("\"trace_id\":7"), "{resp2}");

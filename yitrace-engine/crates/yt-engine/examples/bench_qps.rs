@@ -61,12 +61,17 @@ fn main() {
                 output_tokens: Some(20),
                 session_id: None,
                 tenant_id: None,
+                external_trace_id: None,
+                external_span_id: None,
+                external_parent_span_id: None,
+                external_session_id: None,
                 agent_name: Some("风控".into()),
                 tool_name: None,
                 model: None,
                 input_text: None,
                 output_text: Some(text),
                 logs: vec![],
+                attrs: Default::default(),
             });
             i += 1;
         }

@@ -1,0 +1,16 @@
+{
+  "name": "@yitrace/db-darwin-x64",
+  "version": "0.0.1",
+  "cpu": [
+    "x64"
+  ],
+  "main": "yitrace-db.darwin-x64.node",
+  "files": [
+    "yitrace-db.darwin-x64.node"
+  ],
+  "description": "Embedded yiTrace database for Node.js and Electron",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ]
+}

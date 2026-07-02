@@ -169,6 +169,73 @@ def test_http_exporter_sends_auth_and_tenant_headers():
     assert headers["x-tenant-id"] == "7"
 
 
+def test_http_exporter_buffers_failed_batches_and_retries():
+    from yitrace.event import SpanEvent  # noqa: E402
+    import urllib.request  # noqa: E402
+
+    calls = {"n": 0}
+    bodies = []
+    errors = []
+    old_urlopen = urllib.request.urlopen
+
+    class Resp:
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout):
+        calls["n"] += 1
+        bodies.append(req.data)
+        if calls["n"] == 1:
+            raise OSError("network down")
+        return Resp()
+
+    ev = SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                   event_type=EventType.SPAN_START, ext_span_id="s1", ts=1)
+    try:
+        urllib.request.urlopen = fake_urlopen
+        exp = HttpExporter("http://example.invalid/v1/ingest", max_batch=10, on_error=lambda err, dropped: errors.append((str(err), dropped)))
+        exp.export_batch([ev])
+        assert exp.buffered_count() == 1
+        assert errors == [("network down", 0)]
+        exp.flush()
+        assert exp.buffered_count() == 0
+        assert exp.sent_count() == 1
+        assert calls["n"] == 2
+        assert bodies[0] == bodies[1], "失败批次应原样重试"
+    finally:
+        urllib.request.urlopen = old_urlopen
+
+
+def test_http_exporter_caps_buffer_and_reports_dropped():
+    from yitrace.event import SpanEvent  # noqa: E402
+    import urllib.request  # noqa: E402
+
+    errors = []
+    old_urlopen = urllib.request.urlopen
+
+    def fake_urlopen(req, timeout):
+        raise OSError("still down")
+
+    def ev(i):
+        return SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                         event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i)
+
+    try:
+        urllib.request.urlopen = fake_urlopen
+        exp = HttpExporter(
+            "http://example.invalid/v1/ingest",
+            max_batch=10,
+            max_buffered=2,
+            on_error=lambda err, dropped: errors.append(dropped),
+        )
+        exp.export_batch([ev(1), ev(2), ev(3)])
+        assert exp.buffered_count() == 2
+        assert exp.dropped_count() == 1
+        assert errors == [1], "超过上限应丢最老事件并上报 dropped"
+    finally:
+        urllib.request.urlopen = old_urlopen
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

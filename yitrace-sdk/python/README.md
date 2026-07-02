@@ -1,11 +1,11 @@
 # yitrace SDK（Python）
 
-> 许可证:MIT。要求 Python ≥ 3.10。
+> 许可证:MIT。要求 Python ≥ 3.8。
 
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②）。
 
 ```
-python3 tests/test_sdk.py     # 4 个测试,含与引擎逐字节一致的 event_id 校验
+python3 tests/test_sdk.py     # 含与引擎逐字节一致的 event_id、失败缓冲、HTTP header 校验
 ```
 
 ## 用法
@@ -44,7 +44,7 @@ with tracer.trace("反洗钱筛查") as t:
 |---|---|
 | `event.py` | `EventType` / `event_id`（与引擎一致的 FNV）/ `SpanEvent`（对应引擎 WalRecord） |
 | `tracer.py` | `Tracer` / `Trace` / `Span` 打点 API（上下文管理器） |
-| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `BatchExporter`（攒批,留 HTTP 钩子） |
+| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `BatchExporter`（攒批）/ `HttpExporter`（批量 POST + 失败缓冲） |
 | `_snowflake.py` | 单调雪花 ID（trace/span id） |
 
 ## 发到引擎（跨进程已打通）
@@ -60,6 +60,13 @@ tr.close()  # flush → POST 到引擎摄入服务
 
 引擎侧 `cargo run -p yt-engine --example server` 起 HTTP 摄入服务即可接收；`curl localhost:7878/v1/traces` 查回。
 
+## 可靠上报语义
+
+- `HttpExporter` 失败时把整批退回缓冲队首，下次 `flush/close` 重试；`on_error(err, dropped)` 会暴露错误和超上限丢弃数。
+- `buffered_count()` / `sent_count()` / `dropped_count()` 可接监控。
+- 语义是 at-least-once：网络“已送达但响应丢失”会重发，同一事件由引擎按确定性 `event_id` 去重，token/成本不会翻倍。
+- 当前 `flush/close` 是同步阻塞调用；进程退出前调用 `tr.close()`。
+
 ## 还没做
 
-- 异步/批量后台发送(现在 `flush` 同步阻塞)、失败重试/落盘缓冲;采样;上下文跨进程传播(traceparent)。
+- 后台异步发送；采样；上下文跨进程传播(traceparent)；可选落盘缓冲。

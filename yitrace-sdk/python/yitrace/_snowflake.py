@@ -3,6 +3,8 @@
 id = 41 位毫秒时间戳 | 10 位节点 | 12 位序列  → 单调、可排序、跨进程不撞。
 调度层正确性硬前置:event_id 必须真单调(不能用 SEQUENCE CACHE),这里满足。
 """
+from __future__ import annotations
+
 import os
 import threading
 import time

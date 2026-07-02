@@ -41,6 +41,8 @@ yitrace-vecindex-graph/      # graph_index FFI（可选；引擎默认用自研�
 yitrace-sdk/                 # 打点 SDK
 │   ├── python/                  # yitrace 包（pyproject.toml 已配，纯标准库）
 │   └── typescript/              # @yitrace/trace-sdk（tsconfig + build 已配）
+yitrace-node/                # @yitrace/db：Node/Electron 嵌入式 DB（N-API，独立于 engine workspace）
+│   └── npm/                     # NAPI-RS optional platform packages（darwin/linux/win）
 yitrace-console/             # 控制台前端（React + Vite + TS，构建产物内嵌进引擎单二进制）
 docs/                        # 设计文档 / 现状索引 / 分析
 ```
@@ -84,6 +86,36 @@ cd yitrace-sdk/typescript && npm install && npm run build   # tsc 出 dist/
 npm test                                      # tsx 跑测试
 ```
 
+**Node / Electron 嵌入式 DB（`@yitrace/db`）：**
+
+```bash
+cd yitrace-node
+npm install
+npm run build       # 本机 N-API native binary，生成的 *.node 不入库
+npm test            # Node 集成测试：ingest/search/traces/sessions/reopen/tenant/lock
+```
+
+对外 npm 发布必须走 NAPI-RS optional platform package 流程，不能把只包含当前机器 `.node` 的 root 包发出去：
+
+```bash
+cd yitrace-node
+npm ci
+npm run npm:dirs
+npm run build:release -- --target x86_64-unknown-linux-gnu   # CI matrix 中按 target 分别跑
+npm run release:artifacts                                    # 把 artifacts/*.node 拷进 npm/*/
+npm run release:prepublish                                   # 只更新元信息；脚本禁止自动 publish optional 包
+npm run pack:check
+npm run pack:verify                                          # 干净 consumer 安装 tarball，验证 ESM/CJS/native
+
+# 先发布平台包，再发布 root 包
+npm publish npm/darwin-x64 --access public
+npm publish npm/darwin-arm64 --access public
+npm publish npm/linux-x64-gnu --access public
+npm publish npm/linux-arm64-gnu --access public
+npm publish npm/win32-x64-msvc --access public
+npm publish --access public
+```
+
 **前端：**
 
 ```bash
@@ -98,7 +130,9 @@ VITE_API=http npm run build                          # 构建对接真实引擎�
 - **Rust**：edition 2021，`#![allow(dead_code)]` 在骨架 crate 里是刻意的（接缝实现待替换）。模块用中文 doc-comment 解释"为什么这么设计"，改代码要延续这个习惯（写清意图，不只是 what）。
 - **零依赖**：要在 `yt-engine` 引入外部 crate，先想清楚能不能放进独立的外部 crate。引擎本体只 std。
 - **测试是承重的**：每个不变量都有"真会失败的测试"（崩溃重放、召回对标、确定性 event_id 跨语言对账）。改逻辑前先看相关测试，改完跑全量。
-- **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 包 `yitrace`，TS 包 `@yitrace/trace-sdk`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
+- **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 包 `yitrace`，TS 包 `@yitrace/trace-sdk`，嵌入式 DB 包 `@yitrace/db`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
+- **N-API 包隔离**：`yitrace-node/` 可以依赖 NAPI-RS；这些依赖不得进入 `yt-engine`。`@yitrace/db` 只通过 Rust engine API 打开数据目录，不允许 JS 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
+- **npm 发布**：`@yitrace/db` root 包只放 JS 入口（ESM + CommonJS）和类型声明；native binary 放在 `npm/*` 平台 optional packages。正式发布前必须跑 `npm run release:artifacts` + `npm run release:prepublish` + `npm run pack:check`，并先发布平台包再发布 root 包。
 - **提交信息**：纯净的中文/英文描述，首行简短，body 说清 what + why。不带 AI 工具名。
 
 ---
@@ -150,7 +184,7 @@ const tracer = new Tracer({ exporter: new HttpExporter("http://localhost:7878/v1
 | POST | `/v1/ingest` | 灌入 SDK 线格式 JSON 批（自定义高效格式） |
 | POST | `/v1/traces` | **OTLP/HTTP 标准端点**（生态入口，已埋点应用直接接） |
 | GET  | `/v1/traces` | trace 列表 |
-| POST | `/v1/search` | 中文检索 + 向量召回 + 混合，可带 `filter`（agent/状态/tenant/时间） |
+| POST | `/v1/search` | 中文检索 + 向量召回 + 混合，可带 `filter`（agent/状态/tenant/时间/attrs） |
 | GET  | `/v1/sessions` | 会话列表（游标分页） |
 | GET  | `/v1/sessions/:id/turns` | 一个会话的各轮 |
 | GET  | `/v1/traces/:id` | 一条 trace 的折叠 span（瀑布） |
@@ -159,9 +193,9 @@ const tracer = new Tracer({ exporter: new HttpExporter("http://localhost:7878/v1
 **检索示例：**
 
 ```bash
-# 中文 BM25 + 按 agent/状态过滤
+# 中文 BM25 + 按 agent/状态/attrs 过滤
 curl -XPOST localhost:7878/v1/search \
-  -d '{"text":"盗刷","k":10,"filter":{"agent_name":"风控","status":1}}'
+  -d '{"text":"盗刷","k":10,"filter":{"agent_name":"风控","status":1,"attrs":{"project_id":"agentic-data","skill":"review"}}}'
 
 # 纯向量找相似
 curl -XPOST localhost:7878/v1/search -d '{"vector":[0.1,0.2,...],"k":10}'
@@ -172,7 +206,35 @@ curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2,...]
 
 **多租户**：tenant 从 `X-Tenant-Id` 请求头取（非 body，客户端不能越权），`/v1/search` 与 `GET /v1/traces` 都按 tenant 隔离。
 
-### 5.4 控制台
+### 5.4 嵌入式 Node / Electron DB
+
+Node 后端或 Electron 应用不一定要启动 HTTP server。发布到 npm 后，用户可以直接安装：
+
+```bash
+npm install @yitrace/db
+```
+
+```typescript
+import { YiTraceDB, createSpanEventBuilder } from "@yitrace/db";
+
+const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
+const events = createSpanEventBuilder({
+  traceId: "run-uuid",
+  sessionId: "session-uuid",
+  attrs: { project_id: "agentic-data", skill: "review", mode: "auto", call_site: "worker.ts:10" },
+});
+events.startSpan({ spanId: "span-uuid", name: "风控研判", agentName: "风控 Agent" });
+events.log({ spanId: "span-uuid", message: "疑似盗刷" });
+events.endSpan({ spanId: "span-uuid", status: 0, durationNs: 12_000_000 });
+await events.ingest(db);
+
+const traces = await db.search({ text: "盗刷", k: 10, filter: { attrs: { project_id: "agentic-data", skill: "review" } } });
+await db.close();
+```
+
+这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` 支持 search 和 sessions 精确过滤，JSON value 会按 string/number/bool/null/array/object round-trip。Electron 应用应在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。一个 data dir 同时只允许一个写者，`.yitrace.lock` 会阻止多进程同时打开。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
+
+### 5.5 控制台
 
 服务起来后浏览器开 `http://127.0.0.1:7878/`——前端已内嵌进引擎单二进制。左栏会话列表、中栏多轮时间线 + 瀑布、右栏 Span 详情。
 
@@ -184,5 +246,6 @@ curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2,...]
 2. **不要在 `yt-engine` 加外部依赖**；要加重依赖，放进独立外部 crate。
 3. **改 event 编码 / 折叠逻辑 / 检索算子**，必须更新或新增对应测试（这些是承重不变量）。
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
-5. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
-6. **提交信息不带 AI 工具名**，写清 what + why。
+5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
+6. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
+7. **提交信息不带 AI 工具名**，写清 what + why。

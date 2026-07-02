@@ -22,7 +22,7 @@ cd yitrace-engine && cargo run -p yt-engine --example server
 ### 请求
 - 所有端点都在 `/v1/` 下。
 - 请求/响应都是 JSON（`Content-Type: application/json`）。
-- 路径参数 `:id` / `:spanId` 是数字（内部 trace_id / span_id 是 `u64`）。
+- 路径参数 `:id` / `:spanId` 可传内部数字 ID，也可传 direct ingest 时的外部字符串 ID（例如 UUID）。
 
 ### 鉴权
 - **不配 token（默认）**：所有请求放行。仅限本机开发。
@@ -45,7 +45,7 @@ cd yitrace-engine && cargo run -p yt-engine --example server
 | 码 | 含义 |
 |---|---|
 | 200 | 成功 |
-| 400 | 请求体非法（JSON 解析失败 / 缺字段 / id 不是数字） |
+| 400 | 请求体非法（JSON 解析失败 / 缺字段 / 非法数值字段） |
 | 401 | 鉴权失败（配了 token 但没带 / 不匹配） |
 | 404 | trace / span 不存在 |
 
@@ -75,52 +75,85 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 ```json
 [
   {
-    "trace_id": 7,
-    "span_id": 1,
+    "trace_id": "run-uuid",
+    "span_id": "span-uuid",
     "ts": 1,
     "seq": 1,
     "event_type": 1,
-    "ext_span_id": "7-1",
+    "ext_span_id": "span-uuid",
     "status": 0,
     "duration_ns": null,
     "input_tokens": 900,
     "output_tokens": null,
-    "session_id": null,
+    "session_id": "session-uuid",
     "tenant_id": null,
     "agent_name": "风控",
     "tool_name": null,
     "model": null,
     "input_text": null,
     "output_text": null,
-    "logs": ["开始"]
+    "logs": ["开始"],
+    "attrs": {
+      "external_run_id": "run-uuid",
+      "project_id": "agentic-data",
+      "skill": "review",
+      "mode": "auto",
+      "call_site": "worker.ts:10"
+    }
   }
 ]
 ```
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `trace_id` | u64 | trace 内部 id |
-| `span_id` | u64 | span 内部 id |
+| `trace_id` | u64 或 string | 数字会作为内部 id；UUID/字符串会稳定 hash 成内部 `u64`，原文保存在 `external_trace_id` |
+| `span_id` | u64 或 string | 数字会作为内部 id；UUID/字符串会稳定 hash 成内部 `u64`，原文保存在 `external_span_id` |
 | `ts` | i64 | 纳秒时间戳 |
 | `seq` | u32 | 同一 span 内的事件序号（去重键的一部分） |
 | `event_type` | u8 | **1=SpanStart，2=SpanEnd**，3+=属性补写/日志 |
 | `ext_span_id` | string | span 外部身份（去重键的一部分） |
-| `parent_span_id` | u64? | 父 span（建树） |
+| `parent_span_id` | u64 或 string? | 父 span（建树）；字符串原文保存在 `external_parent_span_id` |
 | `status` | u8? | 0=ok，非 0=error（SpanEnd 时给） |
 | `duration_ns` | u64? | 耗时纳秒（SpanEnd 时给） |
 | `input_tokens`/`output_tokens` | u64? | token 计数 |
-| `session_id`/`tenant_id` | u64? | 会话/租户归属 |
+| `session_id` | u64 或 string? | 会话归属；字符串原文保存在 `external_session_id` |
+| `tenant_id` | u64? | 租户归属；HTTP 服务会被 `X-Tenant-Id` 覆盖 |
 | `agent_name`/`tool_name`/`model` | string? | 标注 |
 | `input_text`/`output_text` | string? | 大文本（晚物化） |
 | `logs` | string[] | 日志行 |
+| `attrs` | object? | 原始/扩展属性；贯穿折叠、WAL/segment/manifest 和查询输出，同 key 后到覆盖 |
 
 **响应**：`200 {"ingested":N}`（N=实际灌入条数）。
 
 > **去重**：`event_id = hash(ext_span_id, seq, event_type)`，内容决定身份——重传/崩溃重放天然幂等，token/成本不重复计数。
 
+**attrs round-trip 契约**：
+
+- `attrs` 必须是 JSON object。
+- value 可为 string / number / bool / null / array / object。
+- yiTrace 会校验并保存 value 的 JSON 字面量；search、trace、span detail 返回时恢复成相同 JSON 形态。
+- 同一 span 多个事件写同一个 attr key 时，后到事件覆盖先到事件。
+- 当前只承诺 `project_id`、`skill`、`mode`、`call_site` 四个 attrs 进入过滤 sidecar；其他 attrs 会持久化并返回，但不保证可过滤。
+
 ### POST /v1/traces  —— OTLP/HTTP 标准端点（生态入口 / 原始 API）
 
 **已埋点 OTLP/OpenInference 的应用不改一行即可灌入**（OTel GenAI `gen_ai.*`、Arize `llm.*`）。请求体是标准 OTLP/HTTP JSON（`{"resourceSpans":[...]}`）。非法/缺字段返回 400。
+
+常用属性映射：
+
+| OTLP / OpenInference 属性 | yiTrace 字段 |
+|---|---|
+| `gen_ai.request.model` / `gen_ai.response.model` / `llm.model_name` | `model` |
+| `gen_ai.usage.input_tokens` / `gen_ai.usage.prompt_tokens` / `llm.token_count.prompt` | `input_tokens` |
+| `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens` / `llm.token_count.completion` | `output_tokens` |
+| `gen_ai.agent.name` / `agent.name` | `agent_name` |
+| `gen_ai.tool.name` / `tool.name` | `tool_name` |
+| `input.value` / `gen_ai.prompt` | `input_text` |
+| `output.value` / `gen_ai.completion` | `output_text` |
+| `yitrace.session_id` / `session.id` / `gen_ai.conversation.id` / `session_id` | `session_id` |
+| `yitrace.tenant_id` / `tenant.id` / `tenant_id` | direct ingest 的 `tenant_id`；HTTP 摄入仍由 `X-Tenant-Id` 覆盖 |
+
+> `user.id` 只应作为业务属性处理，不会被当作 tenant。HTTP 多租户边界只认 `X-Tenant-Id`。
 
 ---
 
@@ -148,6 +181,10 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
 
+### GET /v1/healthz / GET /v1/readyz  —— 进程探针
+
+返回 `{"ok":true}`。用于 Docker Compose / Kubernetes / 反向代理健康检查，只表示 HTTP 服务可路由，不做深度数据一致性扫描。
+
 ---
 
 ## 检索
@@ -174,7 +211,13 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "agent_name": "风控",
     "status": 1,
     "time_from": 1000,
-    "time_to": 5000
+    "time_to": 5000,
+    "attrs": {
+      "project_id": "agentic-data",
+      "skill": "review",
+      "mode": "auto",
+      "call_site": "worker.ts:10"
+    }
   }
 }
 ```
@@ -188,20 +231,34 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `filter.agent_name` | string? | 否 | 限定 agent |
 | `filter.status` | u8? | 否 | 限定状态（0=ok，非 0=error） |
 | `filter.time_from`/`time_to` | i64? | 否 | 时间窗（纳秒） |
+| `filter.project_id` / `filter.projectId` | JSON value? | 否 | 精确匹配 attrs.project_id |
+| `filter.skill` | JSON value? | 否 | 精确匹配 attrs.skill |
+| `filter.mode` | JSON value? | 否 | 精确匹配 attrs.mode |
+| `filter.call_site` / `filter.callSite` | JSON value? | 否 | 精确匹配 attrs.call_site |
+| `filter.attrs.project_id` / `skill` / `mode` / `call_site` | JSON value? | 否 | 与上面字段等价，适合统一传 attrs filter |
 
 > `filter.tenant_id` **不能在请求体里指定**——强制取 `X-Tenant-Id` 头。
+> attrs 过滤是精确匹配，比较的是规范化 JSON 字面量：字符串匹配字符串，数字匹配数字，布尔匹配布尔，`null` 匹配 null。
 
 **响应**：JSON 数组（按 score 降序），每条命中：
 
 ```json
 {
   "trace_id": 7,
+  "external_trace_id": "run-uuid",
   "span_id": 1,
+  "external_span_id": "span-uuid",
   "score": 3.2720,
   "status": 0,
   "duration_ns": 4200000,
   "agent_name": "风控研判",
-  "logs": ["研判结论 ..."]
+  "logs": ["研判结论 ..."],
+  "attrs": {
+    "project_id": "agentic-data",
+    "skill": "review",
+    "mode": "auto",
+    "call_site": "worker.ts:10"
+  }
 }
 ```
 
@@ -220,6 +277,10 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `cursor` | usize | 0 | offset 游标（上一页 `nextCursor` 透传） |
 | `limit` | usize | 50 | 页大小（clamp 1–500） |
 | `filter` | string | 空 | 按标题 / sessionId 子串过滤（URL 编码，支持中文） |
+| `attrs` | JSON object string | 空 | URL 编码后的 attrs 精确过滤，如 `{"project_id":"agentic-data","skill":"review"}` |
+| `project_id` / `skill` / `mode` / `call_site` | string | 空 | attrs 字符串精确过滤的便捷查询参数 |
+
+attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回该会话，返回值仍是完整 session 聚合行。
 
 **响应**：
 
