@@ -402,6 +402,18 @@ pub mod fold {
         pub input_tokens: Option<u64>,
         /// LLM 输出 token（last-non-null）。
         pub output_tokens: Option<u64>,
+        /// 命中 provider cache 的输入 token（last-non-null）。用于成本归因；是否折扣由上层定价表决定。
+        pub cached_input_tokens: Option<u64>,
+        /// 推理/思考 token（last-non-null）。部分模型把它并入 output_tokens，接入方也可显式传入。
+        pub reasoning_tokens: Option<u64>,
+        /// 上游已给出的总 token（last-non-null）。缺失时展示层按 input+output+cached+reasoning 派生。
+        pub total_tokens: Option<u64>,
+        /// 上游显式成本，单位 USD nano（1e-9 USD）。不用浮点落盘，避免跨平台不可复算。
+        pub cost_usd_nanos: Option<u64>,
+        /// 成本币种，默认 USD。先保留字段，后续多币种报价可直接接入。
+        pub cost_currency: Option<String>,
+        /// 模型供应商 / 系统，例如 openai、anthropic、qwen。last-non-null。
+        pub provider: Option<String>,
         /// 会话 id（多轮对话/agent 会话；同一 session 串起多条 trace）。last-non-null。
         pub session_id: Option<u64>,
         /// 租户 id（**逻辑隔离维度**）：多租户共享一套索引，靠每个查询强制带 tenant 过滤隔离。
@@ -415,6 +427,28 @@ pub mod fold {
         pub external_parent_span_id: Option<String>,
         /// 外部 session id 原文。AgenticData 等系统使用 UUID 时不会只剩 hash。
         pub external_session_id: Option<String>,
+        /// Agent/产品侧的稳定项目维度。保存 compact JSON 字面量（例如 `"agentic-data"` 或 `7`），与 attrs round-trip 同口径。
+        pub project_id: Option<String>,
+        /// Agent/技能维度。保存 compact JSON 字面量，作为高频过滤和聚合的一等列。
+        pub skill: Option<String>,
+        /// 执行模式维度。保存 compact JSON 字面量，作为高频过滤和聚合的一等列。
+        pub mode: Option<String>,
+        /// 调用点/代码位置维度。保存 compact JSON 字面量，作为高频过滤和聚合的一等列。
+        pub call_site: Option<String>,
+        /// 同类任务聚合 key。保存 compact JSON 字面量，用于 task group / golden path / loop health。
+        pub task_fingerprint: Option<String>,
+        /// 一次 agent loop 运行 id。保存 compact JSON 字面量，用于 loop 级读模型。
+        pub loop_id: Option<String>,
+        /// workflow / prompt / harness 版本。保存 compact JSON 字面量，用于回归和对比。
+        pub harness_version: Option<String>,
+        /// 验证结果。保存 compact JSON 字面量，例如 `"pass"` / `"fail"`。
+        pub validation_status: Option<String>,
+        /// loop 停止原因。保存 compact JSON 字面量，例如 `"goal_met"` / `"budget_exceeded"`。
+        pub stop_reason: Option<String>,
+        /// agent loop 阶段。保存 compact JSON 字面量，例如 `"plan"` / `"act"` / `"verify"`。
+        pub phase: Option<String>,
+        /// 验证器名称。保存 compact JSON 字面量，例如 `"npm test"` / `"human_review"`。
+        pub validator: Option<String>,
         /// agent 名（成本/可观测按 agent 下钻）。last-non-null。
         pub agent_name: Option<String>,
         /// 工具名（tool/function call span）。last-non-null。
@@ -456,6 +490,24 @@ pub mod fold {
             if other.output_tokens.is_some() {
                 self.output_tokens = other.output_tokens;
             }
+            if other.cached_input_tokens.is_some() {
+                self.cached_input_tokens = other.cached_input_tokens;
+            }
+            if other.reasoning_tokens.is_some() {
+                self.reasoning_tokens = other.reasoning_tokens;
+            }
+            if other.total_tokens.is_some() {
+                self.total_tokens = other.total_tokens;
+            }
+            if other.cost_usd_nanos.is_some() {
+                self.cost_usd_nanos = other.cost_usd_nanos;
+            }
+            if other.cost_currency.is_some() {
+                self.cost_currency = other.cost_currency.clone();
+            }
+            if other.provider.is_some() {
+                self.provider = other.provider.clone();
+            }
             if other.session_id.is_some() {
                 self.session_id = other.session_id;
             }
@@ -473,6 +525,71 @@ pub mod fold {
             }
             if other.external_session_id.is_some() {
                 self.external_session_id = other.external_session_id.clone();
+            }
+            if let Some(v) = other
+                .project_id
+                .as_ref()
+                .or_else(|| other.attrs.get("project_id"))
+            {
+                self.project_id = Some(v.clone());
+            }
+            if let Some(v) = other.skill.as_ref().or_else(|| other.attrs.get("skill")) {
+                self.skill = Some(v.clone());
+            }
+            if let Some(v) = other.mode.as_ref().or_else(|| other.attrs.get("mode")) {
+                self.mode = Some(v.clone());
+            }
+            if let Some(v) = other
+                .call_site
+                .as_ref()
+                .or_else(|| other.attrs.get("call_site"))
+            {
+                self.call_site = Some(v.clone());
+            }
+            if let Some(v) = other
+                .task_fingerprint
+                .as_ref()
+                .or_else(|| other.attrs.get("task_fingerprint"))
+            {
+                self.task_fingerprint = Some(v.clone());
+            }
+            if let Some(v) = other
+                .loop_id
+                .as_ref()
+                .or_else(|| other.attrs.get("loop_id"))
+            {
+                self.loop_id = Some(v.clone());
+            }
+            if let Some(v) = other
+                .harness_version
+                .as_ref()
+                .or_else(|| other.attrs.get("harness_version"))
+            {
+                self.harness_version = Some(v.clone());
+            }
+            if let Some(v) = other
+                .validation_status
+                .as_ref()
+                .or_else(|| other.attrs.get("validation_status"))
+            {
+                self.validation_status = Some(v.clone());
+            }
+            if let Some(v) = other
+                .stop_reason
+                .as_ref()
+                .or_else(|| other.attrs.get("stop_reason"))
+            {
+                self.stop_reason = Some(v.clone());
+            }
+            if let Some(v) = other.phase.as_ref().or_else(|| other.attrs.get("phase")) {
+                self.phase = Some(v.clone());
+            }
+            if let Some(v) = other
+                .validator
+                .as_ref()
+                .or_else(|| other.attrs.get("validator"))
+            {
+                self.validator = Some(v.clone());
             }
             if other.agent_name.is_some() {
                 self.agent_name = other.agent_name.clone();
@@ -526,12 +643,29 @@ pub mod fold {
         pub duration_ns: Option<u64>,
         pub input_tokens: Option<u64>,
         pub output_tokens: Option<u64>,
+        pub cached_input_tokens: Option<u64>,
+        pub reasoning_tokens: Option<u64>,
+        pub total_tokens: Option<u64>,
+        pub cost_usd_nanos: Option<u64>,
+        pub cost_currency: Option<String>,
+        pub provider: Option<String>,
         pub session_id: Option<u64>,
         pub tenant_id: Option<u64>,
         pub external_trace_id: Option<String>,
         pub external_span_id: Option<String>,
         pub external_parent_span_id: Option<String>,
         pub external_session_id: Option<String>,
+        pub project_id: Option<String>,
+        pub skill: Option<String>,
+        pub mode: Option<String>,
+        pub call_site: Option<String>,
+        pub task_fingerprint: Option<String>,
+        pub loop_id: Option<String>,
+        pub harness_version: Option<String>,
+        pub validation_status: Option<String>,
+        pub stop_reason: Option<String>,
+        pub phase: Option<String>,
+        pub validator: Option<String>,
         pub agent_name: Option<String>,
         pub tool_name: Option<String>,
         pub model: Option<String>,
@@ -564,6 +698,24 @@ pub mod fold {
             if p.output_tokens.is_some() {
                 self.output_tokens = p.output_tokens;
             }
+            if p.cached_input_tokens.is_some() {
+                self.cached_input_tokens = p.cached_input_tokens;
+            }
+            if p.reasoning_tokens.is_some() {
+                self.reasoning_tokens = p.reasoning_tokens;
+            }
+            if p.total_tokens.is_some() {
+                self.total_tokens = p.total_tokens;
+            }
+            if p.cost_usd_nanos.is_some() {
+                self.cost_usd_nanos = p.cost_usd_nanos;
+            }
+            if p.cost_currency.is_some() {
+                self.cost_currency = p.cost_currency.clone();
+            }
+            if p.provider.is_some() {
+                self.provider = p.provider.clone();
+            }
             if p.session_id.is_some() {
                 self.session_id = p.session_id;
             }
@@ -581,6 +733,55 @@ pub mod fold {
             }
             if p.external_session_id.is_some() {
                 self.external_session_id = p.external_session_id.clone();
+            }
+            if let Some(v) = p.project_id.as_ref().or_else(|| p.attrs.get("project_id")) {
+                self.project_id = Some(v.clone());
+            }
+            if let Some(v) = p.skill.as_ref().or_else(|| p.attrs.get("skill")) {
+                self.skill = Some(v.clone());
+            }
+            if let Some(v) = p.mode.as_ref().or_else(|| p.attrs.get("mode")) {
+                self.mode = Some(v.clone());
+            }
+            if let Some(v) = p.call_site.as_ref().or_else(|| p.attrs.get("call_site")) {
+                self.call_site = Some(v.clone());
+            }
+            if let Some(v) = p
+                .task_fingerprint
+                .as_ref()
+                .or_else(|| p.attrs.get("task_fingerprint"))
+            {
+                self.task_fingerprint = Some(v.clone());
+            }
+            if let Some(v) = p.loop_id.as_ref().or_else(|| p.attrs.get("loop_id")) {
+                self.loop_id = Some(v.clone());
+            }
+            if let Some(v) = p
+                .harness_version
+                .as_ref()
+                .or_else(|| p.attrs.get("harness_version"))
+            {
+                self.harness_version = Some(v.clone());
+            }
+            if let Some(v) = p
+                .validation_status
+                .as_ref()
+                .or_else(|| p.attrs.get("validation_status"))
+            {
+                self.validation_status = Some(v.clone());
+            }
+            if let Some(v) = p
+                .stop_reason
+                .as_ref()
+                .or_else(|| p.attrs.get("stop_reason"))
+            {
+                self.stop_reason = Some(v.clone());
+            }
+            if let Some(v) = p.phase.as_ref().or_else(|| p.attrs.get("phase")) {
+                self.phase = Some(v.clone());
+            }
+            if let Some(v) = p.validator.as_ref().or_else(|| p.attrs.get("validator")) {
+                self.validator = Some(v.clone());
             }
             if p.agent_name.is_some() {
                 self.agent_name = p.agent_name.clone();
@@ -638,12 +839,29 @@ pub mod fold {
             let mut parent_span_id = None;
             let mut input_tokens = None;
             let mut output_tokens = None;
+            let mut cached_input_tokens = None;
+            let mut reasoning_tokens = None;
+            let mut total_tokens = None;
+            let mut cost_usd_nanos = None;
+            let mut cost_currency: Option<String> = None;
+            let mut provider: Option<String> = None;
             let mut session_id = None;
             let mut tenant_id = None;
             let mut external_trace_id: Option<String> = None;
             let mut external_span_id: Option<String> = None;
             let mut external_parent_span_id: Option<String> = None;
             let mut external_session_id: Option<String> = None;
+            let mut project_id: Option<String> = None;
+            let mut skill: Option<String> = None;
+            let mut mode: Option<String> = None;
+            let mut call_site: Option<String> = None;
+            let mut task_fingerprint: Option<String> = None;
+            let mut loop_id: Option<String> = None;
+            let mut harness_version: Option<String> = None;
+            let mut validation_status: Option<String> = None;
+            let mut stop_reason: Option<String> = None;
+            let mut phase: Option<String> = None;
+            let mut validator: Option<String> = None;
             let mut agent_name: Option<String> = None;
             let mut tool_name: Option<String> = None;
             let mut model: Option<String> = None;
@@ -670,6 +888,24 @@ pub mod fold {
                 if e.fields.output_tokens.is_some() {
                     output_tokens = e.fields.output_tokens;
                 }
+                if e.fields.cached_input_tokens.is_some() {
+                    cached_input_tokens = e.fields.cached_input_tokens;
+                }
+                if e.fields.reasoning_tokens.is_some() {
+                    reasoning_tokens = e.fields.reasoning_tokens;
+                }
+                if e.fields.total_tokens.is_some() {
+                    total_tokens = e.fields.total_tokens;
+                }
+                if e.fields.cost_usd_nanos.is_some() {
+                    cost_usd_nanos = e.fields.cost_usd_nanos;
+                }
+                if e.fields.cost_currency.is_some() {
+                    cost_currency = e.fields.cost_currency.clone();
+                }
+                if e.fields.provider.is_some() {
+                    provider = e.fields.provider.clone();
+                }
                 if e.fields.session_id.is_some() {
                     session_id = e.fields.session_id;
                 }
@@ -687,6 +923,94 @@ pub mod fold {
                 }
                 if e.fields.external_session_id.is_some() {
                     external_session_id = e.fields.external_session_id.clone();
+                }
+                if let Some(v) = e
+                    .fields
+                    .project_id
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("project_id"))
+                {
+                    project_id = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .skill
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("skill"))
+                {
+                    skill = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .mode
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("mode"))
+                {
+                    mode = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .call_site
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("call_site"))
+                {
+                    call_site = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .task_fingerprint
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("task_fingerprint"))
+                {
+                    task_fingerprint = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .loop_id
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("loop_id"))
+                {
+                    loop_id = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .harness_version
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("harness_version"))
+                {
+                    harness_version = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .validation_status
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("validation_status"))
+                {
+                    validation_status = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .stop_reason
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("stop_reason"))
+                {
+                    stop_reason = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .phase
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("phase"))
+                {
+                    phase = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .validator
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("validator"))
+                {
+                    validator = Some(v.clone());
                 }
                 if e.fields.agent_name.is_some() {
                     agent_name = e.fields.agent_name.clone();
@@ -726,12 +1050,29 @@ pub mod fold {
                 duration_ns,
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cost_usd_nanos,
+                cost_currency,
+                provider,
                 session_id,
                 tenant_id,
                 external_trace_id,
                 external_span_id,
                 external_parent_span_id,
                 external_session_id,
+                project_id,
+                skill,
+                mode,
+                call_site,
+                task_fingerprint,
+                loop_id,
+                harness_version,
+                validation_status,
+                stop_reason,
+                phase,
+                validator,
                 agent_name,
                 tool_name,
                 model,

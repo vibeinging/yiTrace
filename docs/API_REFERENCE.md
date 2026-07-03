@@ -58,7 +58,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | 类别 | 端点 | 字段风格 | 用途 |
 |---|---|---|---|
 | **原始 API** | `GET /v1/traces`、`POST /v1/search` | **snake_case**，引擎原始命名（`trace_id`、`duration_ns`） | 程序化对接、检索 |
-| **控制台 API** | `/v1/sessions`、`/v1/sessions/:id/turns`、`/v1/traces/:id`、`/v1/traces/:id/steps`、`/v1/traces/:id/spans/:sid` | **camelCase**，面向 UI（`traceId`、`durMs`） | 写 Trace 浏览器 / 瀑布 / 时间线 |
+| **控制台 API** | `/v1/trace-search`、`/v1/trace-aggregate`、`/v1/trajectory-groups`、`/v1/trace-trajectories`、`/v1/storage-stats`、`/v1/retention-plan`、`/v1/retention/apply`、`/v1/retention-audits`、`/v1/retention-policies`、`/v1/retention-policies/run-due`、`/v1/traces/diff`、`/v1/golden-paths`、`/v1/path-adherence`、`/v1/golden-path-evidence`、`/v1/golden-path-export`、`/v1/golden-path-health`、`/v1/loops`、`/v1/loops/:id`、`/v1/tasks/:fingerprint/traces`、`/v1/sessions`、`/v1/sessions/:id/turns`、`/v1/traces/:id`、`/v1/traces/:id/steps`、`/v1/traces/:id/spans/:sid` | **camelCase**，面向 UI（`traceId`、`durMs`） | 写 Trace 浏览器 / 瀑布 / 时间线 / loop/path mining / storage governance |
 
 下面每节会标注属于哪一类。
 
@@ -116,12 +116,16 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `status` | u8? | 0=ok，非 0=error（SpanEnd 时给） |
 | `duration_ns` | u64? | 耗时纳秒（SpanEnd 时给） |
 | `input_tokens`/`output_tokens` | u64? | token 计数 |
+| `cached_input_tokens` / `reasoning_tokens` / `total_tokens` | u64? | cache 命中输入、推理 token、上游总 token；缺 `total_tokens` 时响应按各 token 字段派生 |
+| `cost_usd` / `cost_usd_nanos` / `cost_currency` | number/string? | 显式成本。落盘使用 `cost_usd_nanos` 整数；传 `cost_usd` 时会转换成 nano USD |
 | `session_id` | u64 或 string? | 会话归属；字符串原文保存在 `external_session_id` |
 | `tenant_id` | u64? | 租户归属；HTTP 服务会被 `X-Tenant-Id` 覆盖 |
-| `agent_name`/`tool_name`/`model` | string? | 标注 |
+| `agent_name`/`tool_name`/`model`/`provider` | string? | 标注 |
 | `input_text`/`output_text` | string? | 大文本（晚物化） |
 | `logs` | string[] | 日志行 |
 | `attrs` | object? | 原始/扩展属性；贯穿折叠、WAL/segment/manifest 和查询输出，同 key 后到覆盖 |
+
+`attrs.project_id` / `attrs.skill` / `attrs.mode` / `attrs.call_site` / `attrs.task_fingerprint` / `attrs.loop_id` / `attrs.harness_version` / `attrs.validation_status` / `attrs.stop_reason` / `attrs.phase` / `attrs.validator` 会在摄入时 schema-on-write 提升为折叠后的一等字段，并继续保留在 `attrs` 中用于 round-trip。旧数据或手写引擎记录即使只带 `attrs`，查询也会回退读取 attrs；新数据即使只写一等字段、不镜像 attrs，也能被过滤和返回。
 
 **响应**：`200 {"ingested":N}`（N=实际灌入条数）。
 
@@ -133,7 +137,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 - value 可为 string / number / bool / null / array / object。
 - yiTrace 会校验并保存 value 的 JSON 字面量；search、trace、span detail 返回时恢复成相同 JSON 形态。
 - 同一 span 多个事件写同一个 attr key 时，后到事件覆盖先到事件。
-- 当前只承诺 `project_id`、`skill`、`mode`、`call_site` 四个 attrs 进入过滤 sidecar；其他 attrs 会持久化并返回，但不保证可过滤。
+- `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`validation_status`、`stop_reason`、`phase`、`validator` 是一等字段；`connection_ids`、`data_source_ids`、`schema_fingerprint`、`intent_signature`、`review_status`、`eval_status` 默认进入过滤 sidecar。其他 attrs 会持久化并返回，但可能退回折叠校验慢路径。
 
 ### POST /v1/traces  —— OTLP/HTTP 标准端点（生态入口 / 原始 API）
 
@@ -144,14 +148,31 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | OTLP / OpenInference 属性 | yiTrace 字段 |
 |---|---|
 | `gen_ai.request.model` / `gen_ai.response.model` / `llm.model_name` | `model` |
+| `gen_ai.system` / `llm.provider` / `llm.system` / `yitrace.provider` | `provider` |
 | `gen_ai.usage.input_tokens` / `gen_ai.usage.prompt_tokens` / `llm.token_count.prompt` | `input_tokens` |
 | `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens` / `llm.token_count.completion` | `output_tokens` |
+| `gen_ai.usage.cached_input_tokens` / `llm.token_count.prompt_details.cached` | `cached_input_tokens` |
+| `gen_ai.usage.reasoning_tokens` / `llm.token_count.completion_details.reasoning` | `reasoning_tokens` |
+| `gen_ai.usage.total_tokens` / `llm.token_count.total` | `total_tokens` |
+| `yitrace.cost_usd` / `gen_ai.usage.cost_usd` / `llm.cost.usd` | `cost_usd` |
+| `yitrace.cost_currency` / `gen_ai.usage.cost_currency` / `llm.cost.currency` | `cost_currency` |
 | `gen_ai.agent.name` / `agent.name` | `agent_name` |
 | `gen_ai.tool.name` / `tool.name` | `tool_name` |
 | `input.value` / `gen_ai.prompt` | `input_text` |
 | `output.value` / `gen_ai.completion` | `output_text` |
 | `yitrace.session_id` / `session.id` / `gen_ai.conversation.id` / `session_id` | `session_id` |
 | `yitrace.tenant_id` / `tenant.id` / `tenant_id` | direct ingest 的 `tenant_id`；HTTP 摄入仍由 `X-Tenant-Id` 覆盖 |
+| `yitrace.project_id` / `project.id` / `project_id` | `attrs.project_id`，摄入后提升为一等字段 |
+| `yitrace.skill` / `agent.skill` / `skill` | `attrs.skill`，摄入后提升为一等字段 |
+| `yitrace.mode` / `agent.mode` / `mode` | `attrs.mode`，摄入后提升为一等字段 |
+| `yitrace.call_site` / `code.call_site` / `call_site` | `attrs.call_site`，摄入后提升为一等字段 |
+| `yitrace.task_fingerprint` / `agent.task_fingerprint` / `task.fingerprint` / `task_fingerprint` | `attrs.task_fingerprint`，摄入后提升为一等字段 |
+| `yitrace.loop_id` / `agent.loop_id` / `loop.id` / `loop_id` | `attrs.loop_id`，摄入后提升为一等字段 |
+| `yitrace.harness_version` / `agent.harness_version` / `harness.version` / `harness_version` | `attrs.harness_version`，摄入后提升为一等字段 |
+| `yitrace.validation_status` / `validation.status` / `validation_status` | `attrs.validation_status`，摄入后提升为一等字段 |
+| `yitrace.stop_reason` / `agent.stop_reason` / `stop.reason` / `stop_reason` | `attrs.stop_reason`，摄入后提升为一等字段 |
+| `yitrace.phase` / `agent.phase` / `loop.phase` / `phase` | `attrs.phase`，摄入后提升为一等字段 |
+| `yitrace.validator` / `validation.validator` / `validator` | `attrs.validator`，摄入后提升为一等字段 |
 
 > `user.id` 只应作为业务属性处理，不会被当作 tenant。HTTP 多租户边界只认 `X-Tenant-Id`。
 
@@ -161,7 +182,16 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ### GET /v1/traces  —— trace 列表（原始 API，snake_case）
 
-**查询参数**：无（租户从头取）。
+**查询参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `attrs` | URL 编码 JSON object，如 `{"project_id":"agentic-data"}` |
+| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `validationStatus` / `validation_status` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+| `annotationLabel` / `annotationSource` / `annotationTarget` / `annotationScoreMin` / `annotationScoreMax` | 按 annotation 反向过滤 trace |
+| `datasetId` / `itemId` / `evalRunId` / `datasetLabel` / `datasetScoreMin` / `datasetScoreMax` | 按 dataset association 反向过滤 trace |
+
+metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 annotation/link 只要命中该 trace 中任一 span，就返回该 trace。租户仍从 `X-Tenant-Id` 头取。
 
 **响应**：JSON 数组，每条：
 
@@ -173,13 +203,31 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
   "max_duration_ns": 3000000,
   "error_count": 0,
   "total_input_tokens": 900,
-  "total_output_tokens": 120
+  "total_output_tokens": 120,
+  "total_cached_input_tokens": 0,
+  "total_reasoning_tokens": 0,
+  "total_tokens": 1020,
+  "total_cost_usd": 0.0012,
+  "total_cost_usd_nanos": 1200000,
+  "usage": {
+    "inputTokens": 900,
+    "outputTokens": 120,
+    "cachedInputTokens": 0,
+    "reasoningTokens": 0,
+    "totalTokens": 1020
+  },
+  "costDetail": {
+    "costUsd": 0.0012,
+    "costUsdNanos": 1200000,
+    "currency": "USD",
+    "source": "mixed"
+  }
 }
 ```
 
 ### GET /v1/metrics  —— Prometheus 指标
 
-返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
+返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`、`yt_annotations`、`yt_dataset_associations`。
 
 ### GET /v1/healthz / GET /v1/readyz  —— 进程探针
 
@@ -231,11 +279,17 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `filter.agent_name` | string? | 否 | 限定 agent |
 | `filter.status` | u8? | 否 | 限定状态（0=ok，非 0=error） |
 | `filter.time_from`/`time_to` | i64? | 否 | 时间窗（纳秒） |
-| `filter.project_id` / `filter.projectId` | JSON value? | 否 | 精确匹配 attrs.project_id |
-| `filter.skill` | JSON value? | 否 | 精确匹配 attrs.skill |
-| `filter.mode` | JSON value? | 否 | 精确匹配 attrs.mode |
-| `filter.call_site` / `filter.callSite` | JSON value? | 否 | 精确匹配 attrs.call_site |
-| `filter.attrs.project_id` / `skill` / `mode` / `call_site` | JSON value? | 否 | 与上面字段等价，适合统一传 attrs filter |
+| `filter.project_id` / `filter.projectId` | JSON value? | 否 | 精确匹配一等字段 `project_id`，兼容 attrs.project_id |
+| `filter.skill` | JSON value? | 否 | 精确匹配一等字段 `skill`，兼容 attrs.skill |
+| `filter.mode` | JSON value? | 否 | 精确匹配一等字段 `mode`，兼容 attrs.mode |
+| `filter.call_site` / `filter.callSite` | JSON value? | 否 | 精确匹配一等字段 `call_site`，兼容 attrs.call_site |
+| `filter.task_fingerprint` / `filter.taskFingerprint` | JSON value? | 否 | 精确匹配一等字段 `task_fingerprint`，兼容 attrs.task_fingerprint |
+| `filter.loop_id` / `filter.loopId` | JSON value? | 否 | 精确匹配一等字段 `loop_id`，兼容 attrs.loop_id |
+| `filter.harness_version` / `filter.harnessVersion` | JSON value? | 否 | 精确匹配一等字段 `harness_version`，兼容 attrs.harness_version |
+| `filter.validation_status` / `filter.validationStatus` | JSON value? | 否 | 精确匹配一等字段 `validation_status`，兼容 attrs.validation_status |
+| `filter.stop_reason` / `filter.stopReason` | JSON value? | 否 | 精确匹配一等字段 `stop_reason`，兼容 attrs.stop_reason |
+| `filter.phase` / `filter.validator` | JSON value? | 否 | 精确匹配一等字段 `phase` / `validator`，兼容 attrs fallback |
+| `filter.attrs.<key>` | JSON value? | 否 | 与上面字段等价，也可传任意扩展 attrs filter |
 
 > `filter.tenant_id` **不能在请求体里指定**——强制取 `X-Tenant-Id` 头。
 > attrs 过滤是精确匹配，比较的是规范化 JSON 字面量：字符串匹配字符串，数字匹配数字，布尔匹配布尔，`null` 匹配 null。
@@ -262,6 +316,1249 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 }
 ```
 
+### POST /v1/trace-search  —— 跨 session 结构化 span 搜索（控制台/产品 API，camelCase 响应）
+
+用于 trace inbox、review 列表、golden path 候选列表。它不是 BM25/向量召回，而是对折叠后的 span 做结构化过滤、分页和排序。
+
+**请求体**：
+
+```json
+{
+  "text": "builder",
+  "limit": 20,
+  "sort": "duration",
+  "order": "desc",
+  "filter": {
+    "toolName": "planner",
+    "attrs": {
+      "project_id": "agentic-data"
+    },
+    "annotation": {
+      "label": "best_path",
+      "source": "human",
+      "scoreMin": 900
+    },
+    "dataset": {
+      "datasetId": "best-path-regression",
+      "itemId": "case-1",
+      "evalRunId": "eval-1"
+    }
+  }
+}
+```
+
+常用过滤字段：
+
+| 字段 | 说明 |
+|---|---|
+| `filter.sessionId` / `traceId` / `spanId` | 内部数字 id 或外部字符串 id |
+| `filter.status` / `kind` / `agentName` / `toolName` / `model` | span 结构化字段 |
+| `filter.inputContains` / `outputContains` / `logContains` / 顶层 `text` | 文本 contains 过滤 |
+| `filter.attrs` 或 `projectId` / `skill` / `mode` / `callSite` / `taskFingerprint` / `loopId` / `harnessVersion` / `validationStatus` / `stopReason` / `phase` / `validator` | attrs 精确过滤；这些 key 已提升为一等字段并保留 attrs fallback |
+| `filter.annotation` | 嵌套对象，支持 `target`、`label`、`source`、`scoreMin`、`scoreMax`、`attrs` |
+| `filter.annotationLabel` / `annotationSource` / `annotationScoreMin` | annotation 常用顶层别名 |
+| `filter.dataset` | 嵌套对象，支持 `datasetId`、`itemId`、`evalRunId`、`split`、`label`、`scoreMin`、`scoreMax`、`attrs` |
+| `filter.datasetId` / `itemId` / `evalRunId` / `datasetLabel` | dataset association 常用顶层别名 |
+
+annotation / dataset association 的反向过滤规则：trace 级记录命中整条 trace；span 级记录只命中对应 span。tenant 仍由 `X-Tenant-Id` 强制注入。
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "rank": 0,
+      "traceId": "12629570674344444284",
+      "spanId": "12068206367433246855",
+      "externalTraceId": "run-uuid",
+      "externalSpanId": "span-uuid",
+      "kind": "agent",
+      "name": "risk-agent",
+      "durationNs": 12000000,
+      "usage": {
+        "inputTokens": 900,
+        "outputTokens": 120,
+        "cachedInputTokens": 0,
+        "reasoningTokens": 0,
+        "totalTokens": 1020
+      },
+      "costUsd": 0.0012,
+      "costDetail": {
+        "costUsd": 0.0012,
+        "costUsdNanos": 1200000,
+        "currency": "USD",
+        "source": "explicit"
+      },
+      "provider": "openai",
+      "inputText": { "preview": "疑似盗刷订单", "full": null, "contentHash": "fnv1a64:...", "byteLength": 18, "truncated": false, "blobRef": null },
+      "outputText": { "preview": "建议人工复核", "full": null, "contentHash": "fnv1a64:...", "byteLength": 18, "truncated": false, "blobRef": null },
+      "fields": {
+        "project_id": "agentic-data",
+        "task_fingerprint": "npm-native-packaging",
+        "validation_status": "pass"
+      },
+      "attrs": {
+        "project_id": "agentic-data",
+        "task_fingerprint": "npm-native-packaging",
+        "validation_status": "pass"
+      }
+    }
+  ],
+  "nextCursor": null,
+  "total": 1
+}
+```
+
+### POST /v1/trace-aggregate  —— 跨 session group-by 聚合（控制台/产品 API，camelCase 响应）
+
+用于 trace inbox 统计和 path mining：先复用 `/v1/trace-search` 的过滤语义筛出 folded spans，再按字段分组，返回 span 数、trace 去重数、错误率、duration、usage、cost 和少量示例。
+
+**请求体**：
+
+```json
+{
+  "groupBy": ["skill", "mode", "toolName"],
+  "limit": 50,
+  "sort": "errorRate",
+  "order": "desc",
+  "filter": {
+    "attrs": {
+      "project_id": "agentic-data"
+    },
+    "annotation": {
+      "label": "best_path"
+    },
+    "dataset": {
+      "datasetId": "best-path-regression"
+    }
+  }
+}
+```
+
+`groupBy` 支持 string 或 string array。常用字段：
+
+| 字段 | 说明 |
+|---|---|
+| `projectId` / `project_id` | 按 `project_id` 一等 attrs 字段分组 |
+| `skill` / `mode` / `callSite` / `call_site` | 按 AgenticData 常用 attrs 字段分组 |
+| `taskFingerprint` / `task_fingerprint` | 按同类任务 fingerprint 分组 |
+| `loopId` / `loop_id` | 按 agent loop 运行分组 |
+| `harnessVersion` / `harness_version` | 按 workflow/prompt/harness 版本分组 |
+| `validationStatus` / `validation_status` | 按验证结果分组 |
+| `stopReason` / `stop_reason` | 按 loop 停止原因分组 |
+| `phase` / `validator` | 按执行阶段或验证器分组 |
+| `agentName` / `toolName` / `model` / `provider` / `kind` / `status` | 按 span 结构化字段分组 |
+| `attrs.<key>` 或 `<key>` | 按任意 attrs key 分组，保持 JSON value 形态 |
+
+排序支持：`count`、`traceCount`、`errorCount`、`errorRate`、`duration`、`avgDuration`、`maxDuration`、`cost`、`tokens`。默认按 `count desc`。
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "key": {
+        "skill": "review",
+        "mode": "auto",
+        "toolName": "planner"
+      },
+      "spanCount": 12,
+      "traceCount": 7,
+      "errorCount": 2,
+      "errorRate": 0.166667,
+      "durationNs": {
+        "sum": 930000000,
+        "avg": 77500000,
+        "max": 210000000,
+        "p50": 63000000,
+        "p95": 210000000,
+        "count": 12
+      },
+      "usage": {
+        "inputTokens": 12000,
+        "outputTokens": 2100,
+        "cachedInputTokens": 800,
+        "reasoningTokens": 900,
+        "totalTokens": 15800
+      },
+      "costUsd": 0.018,
+      "costDetail": {
+        "costUsd": 0.018,
+        "costUsdNanos": 18000000,
+        "currency": "USD",
+        "source": "mixed"
+      },
+      "examples": [
+        {
+          "traceId": "12629570674344444284",
+          "spanId": "12068206367433246855",
+          "externalTraceId": "run-uuid",
+          "externalSpanId": "span-uuid",
+          "name": "risk-agent"
+        }
+      ]
+    }
+  ],
+  "total": 1,
+  "spanTotal": 12
+}
+```
+
+### POST /v1/trajectory-groups  —— Trajectory group / best-path candidates（控制台/产品 API，camelCase 响应）
+
+按过滤条件先找候选 trace，再读取每条 trace 的完整 folded spans，按规范化 trajectory signature 分桶。这个端点用于发现“同类任务中哪些执行路径最稳定、成功率最高、成本最低”，返回确定性统计证据；它不创建 golden path，也不替业务自动做最终判优。兼容别名：`POST /v1/trajectory-aggregate`、`POST /v1/best-paths`。
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "taskFingerprint": "npm-native-packaging",
+    "attrs": { "project_id": "agentic-data" },
+    "annotation": { "label": "best_path", "scoreMin": 900 }
+  },
+  "sort": "best",
+  "limit": 20,
+  "exampleLimit": 3
+}
+```
+
+过滤语义复用 `/v1/trace-search`：支持 text、status、toolName、model、attrs、annotation、dataset 等条件。默认 `sort="best"`，综合 success rate、evalScore、annotation score、dataset score，并用 traceCount、duration、cost 做 tie-breaker。可选排序：`traceCount`、`successRate`、`evalScore`、`annotationScore`、`datasetScore`、`duration`、`cost`、`tokens`。
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "signature": "fnv1a64:94db9e1afaf33121",
+      "stepCount": 2,
+      "steps": ["tool:planner|phase:plan", "tool:tester|phase:verify|validator:npm_test"],
+      "traceCount": 2,
+      "spanCount": 4,
+      "successCount": 2,
+      "errorTraceCount": 0,
+      "errorSpanCount": 0,
+      "successRate": 1.0,
+      "errorRate": 0.0,
+      "qualityScore": 960,
+      "durationNs": { "sum": 54, "avg": 27, "max": 30, "p50": 24, "p95": 30, "count": 2 },
+      "usage": { "inputTokens": 54, "outputTokens": 27, "cachedInputTokens": 0, "reasoningTokens": 0, "totalTokens": 81 },
+      "costUsd": 0.000005,
+      "costDetail": { "costUsd": 0.000005, "costUsdNanos": 5400, "currency": "USD", "source": "mixed" },
+      "scores": {
+        "eval": { "count": 0, "avg": null, "min": null, "max": null },
+        "annotation": { "count": 2, "avg": 940, "min": 920, "max": 960 },
+        "dataset": { "count": 2, "avg": 940, "min": 930, "max": 950 }
+      },
+      "examples": [
+        {
+          "traceId": "401",
+          "externalTraceId": "run-401",
+          "status": "ok",
+          "qualityScore": 970,
+          "fields": { "task_fingerprint": "npm-native-packaging", "validation_status": "pass" }
+        }
+      ]
+    }
+  ],
+  "total": 1,
+  "traceTotal": 2,
+  "spanTotal": 4
+}
+```
+
+### POST /v1/trace-trajectories  —— Materialized trace trajectory read model（控制台/产品 API，camelCase 响应）
+
+按 `/v1/trace-search` 的过滤语义筛出 trace，再返回每条 trace 的轻量 trajectory 摘要。它面向 Trace Inbox、Golden Path review 和 Agent Memory 导出前的列表页：不读取 input/output/log 大字段，只返回路径、耗时、usage/cost 和 scope 字段。兼容别名：`POST /v1/trajectories`。
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "taskFingerprint": "npm-native-packaging",
+    "attrs": {
+      "project_id": "agentic-data",
+      "skill": "builder"
+    }
+  },
+  "limit": 50,
+  "cursor": 0
+}
+```
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "trace": {
+        "traceId": "401",
+        "externalTraceId": "run-401",
+        "spanCount": 2,
+        "errorCount": 0,
+        "status": "ok",
+        "durationNs": { "sum": 54, "max": 30 },
+        "usage": { "inputTokens": 54, "outputTokens": 27, "cachedInputTokens": 0, "reasoningTokens": 0, "totalTokens": 81 },
+        "costUsd": 0.000005,
+        "fields": {
+          "project_id": "agentic-data",
+          "task_fingerprint": "npm-native-packaging",
+          "model": "qwen"
+        }
+      },
+      "trajectory": {
+        "signature": "fnv1a64:94db9e1afaf33121",
+        "stepCount": 2,
+        "steps": ["tool:planner|phase:plan", "tool:tester|phase:verify|validator:npm_test"]
+      },
+      "index": "materialized"
+    }
+  ],
+  "nextCursor": null,
+  "total": 1,
+  "spanTotal": 2,
+  "index": "materialized"
+}
+```
+
+### POST /v1/storage-stats  —— Storage governance stats（控制台/产品 API，camelCase 响应）
+
+按 `/v1/trace-search` 的过滤语义统计 trace/span/event 数量和可解释的存储占用估算。它不是物理磁盘精确账单：input/output/log/attrs/external id 字节按 UTF-8 长度计算，segment/WAL 结构开销用 `estimatedBytes` 近似表达。
+
+兼容别名：`POST /v1/storage/stats`。
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data",
+    "taskFingerprint": "npm-native-packaging"
+  },
+  "groupBy": ["projectId", "validationStatus"],
+  "timeBucketNs": 86400000000000
+}
+```
+
+`groupBy` 支持 camelCase / snake_case，常用值包括 `projectId`、`skill`、`mode`、`taskFingerprint`、`validationStatus`、`sessionId`、`time`。`time` 使用 trace 最早事件时间按 `timeBucketNs` 分桶。
+
+**响应**：
+
+```json
+{
+  "groupBy": ["project_id", "validation_status"],
+  "total": {
+    "traceCount": 2,
+    "spanCount": 2,
+    "sessionCount": 2,
+    "eventCount": 5,
+    "errorSpanCount": 0,
+    "firstTs": 100,
+    "lastTs": 220,
+    "bytes": {
+      "inputText": 120,
+      "outputText": 80,
+      "logs": 30,
+      "payload": 230,
+      "attrs": 180,
+      "externalIds": 70,
+      "fields": 160,
+      "estimated": 1200,
+      "estimatedBytes": 1200
+    },
+    "metadata": {
+      "annotations": 1,
+      "datasetAssociations": 1,
+      "goldenPaths": 1,
+      "snapshotRefs": 1,
+      "evalLinks": 1,
+      "pathMemoryRefs": 1
+    }
+  },
+  "groups": [
+    {
+      "key": {
+        "project_id": "agentic-data",
+        "validation_status": "pass"
+      },
+      "traceCount": 2,
+      "spanCount": 2,
+      "sessionCount": 2,
+      "eventCount": 5,
+      "errorSpanCount": 0,
+      "firstTs": 100,
+      "lastTs": 220,
+      "bytes": { "estimatedBytes": 1200 },
+      "metadata": {
+        "annotations": 1,
+        "datasetAssociations": 1,
+        "goldenPaths": 1,
+        "snapshotRefs": 1,
+        "evalLinks": 1,
+        "pathMemoryRefs": 1
+      }
+    }
+  ]
+}
+```
+
+### POST /v1/retention-plan / POST /v1/retention/apply  —— Retention planning and segment-row delete（控制台/产品 API，camelCase 响应）
+
+`retention-plan` 是 dry-run：按 `/v1/trace-search` 过滤和 `deleteBeforeTs` 找候选 trace，默认保护已被 annotation、dataset association、active Golden Path（candidate/confirmed）、snapshot 引用、eval link、path memory 引用的 trace。`retention/apply` 执行删除，但只软删除已经 flush 到 segment 的行；仍在 MemTable/WAL tail 的热 trace 会整条跳过，避免半删。
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data",
+    "taskFingerprint": "npm-native-packaging"
+  },
+  "deleteBeforeTs": 1751540000000000000,
+  "protect": {
+    "annotations": true,
+    "datasetAssociations": true,
+    "goldenPaths": true,
+    "snapshots": true,
+    "evalLinks": true,
+    "pathMemory": true
+  },
+  "compact": true,
+  "compactMinDeletedRows": 1,
+  "compactMinDeletedPercent": 1,
+  "compactMaxSegments": 64,
+  "reclaim": true,
+  "requestedBy": "nightly-retention-policy",
+  "reason": "ttl cleanup",
+  "exampleLimit": 20
+}
+```
+
+`POST /v1/retention/apply` 必须传 `deleteBeforeTs`。`POST /v1/retention-plan` 不传 `deleteBeforeTs` 时只做“当前 filter 命中的数据如果清理会怎样”的估算。`protect` 默认全开；可分别关闭 `annotations`、`datasetAssociations`、`goldenPaths`、`snapshots`、`evalLinks`、`pathMemory`。其中 `snapshots` 来自 dataset/golden path 上的 `snapshotId` / `snapshotHash`，`evalLinks` 来自 `evalRunId` 或 eval attrs，`pathMemory` 来自 metadata attrs 的 `path_memory_id`。`compact` 默认 `false`；设为 `true` 时，apply 后会选择 deletion ratio 达标的 segment 重写成干净 segment，并按 `reclaim` 尝试走 GC log 安全回收。仍有旧读者 pin 住快照时，`reclaim` 可能暂时回收 0 个段，这是正常的水位保护。
+
+**响应**：
+
+```json
+{
+  "dryRun": true,
+  "applied": false,
+  "deleteBeforeTs": 1751540000000000000,
+  "protect": {
+    "goldenPaths": true,
+    "annotations": true,
+    "datasetAssociations": true,
+    "snapshots": true,
+    "evalLinks": true,
+    "pathMemory": true
+  },
+  "compact": {
+    "requested": true,
+    "minDeletedRows": 1,
+    "minDeletedPercent": 1,
+    "maxSegments": 64,
+    "reclaim": true
+  },
+  "candidates": { "traceCount": 2, "bytes": { "estimatedBytes": 1200 } },
+  "protected": { "traceCount": 1, "bytes": { "estimatedBytes": 700 } },
+  "deletable": { "traceCount": 1, "bytes": { "estimatedBytes": 500 } },
+  "protectedReasons": {
+    "823456789": ["annotation", "datasetAssociation", "goldenPath", "snapshot", "evalLink", "pathMemory"]
+  },
+  "deletableTraceIds": ["923456789"],
+  "applyResult": null,
+  "compactResult": null,
+  "audit": null
+}
+```
+
+`retention/apply` 的 `applyResult` 会返回：
+
+```json
+{
+  "requestedTraceCount": 1,
+  "deletedTraceCount": 1,
+  "deletedSegmentRowCount": 2,
+  "skippedLiveTraceCount": 0,
+  "deletedTraceIds": ["923456789"],
+  "skippedLiveTraceIds": []
+}
+```
+
+如果 `compact=true`，`compactResult` 会返回：
+
+```json
+{
+  "beforeLiveSegmentCount": 1,
+  "afterLiveSegmentCount": 1,
+  "beforeDeadSegmentCount": 0,
+  "afterDeadSegmentCount": 0,
+  "selectedSegmentCount": 1,
+  "compactedSegmentCount": 1,
+  "reclaimedSegmentCount": 1,
+  "droppedDeletedRowCount": 2,
+  "rewrittenLiveRowCount": 4,
+  "selectedSegmentIds": ["12"]
+}
+```
+
+`retention/apply` 成功执行后会同步写入一条 tenant-scoped audit record，响应中的 `audit` 会返回同一条记录。审计只保存策略、保护开关、计数和 trace id 样本，不复制 trace payload；单批 trace id 样本默认最多 100 条，超过时 `sampleTruncated=true`。
+
+```json
+{
+  "auditId": "1",
+  "tenantId": "1",
+  "createdAtNs": "1751540000000000000",
+  "source": "nightly-retention-policy",
+  "reason": "ttl cleanup",
+  "deleteBeforeTs": 1751540000000000000,
+  "query": {
+    "filter": { "projectId": "agentic-data" },
+    "deleteBeforeTs": 1751540000000000000,
+    "compact": true
+  },
+  "protect": {
+    "goldenPaths": true,
+    "annotations": true,
+    "datasetAssociations": true,
+    "snapshots": true,
+    "evalLinks": true,
+    "pathMemory": true
+  },
+  "compact": {
+    "requested": true,
+    "reclaim": true,
+    "compactedSegmentCount": 1,
+    "reclaimedSegmentCount": 1,
+    "droppedDeletedRowCount": 2,
+    "rewrittenLiveRowCount": 4
+  },
+  "counts": {
+    "candidateTraceCount": 2,
+    "protectedTraceCount": 1,
+    "deletableTraceCount": 1,
+    "requestedTraceCount": 1,
+    "deletedTraceCount": 1,
+    "deletedSegmentRowCount": 2,
+    "skippedLiveTraceCount": 0
+  },
+  "traceIds": {
+    "deletable": ["923456789"],
+    "deleted": ["923456789"],
+    "skippedLive": [],
+    "sampleTruncated": false
+  }
+}
+```
+
+### POST/GET /v1/retention-policies / POST /v1/retention-policies/run-due  —— Retention policy scheduler（控制台/产品 API，camelCase 响应）
+
+Retention policy 是可持久化、可重复执行的清理策略。yiTrace 只提供调度底座：保存策略、计算到期、手动触发到期策略，并复用 `retention/apply` 写审计；它不会在嵌入式 Node/Electron 进程里自动启动后台删除线程。业务侧可以用 cron、队列、Electron main process timer 或运维任务定期调用 `run-due`。
+
+兼容别名：`POST /v1/retention/policies`、`GET /v1/retention/policies`、`POST /v1/retention/policies/run-due`、`POST /v1/retention/run-due`。
+
+创建 policy：
+
+```bash
+curl -XPOST localhost:7878/v1/retention-policies \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "nightly-retention-policy",
+    "intervalNs": 86400000000000,
+    "nextRunAtNs": 1751540000000000000,
+    "source": "nightly-retention-policy",
+    "reason": "ttl cleanup",
+    "query": {
+      "filter": { "attrs": { "project_id": "agentic-data" } },
+      "olderThanNs": 2592000000000000,
+      "compact": true
+    }
+  }'
+```
+
+`query` 是 `retention/apply` 的查询模板，必须包含 `deleteBeforeTs` 或 `olderThanNs` / `ttlNs` / `retentionNs`。推荐用 `olderThanNs` 这类 TTL 字段；每次执行时 yiTrace 会按本次 `nowNs` 动态换算成 `deleteBeforeTs`，再注入 `apply:true`、`requestedBy` 和 `reason`。
+
+创建响应：
+
+```json
+{
+  "policyId": "1",
+  "tenantId": "1",
+  "name": "nightly-retention-policy",
+  "enabled": true,
+  "createdAtNs": "1751540000000000000",
+  "updatedAtNs": "1751540000000000000",
+  "lastRunAtNs": null,
+  "nextRunAtNs": "1751540000000000000",
+  "intervalNs": "86400000000000",
+  "source": "nightly-retention-policy",
+  "reason": "ttl cleanup",
+  "query": {
+    "filter": { "attrs": { "project_id": "agentic-data" } },
+    "olderThanNs": 2592000000000000,
+    "compact": true
+  }
+}
+```
+
+查询 policy：
+
+```bash
+curl "localhost:7878/v1/retention-policies?name=nightly-retention-policy&enabled=true&limit=20"
+```
+
+响应：
+
+```json
+{
+  "items": [
+    { "policyId": "1", "name": "nightly-retention-policy", "enabled": true }
+  ],
+  "nextCursor": null,
+  "total": 1
+}
+```
+
+执行到期 policy：
+
+```bash
+curl -XPOST localhost:7878/v1/retention-policies/run-due \
+  -H 'Content-Type: application/json' \
+  -d '{"nowNs":1751540000000000000,"limit":10}'
+```
+
+响应：
+
+```json
+{
+  "nowNs": "1751540000000000000",
+  "ran": 1,
+  "failed": 0,
+  "skipped": 0,
+  "items": [
+    {
+      "policy": {
+        "policyId": "1",
+        "lastRunAtNs": "1751540000000000000",
+        "nextRunAtNs": "1751626400000000000"
+      },
+      "ok": true,
+      "statusCode": 200,
+      "result": {
+        "applied": true,
+        "applyResult": { "deletedTraceCount": 1 },
+        "audit": { "source": "nightly-retention-policy" }
+      }
+    }
+  ]
+}
+```
+
+只有 `statusCode=200` 的 policy 会推进 `lastRunAtNs/nextRunAtNs`。执行失败会保留原有 `nextRunAtNs`，便于下次重试。
+
+### GET/POST /v1/retention-audits  —— Retention audit log（控制台/产品 API，camelCase 响应）
+
+查询历史 `retention/apply` 执行审计。兼容别名：`/v1/retention/audits`。GET 用 query string，POST 用 JSON body，二者都按 `X-Tenant-Id` 隔离。
+
+```bash
+curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=20"
+```
+
+```json
+{
+  "filter": {
+    "source": "nightly-retention-policy"
+  },
+  "limit": 20,
+  "cursor": 0
+}
+```
+
+响应：
+
+```json
+{
+  "items": [
+    { "auditId": "1", "source": "nightly-retention-policy", "counts": { "deletedTraceCount": 1 } }
+  ],
+  "nextCursor": null,
+  "total": 1
+}
+```
+
+### Golden Path Candidate Store  —— 候选路径资产（控制台/产品 API，camelCase 响应）
+
+`trajectory-groups` 负责发现候选路径，`trace-trajectories` 负责逐 trace 读取轻量路径摘要，Golden Path Store 负责把其中一条 trace/trajectory 登记成可治理资产。它保存源 trace/snapshot 引用、trajectory signature、scope attrs、轻量 source trajectory、证据摘要、状态和评审信息；不复制 input/output/log 等 trace payload。
+
+默认 scope 会从 source trace 补齐 `project_id`、`task_fingerprint`、`skill`、`mode`、`harness_version`、`schema_fingerprint`、`eval_profile`、`model`、`provider`、`tool_version`。这些字段用于后续 `goldenPaths()`、`pathAdherence()` 和 `goldenPathHealth()` 收窄比较范围，避免跨模型、跨工具版本或跨 schema 混在一起判优。
+
+当前版本不提供重复命中记录或引用计数。重复场景的 raw trace 仍按正常摄入和保留策略处理；是否要做 hit/reference count、压缩重复 trace、或只保留 canonical source snapshot，后续作为单独需求设计。
+
+**创建候选：`POST /v1/golden-paths`**
+
+```json
+{
+  "sourceTraceId": "run-uuid",
+  "taskFingerprint": "npm-native-packaging",
+  "score": 960,
+  "label": "fast packaging path",
+  "reason": "best observed route",
+  "source": "human",
+  "projectId": "agentic-data"
+}
+```
+
+字段说明：
+
+- `sourceTraceId` 支持数字 trace id 或外部字符串 id。
+- `taskFingerprint` 必填；未传时会尝试从 source trace 的 `task_fingerprint` 字段推断。
+- `trajectorySignature` 可选；未传时由 source trace 的 folded spans 自动计算 `fnv1a64:*`。
+- `status` 可选，默认 `candidate`；可用值：`candidate` / `confirmed` / `rejected` / `deprecated`。
+- `projectId`、`skill`、`mode`、`callSite`、`evalProfile`、`model`、`provider`、`toolVersion` 等一等 attrs 会写入 `attrs`，用于后续过滤。
+- `evidence` / `evidenceSummary` 可传入产品层证据摘要，例如 `sampleCount`、`successRate`、`avgCostUsdNanos`、`p95DurationNs`；系统也会补 `source_span_count`、`source_status`、`source_total_tokens`、`source_cost_usd_nanos`、`source_trajectory_signature` 等 source 摘要。
+
+**查询：`GET /v1/golden-paths?taskFingerprint=...&status=confirmed&projectId=...`**
+
+支持按 `goldenPathId`、`taskFingerprint`、`trajectorySignature`、`sourceTraceId`、`status` 和 attrs 精确过滤；tenant 从 `X-Tenant-Id` 注入。
+
+**确认/拒绝/废弃：`POST /v1/golden-paths/:id/status`**
+
+```json
+{
+  "status": "confirmed",
+  "reason": "manual accept",
+  "source": "reviewer"
+}
+```
+
+响应示例：
+
+```json
+{
+  "goldenPathId": "1",
+  "tenantId": "1",
+  "taskFingerprint": "npm-native-packaging",
+  "trajectorySignature": "fnv1a64:94db9e1afaf33121",
+  "sourceTraceId": "15331101233991596328",
+  "externalSourceTraceId": "run-uuid",
+  "status": "confirmed",
+  "score": 960,
+  "label": "fast packaging path",
+  "reason": "manual accept",
+  "source": "reviewer",
+  "attrs": {
+    "project_id": "agentic-data",
+    "task_fingerprint": "npm-native-packaging",
+    "model": "qwen"
+  },
+  "sourceTrajectory": {
+    "signature": "fnv1a64:94db9e1afaf33121",
+    "stepCount": 2,
+    "steps": ["tool:planner|phase:plan", "tool:tester|phase:verify|validator:npm_test"]
+  },
+  "evidenceSummary": {
+    "source_span_count": 2,
+    "source_status": "ok",
+    "source_trajectory_step_count": 2
+  }
+}
+```
+
+### POST /v1/path-adherence  —— Golden Path adherence evidence（控制台/产品 API，camelCase 响应）
+
+比较一条新 trace 是否沿着某个 Golden Path 的 trajectory 执行。这个端点只返回底层证据：signature 是否一致、共同步骤、缺失步骤、额外步骤和 coverage；它不判断“这条路径是不是当前最佳”。
+
+兼容路径：`POST /v1/golden-paths/:id/adherence`，此时 body 只需要 `traceId`。
+
+**请求体**：
+
+```json
+{
+  "goldenPathId": "1",
+  "traceId": "candidate-run-uuid"
+}
+```
+
+**响应要点**：
+
+- `adherence`: `followed` 表示 signature 完全一致；`extended` 表示 Golden Path 步骤都按顺序出现，但新 trace 多走了额外步骤；`partial` 表示只命中部分步骤；`deviated` 表示没有共同轨迹；`unknown` 表示 source trace 已不可读，只能看存下来的 signature。
+- `sameSignature`: 新 trace 的 trajectory signature 是否等于 Golden Path 存储的 signature。
+- `sourceRetained`: 即使 raw source trace 已被 retention 清理，Golden Path 元数据里仍保留轻量 source trajectory，可继续做 path adherence；如果为 `false`，只能看存储的 signature。
+- `commonSteps` / `missingSteps` / `extraSteps`: 用于 UI diff、回归解释和 Agent Memory 候选证据。
+
+示例：
+
+```json
+{
+  "adherence": "extended",
+  "sameSignature": false,
+  "sourceAvailable": true,
+  "sourceRetained": true,
+  "goldenTrajectory": {
+    "signature": "fnv1a64:fd0b5f81980a77a2",
+    "stepCount": 1,
+    "steps": ["tool:planner|phase:plan"]
+  },
+  "traceTrajectory": {
+    "signature": "fnv1a64:94db9e1afaf33121",
+    "stepCount": 2,
+    "steps": ["tool:planner|phase:plan", "tool:tester|phase:verify"]
+  },
+  "scores": {
+    "commonStepCount": 1,
+    "goldenStepCount": 1,
+    "traceStepCount": 2,
+    "goldenCoverage": 1.0,
+    "traceCoverage": 0.5
+  },
+  "missingSteps": [],
+  "extraSteps": ["tool:tester|phase:verify"]
+}
+```
+
+### POST /v1/golden-path-evidence  —— Golden Path evidence bundle（控制台/产品 API，camelCase 响应）
+
+导出一条 Golden Path 的底层证据包：source trace 摘要、trajectory、annotation、dataset association。传入 `candidateTraceId` 时，会额外附带 `pathAdherence` 和 `traceDiff`。这个端点用于人工 review、回归集构建或 Agent Memory 导出前的证据收集，不更新 Golden Path 状态。
+
+兼容路径：`POST /v1/golden-paths/evidence`、`POST /v1/golden-paths/:id/evidence`。
+
+**请求体**：
+
+```json
+{
+  "goldenPathId": "1",
+  "candidateTraceId": "candidate-run-uuid"
+}
+```
+
+**响应要点**：
+
+- `source`: Golden Path 引用的 source trace 证据；如果 raw trace 已被保留策略清掉，`available=false`，但 Golden Path 元数据仍保留 `sourceTrajectory` 作为轻量路径证据。
+- `candidate`: 未传 `candidateTraceId` 时为 `null`；传入后包含候选 trace 的 evidence、`pathAdherence` 和 `traceDiff`。
+- `annotations` / `datasetAssociations`: 保留原始业务元数据，便于上层复核“为什么这条路径被选中”。
+
+示例：
+
+```json
+{
+  "goldenPath": { "goldenPathId": "1", "status": "confirmed" },
+  "source": {
+    "available": true,
+    "trajectory": { "signature": "fnv1a64:fd0b5f81980a77a2", "steps": ["tool:planner|phase:plan"] },
+    "annotationCount": 1,
+    "datasetAssociationCount": 1
+  },
+  "candidate": {
+    "pathAdherence": { "adherence": "extended", "sameSignature": false },
+    "traceDiff": { "delta": { "spanCount": 1 } }
+  }
+}
+```
+
+### POST /v1/golden-path-export  —— Golden Path JSONL export（控制台/产品 API，camelCase 响应）
+
+按稳定 schema 导出 Golden Path 记录，供 Agent Memory 或 regression dataset 管线消费。默认只导出 `confirmed` Golden Path；如需导出 `candidate` / `rejected` / `deprecated`，显式传 `status`。响应同时返回 `items` 和 `jsonl`：前者方便 SDK 直接用，后者可直接写入 JSONL 文件。消费侧应该把它当作“可追溯候选证据”，而不是数据库替业务下的 BestPath 结论。
+
+兼容路径：`POST /v1/golden-paths/export`。
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "taskFingerprint": "npm-native-packaging",
+    "projectId": "agentic-data"
+  },
+  "limit": 100
+}
+```
+
+过滤字段复用 Golden Path 查询语义：`goldenPathId`、`taskFingerprint`、`trajectorySignature`、`sourceTraceId`、`status`、`attrs` / 一等 attrs。`limit` 最大 500。
+
+**响应**：
+
+```json
+{
+  "schemaVersion": "yitrace.golden_path_export.v1",
+  "format": "jsonl",
+  "count": 1,
+  "items": [
+    {
+      "schemaVersion": "yitrace.golden_path_export.v1",
+      "recordType": "golden_path",
+      "goldenPath": { "goldenPathId": "1", "status": "confirmed" },
+      "source": {
+        "available": true,
+        "trajectory": { "signature": "fnv1a64:fd0b5f81980a77a2", "steps": ["tool:planner|phase:plan"] },
+        "annotationCount": 1,
+        "datasetAssociationCount": 1
+      },
+      "exportedAtNs": "1783090000000000000"
+    }
+  ],
+  "jsonl": "{\"schemaVersion\":\"yitrace.golden_path_export.v1\",...}"
+}
+```
+
+### POST /v1/golden-path-health  —— Golden Path adherence health（控制台/产品 API，camelCase 响应）
+
+批量统计一批同 scope trace 是否还遵循某条 Golden Path。默认用 Golden Path 的 `taskFingerprint + attrs` 收窄窗口，并排除 source trace，避免把确认样本本身算进后续健康度。这个端点只返回持续校验证据，不会自动 promote/deprecate，也不会判断“当前最佳”。
+
+兼容路径：`POST /v1/golden-paths/health`、`POST /v1/golden-paths/:id/health`。
+
+**请求体**：
+
+```json
+{
+  "goldenPathId": "1",
+  "filter": {
+    "projectId": "agentic-data",
+    "timeFrom": 1783090000000000000
+  },
+  "limit": 100,
+  "examples": 5,
+  "includeSource": false
+}
+```
+
+过滤语义复用 `/v1/trace-search`：支持 attrs、一等字段、time range、annotation、dataset 等条件。`limit` 最大 500；`examples` 最大 50。
+
+**响应要点**：
+
+- `counts`: `followed` / `extended` / `partial` / `deviated` / `unknown` 分布。
+- `rates.usable`: `followed + extended` 的比例，用来观察旧路径是否仍被后续 trace 覆盖。
+- `coverage`: 聚合 common/golden/trace step coverage。
+- `sourceRetained`: 使用 Golden Path 元数据里保留的 source trajectory 时也会为 `true`，避免 raw source trace 被清理后 health 直接退化为 unknown。
+- `examples`: 轻量 trace 摘要和 trajectory，不包含大字段正文。
+
+```json
+{
+  "goldenPath": { "goldenPathId": "1", "status": "confirmed" },
+  "sourceAvailable": true,
+  "sourceRetained": true,
+  "window": {
+    "limit": 100,
+    "includeSource": false,
+    "spanTotal": 42,
+    "matchingTraceTotal": 12,
+    "analyzedTraceTotal": 12
+  },
+  "counts": {
+    "total": 12,
+    "followed": 8,
+    "extended": 2,
+    "partial": 1,
+    "deviated": 1,
+    "unknown": 0
+  },
+  "rates": {
+    "followed": 0.666667,
+    "usable": 0.833333,
+    "deviated": 0.083333,
+    "unknown": 0.0
+  },
+  "coverage": {
+    "commonStepCount": 30,
+    "goldenStepCount": 36,
+    "traceStepCount": 40,
+    "goldenCoverage": 0.833333,
+    "traceCoverage": 0.75
+  },
+  "examples": [
+    {
+      "adherence": "deviated",
+      "trace": { "traceId": "candidate-run-uuid", "status": "ok" },
+      "traceTrajectory": { "signature": "fnv1a64:..." }
+    }
+  ]
+}
+```
+
+### POST /v1/traces/diff  —— Trace trajectory diff（控制台/产品 API，camelCase 响应）
+
+比较两条 trace 的 route、step、trajectory signature、duration、token、cost、status 和主要 agent 字段差异。这个端点只返回确定性证据，不自动判断哪条更好；上层可以结合 eval、annotation 或业务规则做 golden path 判优。`POST /v1/trace-diff` 是兼容别名。
+
+**请求体**：
+
+```json
+{
+  "leftTraceId": "run-old",
+  "rightTraceId": "run-new"
+}
+```
+
+trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / `left_trace_id` / `left` / `baseTraceId` / `a`，以及 `rightTraceId` / `right_trace_id` / `right` / `candidateTraceId` / `b`。
+
+**响应**：
+
+```json
+{
+  "left": {
+    "traceId": "301",
+    "externalTraceId": "run-old",
+    "spanCount": 1,
+    "errorCount": 0,
+    "status": "ok",
+    "durationNs": { "sum": 10, "max": 10 },
+    "usage": { "inputTokens": 5, "outputTokens": 10, "cachedInputTokens": 0, "reasoningTokens": 0, "totalTokens": 15 },
+    "costUsd": 0.000001,
+    "costDetail": { "costUsdNanos": 1000, "currency": "USD", "source": "mixed" },
+    "fields": { "task_fingerprint": "diff-task", "loop_id": "loop-a" }
+  },
+  "right": {
+    "traceId": "302",
+    "spanCount": 2,
+    "errorCount": 1,
+    "status": "error"
+  },
+  "delta": {
+    "spanCount": 1,
+    "errorCount": 1,
+    "durationNs": 18,
+    "inputTokens": 1,
+    "outputTokens": 1,
+    "totalTokens": 2,
+    "costUsdNanos": 1500,
+    "costUsd": 0.000002
+  },
+  "trajectory": {
+    "left": {
+      "signature": "fnv1a64:fd0b5f81980a77a2",
+      "stepCount": 1,
+      "steps": ["tool:planner|phase:plan"]
+    },
+    "right": {
+      "signature": "fnv1a64:94db9e1afaf33121",
+      "stepCount": 2,
+      "steps": ["tool:planner|phase:plan", "tool:tester|phase:verify"]
+    },
+    "same": false
+  },
+  "routes": {
+    "left": [{ "spanId": "1", "kind": "tool", "name": "planner", "spanOrdinal": 0, "sortKey": "00000000000000000000:00000000000000000001", "toolName": "planner", "statusText": "ok" }],
+    "right": [
+      { "spanId": "1", "kind": "tool", "name": "planner", "spanOrdinal": 0, "sortKey": "00000000000000000000:00000000000000000001", "toolName": "planner", "statusText": "ok" },
+      { "spanId": "2", "kind": "tool", "name": "tester", "spanOrdinal": 1, "sortKey": "00000000000000000001:00000000000000000002", "toolName": "tester", "statusText": "error" }
+    ]
+  },
+  "steps": [
+    {
+      "index": 0,
+      "status": "changed",
+      "changes": ["durationNs", "totalTokens", "costUsd"],
+      "left": { "spanId": "1", "toolName": "planner", "evalScore": 1000, "evalLabel": "通过", "outputPreview": "只跑相关测试" },
+      "right": { "spanId": "1", "toolName": "planner", "evalScore": 1000, "evalLabel": "通过", "outputPreview": "只跑相关测试" },
+      "delta": { "durationNs": -2, "totalTokens": -3, "costUsdNanos": -500, "costUsd": -0.000001 }
+    },
+    {
+      "index": 1,
+      "status": "right_only",
+      "changes": [],
+      "left": null,
+      "right": { "spanId": "2", "toolName": "tester", "statusText": "error", "evalScore": 0, "evalLabel": "未通过", "outputPreview": "npm test failed" }
+    }
+  ]
+}
+```
+
+### GET /v1/loops  —— Agent loop 摘要列表（控制台/产品 API，camelCase 响应）
+
+按 `loop_id` 聚合 folded spans，给 Loop Health / Path Mining 页直接用。它不做自动诊断，只返回稳定读模型。
+
+查询参数：`cursor` / `limit` 分页，`filter` / `text` / `q` 做 contains；`attrs`、`projectId`、`skill`、`mode`、`taskFingerprint`、`validationStatus` 等一等字段可精确过滤；annotation / dataset 反向过滤参数与 `traceSearch` 相同。
+
+响应：
+
+```json
+{
+  "items": [
+    {
+      "loopId": "loop-a",
+      "loopValue": "loop-a",
+      "taskFingerprint": "npm-native-packaging",
+      "status": "error",
+      "spanCount": 2,
+      "traceCount": 2,
+      "sessionCount": 2,
+      "errorCount": 1,
+      "errorRate": 0.5,
+      "firstTraceId": "201",
+      "lastTraceId": "202",
+      "durationNs": { "sum": 30, "avg": 15, "max": 20, "p50": 10, "p95": 20, "count": 2 },
+      "usage": { "inputTokens": 12, "outputTokens": 18, "cachedInputTokens": 0, "reasoningTokens": 0, "totalTokens": 30 },
+      "costUsd": 0.000003,
+      "costDetail": { "costUsd": 0.000003, "costUsdNanos": 3000, "currency": "USD", "source": "mixed" },
+      "phases": ["verify"],
+      "validators": ["npm test"],
+      "fields": { "task_fingerprint": "npm-native-packaging", "loop_id": "loop-a", "validation_status": "pass" },
+      "examples": [{ "traceId": "201", "spanId": "1", "externalTraceId": null, "externalSpanId": null, "name": "builder" }]
+    }
+  ],
+  "nextCursor": null,
+  "total": 1
+}
+```
+
+### GET /v1/loops/:loopId  —— Agent loop 详情（控制台/产品 API，camelCase 响应）
+
+返回一个 loop 的 `summary`、该 loop 下的 trace 摘要和 span 列表。`loopId` 按字符串匹配 `loop_id` 一等字段。
+
+```json
+{
+  "summary": { "loopId": "loop-a", "traceCount": 2, "spanCount": 2 },
+  "traces": [{ "traceId": "201", "spanCount": 1, "fields": { "loop_id": "loop-a" } }],
+  "spans": [{ "traceId": "201", "spanId": "1", "fields": { "loop_id": "loop-a" } }]
+}
+```
+
+### GET /v1/tasks/:fingerprint/traces  —— 同类任务 trace 列表（控制台/产品 API，camelCase 响应）
+
+按 `task_fingerprint` 精确过滤并返回 trace 摘要页。支持与 `/v1/loops` 相同的 attrs、metadata、`filter`、`cursor`、`limit` 查询参数。
+
+```json
+{
+  "items": [
+    {
+      "traceId": "201",
+      "externalTraceId": "run-uuid",
+      "spanCount": 1,
+      "errorCount": 0,
+      "status": "ok",
+      "durationNs": { "sum": 10, "max": 10 },
+      "usage": { "inputTokens": 5, "outputTokens": 10, "cachedInputTokens": 0, "reasoningTokens": 0, "totalTokens": 15 },
+      "costUsd": 0.000001,
+      "costDetail": { "costUsd": 0.000001, "costUsdNanos": 1000, "currency": "USD", "source": "mixed" },
+      "fields": { "task_fingerprint": "npm-native-packaging", "loop_id": "loop-a" }
+    }
+  ],
+  "nextCursor": null,
+  "total": 1
+}
+```
+
+---
+
+## 业务元数据 API（annotation / dataset association）
+
+这组端点不改写 trace 主数据。它保存的是后验业务判断：某条 trace/span 被人工或自动流程标成什么，以及它对应哪个外部 dataset item。持久化文件是 durable data dir 下的 `metadata.dat`，在线备份会一起拷走。
+
+### POST /v1/annotations
+
+给 trace 或 span 追加一条 annotation。
+
+**请求体**：
+
+```json
+{
+  "traceId": "run-uuid",
+  "spanId": "span-uuid",
+  "target": "span",
+  "label": "best_path",
+  "score": 920,
+  "reason": "人工确认这次路径最短",
+  "source": "human",
+  "projectId": "agentic-data",
+  "skill": "review"
+}
+```
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---|---|
+| `trace_id` / `traceId` | u64 或 string | 是 | 支持内部数字 id 或外部字符串 id；字符串会稳定 hash，并保留到 `externalTraceId` |
+| `span_id` / `spanId` | u64 或 string | 否 | 传了则默认 `target=span`；字符串原文保留到 `externalSpanId` |
+| `target` | `trace` / `span` | 否 | 不传时根据是否有 span id 推断 |
+| `label` | string | 是 | 业务标签，如 `best_path`、`bad_answer`、`needs_review` |
+| `score` | u32? | 否 | 建议沿用千分制 0–1000 |
+| `reason` / `comment` / `note` | string? | 否 | 判断原因 |
+| `source` / `createdBy` | string? | 否 | `human` / `rule` / `eval` / `model` 等 |
+| `attrs` 或顶层 attrs 别名 | object / JSON value | 否 | `projectId`、`skill`、`mode`、`callSite` 等会保存为 attrs，用于过滤 |
+
+**响应**：
+
+```json
+{
+  "annotationId": "1",
+  "tenantId": "1",
+  "target": "span",
+  "traceId": "12629570674344444284",
+  "spanId": "12068206367433246855",
+  "externalTraceId": "run-uuid",
+  "externalSpanId": "span-uuid",
+  "label": "best_path",
+  "score": 920,
+  "reason": "人工确认这次路径最短",
+  "source": "human",
+  "createdAtNs": "1783000000000000000",
+  "attrs": {
+    "project_id": "agentic-data",
+    "skill": "review"
+  }
+}
+```
+
+### GET /v1/annotations
+
+按 tenant、trace/span、label/source、attrs 查询 annotation。
+
+**查询参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `trace_id` / `traceId` | 内部数字 id 或外部字符串 id |
+| `span_id` / `spanId` | 内部数字 id 或外部字符串 id |
+| `target` | `trace` / `span` |
+| `label` | 精确匹配 |
+| `source` | 精确匹配 |
+| `attrs` | URL 编码 JSON object，如 `{"project_id":"agentic-data"}` |
+| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `validationStatus` / `validation_status` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+
+响应：`{"items":[...],"count":N}`。
+
+### POST /v1/dataset-associations
+
+把一条 trace/span 绑定到外部 dataset item。yiTrace 不管理 dataset item 本体，只保存可回查的 source link。
+
+**请求体**：
+
+```json
+{
+  "datasetId": "best-path-regression",
+  "itemId": "case-1",
+  "traceId": "run-uuid",
+  "spanId": "span-uuid",
+  "snapshotId": "snap-1",
+  "snapshotHash": "fnv1a64:abc",
+  "evalRunId": "eval-1",
+  "split": "train",
+  "label": "pass",
+  "score": 920,
+  "projectId": "agentic-data",
+  "skill": "review"
+}
+```
+
+| 字段 | 类型 | 必需 | 说明 |
+|---|---|---|---|
+| `dataset_id` / `datasetId` / `dataset` | string | 是 | 外部 dataset id |
+| `item_id` / `itemId` / `datasetItemId` | string | 是 | 外部 dataset item id |
+| `trace_id` / `traceId` | u64 或 string | 是 | source trace |
+| `span_id` / `spanId` | u64 或 string | 否 | source span |
+| `snapshotId` / `snapshotHash` | string? | 否 | 建议绑定 `GET /v1/traces/:id/snapshot` 的快照身份 |
+| `evalRunId` / `split` / `label` / `score` | 可选 | 否 | 评测或训练集管理字段 |
+| `attrs` 或顶层 attrs 别名 | object / JSON value | 否 | project/skill/mode/call_site/task/loop/validation 等过滤维度 |
+
+响应字段同请求语义，额外包含 `associationId`、`tenantId`、`createdAtNs`、`externalTraceId`、`externalSpanId`。
+
+### GET /v1/dataset-associations
+
+按 dataset/item、trace/span、evalRunId、split、label、attrs 查询关联。别名 `/v1/dataset-links` 也可用。
+
+响应：`{"items":[...],"count":N}`。
+
 ---
 
 ## 控制台 API（写 Trace 浏览器用，camelCase）
@@ -278,7 +1575,9 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `limit` | usize | 50 | 页大小（clamp 1–500） |
 | `filter` | string | 空 | 按标题 / sessionId 子串过滤（URL 编码，支持中文） |
 | `attrs` | JSON object string | 空 | URL 编码后的 attrs 精确过滤，如 `{"project_id":"agentic-data","skill":"review"}` |
-| `project_id` / `skill` / `mode` / `call_site` | string | 空 | attrs 字符串精确过滤的便捷查询参数 |
+| `project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `validation_status` / `stop_reason` / `phase` / `validator` | string | 空 | attrs 字符串精确过滤的便捷查询参数 |
+| `annotationLabel` / `annotationSource` / `annotationScoreMin` | string / number | 空 | 会话内任一 trace/span 有匹配 annotation 时返回该会话 |
+| `datasetId` / `itemId` / `evalRunId` / `datasetLabel` | string | 空 | 会话内任一 trace/span 有匹配 dataset association 时返回该会话 |
 
 attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回该会话，返回值仍是完整 session 聚合行。
 
@@ -326,6 +1625,20 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
   "name": "如何修改预留手机号",
   "durMs": 7,
   "cost": 0.001,
+  "costUsd": 0.0012,
+  "costDetail": {
+    "costUsd": 0.0012,
+    "costUsdNanos": 1200000,
+    "currency": "USD",
+    "source": "mixed"
+  },
+  "usage": {
+    "inputTokens": 1258,
+    "outputTokens": 566,
+    "cachedInputTokens": 0,
+    "reasoningTokens": 0,
+    "totalTokens": 1824
+  },
   "inTok": 1258,
   "outTok": 566,
   "spanCount": 3,
@@ -339,7 +1652,9 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `turnIndex` | u32 | 第几轮（0 起） |
 | `name` | string | 轮标题（取 user_input 截断） |
 | `durMs` | u64 | 该轮总耗时毫秒 |
-| `cost` | f64 | 该轮成本 |
+| `cost` | f64 | 旧兼容成本字段 |
+| `costUsd` / `costDetail` | object | 标准化成本；`costDetail.source` 为 `explicit` / `estimated` / `mixed` |
+| `usage` | object | 标准 token 用量，含 input/output/cached/reasoning/total |
 | `inTok`/`outTok` | u64 | 输入/输出 token |
 | `spanCount` | u32 | span 数 |
 | `status` | string | `"ok"` / `"error"` |
@@ -355,6 +1670,14 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
     "name": "数据分析师",
     "durMs": 6,
     "cost": 0.001,
+    "costUsd": 0.0012,
+    "usage": {
+      "inputTokens": 900,
+      "outputTokens": 120,
+      "cachedInputTokens": 0,
+      "reasoningTokens": 0,
+      "totalTokens": 1020
+    },
     "spanCount": 3,
     "status": "ok"
   },
@@ -368,9 +1691,18 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
       "durMs": 6,
       "status": "ok",
       "cost": 0.001,
+      "costUsd": 0.0012,
+      "usage": {
+        "inputTokens": 900,
+        "outputTokens": 120,
+        "cachedInputTokens": 0,
+        "reasoningTokens": 0,
+        "totalTokens": 1020
+      },
       "inTok": null,
       "outTok": null,
       "model": null,
+      "provider": null,
       "depth": 0,
       "logEvents": [
         {
@@ -400,9 +1732,12 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `startMs` | i64 | 起点（瀑布定位用） |
 | `durMs` | i64 | 耗时 |
 | `status` | string | `"ok"`/`error`/`run` |
-| `cost` | f64 | 成本 |
+| `cost` | f64 | 旧兼容成本字段 |
+| `costUsd` / `costDetail` | object | 标准化成本；显式 `cost_usd` 优先，否则按默认单价估算 |
+| `usage` | object | 标准 token 用量 |
 | `inTok`/`outTok` | u64? | token（仅 llm） |
 | `model` | string? | 模型名（仅 llm） |
+| `provider` | string? | 模型供应商 / 系统 |
 | `depth` | u32 | 调用深度（缩进/树层级） |
 | `logEvents` | object[] | span 内携带 `logs` 的原始事件，按 `ts, seq, eventId` 排序 |
 
@@ -512,6 +1847,14 @@ curl localhost:7878/v1/traces/400035
 
 # 中文检索 + 过滤
 curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","k":10,"filter":{"agent_name":"风控","status":1}}'
+
+# 给 trace/span 打 annotation
+curl -XPOST localhost:7878/v1/annotations \
+  -d '{"traceId":"run-uuid","spanId":"span-uuid","label":"best_path","score":920,"projectId":"agentic-data"}'
+
+# 把 trace/span 关联到外部 dataset item
+curl -XPOST localhost:7878/v1/dataset-associations \
+  -d '{"datasetId":"best-path-regression","itemId":"case-1","traceId":"run-uuid","spanId":"span-uuid","snapshotHash":"fnv1a64:abc"}'
 
 # 向量找相似
 curl -XPOST localhost:7878/v1/search -d '{"vector":[0.1,0.2],"k":10}'

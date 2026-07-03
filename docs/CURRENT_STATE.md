@@ -1,6 +1,6 @@
 # yiTrace 当前态（唯一权威现状索引）
 
-> 更新：2026-06-22
+> 更新：2026-07-03
 > 这篇是**现状的唯一权威入口**。docs/ 下文档很多（41+ 篇，含多轮红队过程产物），新读者从这里看，不要被历史过程文档带偏。
 > 一句话：**项目走过一次大转向（openGauss 扩展 → 自研 Rust 引擎），当前承重的是 Rust 引擎；仓库里两套代码并存，本文讲清哪套是当前态。**
 
@@ -12,11 +12,26 @@
 
 | 目录 | 是什么 | 状态 |
 |---|---|---|
-| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，yt-core 9 + yt-engine 130 + eval_harness 6 + manifest 4 + memtable 2 + wal 5 测试绿 |
+| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，yt-core 9 + yt-engine 139 + eval_harness 8 + manifest 4 + memtable 2 + wal 5 测试绿 |
 | `yitrace-segstore-vortex/` | **列式段存储（Vortex）**，实现引擎的 `SegmentStore`。独立 crate、工作区外，**不污染零依赖骨架**。 | 已落地：写读 + 谓词下推 + 投影下推 + 默认压缩，7 测试绿 |
 | `yitrace-tokenizer-jieba/` | **团队 jieba 词级分词接入**（FFI），实现引擎的 `Tokenizer`。Vortex 同款隔离、工作区外。 | 接缝 + ABI 契约 + 离线 mock 测试绿（3 测）；真库在构建机 `--features link` 接 |
 | `yitrace-vecindex-graph/` | **团队 graph_index 向量 ANN 接入**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 接缝 + ABI 契约（带过滤回调）+ 离线 mock 测试绿（4 测）；真库在构建机 `--features link` 接 |
 | `yitrace-sdk/python`、`yitrace-sdk/typescript` | 打点 SDK，确定性 event_id 与引擎逐字节一致。 | 可用，各带测试 |
+| `yitrace-node/` | `@yitrace/db` Node/Electron 嵌入式 DB（N-API），通过进程内 `EngineJsonApi` 调 Rust 引擎，不读文件、不起本地 HTTP server。 | 可用：ESM/CJS、native load、ingest/search/traces/sessions/trace detail/snapshot/logEvents/attrs filter/traceAggregate/traceTrajectories/trajectoryGroups/traceDiff/goldenPaths/storageStats/retentionPlan/retentionAudits/retentionPolicies/annotation/dataset association 测试绿 |
+
+### 2026-07-03 关键增量
+
+- `@yitrace/db` 支持 Node/Electron 嵌入式打开 durable data dir，root 包 + per-platform optional native packages 的发布/本地 tarball 验证流程已成型。
+- direct ingest 支持外部字符串 id（UUID 等）：内部稳定 hash 成 u64，原始 id 保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`。
+- `attrs` 已贯穿 wire、WAL/segment、fold、查询输出和 Node 包；string/number/bool/null/array/object 按 JSON 形态 round-trip。
+- `project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `validation_status` / `stop_reason` / `phase` / `validator` 已从 attrs schema-on-write 提升为折叠后的一等字段，并保留 attrs fallback；这批字段可用于 search、traces、sessions、traceSearch、traceAggregate、loops 和 taskTraces 过滤/分组。
+- attrs 过滤已有高性能第一版：segment-local `attr_postings/seg-*.attrs` sidecar，内存常驻 term→segment 目录 + LRU posting-list cache，live WAL tail 用内存 overlay。
+- 新增产品化 trace 查询能力：`POST /v1/trace-search`、`POST /v1/trace-aggregate`、`POST /v1/trajectory-groups`、`POST /v1/trace-trajectories`、`POST /v1/storage-stats`、`POST /v1/retention-plan`、`POST /v1/retention/apply`、`GET/POST /v1/retention-audits`、`POST/GET /v1/retention-policies`、`POST /v1/retention-policies/run-due`、`POST /v1/traces/diff`、`POST/GET /v1/golden-paths`、`POST /v1/path-adherence`、`POST /v1/golden-path-evidence`、`POST /v1/golden-path-export`、`POST /v1/golden-path-health`、`GET /v1/loops`、`GET /v1/loops/:id`、`GET /v1/tasks/:fingerprint/traces`、trace snapshot、span ordinal/event ordinal、`logEvents`、span detail 分页和 batch detail；Node 包暴露 `db.traceSearch()` / `db.traceAggregate()` / `db.traceTrajectories()` / `db.trajectoryGroups()` / `db.storageStats()` / `db.retentionPlan()` / `db.applyRetention()` / `db.retentionAudits()` / `db.createRetentionPolicy()` / `db.retentionPolicies()` / `db.runRetentionPolicies()` / `db.traceDiff()` / `db.createGoldenPath()` / `db.goldenPaths()` / `db.updateGoldenPathStatus()` / `db.pathAdherence()` / `db.goldenPathEvidence()` / `db.goldenPathExport()` / `db.goldenPathHealth()` / `db.loops()` / `db.loop()` / `db.taskTraces()`。
+- `traceTrajectories` 已提供逐 trace 的物化 trajectory read model：复用 `traceSearch` 过滤语义，返回 trace 摘要、scope fields、usage/cost 和稳定 trajectory signature，不读取 input/output/log 大字段；`trajectoryGroups` 已提供 golden path mining 候选证据：按过滤条件找候选 trace，按完整 trajectory signature 分桶，输出 success rate、duration、usage/cost、eval/annotation/dataset score stats 和 examples；Golden Path Candidate Store 已落地，用 `metadata.dat` 保存 canonical source trace/snapshot 引用、scope attrs、轻量 `sourceTrajectory`、`evidenceSummary`、状态和评审信息；`pathAdherence` 可比较新 trace 是否遵循某个 Golden Path，返回共同/缺失/额外步骤、coverage 和 `sourceRetained`；`goldenPathEvidence` 把 source trace trajectory、annotation、dataset association 以及可选 candidate adherence/diff 打成证据包；`goldenPathExport` 用稳定 `yitrace.golden_path_export.v1` schema 输出 `items` + JSONL；`goldenPathHealth` 按同 scope trace 批量统计 followed/extended/partial/deviated 分布，给产品层 challenger/降级策略提供持续校验证据。重复命中、引用计数和压缩策略后续单独设计。
+- `traceDiff` 已进入 eval harness 验证：两条同类任务 trace 先经规则 scorer 写回 `eval_score` / `eval_label`，再比较 route、trajectory signature、失败状态、duration/token/cost delta 和 eval 分数差异。
+- 新增业务元数据基础层：tenant-scoped durable annotation 和 external dataset association，HTTP/Node 都可创建和查询，持久化到 `metadata.dat`，在线备份会一起拷走；`traceSearch()` / `traces()` / `sessions()` 已支持按 annotation/dataset association 反向过滤 source trace/span。
+- 存储治理基础版已落地：`storageStats()` 按 `traceSearch` filter 统计 trace/span/event、payload/attrs/external id 估算字节和 annotation/dataset/Golden Path/snapshot/eval link/path memory 引用；`retentionPlan()` dry-run 默认保护被 annotation、dataset association、active Golden Path、snapshot、eval link、path memory 引用的 trace；`applyRetention()` 只软删除已 flush 的 segment row，跳过仍在 MemTable/WAL tail 的热 trace，可选 `compact: true` 触发 deletion-vector segment 重写和 GC log 安全 reclaim；真实 apply 会写 tenant-scoped retention audit，`retentionAudits()` 可按 source/id/time 查询并随 `metadata.dat` 持久化；`retentionPolicies()` / `runRetentionPolicies()` 提供持久化 TTL 策略和显式 run-due 调度底座，不在 embedded 进程里自动启动后台删除线程。
+- 标准 usage/cost 字段已贯通 direct ingest、OTLP、WAL/segment/fold、Node builder 和查询输出：支持 provider、cached/reasoning/total tokens、显式 `cost_usd` / `cost_usd_nanos`、currency；列表和详情保留旧 `cost` 的同时输出 `usage` / `costDetail`。
 
 **权威产品/技术入口**：`docs/2026-06-22_yitrace-产品说明.md`（决策层）、`docs/design/2026-06-22_yitrace-技术文档.md`（工程）、`docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`（列式段）。
 
@@ -59,8 +74,8 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 - **CRC32 已换查表**（零依赖，已做）；BM25 logs 编码已换可逆转义（含 NUL/二进制/CJK 安全，已做）。
 - **真 kill -9 崩溃测试**（§1.3）：`tests/crash_recovery_kill9.sh` + `server_durable` example，连续 20 次"灌→kill-9→重启→验证数据+检索"，零失败。顺手修了 agent_name 未被 BM25 索引的真 bug（用户按 agent 名搜会搜空）。
 - **模糊测试**（§1.4）：`fuzz_fold_semantics_across_random_op_sequences` —— 8 个种子 × 80-119 步随机「ingest/flush/compaction/崩溃重放」，oracle 逐字段断言折叠结果一致、span 数无多无少。钉死随机组合下 last-non-null 折叠、compaction 不丢、崩溃幂等不塌。
-- **`/v1/metrics` 端点**（§3.1）：Prometheus 文本格式，暴露 manifest 版本/活跃段数/dead 段数/内存表行数/活跃读者/WAL 尾/刷盘阈值/过滤属性/折叠缓存/Bloom/数据集 11 个指标。curl + 单测实测。Prometheus 可直接抓、Grafana 出看板。
-- **在线快照备份**（§3.3）：`backup_snapshot(dest)` 走 pin 协议拿一致快照（GC 不会删被引用的段），拷 segments/ + wal.log + manifest.dat + vecindex/ + gc.log 到目标目录,得到可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。测试 `backup_snapshot_restores_consistent_data` 钉死。
+- **`/v1/metrics` 端点**（§3.1）：Prometheus 文本格式，暴露 manifest 版本/活跃段数/dead 段数/内存表行数/活跃读者/WAL 尾/刷盘阈值/过滤属性/attrs sidecar cache/折叠缓存/Bloom/数据集/annotation/dataset association 等指标。curl + 单测实测。Prometheus 可直接抓、Grafana 出看板。
+- **在线快照备份**（§3.3）：`backup_snapshot(dest)` 走 pin 协议拿一致快照（GC 不会删被引用的段），拷 segments/ + attr_postings/ + wal.log + manifest.dat + metadata.dat + vecindex/ + gc.log 到目标目录,得到可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。测试 `backup_snapshot_restores_consistent_data` 钉死。
 - **升级迁移**（§3.4）：`manifest.dat` 已带 `MAGIC + FORMAT_VER`（=1），decode 区分坏 magic/未来版本/老版本（各走明确日志而非静默 None）。`check_format(dir)` 返回 (磁盘版本, 引擎版本)；`migrate(dir)` 骨架（版本相等=Ok，老版本/未来版本=明确 Err）。`/metrics` 暴露 `yt_format_version`。当前无历史老版本数据，真实逐版本迁移在引入格式变更时扩展。
 
 ---

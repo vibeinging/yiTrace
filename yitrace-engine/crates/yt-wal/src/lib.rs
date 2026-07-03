@@ -258,7 +258,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
 fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_u64(b, SPAN_FIELDS_MAGIC_V2);
-    put_u64(b, 2);
+    put_u64(b, 5);
     put_opt_u8(b, f.status);
     put_opt_u64(b, f.duration_ns);
     put_opt_u64(b, f.parent_span_id);
@@ -270,6 +270,17 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_opt_str(b, &f.external_span_id);
     put_opt_str(b, &f.external_parent_span_id);
     put_opt_str(b, &f.external_session_id);
+    put_opt_str(b, &f.project_id);
+    put_opt_str(b, &f.skill);
+    put_opt_str(b, &f.mode);
+    put_opt_str(b, &f.call_site);
+    put_opt_str(b, &f.task_fingerprint);
+    put_opt_str(b, &f.loop_id);
+    put_opt_str(b, &f.harness_version);
+    put_opt_str(b, &f.validation_status);
+    put_opt_str(b, &f.stop_reason);
+    put_opt_str(b, &f.phase);
+    put_opt_str(b, &f.validator);
     put_opt_str(b, &f.agent_name);
     put_opt_str(b, &f.tool_name);
     put_opt_str(b, &f.model);
@@ -286,11 +297,17 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
         put_str(b, k);
         put_str(b, v);
     }
+    put_opt_u64(b, f.cached_input_tokens);
+    put_opt_u64(b, f.reasoning_tokens);
+    put_opt_u64(b, f.total_tokens);
+    put_opt_u64(b, f.cost_usd_nanos);
+    put_opt_str(b, &f.cost_currency);
+    put_opt_str(b, &f.provider);
 }
 
 fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
     let ver = c.u64()?;
-    if ver != 2 {
+    if !(2..=5).contains(&ver) {
         return None;
     }
     let status = c.opt_u8()?;
@@ -304,6 +321,32 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
     let external_span_id = c.opt_str()?;
     let external_parent_span_id = c.opt_str()?;
     let external_session_id = c.opt_str()?;
+    let (project_id, skill, mode, call_site) = if ver >= 3 {
+        (c.opt_str()?, c.opt_str()?, c.opt_str()?, c.opt_str()?)
+    } else {
+        (None, None, None, None)
+    };
+    let (
+        task_fingerprint,
+        loop_id,
+        harness_version,
+        validation_status,
+        stop_reason,
+        phase,
+        validator,
+    ) = if ver >= 5 {
+        (
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+        )
+    } else {
+        (None, None, None, None, None, None, None)
+    };
     let agent_name = c.opt_str()?;
     let tool_name = c.opt_str()?;
     let model = c.opt_str()?;
@@ -321,18 +364,54 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
     for _ in 0..attr_n {
         attrs.insert(c.string()?, c.string()?);
     }
+    let (
+        cached_input_tokens,
+        reasoning_tokens,
+        total_tokens,
+        cost_usd_nanos,
+        cost_currency,
+        provider,
+    ) = if ver >= 4 {
+        (
+            c.opt_u64()?,
+            c.opt_u64()?,
+            c.opt_u64()?,
+            c.opt_u64()?,
+            c.opt_str()?,
+            c.opt_str()?,
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
     Some(SpanFields {
         status,
         duration_ns,
         parent_span_id,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+        total_tokens,
+        cost_usd_nanos,
+        cost_currency,
+        provider,
         session_id,
         tenant_id,
         external_trace_id,
         external_span_id,
         external_parent_span_id,
         external_session_id,
+        project_id,
+        skill,
+        mode,
+        call_site,
+        task_fingerprint,
+        loop_id,
+        harness_version,
+        validation_status,
+        stop_reason,
+        phase,
+        validator,
         agent_name,
         tool_name,
         model,
@@ -371,6 +450,12 @@ fn decode_span_fields_legacy_from(c: &mut Cur) -> Option<SpanFields> {
         parent_span_id,
         input_tokens,
         output_tokens,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        cost_usd_nanos: None,
+        cost_currency: None,
+        provider: None,
         session_id,
         tenant_id,
         agent_name,
@@ -675,6 +760,17 @@ mod tests {
             external_trace_id: Some("run-uuid".into()),
             external_span_id: Some("span-uuid".into()),
             external_session_id: Some("session-uuid".into()),
+            project_id: Some("\"agentic-data\"".into()),
+            skill: Some("\"review\"".into()),
+            mode: Some("\"auto\"".into()),
+            call_site: Some("\"worker.ts:10\"".into()),
+            task_fingerprint: Some("\"npm-native-packaging\"".into()),
+            loop_id: Some("\"loop-1\"".into()),
+            harness_version: Some("\"h1\"".into()),
+            validation_status: Some("\"pass\"".into()),
+            stop_reason: Some("\"goal_met\"".into()),
+            phase: Some("\"verify\"".into()),
+            validator: Some("\"npm test\"".into()),
             attrs,
             logs: vec!["ok".into()],
             ..Default::default()
@@ -687,6 +783,20 @@ mod tests {
             decoded.attrs.get("project_id").map(String::as_str),
             Some("\"agentic-data\"")
         );
+        assert_eq!(decoded.project_id.as_deref(), Some("\"agentic-data\""));
+        assert_eq!(decoded.skill.as_deref(), Some("\"review\""));
+        assert_eq!(decoded.mode.as_deref(), Some("\"auto\""));
+        assert_eq!(decoded.call_site.as_deref(), Some("\"worker.ts:10\""));
+        assert_eq!(
+            decoded.task_fingerprint.as_deref(),
+            Some("\"npm-native-packaging\"")
+        );
+        assert_eq!(decoded.loop_id.as_deref(), Some("\"loop-1\""));
+        assert_eq!(decoded.harness_version.as_deref(), Some("\"h1\""));
+        assert_eq!(decoded.validation_status.as_deref(), Some("\"pass\""));
+        assert_eq!(decoded.stop_reason.as_deref(), Some("\"goal_met\""));
+        assert_eq!(decoded.phase.as_deref(), Some("\"verify\""));
+        assert_eq!(decoded.validator.as_deref(), Some("\"npm test\""));
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
     }

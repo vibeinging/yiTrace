@@ -1,10 +1,10 @@
 # yiTrace
 
-**A single-binary trace database for AI agents.**
+**Trace SDK and run replay for AI agents.**
 
-Run it locally, point OTLP/OpenInference or the SDK at it, and get trace replay,
-Chinese search, vector recall, cost attribution, and evals without sending agent
-data to a hosted observability service.
+Add the SDK, send agent runs to a local yiTrace collector, and replay every
+multi-turn conversation, tool call, token cost, and failure without sending data
+to a hosted observability service.
 
 [中文](README.zh-CN.md) · English
 
@@ -12,21 +12,23 @@ data to a hosted observability service.
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![status](https://img.shields.io/badge/status-alpha-3fb950)](#project-status)
 [![engine](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#how-it-works)
-[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#ingest-from-your-agent)
+[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#start-with-the-trace-sdk)
 
 Open the bundled console to replay multi-turn sessions, inspect spans, search
 Chinese trace text, and drill into model/tool calls.
 
 ![yiTrace console](docs/images/console-overview.png)
 
-yiTrace is for teams building agents that need private, inspectable traces:
+yiTrace is for teams building agents that want tracing to feel like adding an
+SDK, not adopting a database:
 
+- add Python or TypeScript tracing with a few lines of code
 - replay multi-turn conversations, tool calls, and multi-agent handoffs
 - search Chinese trace text with BM25, then blend it with vector recall
 - filter search by tenant, agent, status, trace, and time
 - attribute token cost per trace, session, and agent
 - collect failed spans into eval datasets and track regressions
-- run in one directory, with the engine core using only the Rust standard library
+- keep the storage engine local and hidden until you need it
 
 > Status: alpha, runnable today. Storage, WAL recovery, OTLP ingest, SDKs,
 > Chinese search, vector recall, and evals are covered by offline tests.
@@ -100,6 +102,60 @@ curl localhost:7878/v1/traces \
   -H 'X-Tenant-Id: 1'
 ```
 
+## Start With The Trace SDK
+
+You do not need to adopt yiTrace as a database to begin. Run the local collector
+or server, add the SDK, and treat yiTrace like a private flight recorder for
+agent runs.
+
+Python:
+
+```python
+from yitrace import Tracer, HttpExporter
+
+tracer = Tracer(
+    exporter=HttpExporter(
+        "http://127.0.0.1:7878/v1/ingest",
+        tenant_id=1,
+    ),
+    node_id=1,
+)
+
+with tracer.trace("AML screening", tenant_id=1) as t:
+    with t.span("risk agent") as span:
+        span.log("possible card fraud")
+        span.set_tokens(input_tokens=900, output_tokens=120)
+
+tracer.close()
+```
+
+TypeScript:
+
+```ts
+import { HttpExporter, Tracer } from "@yitrace/trace-sdk";
+
+const tracer = new Tracer(
+  new HttpExporter({
+    url: "http://127.0.0.1:7878/v1/ingest",
+    tenantId: 1,
+  }),
+  1,
+);
+
+tracer.trace("AML screening", (t) => {
+  t.span("risk agent", (span) => {
+    span.log("possible card fraud");
+    span.setTokens(900, 120);
+  });
+}, undefined, 1);
+
+await tracer.close();
+```
+
+Already have OpenTelemetry or OpenInference spans? POST OTLP/HTTP JSON to
+`/v1/traces`. yiTrace maps OTel GenAI `gen_ai.*` and OpenInference `llm.*`
+attributes into the same trace store.
+
 ## Console
 
 The engine can serve the React console as embedded static assets. From source,
@@ -123,12 +179,12 @@ any other UI. See [HTTP API Reference](docs/API_REFERENCE.md).
 
 ---
 
-## Embedded Node / Electron
+## Advanced: Embedded Node / Electron
 
-For Node backends and Electron apps, yiTrace can also run in-process as an
-embedded database. This does not read data files directly; it loads the Rust
-engine through Node-API and uses the same WAL, manifest, folding, search, and
-tenant filtering code as the server.
+For Node backends and Electron apps that want local persistence without running
+a separate process, yiTrace can also run in-process. This is the advanced path:
+it loads the Rust engine through Node-API and uses the same WAL, manifest,
+folding, search, and tenant filtering code as the server.
 
 ```bash
 npm install @yitrace/db
@@ -186,78 +242,29 @@ native platform packages (`@yitrace/db-darwin-arm64`,
 single command while avoiding a Rust toolchain requirement on the user's
 machine. Maintainer packaging and publish steps are documented in
 [`yitrace-node/README.md`](yitrace-node/README.md).
-Before the public npm release, teams can use `npm run pack:local` in
-`yitrace-node/` to produce versioned tarballs and lock those tarballs in a
-consumer repository or internal npm registry.
-
----
-
-## Ingest From Your Agent
-
-Python:
-
-```python
-from yitrace import Tracer, HttpExporter
-
-tracer = Tracer(
-    exporter=HttpExporter(
-        "http://127.0.0.1:7878/v1/ingest",
-        tenant_id=1,
-    ),
-    node_id=1,
-)
-
-with tracer.trace("AML screening", tenant_id=1) as t:
-    with t.span("risk agent") as span:
-        span.log("possible card fraud")
-        span.set_tokens(input_tokens=900, output_tokens=120)
-
-tracer.close()
-```
-
-TypeScript:
-
-```ts
-import { HttpExporter, Tracer } from "@yitrace/trace-sdk";
-
-const tracer = new Tracer(
-  new HttpExporter({
-    url: "http://127.0.0.1:7878/v1/ingest",
-    tenantId: 1,
-  }),
-  1,
-);
-
-tracer.trace("AML screening", (t) => {
-  t.span("risk agent", (span) => {
-    span.log("possible card fraud");
-    span.setTokens(900, 120);
-  });
-}, undefined, 1);
-
-await tracer.close();
-```
-
-Already have OpenTelemetry or OpenInference spans? POST OTLP/HTTP JSON to
-`/v1/traces`. yiTrace maps OTel GenAI `gen_ai.*` and OpenInference `llm.*`
-attributes into the same trace store.
+Before the public npm release, teams can use `npm run pack:verify` in
+`yitrace-node/` to produce immutable commit-labeled tarballs and lock those
+tarballs in a consumer repository or internal npm registry.
 
 ---
 
 ## Why yiTrace
 
-Most observability tools can store traces. yiTrace is built for agent traces as
-data you query, evaluate, and keep private.
+Most tracing SDKs stop at export, and most databases feel too heavy for first
+contact. yiTrace keeps the first step SDK-shaped, then gives you private replay,
+search, cost attribution, and eval data behind it.
 
 | You need | Use |
 |---|---|
 | Hosted tracing, prompt runs, team workflows | LangSmith / Langfuse |
 | OpenTelemetry routing, metrics, and pipeline glue | OpenTelemetry Collector |
 | SQL analytics over large general-purpose event tables | ClickHouse / DuckDB |
-| Local/private agent trace storage with Chinese search, vector recall, and evals | yiTrace |
+| SDK-first private agent run replay with Chinese search, vector recall, and evals | yiTrace |
 
 What is different:
 
+- **SDK-first adoption**: start with `@yitrace/trace-sdk` or the Python SDK; use
+  the embedded DB only when you need in-process local persistence.
 - **Private by default**: one local process, one data directory, no external services.
 - **Agent-native records**: multi-turn sessions, span trees, tools, models, tokens, eval scores.
 - **Retry-safe ingest**: deterministic `event_id = hash(ext_span_id, seq, event_type)` across Rust, Python, and TypeScript.

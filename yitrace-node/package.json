@@ -42,6 +42,7 @@
     "native.cjs",
     "native.js",
     "native.d.ts",
+    "examples",
     "README.md"
   ],
   "scripts": {

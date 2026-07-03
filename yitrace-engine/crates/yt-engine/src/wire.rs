@@ -61,6 +61,12 @@ impl Json {
             _ => None,
         }
     }
+    pub(crate) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Num(s) | Json::Str(s) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+    }
     fn as_str_array(&self) -> Vec<String> {
         match self {
             Json::Arr(items) => items
@@ -160,6 +166,22 @@ fn attrs_map(v: Option<&Json>) -> BTreeMap<String, String> {
     }
 }
 
+pub(crate) fn usd_nanos(v: &Json) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n.saturating_mul(1_000_000_000));
+    }
+    let usd = v.as_f64()?;
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    let nanos = (usd * 1_000_000_000.0).round();
+    if nanos > u64::MAX as f64 {
+        None
+    } else {
+        Some(nanos as u64)
+    }
+}
+
 /// 把一批 SDK 线格式 JSON（数组）解析成 WireRecord。引擎自算 event_id，故忽略线里的 event_id。
 pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
     let v = parse(s)?;
@@ -185,6 +207,12 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
         let (span_id, span_ext_from_id) = parse_req_id(obj, "span_id", i)?;
         let (parent_span_id, parent_ext_from_id) = parse_opt_id(obj, "parent_span_id");
         let (session_id, session_ext_from_id) = parse_opt_id(obj, "session_id");
+        let mut attrs = attrs_map(field(obj, "attrs"));
+        for (alias, key) in wire_attr_aliases() {
+            if let Some(value) = field(obj, alias) {
+                attrs.insert((*key).to_string(), value.to_compact_json());
+            }
+        }
         out.push(WireRecord {
             trace_id,
             span_id,
@@ -200,6 +228,28 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             duration_ns: opt_u64("duration_ns"),
             input_tokens: opt_u64("input_tokens"),
             output_tokens: opt_u64("output_tokens"),
+            cached_input_tokens: json_field_alias(
+                obj,
+                &[
+                    "cached_input_tokens",
+                    "cachedInputTokens",
+                    "input_tokens_cached",
+                ],
+            )
+            .and_then(Json::as_u64),
+            reasoning_tokens: json_field_alias(obj, &["reasoning_tokens", "reasoningTokens"])
+                .and_then(Json::as_u64),
+            total_tokens: json_field_alias(obj, &["total_tokens", "totalTokens"])
+                .and_then(Json::as_u64),
+            cost_usd_nanos: json_field_alias(obj, &["cost_usd_nanos", "costUsdNanos"])
+                .and_then(Json::as_u64)
+                .or_else(|| json_field_alias(obj, &["cost_usd", "costUsd"]).and_then(usd_nanos)),
+            cost_currency: json_field_alias(obj, &["cost_currency", "costCurrency"])
+                .and_then(Json::as_str)
+                .map(|s| s.to_string()),
+            provider: json_field_alias(obj, &["provider", "llm_provider", "llmProvider"])
+                .and_then(Json::as_str)
+                .map(|s| s.to_string()),
             session_id,
             tenant_id: opt_u64("tenant_id"),
             external_trace_id: opt_str("external_trace_id").or(trace_ext_from_id),
@@ -212,10 +262,37 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             input_text: opt_str("input_text"),
             output_text: opt_str("output_text"),
             logs: obj.get("logs").map(Json::as_str_array).unwrap_or_default(),
-            attrs: attrs_map(field(obj, "attrs")),
+            attrs,
         });
     }
     Ok(out)
+}
+
+fn wire_attr_aliases() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("project_id", "project_id"),
+        ("projectId", "project_id"),
+        ("skill", "skill"),
+        ("mode", "mode"),
+        ("call_site", "call_site"),
+        ("callSite", "call_site"),
+        ("task_fingerprint", "task_fingerprint"),
+        ("taskFingerprint", "task_fingerprint"),
+        ("loop_id", "loop_id"),
+        ("loopId", "loop_id"),
+        ("harness_version", "harness_version"),
+        ("harnessVersion", "harness_version"),
+        ("validation_status", "validation_status"),
+        ("validationStatus", "validation_status"),
+        ("stop_reason", "stop_reason"),
+        ("stopReason", "stop_reason"),
+        ("phase", "phase"),
+        ("validator", "validator"),
+    ]
+}
+
+pub(crate) fn json_field_alias<'a>(obj: &'a Json, aliases: &[&str]) -> Option<&'a Json> {
+    aliases.iter().find_map(|key| field(obj, key))
 }
 
 // ───────────────────────── 解析器 ─────────────────────────
@@ -411,8 +488,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_usage_cost_fields() {
+        let body = r#"[{
+          "trace_id":"run-1",
+          "span_id":"span-1",
+          "ts":"100",
+          "seq":"1",
+          "event_type":2,
+          "ext_span_id":"span-1",
+          "input_tokens":1200,
+          "output_tokens":340,
+          "cachedInputTokens":80,
+          "reasoningTokens":40,
+          "totalTokens":1660,
+          "costUsd":0.001234,
+          "costCurrency":"USD",
+          "llmProvider":"openai",
+          "logs":[]
+        }]"#;
+        let recs = parse_wire_batch(body).unwrap();
+        let rec = &recs[0];
+        assert_eq!(rec.cached_input_tokens, Some(80));
+        assert_eq!(rec.reasoning_tokens, Some(40));
+        assert_eq!(rec.total_tokens, Some(1660));
+        assert_eq!(rec.cost_usd_nanos, Some(1_234_000));
+        assert_eq!(rec.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(rec.provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
     fn hashes_external_ids_and_preserves_attrs() {
-        let body = r#"[{"trace_id":"run-uuid","span_id":"span-uuid","parent_span_id":"parent-uuid","session_id":"session-uuid","ts":100,"seq":1,"event_type":1,"ext_span_id":"span-uuid","attrs":{"external_run_id":"run-uuid","project_id":7,"nested":{"ok":true},"skill":"review"}}]"#;
+        let body = r#"[{"trace_id":"run-uuid","span_id":"span-uuid","parent_span_id":"parent-uuid","session_id":"session-uuid","ts":100,"seq":1,"event_type":1,"ext_span_id":"span-uuid","taskFingerprint":"npm-native-packaging","loopId":"loop-1","harnessVersion":"h1","validationStatus":"pass","stopReason":"goal_met","phase":"verify","validator":"npm test","attrs":{"external_run_id":"run-uuid","project_id":7,"nested":{"ok":true},"skill":"review"}}]"#;
         let recs = parse_wire_batch(body).unwrap();
         let r = &recs[0];
         assert_eq!(r.trace_id, fnv1a64(b"run-uuid"));
@@ -428,6 +534,31 @@ mod tests {
             Some("\"run-uuid\"")
         );
         assert_eq!(r.attrs.get("project_id").map(String::as_str), Some("7"));
+        assert_eq!(
+            r.attrs.get("task_fingerprint").map(String::as_str),
+            Some("\"npm-native-packaging\"")
+        );
+        assert_eq!(
+            r.attrs.get("loop_id").map(String::as_str),
+            Some("\"loop-1\"")
+        );
+        assert_eq!(
+            r.attrs.get("harness_version").map(String::as_str),
+            Some("\"h1\"")
+        );
+        assert_eq!(
+            r.attrs.get("validation_status").map(String::as_str),
+            Some("\"pass\"")
+        );
+        assert_eq!(
+            r.attrs.get("stop_reason").map(String::as_str),
+            Some("\"goal_met\"")
+        );
+        assert_eq!(r.attrs.get("phase").map(String::as_str), Some("\"verify\""));
+        assert_eq!(
+            r.attrs.get("validator").map(String::as_str),
+            Some("\"npm test\"")
+        );
         assert_eq!(
             r.attrs.get("nested").map(String::as_str),
             Some("{\"ok\":true}")

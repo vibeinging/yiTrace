@@ -185,9 +185,37 @@ const tracer = new Tracer({ exporter: new HttpExporter("http://localhost:7878/v1
 | POST | `/v1/traces` | **OTLP/HTTP 标准端点**（生态入口，已埋点应用直接接） |
 | GET  | `/v1/traces` | trace 列表 |
 | POST | `/v1/search` | 中文检索 + 向量召回 + 混合，可带 `filter`（agent/状态/tenant/时间/attrs） |
+| POST | `/v1/trace-search` | 跨 session 结构化 span 搜索（分页/排序/attrs/text contains） |
+| POST | `/v1/trace-aggregate` | 对结构化搜索结果做 group-by 聚合（path mining / trace inbox stats） |
+| POST | `/v1/trajectory-groups` | 按完整 trajectory signature 分桶，发现稳定路径候选证据 |
+| POST | `/v1/trace-trajectories` | 按 traceSearch 过滤返回每条 trace 的物化 trajectory 摘要 |
+| POST | `/v1/storage-stats` | 按 traceSearch 过滤统计 trace/span/event、估算字节和 metadata 引用 |
+| POST | `/v1/retention-plan` | dry-run 生成 retention 计划，默认保护 annotation/dataset/active Golden Path/snapshot/eval/path memory 引用 |
+| POST | `/v1/retention/apply` | 执行 segment-row 软删除；要求 `deleteBeforeTs`，跳过 MemTable/WAL tail 热 trace；可选 `compact:true` 压实并 reclaim |
+| GET/POST | `/v1/retention-audits` | 查询 retention/apply 审计记录（策略、计数、trace id 样本） |
+| POST/GET | `/v1/retention-policies` | 创建/查询持久化 retention TTL 策略 |
+| POST | `/v1/retention-policies/run-due` | 显式执行到期 retention policies；不会自动后台删除 |
+| POST | `/v1/traces/diff` | 比较两条 trace 的 route、step、trajectory、duration/token/cost/status 差异 |
+| POST | `/v1/golden-paths` | 登记 Golden Path 候选资产（只存源 trace/snapshot 引用，不复制 trace payload） |
+| GET  | `/v1/golden-paths` | 查询 Golden Path 候选/已确认路径（支持 task/status/attrs 过滤） |
+| POST | `/v1/golden-paths/:id/status` | 确认、拒绝或废弃候选路径 |
+| POST | `/v1/path-adherence` | 比较新 trace 是否遵循某个 Golden Path，只返回 trajectory 证据 |
+| POST | `/v1/golden-path-evidence` | 导出 Golden Path 的 source/candidate 证据包 |
+| POST | `/v1/golden-path-export` | 按稳定 JSONL schema 导出 confirmed Golden Path |
+| POST | `/v1/golden-path-health` | 批量统计同 scope trace 对 Golden Path 的遵循分布 |
+| GET  | `/v1/loops` | agent loop 摘要列表 |
+| GET  | `/v1/loops/:loopId` | 单个 loop 的摘要、trace 列表和 span 列表 |
+| GET  | `/v1/tasks/:fingerprint/traces` | 同类 task 的 trace 列表 |
+| POST | `/v1/annotations` | 给 trace/span 追加业务 annotation |
+| GET  | `/v1/annotations` | 查询业务 annotation |
+| POST | `/v1/dataset-associations` | 关联外部 dataset item 与 trace/span |
+| GET  | `/v1/dataset-associations` | 查询外部 dataset item 关联 |
 | GET  | `/v1/sessions` | 会话列表（游标分页） |
 | GET  | `/v1/sessions/:id/turns` | 一个会话的各轮 |
+| GET  | `/v1/traces/:id/snapshot` | 导出带 hash 的完整 trace snapshot |
 | GET  | `/v1/traces/:id` | 一条 trace 的折叠 span（瀑布） |
+| GET  | `/v1/traces/:id/spans` | span detail 分页列表 |
+| POST | `/v1/traces/:id/spans/batch` | 批量 span detail |
 | GET  | `/v1/traces/:id/spans/:spanId` | 单 span 大字段（晚物化）+ `logEvents` |
 
 **检索示例：**
@@ -221,7 +249,14 @@ const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
 const events = createSpanEventBuilder({
   traceId: "run-uuid",
   sessionId: "session-uuid",
-  attrs: { project_id: "agentic-data", skill: "review", mode: "auto", call_site: "worker.ts:10" },
+  attrs: {
+    project_id: "agentic-data",
+    skill: "review",
+    mode: "auto",
+    call_site: "worker.ts:10",
+    task_fingerprint: "npm-native-packaging",
+    validation_status: "pass"
+  },
 });
 events.startSpan({ spanId: "span-uuid", name: "风控研判", agentName: "风控 Agent" });
 events.log({ spanId: "span-uuid", message: "疑似盗刷" });
@@ -229,10 +264,41 @@ events.endSpan({ spanId: "span-uuid", status: 0, durationNs: 12_000_000 });
 await events.ingest(db);
 
 const traces = await db.search({ text: "盗刷", k: 10, filter: { attrs: { project_id: "agentic-data", skill: "review" } } });
+await db.annotate({ traceId: "run-uuid", spanId: "span-uuid", label: "best_path", score: 920, projectId: "agentic-data" });
+await db.linkDatasetItem({ datasetId: "best-path-regression", itemId: "case-1", traceId: "run-uuid", spanId: "span-uuid" });
+const stats = await db.traceAggregate({ groupBy: ["taskFingerprint", "validationStatus", "toolName"], filter: { attrs: { project_id: "agentic-data" } } });
+const candidates = await db.trajectoryGroups({ filter: { taskFingerprint: "npm-native-packaging" }, sort: "best" });
+const trajectories = await db.traceTrajectories({ filter: { taskFingerprint: "npm-native-packaging", attrs: { project_id: "agentic-data" } } });
+const storage = await db.storageStats({ filter: { taskFingerprint: "npm-native-packaging", attrs: { project_id: "agentic-data" } }, groupBy: ["projectId", "validationStatus"] });
+const retention = await db.retentionPlan({ filter: { taskFingerprint: "npm-native-packaging" }, deleteBeforeTs: 1751540000000000000 });
+const applyResult = await db.applyRetention({ filter: { taskFingerprint: "npm-native-packaging" }, deleteBeforeTs: 1751540000000000000, compact: true, requestedBy: "nightly-retention-policy", reason: "ttl cleanup" });
+const retentionAudits = await db.retentionAudits({ filter: { source: "nightly-retention-policy" } });
+const retentionPolicy = await db.createRetentionPolicy({ name: "nightly-retention-policy", intervalNs: 86_400_000_000_000, source: "nightly-retention-policy", reason: "ttl cleanup", query: { filter: { attrs: { project_id: "agentic-data" } }, olderThanNs: 30 * 86_400_000_000_000, compact: true } });
+const retentionPolicyRun = await db.runRetentionPolicies({ nowNs: (BigInt(Date.now()) * 1_000_000n).toString(), limit: 10 });
+const diff = await db.traceDiff("run-uuid", "candidate-run-uuid");
+const golden = await db.createGoldenPath({ sourceTraceId: "run-uuid", taskFingerprint: "npm-native-packaging", score: 960, projectId: "agentic-data" });
+await db.updateGoldenPathStatus(golden.goldenPathId, { status: "confirmed", reason: "manual accept", source: "human" });
+const adherence = await db.pathAdherence(golden.goldenPathId, "candidate-run-uuid");
+const evidence = await db.goldenPathEvidence({ goldenPathId: golden.goldenPathId, candidateTraceId: "candidate-run-uuid" });
+const exportPage = await db.goldenPathExport({ filter: { taskFingerprint: "npm-native-packaging", projectId: "agentic-data" } });
+const health = await db.goldenPathHealth(golden.goldenPathId, { filter: { projectId: "agentic-data" } });
+const loops = await db.loops({ taskFingerprint: "npm-native-packaging" });
+const loop = await db.loop("loop-builder");
+const taskTraces = await db.taskTraces("npm-native-packaging", { validationStatus: "pass" });
 await db.close();
 ```
 
-这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` 支持 search 和 sessions 精确过滤，JSON value 会按 string/number/bool/null/array/object round-trip。Electron 应用应在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。一个 data dir 同时只允许一个写者，`.yitrace.lock` 会阻止多进程同时打开。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成带 commit/label 后缀的 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；不要长期覆盖复用 `0.0.1.tgz`。AgenticData server 侧必须选定单一 native 架构：当前默认 x64 时 DuckDB、yiTrace、sqlite 都保持 x64；若切 arm64，先把 DuckDB/sqlite 也切到 arm64 或 optional per-platform 策略，不能混用架构。交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
+这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `validation_status` / `stop_reason` / `phase` / `validator` 已提升为一等字段，支持 search、sessions、traceSearch、traces、traceAggregate、trajectoryGroups、traceDiff、goldenPaths、loops 和 taskTraces 精确过滤/分组，`pathAdherence` 复用同一租户和 trace id 边界做路径对比，JSON value 会按 string/number/bool/null/array/object round-trip。标准 usage/cost 字段也走同一链路：`provider`、`cached_input_tokens`、`reasoning_tokens`、`total_tokens`、`cost_usd` / `cost_usd_nanos`、`cost_currency` 可直接摄入，查询输出保留旧 `cost` 的同时返回 `usage` / `costDetail`。`db.annotate()`、`db.linkDatasetItem()` 和 `db.createGoldenPath()` 用独立 `metadata.dat` 保存后验标注、外部 dataset item source link 与 Golden Path 候选资产，tenant-scoped，随在线备份一起拷走；`db.traceSearch()` / `db.traceAggregate()` / `db.trajectoryGroups()` / `db.traceDiff()` / `db.goldenPaths()` / `db.pathAdherence()` / `db.goldenPathHealth()` / `db.loops()` / `db.loop()` / `db.taskTraces()` / `db.traces()` / `db.sessions()` 可用 `annotation` / `dataset` 反查被标注或已绑定数据集的 trace/span/session/loop/task；`db.storageStats()` 复用 traceSearch filter 统计 trace/span/event、payload/attrs/external id 估算字节和 metadata 引用；`db.retentionPlan()` 默认保护 annotation、dataset association、active Golden Path、snapshot、eval link 和 path memory 引用的 trace，`db.applyRetention()` 只软删除已 flush 的 segment rows 并跳过 MemTable/WAL tail 热 trace，传 `compact:true` 时会把 deletion vector 物化进新段并走 GC log 安全 reclaim，`db.retentionAudits()` 可查真实执行审计，`db.createRetentionPolicy()` / `db.retentionPolicies()` / `db.runRetentionPolicies()` 提供持久化 TTL 策略和显式 run-due 调度底座，不会在 embedded 进程里自动后台删除；`db.trajectoryGroups()` 按完整 trajectory signature 分桶并输出 success/eval/annotation/dataset/cost/duration 证据，`db.traceDiff()` 额外返回两条 trace 的 route、逐步变化和 duration/token/cost/status delta，`db.pathAdherence()` 比较新 trace 是否遵循某个 Golden Path 并返回 common/missing/extra steps，`db.goldenPathHealth()` 批量统计同 scope 后续 trace 的 followed/extended/partial/deviated 分布，供 golden path mining、回归对比和 challenger 策略使用；`db.createGoldenPath()` 只保存 canonical source trace/snapshot 引用和状态，重复命中/引用计数后续作为独立需求设计。Electron 应用应在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。一个 data dir 同时只允许一个写者，`.yitrace.lock` 会阻止多进程同时打开。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成带 commit/label 后缀的 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；不要长期覆盖复用 `0.0.1.tgz`。AgenticData server 侧必须选定单一 native 架构：当前默认 x64 时 DuckDB、yiTrace、sqlite 都保持 x64；若切 arm64，先把 DuckDB/sqlite 也切到 arm64 或 optional per-platform 策略，不能混用架构。交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
+
+`db.traceTrajectories()` 是逐 trace 的物化 trajectory read model：复用 `traceSearch` 过滤语义，返回 trace 摘要、scope fields、usage/cost 和稳定 trajectory signature，不读取 input/output/log 大字段。
+
+Golden Path scope 已包含 `project_id` / `task_fingerprint` / `skill` / `mode` / `harness_version` / `schema_fingerprint` / `eval_profile` / `model` / `provider` / `tool_version`；`db.createGoldenPath()` 会保存轻量 `sourceTrajectory` 和 `evidenceSummary`，raw source trace 被 retention 清理后仍可做 path adherence/health 的底层对比。重复命中和引用计数后续仍作为独立需求处理。
+
+`db.goldenPathEvidence()` 是只读证据包 API：默认返回 Golden Path source trace 的摘要、trajectory、annotation 和 dataset association；传 `candidateTraceId` 时附带 path adherence 与 trace diff。它不做最佳路径裁决，也不做重复 trace 压缩。
+
+`db.goldenPathExport()` 是稳定导出 API：默认只导出 confirmed Golden Path，返回 `schemaVersion="yitrace.golden_path_export.v1"`、`items` 和 `jsonl`，供 Agent Memory / regression dataset 管线消费；显式传 `status` 才会导出 candidate/rejected/deprecated。
+
+`db.goldenPathHealth()` 是只读持续校验证据 API：默认按 Golden Path 的 `taskFingerprint + attrs` 收窄并排除 source trace，返回后续 trace 的 followed/extended/partial/deviated 分布、coverage 和轻量 examples；它不做 BestPath 裁决，也不更新 Golden Path 状态。
 
 ### 5.5 控制台
 

@@ -5,9 +5,38 @@ export declare class NativeYiTraceDB {
   ingestJson(eventsJson: string, tenantId?: string | undefined | null): string
   ingestOtlpJson(otlpJson: string, tenantId?: string | undefined | null): string
   searchJson(queryJson: string, tenantId?: string | undefined | null): string
-  tracesJson(tenantId?: string | undefined | null): string
-  sessionsJson(cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, tenantId?: string | undefined | null): string
+  traceSearchJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceAggregateJson(queryJson: string, tenantId?: string | undefined | null): string
+  trajectoryGroupsJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceTrajectoriesJson(queryJson: string, tenantId?: string | undefined | null): string
+  storageStatsJson(queryJson: string, tenantId?: string | undefined | null): string
+  retentionPlanJson(queryJson: string, tenantId?: string | undefined | null): string
+  applyRetentionJson(queryJson: string, tenantId?: string | undefined | null): string
+  retentionAuditsJson(queryJson: string, tenantId?: string | undefined | null): string
+  createRetentionPolicyJson(policyJson: string, tenantId?: string | undefined | null): string
+  retentionPoliciesJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
+  runRetentionPoliciesJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceDiffJson(queryJson: string, tenantId?: string | undefined | null): string
+  createGoldenPathJson(candidateJson: string, tenantId?: string | undefined | null): string
+  goldenPathsJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
+  updateGoldenPathStatusJson(goldenPathId: string, bodyJson: string, tenantId?: string | undefined | null): string
+  pathAdherenceJson(queryJson: string, tenantId?: string | undefined | null): string
+  goldenPathEvidenceJson(queryJson: string, tenantId?: string | undefined | null): string
+  goldenPathExportJson(queryJson: string, tenantId?: string | undefined | null): string
+  goldenPathHealthJson(queryJson: string, tenantId?: string | undefined | null): string
+  loopsJson(cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
+  loopJson(loopId: string, filter?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
+  taskTracesJson(taskFingerprint: string, cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
+  createAnnotationJson(annotationJson: string, tenantId?: string | undefined | null): string
+  annotationsJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
+  createDatasetAssociationJson(associationJson: string, tenantId?: string | undefined | null): string
+  datasetAssociationsJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
+  tracesJson(attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
+  sessionsJson(cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
   traceJson(traceId: string, tenantId?: string | undefined | null): string
+  traceSnapshotJson(traceId: string, tenantId?: string | undefined | null): string
+  spansJson(traceId: string, cursor?: number | undefined | null, limit?: number | undefined | null, includeFull?: boolean | undefined | null, tenantId?: string | undefined | null): string
+  spansBatchJson(traceId: string, bodyJson: string, tenantId?: string | undefined | null): string
   spanJson(traceId: string, spanId: string, tenantId?: string | undefined | null): string
   flush(): void
   close(): void

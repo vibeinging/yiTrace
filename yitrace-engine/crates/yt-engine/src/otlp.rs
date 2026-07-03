@@ -14,8 +14,9 @@
 //! 用于分组/剪枝，真正的去重身份是 `ext_span_id`（原样保留十六进制串）。
 #![allow(dead_code)]
 
-use crate::wire::{field, parse, Json};
+use crate::wire::{field, parse, usd_nanos, Json};
 use crate::WireRecord;
+use std::collections::BTreeMap;
 use yt_core::event::EventType;
 
 /// 把一段 OTLP/HTTP JSON（`{"resourceSpans":[...]}`）解析并映射成 WireRecord 批。
@@ -105,6 +106,59 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
             "llm.token_count.completion",
         ],
     );
+    let cached_input_tokens = first_u64(
+        attrs,
+        &[
+            "gen_ai.usage.cached_input_tokens",
+            "gen_ai.usage.input_tokens.cached",
+            "llm.token_count.prompt_details.cached",
+            "llm.token_count.prompt.cached",
+        ],
+    );
+    let reasoning_tokens = first_u64(
+        attrs,
+        &[
+            "gen_ai.usage.reasoning_tokens",
+            "gen_ai.usage.output_tokens.reasoning",
+            "llm.token_count.completion_details.reasoning",
+            "llm.token_count.completion.reasoning",
+        ],
+    );
+    let total_tokens = first_u64(
+        attrs,
+        &[
+            "gen_ai.usage.total_tokens",
+            "llm.token_count.total",
+            "token_count.total",
+        ],
+    );
+    let cost_usd_nanos = first_usd_nanos(
+        attrs,
+        &[
+            "yitrace.cost_usd",
+            "gen_ai.usage.cost_usd",
+            "gen_ai.cost_usd",
+            "llm.cost.usd",
+            "llm.cost",
+        ],
+    );
+    let cost_currency = first_str(
+        attrs,
+        &[
+            "yitrace.cost_currency",
+            "gen_ai.usage.cost_currency",
+            "llm.cost.currency",
+        ],
+    );
+    let provider = first_str(
+        attrs,
+        &[
+            "gen_ai.system",
+            "llm.provider",
+            "llm.system",
+            "yitrace.provider",
+        ],
+    );
     let agent_name = first_str(attrs, &["gen_ai.agent.name", "agent.name"]);
     let tool_name = first_str(attrs, &["gen_ai.tool.name", "tool.name"]);
     // 大文本：OTel GenAI 的 gen_ai.prompt/completion 常是 **JSON 消息数组串**（[{role,content}]），
@@ -134,6 +188,7 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
     // 租户 id：只接受数字。HTTP 网关会用 X-Tenant-Id 统一覆盖这里的值；解析出的 tenant
     // 只服务于直接调用 `ingest_otlp` 的本地/开发路径，不能作为 HTTP 安全边界。
     let tenant_id = first_numeric_u64(attrs, &["yitrace.tenant_id", "tenant.id", "tenant_id"]);
+    let agentic_attrs = agentic_attrs_from_otlp(attrs);
 
     // SpanStart：携带所有属性派生字段（model/tokens/agent/tool/session/文本），name 进 logs。
     out.push(WireRecord {
@@ -148,6 +203,12 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         duration_ns: None,
         input_tokens,
         output_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+        total_tokens,
+        cost_usd_nanos,
+        cost_currency,
+        provider,
         session_id,
         tenant_id,
         external_trace_id: Some(trace_hex.to_string()),
@@ -176,7 +237,7 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         } else {
             vec![name]
         },
-        attrs: Default::default(),
+        attrs: agentic_attrs,
     });
     // SpanEnd：状态 + 耗时。
     out.push(WireRecord {
@@ -191,6 +252,12 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         duration_ns: Some(duration_ns),
         input_tokens: None,
         output_tokens: None,
+        cached_input_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: None,
+        cost_usd_nanos: None,
+        cost_currency: None,
+        provider: None,
         session_id: None,
         tenant_id: None,
         external_trace_id: Some(trace_hex.to_string()),
@@ -240,6 +307,51 @@ fn val_u64(v: &Json) -> Option<u64> {
         .or_else(|| v.get("doubleValue").and_then(Json::as_u64))
 }
 
+fn val_usd_nanos(v: &Json) -> Option<u64> {
+    v.get("doubleValue")
+        .and_then(usd_nanos)
+        .or_else(|| v.get("stringValue").and_then(usd_nanos))
+        .or_else(|| v.get("intValue").and_then(usd_nanos))
+}
+
+fn val_compact_json(v: &Json) -> Option<String> {
+    if let Some(s) = v.get("stringValue").and_then(Json::as_str) {
+        return Some(json_string_value(s));
+    }
+    if let Some(n) = v.get("intValue").and_then(Json::as_u64) {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.get("doubleValue").and_then(Json::as_f64) {
+        return Some(format!("{n}"));
+    }
+    if let Some(b) = v.get("boolValue") {
+        if let Json::Bool(value) = b {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn json_string_value(s: &str) -> String {
+    format!("\"{}\"", json_escape(s))
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 按 key 找一条属性的 value 对象。
 fn attr<'a>(attrs: &'a [Json], key: &str) -> Option<&'a Json> {
     attrs
@@ -256,6 +368,84 @@ fn first_str(attrs: &[Json], keys: &[&str]) -> Option<String> {
 /// 多个候选 key 取第一个命中的整数值。
 fn first_u64(attrs: &[Json], keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| attr(attrs, k).and_then(val_u64))
+}
+
+fn first_usd_nanos(attrs: &[Json], keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|k| attr(attrs, k).and_then(val_usd_nanos))
+}
+
+fn first_attr_json(attrs: &[Json], keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| attr(attrs, k).and_then(val_compact_json))
+}
+
+fn agentic_attrs_from_otlp(attrs: &[Json]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, aliases) in [
+        (
+            "project_id",
+            &["yitrace.project_id", "project.id", "project_id"][..],
+        ),
+        ("skill", &["yitrace.skill", "agent.skill", "skill"][..]),
+        ("mode", &["yitrace.mode", "agent.mode", "mode"][..]),
+        (
+            "call_site",
+            &["yitrace.call_site", "code.call_site", "call_site"][..],
+        ),
+        (
+            "task_fingerprint",
+            &[
+                "yitrace.task_fingerprint",
+                "agent.task_fingerprint",
+                "task.fingerprint",
+                "task_fingerprint",
+            ][..],
+        ),
+        (
+            "loop_id",
+            &["yitrace.loop_id", "agent.loop_id", "loop.id", "loop_id"][..],
+        ),
+        (
+            "harness_version",
+            &[
+                "yitrace.harness_version",
+                "agent.harness_version",
+                "harness.version",
+                "harness_version",
+            ][..],
+        ),
+        (
+            "validation_status",
+            &[
+                "yitrace.validation_status",
+                "validation.status",
+                "validation_status",
+            ][..],
+        ),
+        (
+            "stop_reason",
+            &[
+                "yitrace.stop_reason",
+                "agent.stop_reason",
+                "stop.reason",
+                "stop_reason",
+            ][..],
+        ),
+        (
+            "phase",
+            &["yitrace.phase", "agent.phase", "loop.phase", "phase"][..],
+        ),
+        (
+            "validator",
+            &["yitrace.validator", "validation.validator", "validator"][..],
+        ),
+    ] {
+        if let Some(value) = first_attr_json(attrs, aliases) {
+            out.insert(key.to_string(), value);
+        }
+    }
+    out
 }
 
 /// 多个候选 key 取第一个命中的整数值；接受 OTLP `intValue` 和 `stringValue:"123"`。
@@ -384,8 +574,14 @@ mod tests {
             "status": {"code": 2, "message": "boom"},
             "attributes": [
               {"key":"gen_ai.request.model","value":{"stringValue":"qwen3"}},
+              {"key":"gen_ai.system","value":{"stringValue":"qwen"}},
               {"key":"gen_ai.usage.input_tokens","value":{"intValue":"1200"}},
               {"key":"gen_ai.usage.output_tokens","value":{"intValue":"340"}},
+              {"key":"gen_ai.usage.cached_input_tokens","value":{"intValue":"80"}},
+              {"key":"gen_ai.usage.reasoning_tokens","value":{"intValue":"40"}},
+              {"key":"gen_ai.usage.total_tokens","value":{"intValue":"1660"}},
+              {"key":"gen_ai.usage.cost_usd","value":{"doubleValue":"0.001234"}},
+              {"key":"gen_ai.usage.cost_currency","value":{"stringValue":"USD"}},
               {"key":"gen_ai.agent.name","value":{"stringValue":"风控研判"}},
               {"key":"session.id","value":{"stringValue":"会话-7"}}
             ]
@@ -420,8 +616,14 @@ mod tests {
         assert_eq!(start.parent_span_id, None, "空 parentSpanId → 根");
         // GenAI 属性映射
         assert_eq!(start.model.as_deref(), Some("qwen3"));
+        assert_eq!(start.provider.as_deref(), Some("qwen"));
         assert_eq!(start.input_tokens, Some(1200));
         assert_eq!(start.output_tokens, Some(340));
+        assert_eq!(start.cached_input_tokens, Some(80));
+        assert_eq!(start.reasoning_tokens, Some(40));
+        assert_eq!(start.total_tokens, Some(1660));
+        assert_eq!(start.cost_usd_nanos, Some(1_234_000));
+        assert_eq!(start.cost_currency.as_deref(), Some("USD"));
         assert_eq!(start.agent_name.as_deref(), Some("风控研判"));
         assert!(start.session_id.is_some(), "字符串会话 id 哈希成 u64");
         assert_eq!(start.logs, vec!["chat qwen3"], "span 名进 logs");

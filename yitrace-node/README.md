@@ -1,6 +1,8 @@
 # @yitrace/db
 
-Embedded yiTrace database for Node.js and Electron.
+Advanced local persistence package for Node.js and Electron apps that want
+yiTrace in-process. If you only need to record agent runs, start with
+`@yitrace/trace-sdk` and a local yiTrace collector/server instead.
 
 ## Install
 
@@ -99,7 +101,10 @@ builder.startSpan({
   agentName: "risk-agent",
   toolName: "card-risk",
   model: "gpt-5",
+  provider: "openai",
   inputText: "疑似盗刷订单",
+  inputTokens: 900,
+  cachedInputTokens: 120,
 });
 builder.log({ spanId: "span-uuid", message: "疑似盗刷" });
 builder.endSpan({
@@ -107,6 +112,11 @@ builder.endSpan({
   status: 0,
   durationNs: 12_000_000,
   outputText: "建议人工复核",
+  outputTokens: 140,
+  reasoningTokens: 30,
+  totalTokens: 1190,
+  costUsd: 0.0042,
+  costCurrency: "USD",
 });
 
 await builder.ingest(db);
@@ -179,8 +189,8 @@ search, trace, and span detail responses.
 
 Trace and span detail responses also return raw `logEvents`, so applications do
 not need to mirror log lines into `attrs.event_logs`. Each event keeps its
-`ts`, `seq`, `eventType`, stable `eventId`, `messages`, and event-level
-`attrs`:
+`ts`, `seq`, `eventType`, stable `eventId`, `messages`, event-level `attrs`,
+and stable `eventOrdinal` / `sortKey`:
 
 ```ts
 const span = await db.span("run-uuid", "tool-call-1");
@@ -195,10 +205,20 @@ can inspect `builder.events()` before sending or call `builder.ingest(db)` to
 flush the batch.
 
 `SpanEvent` explicitly supports the commonly consumed fields:
-`duration_ns`, `tool_name`, `model`, `input_text`, and `output_text`, plus token
-counts, status, logs, tenant, external IDs, and `attrs`.
+`duration_ns`, `tool_name`, `model`, `provider`, `input_text`, and
+`output_text`, plus token/cost fields (`input_tokens`, `output_tokens`,
+`cached_input_tokens`, `reasoning_tokens`, `total_tokens`, `cost_usd`,
+`cost_usd_nanos`, `cost_currency`), status, logs, tenant, external IDs, and
+`attrs`. Query responses keep the old `cost` / `inTok` / `outTok` fields for
+compatibility and also return structured `usage` and `costDetail`:
 
-Search supports exact attrs filters for the high-cardinality dimensions used by
+```ts
+const page = await db.traceSearch({ text: "盗刷" });
+const item = page.items[0];
+console.log(item.usage.totalTokens, item.costDetail.costUsd);
+```
+
+Search supports attrs filters for the high-cardinality dimensions used by
 AgenticData trace pages:
 
 ```ts
@@ -209,17 +229,45 @@ await db.search({
     skill: "review",
     mode: "auto",
     call_site: "worker.ts:10",
+    taskFingerprint: "npm-native-packaging",
+    validationStatus: "pass",
   },
 });
 ```
 
-The equivalent nested form is `filter.attrs.{project_id,skill,mode,call_site}`.
-Values are exact matches after JSON normalization. Strings remain strings,
-numbers remain JSON numbers, booleans remain booleans, `null` remains null, and
-arrays/objects round-trip as JSON arrays/objects in `attrs` on search, trace,
-and span detail responses. Filtering is currently guaranteed only for
-`project_id`, `skill`, `mode`, and `call_site`; other attrs are stored and
-returned but not indexed as filter sidecars.
+The equivalent nested form is `filter.attrs`. Values are compared after JSON
+normalization. Strings, numbers, booleans, `null`, arrays, and objects
+round-trip with the same JSON shape in `attrs` on search, trace, and span
+detail responses. Scalar values use exact matching; string arrays also support
+includes matching, so a stored `connection_ids: ["a", "b"]` matches
+`attrs: { connection_ids: "a" }`. Common top-level aliases are supported for
+`project_id`, `external_run_id`, `skill`, `mode`, `call_site`,
+`task_fingerprint`, `loop_id`, `harness_version`, `validation_status`,
+`stop_reason`, `phase`, `validator`, `connection_ids`, `data_source_ids`,
+`schema_fingerprint`, `intent_signature`, `review_status`, `eval_status`, and
+`path_memory_id`.
+Responses keep the original `attrs` and also expose these high-frequency keys
+under `fields`, so product code can read stable dimensions without scanning the
+full extension object.
+
+`project_id`, `skill`, `mode`, `call_site`, `task_fingerprint`, `loop_id`,
+`harness_version`, `validation_status`, `stop_reason`, `phase`, and `validator`
+are promoted inside the engine as schema-on-write fields. Passing them through
+`attrs`, builder defaults, or the top-level builder aliases gives the same query
+behavior; the original `attrs` object is still returned unchanged for round-trip
+compatibility. Other stable keys such as `connection_ids` and `path_memory_id`
+remain extension attrs that can be filtered through the sidecar/folded
+verification path and surfaced under `fields`.
+
+Internally, attrs filters use segment-local postings sidecars to narrow
+candidate spans before folded snapshot verification. Durable data dirs contain
+derived `attr_postings/seg-*.attrs` files; they are rebuilt from segment data if
+missing. The final result still goes through tenant, deletion, and attrs
+validation, so stale candidates cannot leak data. Stable high-frequency keys are
+indexed by default, while very high-cardinality keys such as `external_run_id`
+or `path_memory_id` remain queryable through folded verification. Only a light
+term-to-segment directory and a bounded LRU cache of hot posting lists stay in
+memory; live WAL tail data uses a small in-memory overlay.
 
 Session listing also accepts the same attrs filter shape:
 
@@ -231,6 +279,412 @@ await db.sessions({
 
 The session filter returns a session when at least one span in that session
 matches all supplied attrs, then returns the complete session aggregate.
+Trace listing accepts the same filter:
+
+```ts
+const traces = await db.traces({ attrs: { connection_ids: "conn-a" } });
+console.log(traces[0]?.fields?.project_id);
+```
+
+For product trace pages, use `traceSearch()` when you need structured filters,
+pagination, and sorting across sessions:
+
+```ts
+const page = await db.traceSearch({
+  text: "最优路径",
+  limit: 20,
+  sort: "duration",
+  order: "desc",
+  filter: {
+    toolName: "planner",
+    attrs: { project_id: "agentic-data", connection_ids: "conn-a" },
+  },
+});
+```
+
+Use `traceAggregate()` when a product page needs grouped stats before drilling
+into individual spans. It uses the same filter shape as `traceSearch()` and
+groups the filtered folded spans:
+
+```ts
+const stats = await db.traceAggregate({
+  groupBy: ["taskFingerprint", "validationStatus", "toolName"],
+  sort: "errorRate",
+  order: "desc",
+  filter: {
+    attrs: { project_id: "agentic-data" },
+  },
+});
+
+console.log(stats.items[0]?.key, stats.items[0]?.errorRate);
+```
+
+Use `trajectoryGroups()` when a product page needs to find repeated successful
+paths for the same task. It groups full traces by a stable trajectory signature
+and ranks candidate paths with success rate plus eval/annotation/dataset scores:
+
+```ts
+const candidates = await db.trajectoryGroups({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    attrs: { project_id: "agentic-data" },
+  },
+  sort: "best",
+});
+
+console.log(candidates.items[0]?.signature, candidates.items[0]?.successRate);
+console.log(candidates.items[0]?.steps);
+```
+
+Use `traceTrajectories()` when a page or export job needs one row per trace
+with the materialized path summary. It uses the same filter shape as
+`traceSearch()` but returns lightweight trace/trajectory data instead of span
+details or large text columns:
+
+```ts
+const trajectories = await db.traceTrajectories({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    attrs: { project_id: "agentic-data", skill: "builder" },
+  },
+  limit: 50,
+});
+
+console.log(trajectories.items[0]?.trace.fields);
+console.log(trajectories.items[0]?.trajectory.signature);
+```
+
+Use `storageStats()` to inspect what a filtered slice of trace data costs before
+building retention or cleanup flows. It uses the same filter shape as
+`traceSearch()` and returns explainable estimates for text payload, attrs,
+external IDs, event count, and metadata references:
+
+```ts
+const storage = await db.storageStats({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    attrs: { project_id: "agentic-data" },
+  },
+  groupBy: ["projectId", "validationStatus"],
+});
+
+console.log(storage.total.traceCount, storage.total.bytes.estimatedBytes);
+console.log(storage.groups[0]?.key, storage.groups[0]?.metadata);
+```
+
+Use `retentionPlan()` for dry-runs and `applyRetention()` only when you want to
+execute deletion. By default yiTrace protects traces referenced by annotation,
+dataset association, active Golden Path metadata, snapshot references, eval
+links, or path memory metadata. Apply only soft-deletes rows already flushed to
+segment files; hot MemTable/WAL-tail traces are skipped to avoid partial
+deletion:
+
+```ts
+const plan = await db.retentionPlan({
+  filter: { taskFingerprint: "npm-native-packaging" },
+  deleteBeforeTs: 1751540000000000000,
+  protect: {
+    annotations: true,
+    datasetAssociations: true,
+    goldenPaths: true,
+    snapshots: true,
+    evalLinks: true,
+    pathMemory: true,
+  },
+});
+
+console.log(plan.candidates.traceCount, plan.deletable.traceCount);
+
+const result = await db.applyRetention({
+  filter: { taskFingerprint: "npm-native-packaging" },
+  deleteBeforeTs: 1751540000000000000,
+  compact: true,
+  requestedBy: "nightly-retention-policy",
+  reason: "ttl cleanup",
+});
+
+console.log(result.applyResult?.deletedTraceCount);
+console.log(result.compactResult?.compactedSegmentCount);
+console.log(result.audit?.auditId, result.audit?.counts.deletedTraceCount);
+
+const audits = await db.retentionAudits({
+  filter: { source: "nightly-retention-policy" },
+  limit: 20,
+});
+
+console.log(audits.items[0]?.traceIds.deleted);
+```
+
+For repeatable retention, persist a policy and trigger due policies from your
+own scheduler. yiTrace does not start a background delete thread in embedded
+Node/Electron; `runRetentionPolicies()` explicitly executes the currently due
+policies through the same `applyRetention()` path and writes audit records:
+
+```ts
+const policy = await db.createRetentionPolicy({
+  name: "nightly-retention-policy",
+  intervalNs: 86_400_000_000_000,
+  source: "nightly-retention-policy",
+  reason: "ttl cleanup",
+  query: {
+    filter: { attrs: { project_id: "agentic-data" } },
+    olderThanNs: 30 * 86_400_000_000_000,
+    compact: true,
+  },
+});
+
+const policies = await db.retentionPolicies({
+  policyName: "nightly-retention-policy",
+  enabled: true,
+});
+
+const run = await db.runRetentionPolicies({
+  nowNs: (BigInt(Date.now()) * 1_000_000n).toString(),
+  limit: 10,
+});
+
+console.log(policy.policyId, policies.total, run.ran, run.items[0]?.result?.audit?.auditId);
+```
+
+Once a path is accepted by a product workflow, store it as a golden path
+candidate/asset. yiTrace stores only the source trace/snapshot reference,
+trajectory signature, scope attrs, retained lightweight source trajectory,
+evidence summary, status, score, and review metadata. Repeated-run hit tracking
+and reference-count compression are intentionally left for a separate future API:
+
+```ts
+const golden = await db.createGoldenPath({
+  sourceTraceId: "builder-run",
+  taskFingerprint: "npm-native-packaging",
+  score: 960,
+  label: "fast packaging path",
+  reason: "best observed route",
+  source: "human",
+  projectId: "agentic-data",
+});
+
+await db.updateGoldenPathStatus(golden.goldenPathId, {
+  status: "confirmed",
+  reason: "manual accept",
+  source: "reviewer",
+});
+
+const goldenPaths = await db.goldenPaths({
+  taskFingerprint: "npm-native-packaging",
+  status: "confirmed",
+  projectId: "agentic-data",
+});
+console.log(goldenPaths.items[0]?.trajectorySignature);
+console.log(goldenPaths.items[0]?.sourceTrajectory.steps);
+console.log(goldenPaths.items[0]?.evidenceSummary);
+```
+
+Use `pathAdherence()` to compare a new run against a golden path without
+letting the database decide what is "best". It returns deterministic trajectory
+evidence: exact signature match, ordered common steps, missing steps, extra
+steps, and coverage.
+
+```ts
+const adherence = await db.pathAdherence(golden.goldenPathId, "builder-run-2");
+console.log(adherence.adherence, adherence.sameSignature);
+console.log(adherence.sourceRetained);
+console.log(adherence.commonSteps, adherence.missingSteps, adherence.extraSteps);
+
+const sameAdherence = await db.pathAdherence({
+  goldenPathId: golden.goldenPathId,
+  traceId: "builder-run-2",
+});
+```
+
+Use `goldenPathEvidence()` when a review page or export job needs the evidence
+behind a golden path. It bundles the source trace summary, trajectory,
+annotations, dataset links, and optionally the candidate adherence/diff:
+
+```ts
+const evidence = await db.goldenPathEvidence({
+  goldenPathId: golden.goldenPathId,
+  candidateTraceId: "builder-run-2",
+});
+console.log(evidence.source.annotationCount, evidence.source.datasetAssociationCount);
+console.log(evidence.candidate?.pathAdherence.adherence);
+
+const sourceOnly = await db.goldenPathEvidence(golden.goldenPathId);
+```
+
+Use `goldenPathExport()` for a stable JSONL-oriented record shape. By default
+it exports only confirmed paths; pass `status` explicitly if a pipeline wants
+candidate or deprecated records:
+
+```ts
+const exported = await db.goldenPathExport({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    projectId: "agentic-data",
+  },
+});
+console.log(exported.schemaVersion, exported.items[0]?.source.trajectory?.signature);
+console.log(exported.jsonl);
+```
+
+See `examples/golden-path-export-consumer.mjs` for a minimal consumer that turns
+`yitrace.golden_path_export.v1` records into Agent Memory candidates and
+regression dataset items.
+
+Use `goldenPathHealth()` to watch whether later traces still follow a confirmed
+path. It defaults to the golden path scope and excludes the source trace, so the
+numbers describe follow-up runs rather than the original example:
+
+```ts
+const health = await db.goldenPathHealth({
+  goldenPathId: golden.goldenPathId,
+  filter: { projectId: "agentic-data" },
+  examples: 5,
+});
+console.log(health.counts, health.rates.usable);
+console.log(health.sourceRetained);
+
+const healthWithSource = await db.goldenPathHealth(golden.goldenPathId, {
+  includeSource: true,
+});
+```
+
+Use `traceDiff()` when a product page needs to compare two runs of the same
+task before picking a golden path. It returns deterministic evidence only:
+route changes, per-step changes, and duration/token/cost/status deltas.
+
+```ts
+const diff = await db.traceDiff("run-old", "run-new");
+console.log(diff.delta.costUsdNanos, diff.steps[0]?.changes);
+console.log(diff.steps[0]?.right?.evalScore, diff.steps[0]?.right?.evalLabel);
+console.log(diff.trajectory.same, diff.trajectory.right.signature);
+
+const sameDiff = await db.traceDiff({
+  leftTraceId: "run-old",
+  rightTraceId: "run-new",
+});
+```
+
+For agent loop and task pages, use the lightweight read models instead of
+grouping spans in product code:
+
+```ts
+const loops = await db.loops({
+  taskFingerprint: "npm-native-packaging",
+  validationStatus: "pass",
+});
+console.log(loops.items[0]?.loopId, loops.items[0]?.traceCount);
+
+const loop = await db.loop("loop-builder");
+console.log(loop?.summary.status, loop?.traces.length, loop?.spans.length);
+
+const taskTraces = await db.taskTraces("npm-native-packaging", {
+  validationStatus: "pass",
+});
+console.log(taskTraces.items[0]?.fields?.loop_id);
+```
+
+Trace detail exposes stable `spanOrdinal` and `siblingOrdinal`. For eval drafts
+or regression samples, export a snapshot:
+
+```ts
+const snapshot = await db.traceSnapshot("run-uuid");
+console.log(snapshot?.snapshotHash, snapshot?.trace.spans.length);
+```
+
+For product review flows, add lightweight annotations without changing the trace
+itself:
+
+```ts
+await db.annotate({
+  traceId: "run-uuid",
+  spanId: "span-uuid",
+  target: "span",
+  label: "best_path",
+  score: 920,
+  reason: "manual review picked this path",
+  source: "human",
+  projectId: "agentic-data",
+  skill: "review",
+});
+
+const annotations = await db.annotations({
+  traceId: "run-uuid",
+  label: "best_path",
+  projectId: "agentic-data",
+});
+console.log(annotations.count, annotations.items[0]?.reason);
+```
+
+To connect trace evidence to an external eval or training dataset, store a
+dataset association. yiTrace stores the source link and snapshot identity; the
+dataset item body can stay in your own eval system:
+
+```ts
+await db.linkDatasetItem({
+  datasetId: "best-path-regression",
+  itemId: "case-1",
+  traceId: "run-uuid",
+  spanId: "span-uuid",
+  snapshotId: snapshot?.snapshotId,
+  snapshotHash: snapshot?.snapshotHash,
+  evalRunId: "eval-2026-07-03",
+  split: "train",
+  label: "pass",
+  score: 920,
+  projectId: "agentic-data",
+});
+
+const links = await db.datasetAssociations({
+  datasetId: "best-path-regression",
+  itemId: "case-1",
+});
+```
+
+Those metadata records can also drive product search pages:
+
+```ts
+const reviewed = await db.traceSearch({
+  filter: {
+    annotation: { label: "best_path", source: "human", scoreMin: 900 },
+  },
+});
+
+const regressionCases = await db.traceSearch({
+  filter: {
+    dataset: { datasetId: "best-path-regression", evalRunId: "eval-2026-07-03" },
+  },
+});
+
+const reviewedTraces = await db.traces({
+  annotation: { label: "best_path", scoreMin: 900 },
+});
+
+const regressionSessions = await db.sessions({
+  dataset: { datasetId: "best-path-regression", label: "pass" },
+});
+```
+
+Trace-level annotations or dataset links match every span in the trace; span-level
+records only match that span for `traceSearch()`. Trace and session list filters
+return a trace/session when any visible span in it has a matching span-level
+record.
+
+Annotations and dataset associations are tenant-scoped, persisted in the same
+data directory as `metadata.dat`, and included in `backup_snapshot()`. They are
+queried through the same in-process `EngineJsonApi`; there is still no local
+HTTP server involved.
+
+Use batch span detail when a page needs many large fields at once:
+
+```ts
+const spans = await db.spans("run-uuid", { limit: 50 });
+const details = await db.spansBatch("run-uuid", ["tool-call-1"], { includeFull: true });
+```
+
+Large text fields in `traceSearch()`, `traceSnapshot()`, `spans()`, and
+`spansBatch()` are returned as `{ preview, full, contentHash, byteLength,
+truncated, blobRef }`. List-style calls keep `full: null` by default; snapshot
+and `includeFull: true` detail calls include the full text.
 
 `OpenOptions.readOnly` is intentionally not exposed yet. Passing `readOnly`
 throws at runtime so applications do not accidentally assume a true read-only

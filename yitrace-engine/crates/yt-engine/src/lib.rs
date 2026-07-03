@@ -11,7 +11,7 @@
 //!   归并，去重键 = 确定性 event_id。真实实现是 DataFusion 的 `ExecutionPlan`。
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,7 +43,16 @@ pub use tokenizer_cn::{ChineseTokenizer, Dict};
 mod segstore;
 pub use segstore::FileSegmentStore;
 
+mod metadata;
 mod persist;
+pub use metadata::{
+    AnnotationTarget, DatasetAssociation, DatasetAssociationFilter, GoldenPathCandidate,
+    GoldenPathFilter, GoldenPathStatus, NewDatasetAssociation, NewGoldenPathCandidate,
+    NewRetentionAuditRecord, NewRetentionPolicy, NewTraceAnnotation, RetentionAuditFilter,
+    RetentionAuditRecord, RetentionPolicy, RetentionPolicyFilter, TraceAnnotation,
+    TraceAnnotationFilter,
+};
+
 mod vecstore;
 
 mod gc_log;
@@ -105,8 +114,10 @@ impl Projection {
     pub const TENANT_ID: u32 = 1 << 14;
     pub const EXTERNAL_IDS: u32 = 1 << 15;
     pub const ATTRS: u32 = 1 << 16;
+    pub const AGENTIC_FIELDS: u32 = 1 << 17;
+    pub const USAGE_COST: u32 = 1 << 18;
 
-    const MASK: u32 = (1 << 17) - 1;
+    const MASK: u32 = (1 << 19) - 1;
 
     /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
     pub const ALL: Projection = Projection(Self::MASK);
@@ -409,6 +420,1196 @@ struct FilterAttrs {
     tenant_id: Option<u64>,
 }
 
+type SpanKey = (u64, u64);
+
+#[derive(Clone)]
+enum PostingList {
+    One(SpanKey),
+    Small(Vec<SpanKey>),
+    Many(HashSet<SpanKey>),
+}
+
+impl PostingList {
+    fn from_keys(mut keys: Vec<SpanKey>) -> Option<Self> {
+        keys.sort_unstable();
+        keys.dedup();
+        match keys.len() {
+            0 => None,
+            1 => Some(PostingList::One(keys[0])),
+            n if n <= ATTR_POSTING_SMALL_VEC_MAX => Some(PostingList::Small(keys)),
+            _ => Some(PostingList::Many(keys.into_iter().collect())),
+        }
+    }
+
+    fn contains(&self, key: SpanKey) -> bool {
+        match self {
+            PostingList::One(one) => *one == key,
+            PostingList::Small(keys) => keys.binary_search(&key).is_ok(),
+            PostingList::Many(keys) => keys.contains(&key),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            PostingList::One(_) => 1,
+            PostingList::Small(keys) => keys.len(),
+            PostingList::Many(keys) => keys.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            PostingList::One(_) => false,
+            PostingList::Small(keys) => keys.is_empty(),
+            PostingList::Many(keys) => keys.is_empty(),
+        }
+    }
+
+    fn is_singleton(&self) -> bool {
+        matches!(self, PostingList::One(_))
+    }
+
+    fn is_small(&self) -> bool {
+        matches!(self, PostingList::Small(_))
+    }
+
+    fn is_hashset(&self) -> bool {
+        matches!(self, PostingList::Many(_))
+    }
+
+    fn insert(&mut self, key: SpanKey) -> bool {
+        match self {
+            PostingList::One(one) if *one == key => false,
+            PostingList::One(one) => {
+                let old = *one;
+                let mut keys = vec![old, key];
+                keys.sort_unstable();
+                *self = PostingList::Small(keys);
+                true
+            }
+            PostingList::Small(keys) => match keys.binary_search(&key) {
+                Ok(_) => false,
+                Err(pos) => {
+                    keys.insert(pos, key);
+                    if keys.len() > ATTR_POSTING_SMALL_VEC_MAX {
+                        *self = PostingList::Many(keys.iter().copied().collect());
+                    }
+                    true
+                }
+            },
+            PostingList::Many(keys) => keys.insert(key),
+        }
+    }
+
+    fn remove(&mut self, key: SpanKey) -> bool {
+        match self {
+            PostingList::One(one) if *one == key => {
+                *self = PostingList::Many(HashSet::new());
+                true
+            }
+            PostingList::One(_) => false,
+            PostingList::Small(keys) => match keys.binary_search(&key) {
+                Ok(pos) => {
+                    keys.remove(pos);
+                    if keys.len() == 1 {
+                        *self = PostingList::One(keys[0]);
+                    }
+                    true
+                }
+                Err(_) => false,
+            },
+            PostingList::Many(keys) => {
+                let removed = keys.remove(&key);
+                if removed && keys.len() == 1 {
+                    if let Some(one) = keys.iter().next().copied() {
+                        *self = PostingList::One(one);
+                    }
+                } else if removed && keys.len() <= ATTR_POSTING_SMALL_VEC_MAX {
+                    let mut small: Vec<SpanKey> = keys.iter().copied().collect();
+                    small.sort_unstable();
+                    *self = PostingList::Small(small);
+                }
+                removed
+            }
+        }
+    }
+
+    fn extend_into(&self, out: &mut HashSet<SpanKey>) {
+        match self {
+            PostingList::One(one) => {
+                out.insert(*one);
+            }
+            PostingList::Small(keys) => {
+                out.extend(keys.iter().copied());
+            }
+            PostingList::Many(keys) => {
+                out.extend(keys.iter().copied());
+            }
+        }
+    }
+
+    fn to_hashset(&self) -> HashSet<SpanKey> {
+        match self {
+            PostingList::One(one) => HashSet::from([*one]),
+            PostingList::Small(keys) => keys.iter().copied().collect(),
+            PostingList::Many(keys) => keys.clone(),
+        }
+    }
+
+    fn to_sorted_vec(&self) -> Vec<SpanKey> {
+        let mut out: Vec<SpanKey> = match self {
+            PostingList::One(one) => vec![*one],
+            PostingList::Small(keys) => keys.clone(),
+            PostingList::Many(keys) => keys.iter().copied().collect(),
+        };
+        out.sort_unstable();
+        out
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        match self {
+            PostingList::One(_) => {
+                posting_list_estimated_bytes() + ATTR_POSTING_SINGLE_ENTRY_ESTIMATED_BYTES
+            }
+            PostingList::Small(keys) => posting_total_estimated_bytes_for_small(keys.len()),
+            PostingList::Many(keys) => {
+                posting_list_estimated_bytes()
+                    + ATTR_POSTING_HASHSET_ESTIMATED_BYTES
+                    + keys
+                        .len()
+                        .saturating_mul(ATTR_POSTING_HASHSET_ENTRY_ESTIMATED_BYTES)
+            }
+        }
+    }
+}
+
+type AttrPostingTerm = (u32, u32);
+
+#[derive(Default)]
+struct StringInterner {
+    ids: HashMap<String, u32>,
+    next_id: u32,
+}
+
+impl StringInterner {
+    fn get(&self, value: &str) -> Option<u32> {
+        self.ids.get(value).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn estimated_insert_bytes(&self, value: &str) -> usize {
+        if self.ids.contains_key(value) {
+            0
+        } else {
+            interned_string_estimated_bytes(value)
+        }
+    }
+
+    fn get_or_intern(&mut self, value: &str) -> Option<(u32, usize)> {
+        if let Some(id) = self.get(value) {
+            return Some((id, 0));
+        }
+        let next = self.next_id.checked_add(1)?;
+        let id = self.next_id;
+        self.next_id = next;
+        let bytes = interned_string_estimated_bytes(value);
+        self.ids.insert(value.to_string(), id);
+        Some((id, bytes))
+    }
+}
+
+#[derive(Default)]
+struct AttrPostings {
+    /// compact JSON exact postings: (key_id, value_json_id) -> span keys.
+    exact: HashMap<AttrPostingTerm, PostingList>,
+    /// string-array includes postings: (key_id, item_json_string_id) -> span keys.
+    array_items: HashMap<AttrPostingTerm, PostingList>,
+    /// postings 字符串字典。HashMap key 只保存小整数，避免每个桶重复持有 String。
+    attr_keys: StringInterner,
+    attr_values: StringInterner,
+    /// 当前索引条目数（exact + array item posting entries）。用于给派生索引做硬预算。
+    indexed_entries: usize,
+    /// postings 的近似内存占用。用于保护常驻 sidecar，不等同进程 RSS。
+    estimated_bytes: usize,
+    /// 因预算/value/fan-out 限制被降级的 key。查询这些 key 必须走慢路径，不能用不完整 postings。
+    incomplete_keys: HashSet<String>,
+}
+
+impl AttrPostings {
+    fn update(&mut self, span_key: (u64, u64), attr_key: &str, old: Option<&str>, new: &str) {
+        if old == Some(new) {
+            return;
+        }
+        if let Some(old) = old {
+            self.remove_value(span_key, attr_key, old);
+        }
+        self.add_value(span_key, attr_key, new);
+    }
+
+    fn add_value(&mut self, span_key: (u64, u64), attr_key: &str, value: &str) {
+        if !self.key_is_complete(attr_key) {
+            return;
+        }
+        if value.len() > ATTR_POSTINGS_MAX_VALUE_BYTES {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        let array_items = string_array_items(value);
+        if array_items.len() > ATTR_POSTINGS_MAX_ARRAY_ITEMS {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        let needed = 1 + array_items.len();
+        if self.indexed_entries.saturating_add(needed) > ATTR_POSTINGS_MAX_ENTRIES {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        let mut values_to_intern = Vec::with_capacity(1 + array_items.len());
+        values_to_intern.push(value);
+        for item in &array_items {
+            values_to_intern.push(item.as_str());
+        }
+        let estimated_new_bytes = self.estimate_intern_bytes(attr_key, &values_to_intern)
+            + estimate_posting_insert(&self.exact, self.lookup_term(attr_key, value), span_key)
+            + array_items
+                .iter()
+                .map(|item| {
+                    estimate_posting_insert(
+                        &self.array_items,
+                        self.lookup_term(attr_key, item),
+                        span_key,
+                    )
+                })
+                .sum::<usize>();
+        if self.estimated_bytes.saturating_add(estimated_new_bytes)
+            > ATTR_POSTINGS_MAX_ESTIMATED_BYTES
+        {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        let Some(exact_term) = self.intern_term(attr_key, value) else {
+            self.mark_key_incomplete(attr_key);
+            return;
+        };
+        let mut array_terms = Vec::with_capacity(array_items.len());
+        for item in &array_items {
+            let Some(term) = self.intern_term(attr_key, item) else {
+                self.mark_key_incomplete(attr_key);
+                return;
+            };
+            array_terms.push(term);
+        }
+        insert_posting(
+            &mut self.exact,
+            &mut self.indexed_entries,
+            &mut self.estimated_bytes,
+            exact_term,
+            span_key,
+        );
+        for term in array_terms {
+            insert_posting(
+                &mut self.array_items,
+                &mut self.indexed_entries,
+                &mut self.estimated_bytes,
+                term,
+                span_key,
+            );
+        }
+    }
+
+    fn remove_value(&mut self, span_key: (u64, u64), attr_key: &str, value: &str) {
+        let exact_term = self.lookup_term(attr_key, value);
+        remove_posting(
+            &mut self.exact,
+            &mut self.indexed_entries,
+            &mut self.estimated_bytes,
+            exact_term,
+            span_key,
+        );
+        for item in string_array_items(value) {
+            let item_term = self.lookup_term(attr_key, &item);
+            remove_posting(
+                &mut self.array_items,
+                &mut self.indexed_entries,
+                &mut self.estimated_bytes,
+                item_term,
+                span_key,
+            );
+        }
+    }
+
+    fn candidates_for_filters(
+        &self,
+        attrs: &BTreeMap<String, String>,
+    ) -> Option<HashSet<(u64, u64)>> {
+        let mut out: Option<HashSet<(u64, u64)>> = None;
+        let mut used_index = false;
+        for (attr_key, expected) in attrs {
+            if !self.key_is_complete(attr_key) {
+                continue;
+            }
+            used_index = true;
+            let one = self.candidates_for_attr(attr_key, expected);
+            out = Some(match out {
+                None => one,
+                Some(prev) => prev.intersection(&one).copied().collect(),
+            });
+            if out.as_ref().map_or(false, HashSet::is_empty) {
+                break;
+            }
+        }
+        if used_index {
+            Some(out.unwrap_or_default())
+        } else {
+            None
+        }
+    }
+
+    fn candidates_for_attr(&self, attr_key: &str, expected: &str) -> HashSet<(u64, u64)> {
+        let mut out = HashSet::new();
+        if let Some(term) = self.lookup_term(attr_key, expected) {
+            if let Some(keys) = self.exact.get(&term) {
+                keys.extend_into(&mut out);
+            }
+        }
+        let Ok(expected_json) = crate::wire::parse(expected) else {
+            return out;
+        };
+        match expected_json {
+            crate::wire::Json::Str(s) => {
+                let item = json_string_compact(&s);
+                if let Some(term) = self.lookup_term(attr_key, &item) {
+                    if let Some(keys) = self.array_items.get(&term) {
+                        keys.extend_into(&mut out);
+                    }
+                }
+            }
+            crate::wire::Json::Arr(items) => {
+                let expected_strings: Vec<String> = items
+                    .iter()
+                    .filter_map(crate::wire::Json::as_str)
+                    .map(json_string_compact)
+                    .collect();
+                for item in &expected_strings {
+                    if let Some(term) = self.lookup_term(attr_key, item) {
+                        if let Some(keys) = self.exact.get(&term) {
+                            keys.extend_into(&mut out);
+                        }
+                    }
+                }
+                if !expected_strings.is_empty() {
+                    let mut array_match: Option<HashSet<SpanKey>> = None;
+                    for item in expected_strings {
+                        let keys = self
+                            .lookup_term(attr_key, &item)
+                            .and_then(|term| self.array_items.get(&term))
+                            .map(PostingList::to_hashset)
+                            .unwrap_or_default();
+                        array_match = Some(match array_match {
+                            None => keys,
+                            Some(prev) => prev.intersection(&keys).copied().collect(),
+                        });
+                    }
+                    if let Some(keys) = array_match {
+                        out.extend(keys);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn key_is_complete(&self, attr_key: &str) -> bool {
+        is_postings_attr_key(attr_key) && !self.incomplete_keys.contains(attr_key)
+    }
+
+    fn mark_key_incomplete(&mut self, attr_key: &str) {
+        self.incomplete_keys.insert(attr_key.to_string());
+        if let Some(attr_key_id) = self.attr_keys.get(attr_key) {
+            remove_attr_key_from_postings(
+                &mut self.exact,
+                &mut self.indexed_entries,
+                &mut self.estimated_bytes,
+                attr_key_id,
+            );
+            remove_attr_key_from_postings(
+                &mut self.array_items,
+                &mut self.indexed_entries,
+                &mut self.estimated_bytes,
+                attr_key_id,
+            );
+        }
+    }
+
+    fn lookup_term(&self, attr_key: &str, attr_value: &str) -> Option<AttrPostingTerm> {
+        Some((
+            self.attr_keys.get(attr_key)?,
+            self.attr_values.get(attr_value)?,
+        ))
+    }
+
+    fn intern_term(&mut self, attr_key: &str, attr_value: &str) -> Option<AttrPostingTerm> {
+        let (key_id, key_bytes) = self.attr_keys.get_or_intern(attr_key)?;
+        let (value_id, value_bytes) = self.attr_values.get_or_intern(attr_value)?;
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(key_bytes.saturating_add(value_bytes));
+        Some((key_id, value_id))
+    }
+
+    fn estimate_intern_bytes(&self, attr_key: &str, attr_values: &[&str]) -> usize {
+        let mut bytes = self.attr_keys.estimated_insert_bytes(attr_key);
+        let mut new_values = HashSet::new();
+        for attr_value in attr_values {
+            if self.attr_values.get(attr_value).is_none() && new_values.insert(*attr_value) {
+                bytes = bytes.saturating_add(interned_string_estimated_bytes(attr_value));
+            }
+        }
+        bytes
+    }
+}
+
+const ATTR_POSTINGS_MAX_VALUE_BYTES: usize = 256;
+const ATTR_POSTINGS_MAX_ARRAY_ITEMS: usize = 32;
+const ATTR_POSTINGS_MAX_ENTRIES: usize = 2_000_000;
+const ATTR_POSTINGS_MAX_ESTIMATED_BYTES: usize = 256 * 1024 * 1024;
+const ATTR_POSTING_LIST_ESTIMATED_BYTES: usize = 96;
+const ATTR_POSTING_SINGLE_ENTRY_ESTIMATED_BYTES: usize = 16;
+const ATTR_POSTING_SMALL_VEC_MAX: usize = 8;
+const ATTR_POSTING_SMALL_VEC_ESTIMATED_BYTES: usize = 32;
+const ATTR_POSTING_SMALL_VEC_ENTRY_ESTIMATED_BYTES: usize = 16;
+const ATTR_POSTING_HASHSET_ESTIMATED_BYTES: usize = 96;
+const ATTR_POSTING_HASHSET_ENTRY_ESTIMATED_BYTES: usize = 32;
+const ATTR_POSTING_INTERNED_STRING_ESTIMATED_BYTES: usize = 64;
+
+fn is_postings_attr_key(k: &str) -> bool {
+    matches!(
+        k,
+        "project_id"
+            | "skill"
+            | "mode"
+            | "call_site"
+            | "task_fingerprint"
+            | "loop_id"
+            | "harness_version"
+            | "validation_status"
+            | "stop_reason"
+            | "phase"
+            | "validator"
+            | "connection_ids"
+            | "data_source_ids"
+            | "schema_fingerprint"
+            | "eval_profile"
+            | "tool_version"
+            | "model"
+            | "provider"
+            | "intent_signature"
+            | "review_status"
+            | "eval_status"
+    )
+}
+
+fn insert_posting(
+    index: &mut HashMap<AttrPostingTerm, PostingList>,
+    entry_count: &mut usize,
+    byte_count: &mut usize,
+    term: AttrPostingTerm,
+    span_key: SpanKey,
+) {
+    let estimated_bytes = estimate_posting_insert(index, Some(term), span_key);
+    let inserted = match index.get_mut(&term) {
+        Some(list) => list.insert(span_key),
+        None => {
+            index.insert(term, PostingList::One(span_key));
+            true
+        }
+    };
+    if inserted {
+        *entry_count += 1;
+        *byte_count = byte_count.saturating_add(estimated_bytes);
+    }
+}
+
+fn remove_posting(
+    index: &mut HashMap<AttrPostingTerm, PostingList>,
+    entry_count: &mut usize,
+    byte_count: &mut usize,
+    term: Option<AttrPostingTerm>,
+    span_key: SpanKey,
+) {
+    let Some(term) = term else {
+        return;
+    };
+    let remove_empty = if let Some(list) = index.get_mut(&term) {
+        let before_bytes = list.estimated_bytes();
+        if list.remove(span_key) {
+            *entry_count = entry_count.saturating_sub(1);
+            let after_bytes = if list.is_empty() {
+                0
+            } else {
+                list.estimated_bytes()
+            };
+            *byte_count = byte_count.saturating_sub(before_bytes.saturating_sub(after_bytes));
+        }
+        list.is_empty()
+    } else {
+        false
+    };
+    if remove_empty {
+        index.remove(&term);
+    }
+}
+
+fn remove_attr_key_from_postings(
+    index: &mut HashMap<AttrPostingTerm, PostingList>,
+    entry_count: &mut usize,
+    byte_count: &mut usize,
+    attr_key_id: u32,
+) {
+    let keys: Vec<AttrPostingTerm> = index
+        .keys()
+        .filter(|(k, _)| *k == attr_key_id)
+        .copied()
+        .collect();
+    for key in keys {
+        if let Some(values) = index.remove(&key) {
+            *entry_count = entry_count.saturating_sub(values.len());
+            *byte_count = byte_count.saturating_sub(values.estimated_bytes());
+        }
+    }
+}
+
+fn estimate_posting_insert(
+    index: &HashMap<AttrPostingTerm, PostingList>,
+    term: Option<AttrPostingTerm>,
+    span_key: SpanKey,
+) -> usize {
+    match term.and_then(|term| index.get(&term)) {
+        Some(list) if list.contains(span_key) => 0,
+        Some(PostingList::One(_)) => posting_total_estimated_bytes_for_small(2).saturating_sub(
+            posting_list_estimated_bytes() + ATTR_POSTING_SINGLE_ENTRY_ESTIMATED_BYTES,
+        ),
+        Some(PostingList::Small(keys)) if keys.len() < ATTR_POSTING_SMALL_VEC_MAX => {
+            posting_total_estimated_bytes_for_small(keys.len() + 1)
+                .saturating_sub(posting_total_estimated_bytes_for_small(keys.len()))
+        }
+        Some(PostingList::Small(keys)) => posting_total_estimated_bytes_for_many(keys.len() + 1)
+            .saturating_sub(posting_total_estimated_bytes_for_small(keys.len())),
+        Some(PostingList::Many(_)) => ATTR_POSTING_HASHSET_ENTRY_ESTIMATED_BYTES,
+        None => posting_list_estimated_bytes() + ATTR_POSTING_SINGLE_ENTRY_ESTIMATED_BYTES,
+    }
+}
+
+fn posting_list_estimated_bytes() -> usize {
+    ATTR_POSTING_LIST_ESTIMATED_BYTES
+}
+
+fn posting_total_estimated_bytes_for_small(entries: usize) -> usize {
+    posting_list_estimated_bytes()
+        + ATTR_POSTING_SMALL_VEC_ESTIMATED_BYTES
+        + entries.saturating_mul(ATTR_POSTING_SMALL_VEC_ENTRY_ESTIMATED_BYTES)
+}
+
+fn posting_total_estimated_bytes_for_many(entries: usize) -> usize {
+    posting_list_estimated_bytes()
+        + ATTR_POSTING_HASHSET_ESTIMATED_BYTES
+        + entries.saturating_mul(ATTR_POSTING_HASHSET_ENTRY_ESTIMATED_BYTES)
+}
+
+fn interned_string_estimated_bytes(value: &str) -> usize {
+    ATTR_POSTING_INTERNED_STRING_ESTIMATED_BYTES + value.len()
+}
+
+fn string_array_items(value: &str) -> Vec<String> {
+    match crate::wire::parse(value) {
+        Ok(crate::wire::Json::Arr(items)) => items
+            .iter()
+            .filter_map(crate::wire::Json::as_str)
+            .map(json_string_compact)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn json_string_compact(s: &str) -> String {
+    crate::wire::Json::Str(s.to_string()).to_compact_json()
+}
+
+#[derive(Clone, Default)]
+struct SegmentAttrSidecar {
+    /// compact JSON exact postings for one immutable segment.
+    exact: HashMap<(String, String), PostingList>,
+    /// string-array includes postings for one immutable segment.
+    array_items: HashMap<(String, String), PostingList>,
+    /// Segment-level fallback set. Used when a key is incomplete in this segment.
+    all_span_keys: HashSet<SpanKey>,
+    /// Attr keys whose postings are intentionally incomplete inside this segment.
+    incomplete_keys: HashSet<String>,
+}
+
+impl SegmentAttrSidecar {
+    fn build(records: &[WalRecord]) -> Self {
+        let mut out = SegmentAttrSidecar::default();
+        for r in records {
+            let span_key = (r.trace_id, r.span_id);
+            out.all_span_keys.insert(span_key);
+            emit_indexable_attrs(&r.fields, |attr_key, value| {
+                out.add_value(span_key, attr_key, value);
+            });
+        }
+        out
+    }
+
+    fn add_value(&mut self, span_key: SpanKey, attr_key: &str, value: &str) {
+        if !is_postings_attr_key(attr_key) || self.incomplete_keys.contains(attr_key) {
+            return;
+        }
+        if value.len() > ATTR_POSTINGS_MAX_VALUE_BYTES {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        let array_items = string_array_items(value);
+        if array_items.len() > ATTR_POSTINGS_MAX_ARRAY_ITEMS {
+            self.mark_key_incomplete(attr_key);
+            return;
+        }
+        insert_segment_attr_posting(&mut self.exact, attr_key, value, span_key);
+        for item in array_items {
+            insert_segment_attr_posting(&mut self.array_items, attr_key, &item, span_key);
+        }
+    }
+
+    fn mark_key_incomplete(&mut self, attr_key: &str) {
+        self.incomplete_keys.insert(attr_key.to_string());
+        self.exact.retain(|(k, _), _| k != attr_key);
+        self.array_items.retain(|(k, _), _| k != attr_key);
+    }
+
+    fn candidates_for_attr(&self, attr_key: &str, expected: &str) -> HashSet<SpanKey> {
+        if self.incomplete_keys.contains(attr_key) {
+            return self.all_span_keys.clone();
+        }
+        let mut out = HashSet::new();
+        if let Some(keys) = self
+            .exact
+            .get(&(attr_key.to_string(), expected.to_string()))
+        {
+            keys.extend_into(&mut out);
+        }
+        let Ok(expected_json) = crate::wire::parse(expected) else {
+            return out;
+        };
+        match expected_json {
+            crate::wire::Json::Str(s) => {
+                let item = json_string_compact(&s);
+                if let Some(keys) = self.array_items.get(&(attr_key.to_string(), item)) {
+                    keys.extend_into(&mut out);
+                }
+            }
+            crate::wire::Json::Arr(items) => {
+                let expected_strings: Vec<String> = items
+                    .iter()
+                    .filter_map(crate::wire::Json::as_str)
+                    .map(json_string_compact)
+                    .collect();
+                for item in &expected_strings {
+                    if let Some(keys) = self.exact.get(&(attr_key.to_string(), item.clone())) {
+                        keys.extend_into(&mut out);
+                    }
+                }
+                if !expected_strings.is_empty() {
+                    let mut array_match: Option<HashSet<SpanKey>> = None;
+                    for item in expected_strings {
+                        let keys = self
+                            .array_items
+                            .get(&(attr_key.to_string(), item))
+                            .map(PostingList::to_hashset)
+                            .unwrap_or_default();
+                        array_match = Some(match array_match {
+                            None => keys,
+                            Some(prev) => prev.intersection(&keys).copied().collect(),
+                        });
+                    }
+                    if let Some(keys) = array_match {
+                        out.extend(keys);
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn terms(&self) -> SegmentAttrTerms {
+        SegmentAttrTerms {
+            exact: self
+                .exact
+                .keys()
+                .filter(|(k, _)| !self.incomplete_keys.contains(k))
+                .cloned()
+                .collect(),
+            array_items: self
+                .array_items
+                .keys()
+                .filter(|(k, _)| !self.incomplete_keys.contains(k))
+                .cloned()
+                .collect(),
+            incomplete_keys: self.incomplete_keys.iter().cloned().collect(),
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let terms = self
+            .exact
+            .iter()
+            .chain(self.array_items.iter())
+            .map(|((k, v), list)| {
+                ATTR_SIDECAR_TERM_ESTIMATED_BYTES
+                    + k.len()
+                    + v.len()
+                    + list
+                        .len()
+                        .saturating_mul(ATTR_POSTING_SMALL_VEC_ENTRY_ESTIMATED_BYTES)
+            })
+            .sum::<usize>();
+        terms
+            + self
+                .all_span_keys
+                .len()
+                .saturating_mul(ATTR_POSTING_SMALL_VEC_ENTRY_ESTIMATED_BYTES)
+            + self
+                .incomplete_keys
+                .iter()
+                .map(|k| ATTR_SIDECAR_TERM_ESTIMATED_BYTES + k.len())
+                .sum::<usize>()
+    }
+}
+
+#[derive(Clone, Default)]
+struct SegmentAttrTerms {
+    exact: Vec<(String, String)>,
+    array_items: Vec<(String, String)>,
+    incomplete_keys: Vec<String>,
+}
+
+#[derive(Default)]
+struct SegmentAttrDirectory {
+    exact: HashMap<(String, String), HashSet<u64>>,
+    array_items: HashMap<(String, String), HashSet<u64>>,
+    incomplete_keys: HashMap<String, HashSet<u64>>,
+    terms_by_segment: HashMap<u64, SegmentAttrTerms>,
+}
+
+impl SegmentAttrDirectory {
+    fn add_segment(&mut self, seg: SegmentId, sidecar: &SegmentAttrSidecar) {
+        self.remove_segment(seg);
+        let seg_id = seg.get();
+        let terms = sidecar.terms();
+        for term in &terms.exact {
+            self.exact.entry(term.clone()).or_default().insert(seg_id);
+        }
+        for term in &terms.array_items {
+            self.array_items
+                .entry(term.clone())
+                .or_default()
+                .insert(seg_id);
+        }
+        for key in &terms.incomplete_keys {
+            self.incomplete_keys
+                .entry(key.clone())
+                .or_default()
+                .insert(seg_id);
+        }
+        self.terms_by_segment.insert(seg_id, terms);
+    }
+
+    fn remove_segment(&mut self, seg: SegmentId) {
+        let seg_id = seg.get();
+        let Some(terms) = self.terms_by_segment.remove(&seg_id) else {
+            return;
+        };
+        for term in terms.exact {
+            remove_segment_from_directory_map(&mut self.exact, &term, seg_id);
+        }
+        for term in terms.array_items {
+            remove_segment_from_directory_map(&mut self.array_items, &term, seg_id);
+        }
+        for key in terms.incomplete_keys {
+            remove_segment_from_directory_map(&mut self.incomplete_keys, &key, seg_id);
+        }
+    }
+
+    fn candidate_segments_for_attr(&self, attr_key: &str, expected: &str) -> Option<HashSet<u64>> {
+        if !is_postings_attr_key(attr_key) {
+            return None;
+        }
+        let mut out = HashSet::new();
+        extend_segment_set(
+            &mut out,
+            self.exact
+                .get(&(attr_key.to_string(), expected.to_string())),
+        );
+        let Ok(expected_json) = crate::wire::parse(expected) else {
+            extend_segment_set(&mut out, self.incomplete_keys.get(attr_key));
+            return Some(out);
+        };
+        match expected_json {
+            crate::wire::Json::Str(s) => {
+                let item = json_string_compact(&s);
+                extend_segment_set(
+                    &mut out,
+                    self.array_items.get(&(attr_key.to_string(), item)),
+                );
+            }
+            crate::wire::Json::Arr(items) => {
+                let expected_strings: Vec<String> = items
+                    .iter()
+                    .filter_map(crate::wire::Json::as_str)
+                    .map(json_string_compact)
+                    .collect();
+                for item in &expected_strings {
+                    extend_segment_set(
+                        &mut out,
+                        self.exact.get(&(attr_key.to_string(), item.clone())),
+                    );
+                }
+                if !expected_strings.is_empty() {
+                    let mut array_segments: Option<HashSet<u64>> = None;
+                    for item in expected_strings {
+                        let segs = self
+                            .array_items
+                            .get(&(attr_key.to_string(), item))
+                            .cloned()
+                            .unwrap_or_default();
+                        array_segments = Some(match array_segments {
+                            None => segs,
+                            Some(prev) => prev.intersection(&segs).copied().collect(),
+                        });
+                    }
+                    if let Some(segs) = array_segments {
+                        out.extend(segs);
+                    }
+                }
+            }
+            _ => {}
+        }
+        extend_segment_set(&mut out, self.incomplete_keys.get(attr_key));
+        Some(out)
+    }
+
+    fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.terms_by_segment.len(),
+            self.exact.len(),
+            self.array_items.len(),
+            self.incomplete_keys
+                .values()
+                .map(HashSet::len)
+                .sum::<usize>(),
+        )
+    }
+}
+
+struct SegmentAttrSidecarCache {
+    cap_bytes: usize,
+    cur_bytes: usize,
+    map: HashMap<u64, (Arc<SegmentAttrSidecar>, usize, u64)>,
+    tick: u64,
+    hits: u64,
+    misses: u64,
+    loads: u64,
+    evictions: u64,
+}
+
+impl SegmentAttrSidecarCache {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes: cap_bytes.max(1),
+            cur_bytes: 0,
+            map: HashMap::new(),
+            tick: 0,
+            hits: 0,
+            misses: 0,
+            loads: 0,
+            evictions: 0,
+        }
+    }
+
+    fn get(&mut self, seg: SegmentId) -> Option<Arc<SegmentAttrSidecar>> {
+        self.tick += 1;
+        let tick = self.tick;
+        match self.map.get_mut(&seg.get()) {
+            Some((sidecar, _, seen)) => {
+                *seen = tick;
+                self.hits += 1;
+                Some(sidecar.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        seg: SegmentId,
+        sidecar: Arc<SegmentAttrSidecar>,
+    ) -> Arc<SegmentAttrSidecar> {
+        self.loads += 1;
+        let bytes = sidecar.estimated_bytes();
+        if bytes > self.cap_bytes {
+            return sidecar;
+        }
+        self.tick += 1;
+        if let Some((_, old_bytes, _)) = self.map.remove(&seg.get()) {
+            self.cur_bytes = self.cur_bytes.saturating_sub(old_bytes);
+        }
+        self.cur_bytes = self.cur_bytes.saturating_add(bytes);
+        self.map
+            .insert(seg.get(), (sidecar.clone(), bytes, self.tick));
+        self.evict();
+        sidecar
+    }
+
+    fn remove(&mut self, seg: SegmentId) {
+        if let Some((_, bytes, _)) = self.map.remove(&seg.get()) {
+            self.cur_bytes = self.cur_bytes.saturating_sub(bytes);
+        }
+    }
+
+    fn evict(&mut self) {
+        let target = (self.cap_bytes * 9 / 10).max(1);
+        let mut by_tick: Vec<(u64, u64, usize)> = self
+            .map
+            .iter()
+            .map(|(&seg, (_, bytes, tick))| (*tick, seg, *bytes))
+            .collect();
+        by_tick.sort_unstable_by_key(|x| x.0);
+        for (_, seg, bytes) in by_tick {
+            if self.cur_bytes <= target || self.map.len() <= 1 {
+                break;
+            }
+            self.map.remove(&seg);
+            self.cur_bytes = self.cur_bytes.saturating_sub(bytes);
+            self.evictions += 1;
+        }
+    }
+
+    fn stats(&self) -> (usize, usize, usize, u64, u64, u64, u64) {
+        (
+            self.map.len(),
+            self.cur_bytes,
+            self.cap_bytes,
+            self.hits,
+            self.misses,
+            self.loads,
+            self.evictions,
+        )
+    }
+}
+
+const ATTR_SIDECAR_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ATTR_SIDECAR_TERM_ESTIMATED_BYTES: usize = 64;
+const ATTR_SIDECAR_MAGIC: &[u8; 8] = b"YTAS1\0\0\0";
+
+fn insert_segment_attr_posting(
+    index: &mut HashMap<(String, String), PostingList>,
+    attr_key: &str,
+    attr_value: &str,
+    span_key: SpanKey,
+) {
+    let key = (attr_key.to_string(), attr_value.to_string());
+    match index.get_mut(&key) {
+        Some(list) => {
+            list.insert(span_key);
+        }
+        None => {
+            index.insert(key, PostingList::One(span_key));
+        }
+    }
+}
+
+fn remove_segment_from_directory_map<K: Eq + std::hash::Hash + Clone>(
+    map: &mut HashMap<K, HashSet<u64>>,
+    key: &K,
+    seg: u64,
+) {
+    let remove = if let Some(segs) = map.get_mut(key) {
+        segs.remove(&seg);
+        segs.is_empty()
+    } else {
+        false
+    };
+    if remove {
+        map.remove(key);
+    }
+}
+
+fn extend_segment_set(out: &mut HashSet<u64>, segs: Option<&HashSet<u64>>) {
+    if let Some(segs) = segs {
+        out.extend(segs.iter().copied());
+    }
+}
+
+fn attr_sidecar_path(dir: &std::path::Path, seg: SegmentId) -> std::path::PathBuf {
+    dir.join(format!("seg-{}.attrs", seg.get()))
+}
+
+fn write_segment_attr_sidecar_file(
+    dir: &std::path::Path,
+    seg: SegmentId,
+    sidecar: &SegmentAttrSidecar,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = attr_sidecar_path(dir, seg);
+    let tmp = dir.join(format!("seg-{}.attrs.tmp", seg.get()));
+    std::fs::write(&tmp, encode_segment_attr_sidecar(sidecar))?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn read_segment_attr_sidecar_file(
+    dir: &std::path::Path,
+    seg: SegmentId,
+) -> Option<SegmentAttrSidecar> {
+    let bytes = std::fs::read(attr_sidecar_path(dir, seg)).ok()?;
+    decode_segment_attr_sidecar(&bytes).ok()
+}
+
+fn encode_segment_attr_sidecar(sidecar: &SegmentAttrSidecar) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(ATTR_SIDECAR_MAGIC);
+    write_sidecar_map(&mut out, &sidecar.exact);
+    write_sidecar_map(&mut out, &sidecar.array_items);
+    write_u32(&mut out, sidecar.all_span_keys.len() as u32);
+    let mut span_keys: Vec<SpanKey> = sidecar.all_span_keys.iter().copied().collect();
+    span_keys.sort_unstable();
+    for (trace_id, span_id) in span_keys {
+        write_u64(&mut out, trace_id);
+        write_u64(&mut out, span_id);
+    }
+    write_u32(&mut out, sidecar.incomplete_keys.len() as u32);
+    let mut incomplete: Vec<&String> = sidecar.incomplete_keys.iter().collect();
+    incomplete.sort_unstable();
+    for key in incomplete {
+        write_string(&mut out, key);
+    }
+    out
+}
+
+fn decode_segment_attr_sidecar(bytes: &[u8]) -> Result<SegmentAttrSidecar, String> {
+    let mut pos = 0usize;
+    if bytes.len() < ATTR_SIDECAR_MAGIC.len()
+        || &bytes[..ATTR_SIDECAR_MAGIC.len()] != ATTR_SIDECAR_MAGIC
+    {
+        return Err("bad attr sidecar magic".into());
+    }
+    pos += ATTR_SIDECAR_MAGIC.len();
+    let exact = read_sidecar_map(bytes, &mut pos)?;
+    let array_items = read_sidecar_map(bytes, &mut pos)?;
+    let span_count = read_u32(bytes, &mut pos)? as usize;
+    let mut all_span_keys = HashSet::with_capacity(span_count);
+    for _ in 0..span_count {
+        let trace_id = read_u64(bytes, &mut pos)?;
+        let span_id = read_u64(bytes, &mut pos)?;
+        all_span_keys.insert((trace_id, span_id));
+    }
+    let incomplete_count = read_u32(bytes, &mut pos)? as usize;
+    let mut incomplete_keys = HashSet::with_capacity(incomplete_count);
+    for _ in 0..incomplete_count {
+        incomplete_keys.insert(read_string(bytes, &mut pos)?);
+    }
+    Ok(SegmentAttrSidecar {
+        exact,
+        array_items,
+        all_span_keys,
+        incomplete_keys,
+    })
+}
+
+fn write_sidecar_map(out: &mut Vec<u8>, map: &HashMap<(String, String), PostingList>) {
+    let mut entries: Vec<(&(String, String), &PostingList)> = map.iter().collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    write_u32(out, entries.len() as u32);
+    for ((key, value), list) in entries {
+        write_string(out, key);
+        write_string(out, value);
+        let span_keys = list.to_sorted_vec();
+        write_u32(out, span_keys.len() as u32);
+        for (trace_id, span_id) in span_keys {
+            write_u64(out, trace_id);
+            write_u64(out, span_id);
+        }
+    }
+}
+
+fn read_sidecar_map(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<HashMap<(String, String), PostingList>, String> {
+    let count = read_u32(bytes, pos)? as usize;
+    let mut out = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key = read_string(bytes, pos)?;
+        let value = read_string(bytes, pos)?;
+        let span_count = read_u32(bytes, pos)? as usize;
+        let mut span_keys = Vec::with_capacity(span_count);
+        for _ in 0..span_count {
+            span_keys.push((read_u64(bytes, pos)?, read_u64(bytes, pos)?));
+        }
+        if let Some(list) = PostingList::from_keys(span_keys) {
+            out.insert((key, value), list);
+        }
+    }
+    Ok(out)
+}
+
+fn write_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn write_string(out: &mut Vec<u8>, s: &str) {
+    write_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
+    let end = pos.saturating_add(4);
+    let Some(slice) = bytes.get(*pos..end) else {
+        return Err("truncated u32".into());
+    };
+    *pos = end;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let end = pos.saturating_add(8);
+    let Some(slice) = bytes.get(*pos..end) else {
+        return Err("truncated u64".into());
+    };
+    *pos = end;
+    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
+    let len = read_u32(bytes, pos)? as usize;
+    let end = pos.saturating_add(len);
+    let Some(slice) = bytes.get(*pos..end) else {
+        return Err("truncated string".into());
+    };
+    *pos = end;
+    String::from_utf8(slice.to_vec()).map_err(|_| "invalid utf8".to_string())
+}
+
 /// 检索过滤条件（产品维度）。下推进图搜索 / 后置过滤关键词候选。全 None = 不过滤。
 /// 例："找 agent『风控研判』报错(status≠0)的相似 span" → trace_id=None, agent_name=Some(风控研判), status...
 #[derive(Default, Clone)]
@@ -418,7 +1619,7 @@ pub struct SearchFilter {
     pub status: Option<u8>,
     pub time_from: Option<i64>,
     pub time_to: Option<i64>,
-    /// attrs 精确过滤。当前只承诺 project_id / skill / mode / call_site 这组高频维度。
+    /// attrs 精确过滤。value 是 compact JSON；标量走精确匹配，字符串数组支持 includes。
     pub attrs: BTreeMap<String, String>,
     /// **租户隔离**：设了它，只返回该租户的 span。服务层须按鉴权身份对每个查询注入它。
     pub tenant_id: Option<u64>,
@@ -465,7 +1666,12 @@ impl SearchFilter {
             }
         }
         for (k, v) in &self.attrs {
-            if a.attrs.get(k) != Some(v) {
+            if !a
+                .attrs
+                .get(k)
+                .map(|actual| attr_json_matches(actual, v))
+                .unwrap_or(false)
+            {
                 return false;
             }
         }
@@ -474,7 +1680,617 @@ impl SearchFilter {
 }
 
 fn is_filter_attr_key(k: &str) -> bool {
-    matches!(k, "project_id" | "skill" | "mode" | "call_site")
+    !k.is_empty()
+}
+
+fn is_agentic_field_key(k: &str) -> bool {
+    matches!(
+        k,
+        "project_id"
+            | "session_id"
+            | "external_run_id"
+            | "skill"
+            | "mode"
+            | "call_site"
+            | "task_fingerprint"
+            | "loop_id"
+            | "harness_version"
+            | "validation_status"
+            | "stop_reason"
+            | "phase"
+            | "validator"
+            | "connection_ids"
+            | "data_source_ids"
+            | "schema_fingerprint"
+            | "eval_profile"
+            | "tool_version"
+            | "model"
+            | "provider"
+            | "intent_signature"
+            | "review_status"
+            | "eval_status"
+            | "path_memory_id"
+    )
+}
+
+pub(crate) fn attr_json_matches(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if let Ok(expected_json) = crate::wire::parse(expected) {
+        match &expected_json {
+            crate::wire::Json::Str(expected_s) if actual == expected_s => return true,
+            crate::wire::Json::Arr(expected_items) => {
+                if expected_items
+                    .iter()
+                    .any(|item| item.as_str() == Some(actual))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(actual_json) = crate::wire::parse(actual) else {
+        return false;
+    };
+    let Ok(expected_json) = crate::wire::parse(expected) else {
+        return false;
+    };
+    match (&actual_json, &expected_json) {
+        (crate::wire::Json::Arr(actual_items), crate::wire::Json::Str(expected_s)) => actual_items
+            .iter()
+            .any(|item| item.as_str() == Some(expected_s.as_str())),
+        (crate::wire::Json::Str(actual_s), crate::wire::Json::Arr(expected_items)) => {
+            expected_items
+                .iter()
+                .any(|item| item.as_str() == Some(actual_s.as_str()))
+        }
+        (crate::wire::Json::Arr(actual_items), crate::wire::Json::Arr(expected_items)) => {
+            let actual_strings: std::collections::HashSet<&str> = actual_items
+                .iter()
+                .filter_map(crate::wire::Json::as_str)
+                .collect();
+            let expected_strings: Vec<&str> = expected_items
+                .iter()
+                .filter_map(crate::wire::Json::as_str)
+                .collect();
+            !expected_strings.is_empty()
+                && expected_strings
+                    .iter()
+                    .all(|expected_s| actual_strings.contains(expected_s))
+        }
+        _ => false,
+    }
+}
+
+fn metadata_attrs_match(
+    actual: &BTreeMap<String, String>,
+    expected: &BTreeMap<String, String>,
+) -> bool {
+    expected.iter().all(|(key, want)| {
+        actual
+            .get(key)
+            .map(|got| attr_json_matches(got, want))
+            .unwrap_or(false)
+    })
+}
+
+fn annotation_matches(a: &TraceAnnotation, f: &TraceAnnotationFilter) -> bool {
+    if let Some(tenant_id) = f.tenant_id {
+        if a.tenant_id != Some(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(target) = f.target {
+        if a.target != target {
+            return false;
+        }
+    }
+    if let Some(trace_id) = f.trace_id {
+        if a.trace_id != trace_id {
+            return false;
+        }
+    }
+    if let Some(span_id) = f.span_id {
+        if a.span_id != Some(span_id) {
+            return false;
+        }
+    }
+    if let Some(label) = &f.label {
+        if a.label != *label {
+            return false;
+        }
+    }
+    if let Some(source) = &f.source {
+        if a.source.as_deref() != Some(source.as_str()) {
+            return false;
+        }
+    }
+    metadata_attrs_match(&a.attrs, &f.attrs)
+}
+
+fn dataset_association_matches(a: &DatasetAssociation, f: &DatasetAssociationFilter) -> bool {
+    if let Some(tenant_id) = f.tenant_id {
+        if a.tenant_id != Some(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(dataset_id) = &f.dataset_id {
+        if a.dataset_id != *dataset_id {
+            return false;
+        }
+    }
+    if let Some(item_id) = &f.item_id {
+        if a.item_id != *item_id {
+            return false;
+        }
+    }
+    if let Some(trace_id) = f.trace_id {
+        if a.trace_id != trace_id {
+            return false;
+        }
+    }
+    if let Some(span_id) = f.span_id {
+        if a.span_id != Some(span_id) {
+            return false;
+        }
+    }
+    if let Some(eval_run_id) = &f.eval_run_id {
+        if a.eval_run_id.as_deref() != Some(eval_run_id.as_str()) {
+            return false;
+        }
+    }
+    if let Some(split) = &f.split {
+        if a.split.as_deref() != Some(split.as_str()) {
+            return false;
+        }
+    }
+    if let Some(label) = &f.label {
+        if a.label.as_deref() != Some(label.as_str()) {
+            return false;
+        }
+    }
+    metadata_attrs_match(&a.attrs, &f.attrs)
+}
+
+fn golden_path_matches(g: &GoldenPathCandidate, f: &GoldenPathFilter) -> bool {
+    if let Some(tenant_id) = f.tenant_id {
+        if g.tenant_id != Some(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(golden_path_id) = f.golden_path_id {
+        if g.golden_path_id != golden_path_id {
+            return false;
+        }
+    }
+    if let Some(task_fingerprint) = &f.task_fingerprint {
+        if g.task_fingerprint != *task_fingerprint {
+            return false;
+        }
+    }
+    if let Some(signature) = &f.trajectory_signature {
+        if g.trajectory_signature != *signature {
+            return false;
+        }
+    }
+    if let Some(source_trace_id) = f.source_trace_id {
+        if g.source_trace_id != source_trace_id {
+            return false;
+        }
+    }
+    if let Some(status) = f.status {
+        if g.status != status {
+            return false;
+        }
+    }
+    metadata_attrs_match(&g.attrs, &f.attrs)
+}
+
+fn retention_audit_matches(a: &RetentionAuditRecord, f: &RetentionAuditFilter) -> bool {
+    if let Some(tenant_id) = f.tenant_id {
+        if a.tenant_id != Some(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(audit_id) = f.audit_id {
+        if a.audit_id != audit_id {
+            return false;
+        }
+    }
+    if let Some(source) = &f.source {
+        if a.source.as_deref() != Some(source.as_str()) {
+            return false;
+        }
+    }
+    if let Some(min_created_at_ns) = f.min_created_at_ns {
+        if a.created_at_ns < min_created_at_ns {
+            return false;
+        }
+    }
+    if let Some(max_created_at_ns) = f.max_created_at_ns {
+        if a.created_at_ns > max_created_at_ns {
+            return false;
+        }
+    }
+    true
+}
+
+fn retention_policy_matches(p: &RetentionPolicy, f: &RetentionPolicyFilter) -> bool {
+    if let Some(tenant_id) = f.tenant_id {
+        if p.tenant_id != Some(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(policy_id) = f.policy_id {
+        if p.policy_id != policy_id {
+            return false;
+        }
+    }
+    if let Some(name) = &f.name {
+        if p.name != *name {
+            return false;
+        }
+    }
+    if let Some(enabled) = f.enabled {
+        if p.enabled != enabled {
+            return false;
+        }
+    }
+    true
+}
+
+fn first_class_attr_value<'a>(fields: &'a yt_core::fold::SpanFields, key: &str) -> Option<&'a str> {
+    match key {
+        "project_id" => fields.project_id.as_deref(),
+        "skill" => fields.skill.as_deref(),
+        "mode" => fields.mode.as_deref(),
+        "call_site" => fields.call_site.as_deref(),
+        "task_fingerprint" => fields.task_fingerprint.as_deref(),
+        "loop_id" => fields.loop_id.as_deref(),
+        "harness_version" => fields.harness_version.as_deref(),
+        "validation_status" => fields.validation_status.as_deref(),
+        "stop_reason" => fields.stop_reason.as_deref(),
+        "phase" => fields.phase.as_deref(),
+        "validator" => fields.validator.as_deref(),
+        "model" => fields.model.as_deref(),
+        "provider" => fields.provider.as_deref(),
+        _ => None,
+    }
+}
+
+pub(crate) fn first_class_span_attr_value<'a>(s: &'a FoldedSpan, key: &str) -> Option<&'a str> {
+    match key {
+        "project_id" => s.project_id.as_deref(),
+        "skill" => s.skill.as_deref(),
+        "mode" => s.mode.as_deref(),
+        "call_site" => s.call_site.as_deref(),
+        "task_fingerprint" => s.task_fingerprint.as_deref(),
+        "loop_id" => s.loop_id.as_deref(),
+        "harness_version" => s.harness_version.as_deref(),
+        "validation_status" => s.validation_status.as_deref(),
+        "stop_reason" => s.stop_reason.as_deref(),
+        "phase" => s.phase.as_deref(),
+        "validator" => s.validator.as_deref(),
+        "model" => s.model.as_deref(),
+        "provider" => s.provider.as_deref(),
+        _ => None,
+    }
+}
+
+pub(crate) fn first_class_console_attr_value<'a>(s: &'a ConsoleSpan, key: &str) -> Option<&'a str> {
+    match key {
+        "project_id" => s.project_id.as_deref(),
+        "skill" => s.skill.as_deref(),
+        "mode" => s.mode.as_deref(),
+        "call_site" => s.call_site.as_deref(),
+        "task_fingerprint" => s.task_fingerprint.as_deref(),
+        "loop_id" => s.loop_id.as_deref(),
+        "harness_version" => s.harness_version.as_deref(),
+        "validation_status" => s.validation_status.as_deref(),
+        "stop_reason" => s.stop_reason.as_deref(),
+        "phase" => s.phase.as_deref(),
+        "validator" => s.validator.as_deref(),
+        "model" => s.model.as_deref(),
+        "provider" => s.provider.as_deref(),
+        _ => None,
+    }
+}
+
+fn fields_attr_value<'a>(fields: &'a yt_core::fold::SpanFields, key: &str) -> Option<&'a str> {
+    first_class_attr_value(fields, key).or_else(|| fields.attrs.get(key).map(String::as_str))
+}
+
+pub(crate) fn folded_span_attr_value<'a>(s: &'a FoldedSpan, key: &str) -> Option<&'a str> {
+    first_class_span_attr_value(s, key).or_else(|| s.attrs.get(key).map(String::as_str))
+}
+
+pub(crate) fn trajectory_steps_for_spans(spans: &[FoldedSpan]) -> Vec<String> {
+    spans.iter().map(trajectory_step_for_span).collect()
+}
+
+pub(crate) fn trajectory_signature_value(steps: &[String]) -> u64 {
+    let mut bytes = Vec::new();
+    for step in steps {
+        bytes.extend_from_slice(step.as_bytes());
+        bytes.push(0);
+    }
+    yt_core::event::fnv1a64(&bytes)
+}
+
+pub(crate) fn trajectory_signature_label(steps: &[String]) -> String {
+    format!("fnv1a64:{:016x}", trajectory_signature_value(steps))
+}
+
+pub(crate) fn trajectory_step_for_span(s: &FoldedSpan) -> String {
+    let (kind, name) = if let Some(tool) = &s.tool_name {
+        ("tool", tool.as_str())
+    } else if let Some(agent) = &s.agent_name {
+        ("agent", agent.as_str())
+    } else if let Some(model) = &s.model {
+        ("llm", model.as_str())
+    } else {
+        ("other", "")
+    };
+    let fallback;
+    let name = if name.is_empty() {
+        fallback = format!("span {}", s.span_id);
+        fallback.as_str()
+    } else {
+        name
+    };
+    let mut out = format!(
+        "{}:{}",
+        normalize_trajectory_part(kind),
+        normalize_trajectory_part(name)
+    );
+    for key in ["phase", "validator"] {
+        if let Some(value) = folded_span_attr_value(s, key) {
+            out.push('|');
+            out.push_str(key);
+            out.push(':');
+            out.push_str(&normalize_trajectory_part(&json_compact_label(value)));
+        }
+    }
+    out
+}
+
+fn normalize_trajectory_part(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_whitespace() || matches!(c, '|' | ':' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn json_compact_label(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn emit_indexable_attrs(fields: &yt_core::fold::SpanFields, mut emit: impl FnMut(&str, &str)) {
+    for key in first_class_agentic_attr_keys() {
+        if let Some(value) = first_class_attr_value(fields, key) {
+            let value_json = first_class_agentic_attr_json(key, value);
+            emit(key, &value_json);
+        }
+    }
+    for (key, value) in &fields.attrs {
+        if first_class_attr_value(fields, key).is_none() {
+            emit(key, value);
+        }
+    }
+}
+
+fn first_class_agentic_attr_keys() -> &'static [&'static str] {
+    &[
+        "project_id",
+        "skill",
+        "mode",
+        "call_site",
+        "task_fingerprint",
+        "loop_id",
+        "harness_version",
+        "validation_status",
+        "stop_reason",
+        "phase",
+        "validator",
+        "model",
+        "provider",
+    ]
+}
+
+fn first_class_agentic_attr_json(key: &str, value: &str) -> String {
+    match key {
+        // `model` / `provider` are native string columns. The other agentic
+        // dimensions are promoted from attrs and already store compact JSON.
+        "model" | "provider" => json_string_compact(value),
+        _ => value.to_string(),
+    }
+}
+
+fn folded_span_attrs_match(s: &FoldedSpan, attrs: &BTreeMap<String, String>) -> bool {
+    attrs.iter().all(|(k, v)| {
+        folded_span_attr_value(s, k)
+            .map(|actual| attr_json_matches(actual, v))
+            .unwrap_or(false)
+    })
+}
+
+fn summarize_trace_spans(spans: Vec<FoldedSpan>) -> Vec<TraceSummary> {
+    let mut by_trace: BTreeMap<u64, TraceSummary> = BTreeMap::new();
+    for s in spans {
+        let e = by_trace.entry(s.trace_id).or_insert(TraceSummary {
+            trace_id: s.trace_id,
+            external_trace_id: s.external_trace_id.clone(),
+            span_count: 0,
+            total_duration_ns: 0,
+            max_duration_ns: 0,
+            error_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cached_input_tokens: 0,
+            total_reasoning_tokens: 0,
+            total_tokens: 0,
+            total_cost_usd_nanos: 0,
+        });
+        if e.external_trace_id.is_none() {
+            e.external_trace_id = s.external_trace_id.clone();
+        }
+        e.span_count += 1;
+        if let Some(d) = s.duration_ns {
+            e.total_duration_ns += d;
+            e.max_duration_ns = e.max_duration_ns.max(d);
+        }
+        if matches!(s.status, Some(st) if st != 0) {
+            e.error_count += 1;
+        }
+        e.total_input_tokens += s.input_tokens.unwrap_or(0);
+        e.total_output_tokens += s.output_tokens.unwrap_or(0);
+        e.total_cached_input_tokens += s.cached_input_tokens.unwrap_or(0);
+        e.total_reasoning_tokens += s.reasoning_tokens.unwrap_or(0);
+        e.total_tokens += usage_total_tokens(
+            s.input_tokens.unwrap_or(0),
+            s.output_tokens.unwrap_or(0),
+            s.cached_input_tokens.unwrap_or(0),
+            s.reasoning_tokens.unwrap_or(0),
+            s.total_tokens,
+        );
+        e.total_cost_usd_nanos += usage_cost_usd_nanos(
+            s.input_tokens.unwrap_or(0),
+            s.output_tokens.unwrap_or(0),
+            s.cached_input_tokens.unwrap_or(0),
+            s.reasoning_tokens.unwrap_or(0),
+            s.cost_usd_nanos,
+        );
+    }
+    by_trace.into_values().collect()
+}
+
+fn trace_trajectory_summary_from_spans(
+    trace_id: u64,
+    tenant_id: Option<u64>,
+    spans: &[FoldedSpan],
+) -> Option<TraceTrajectorySummary> {
+    let first = spans.first()?;
+    let steps = trajectory_steps_for_spans(spans);
+    let mut out = TraceTrajectorySummary {
+        tenant_id,
+        trace_id,
+        external_trace_id: first.external_trace_id.clone(),
+        trajectory_signature: trajectory_signature_label(&steps),
+        steps,
+        span_count: 0,
+        error_count: 0,
+        duration_sum_ns: 0,
+        duration_max_ns: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 0,
+        cost_usd_nanos: 0,
+        fields: BTreeMap::new(),
+    };
+    for s in spans {
+        if out.external_trace_id.is_none() {
+            out.external_trace_id = s.external_trace_id.clone();
+        }
+        out.span_count += 1;
+        if s.status.unwrap_or(0) != 0 {
+            out.error_count += 1;
+        }
+        if let Some(duration) = s.duration_ns {
+            out.duration_sum_ns += duration as u128;
+            out.duration_max_ns = out.duration_max_ns.max(duration);
+        }
+        out.input_tokens += s.input_tokens.unwrap_or(0);
+        out.output_tokens += s.output_tokens.unwrap_or(0);
+        out.cached_input_tokens += s.cached_input_tokens.unwrap_or(0);
+        out.reasoning_tokens += s.reasoning_tokens.unwrap_or(0);
+        out.total_tokens += usage_total_tokens(
+            s.input_tokens.unwrap_or(0),
+            s.output_tokens.unwrap_or(0),
+            s.cached_input_tokens.unwrap_or(0),
+            s.reasoning_tokens.unwrap_or(0),
+            s.total_tokens,
+        );
+        out.cost_usd_nanos += usage_cost_usd_nanos(
+            s.input_tokens.unwrap_or(0),
+            s.output_tokens.unwrap_or(0),
+            s.cached_input_tokens.unwrap_or(0),
+            s.reasoning_tokens.unwrap_or(0),
+            s.cost_usd_nanos,
+        );
+        for key in first_class_agentic_attr_keys() {
+            if let Some(value) = first_class_span_attr_value(s, key) {
+                out.fields
+                    .entry((*key).to_string())
+                    .or_insert_with(|| first_class_agentic_attr_json(key, value));
+            } else if let Some(value) = s.attrs.get(*key) {
+                out.fields
+                    .entry((*key).to_string())
+                    .or_insert_with(|| value.to_string());
+            }
+        }
+        for key in [
+            "schema_fingerprint",
+            "eval_profile",
+            "tool_version",
+            "intent_signature",
+        ] {
+            if let Some(value) = first_class_span_attr_value(s, key) {
+                out.fields
+                    .entry(key.to_string())
+                    .or_insert_with(|| first_class_agentic_attr_json(key, value));
+            } else if let Some(value) = s.attrs.get(key) {
+                out.fields
+                    .entry(key.to_string())
+                    .or_insert_with(|| value.to_string());
+            }
+        }
+    }
+    Some(out)
+}
+
+pub const DEFAULT_INPUT_TOKEN_COST_USD_NANOS: u64 = 800;
+pub const DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS: u64 = 4_000;
+
+pub fn usage_total_tokens(
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    explicit_total_tokens: Option<u64>,
+) -> u64 {
+    explicit_total_tokens
+        .unwrap_or_else(|| input_tokens + output_tokens + cached_input_tokens + reasoning_tokens)
+}
+
+pub fn usage_cost_usd_nanos(
+    input_tokens: u64,
+    output_tokens: u64,
+    _cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    explicit_cost_usd_nanos: Option<u64>,
+) -> u64 {
+    explicit_cost_usd_nanos.unwrap_or_else(|| {
+        input_tokens.saturating_mul(DEFAULT_INPUT_TOKEN_COST_USD_NANOS)
+            + output_tokens
+                .saturating_add(reasoning_tokens)
+                .saturating_mul(DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS)
+    })
 }
 
 /// 一条 trace 的摘要（web 控制台列表视图用）。
@@ -490,6 +2306,65 @@ pub struct TraceSummary {
     /// 全 trace 输入/输出 token 汇总（成本指标）。
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cached_input_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub total_cost_usd_nanos: u64,
+}
+
+/// 每条 trace 的轻量 trajectory 物化摘要。
+///
+/// 这是派生读模型：不进入 WAL/segment 主格式，不保存输入输出原文；写入同 trace 新事件后失效。
+/// Golden Path health、路径导出和后续产品页可复用它，避免每次都重新折叠整条 trace。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceTrajectorySummary {
+    pub tenant_id: Option<u64>,
+    pub trace_id: u64,
+    pub external_trace_id: Option<String>,
+    pub trajectory_signature: String,
+    pub steps: Vec<String>,
+    pub span_count: usize,
+    pub error_count: usize,
+    pub duration_sum_ns: u128,
+    pub duration_max_ns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
+    pub fields: BTreeMap<String, String>,
+}
+
+/// retention apply 的物理删除结果。
+///
+/// 当前只删除已经 flush 进 segment 的行；仍在 MemTable/WAL tail 的热 trace 会跳过，避免半删。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionDeleteResult {
+    pub requested_trace_count: usize,
+    pub deleted_trace_count: usize,
+    pub deleted_segment_row_count: usize,
+    pub skipped_live_trace_count: usize,
+    pub deleted_trace_ids: Vec<u64>,
+    pub skipped_live_trace_ids: Vec<u64>,
+}
+
+/// retention 后可选 compaction 的结果。
+///
+/// 这层只负责把 deletion vector 物化进新段，并触发已有 GC 安全回收；是否真正释放磁盘取决于
+/// 当前是否仍有读者 pin 住旧版本或 buffer pin。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetentionCompactResult {
+    pub before_live_segment_count: usize,
+    pub after_live_segment_count: usize,
+    pub before_dead_segment_count: usize,
+    pub after_dead_segment_count: usize,
+    pub selected_segment_count: usize,
+    pub compacted_segment_count: usize,
+    pub reclaimed_segment_count: usize,
+    pub dropped_deleted_row_count: usize,
+    pub rewritten_live_row_count: usize,
+    pub selected_segment_ids: Vec<u64>,
 }
 
 /// trace 树的一个节点 = 折叠出的 span + 它的孩子 span_id。
@@ -544,6 +2419,10 @@ pub struct AgentGraphNode {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
 }
 
 /// agent 执行图的一条边 = 父 span 的角色"调用/移交给"子 span 的角色（聚合次数）。
@@ -581,6 +2460,10 @@ pub struct SessionTurn {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
     /// 该轮 status≠0 的 span 数（这一轮有没有出错）。
     pub error_count: usize,
     /// 该轮答复 span 的评测分（若已 eval 写回）。
@@ -606,6 +2489,10 @@ pub struct ConsoleSession {
     pub turn_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
     pub has_error: bool,
     pub first_trace_id: u64,
 }
@@ -619,6 +2506,17 @@ pub struct ConsoleSpan {
     pub external_span_id: Option<String>,
     pub external_parent_span_id: Option<String>,
     pub external_session_id: Option<String>,
+    pub project_id: Option<String>,
+    pub skill: Option<String>,
+    pub mode: Option<String>,
+    pub call_site: Option<String>,
+    pub task_fingerprint: Option<String>,
+    pub loop_id: Option<String>,
+    pub harness_version: Option<String>,
+    pub validation_status: Option<String>,
+    pub stop_reason: Option<String>,
+    pub phase: Option<String>,
+    pub validator: Option<String>,
     pub kind: &'static str,
     pub name: String,
     pub start_ns: u64,
@@ -626,7 +2524,13 @@ pub struct ConsoleSpan {
     pub has_error: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
     pub model: Option<String>,
+    pub provider: Option<String>,
+    pub cost_currency: Option<String>,
     pub input_text: Option<String>,
     pub output_text: Option<String>,
     pub attrs: BTreeMap<String, String>,
@@ -661,6 +2565,10 @@ pub struct AgentCost {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_nanos: u64,
 }
 
 // ───────────────────────── 评测（eval 闭环） ─────────────────────────
@@ -829,6 +2737,12 @@ pub struct WireRecord {
     pub duration_ns: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost_usd_nanos: Option<u64>,
+    pub cost_currency: Option<String>,
+    pub provider: Option<String>,
     pub session_id: Option<u64>,
     pub tenant_id: Option<u64>,
     pub external_trace_id: Option<String>,
@@ -846,6 +2760,17 @@ pub struct WireRecord {
 
 impl WireRecord {
     fn into_wal_record(self) -> WalRecord {
+        let project_id = self.attrs.get("project_id").cloned();
+        let skill = self.attrs.get("skill").cloned();
+        let mode = self.attrs.get("mode").cloned();
+        let call_site = self.attrs.get("call_site").cloned();
+        let task_fingerprint = self.attrs.get("task_fingerprint").cloned();
+        let loop_id = self.attrs.get("loop_id").cloned();
+        let harness_version = self.attrs.get("harness_version").cloned();
+        let validation_status = self.attrs.get("validation_status").cloned();
+        let stop_reason = self.attrs.get("stop_reason").cloned();
+        let phase = self.attrs.get("phase").cloned();
+        let validator = self.attrs.get("validator").cloned();
         WalRecord {
             trace_id: self.trace_id,
             span_id: self.span_id,
@@ -861,12 +2786,29 @@ impl WireRecord {
                 parent_span_id: self.parent_span_id,
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                cached_input_tokens: self.cached_input_tokens,
+                reasoning_tokens: self.reasoning_tokens,
+                total_tokens: self.total_tokens,
+                cost_usd_nanos: self.cost_usd_nanos,
+                cost_currency: self.cost_currency,
+                provider: self.provider,
                 session_id: self.session_id,
                 tenant_id: self.tenant_id,
                 external_trace_id: self.external_trace_id,
                 external_span_id: self.external_span_id,
                 external_parent_span_id: self.external_parent_span_id,
                 external_session_id: self.external_session_id,
+                project_id,
+                skill,
+                mode,
+                call_site,
+                task_fingerprint,
+                loop_id,
+                harness_version,
+                validation_status,
+                stop_reason,
+                phase,
+                validator,
                 agent_name: self.agent_name,
                 tool_name: self.tool_name,
                 model: self.model,
@@ -907,14 +2849,44 @@ pub struct WriteCoordinator {
     next_chunk_id: Mutex<u64>,
     /// 评测数据集（按名）。元数据,不进 trace 存储;eval 的"燃料"与回归基准。
     datasets: Mutex<BTreeMap<String, Dataset>>,
+    /// 业务 annotation：给 trace/span 记录人工或自动判断。独立持久化，不污染 trace 主格式。
+    annotations: Mutex<Vec<TraceAnnotation>>,
+    /// 外部 dataset item 与 trace/span 的关联。用于把线上路径沉淀成回归样本或最佳路径样本。
+    dataset_associations: Mutex<Vec<DatasetAssociation>>,
+    /// Golden path 候选与确认状态：只保存源 trace/snapshot 引用和评审状态，不复制 trace 主数据。
+    golden_paths: Mutex<Vec<GoldenPathCandidate>>,
+    /// Retention 执行审计：记录清理策略、保护原因和实际删除/压缩结果，便于误删排查。
+    retention_audits: Mutex<Vec<RetentionAuditRecord>>,
+    /// Retention policy：保存可重复执行的清理策略，调度器只负责触发，不复制删除逻辑。
+    retention_policies: Mutex<Vec<RetentionPolicy>>,
+    next_annotation_id: Mutex<u64>,
+    next_dataset_association_id: Mutex<u64>,
+    next_golden_path_id: Mutex<u64>,
+    next_retention_audit_id: Mutex<u64>,
+    next_retention_policy_id: Mutex<u64>,
     /// manifest 持久化路径。Some = 每次 commit 后原子写盘（重启不丢）；None = 纯内存。
     manifest_path: Option<std::path::PathBuf>,
+    /// 业务元数据持久化路径（annotation + dataset association）。None = 纯内存。
+    metadata_path: Option<std::path::PathBuf>,
     /// 向量独立落盘路径。Some = `index_embedding` 追加写盘、`recover` 重载（向量不在 trace 数据里,
     /// 段重建不出来,只能单独持久）；None = 纯内存。
     vector_path: Option<std::path::PathBuf>,
     /// 检索过滤的属性边车：(trace,span) → 可过滤元数据（带过滤 ANN 的 payload）。
     /// 派生数据：摄入时建,`recover` 时从持久段重建。
     filter_attrs: Mutex<HashMap<(u64, u64), FilterAttrs>>,
+    /// live attrs postings 候选集：(attr_key, attr_value_json) → (trace,span)。
+    /// 只覆盖 MemTable/WAL tail；持久段走 segment-local sidecar，最终结果仍经 snapshot 折叠读验证。
+    attr_postings: Mutex<AttrPostings>,
+    /// segment-local attrs sidecar 的轻量目录：term → segment ids，不保存 span posting list。
+    seg_attr_directory: Mutex<SegmentAttrDirectory>,
+    /// segment-local attrs sidecar 的 LRU cache：按需加载具体 posting list，受 bytes budget 约束。
+    seg_attr_cache: Mutex<SegmentAttrSidecarCache>,
+    /// 持久模式下的 attrs sidecar 目录。缺失/损坏时可由 segment 文件重建。
+    attr_sidecar_dir: Option<std::path::PathBuf>,
+    /// trace → span keys。attrs 命中一个 span 后，用它扩展回整条 trace 的完整聚合。
+    trace_span_keys: Mutex<HashMap<u64, HashSet<(u64, u64)>>>,
+    /// trace trajectory 物化读模型缓存。写入同 trace 后失效，读路径按需重建。
+    trace_trajectory_idx: Mutex<HashMap<(Option<u64>, u64), TraceTrajectorySummary>>,
     /// 控制台会话边车索引：摄入时**增量差量**维护（O(1)/事件），delete/upgrade 标脏、下次读重建。
     session_idx: Mutex<SessionIndex>,
     /// **段折叠缓存**：不可变段首次解码后缓存（行 + (trace,span)→行号 索引），检索路径只取候选行、
@@ -946,6 +2918,13 @@ fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> std::io:
         }
     }
     Ok(())
+}
+
+fn unix_now_ns_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 /// 段级 key Bloom 过滤器（双哈希 + 位组，std-only，无依赖）。`maybe_contains` 假阳允许、假阴不允许：
@@ -1050,6 +3029,12 @@ struct SpanAgg {
     external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
+    cached_tok: u64,
+    reasoning_tok: u64,
+    total_tok: u64,
+    explicit_total_tok: Option<u64>,
+    cost_usd_nanos: u64,
+    explicit_cost_usd_nanos: Option<u64>,
     error: bool,
     agent: Option<String>,
     trace: u64,
@@ -1062,6 +3047,10 @@ struct SessionAgg {
     external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
+    cached_tok: u64,
+    reasoning_tok: u64,
+    total_tok: u64,
+    cost_usd_nanos: u64,
     error_spans: usize,
     title: String,
     first_trace: u64,
@@ -1099,6 +3088,16 @@ impl SessionIndex {
             }
             e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
             e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
+            e.cached_tok =
+                (e.cached_tok as i64 + new.cached_tok as i64 - old.cached_tok as i64).max(0) as u64;
+            e.reasoning_tok = (e.reasoning_tok as i64 + new.reasoning_tok as i64
+                - old.reasoning_tok as i64)
+                .max(0) as u64;
+            e.total_tok =
+                (e.total_tok as i64 + new.total_tok as i64 - old.total_tok as i64).max(0) as u64;
+            e.cost_usd_nanos = (e.cost_usd_nanos as i128 + new.cost_usd_nanos as i128
+                - old.cost_usd_nanos as i128)
+                .max(0) as u64;
             e.error_spans =
                 (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
             if e.title.is_empty() {
@@ -1116,6 +3115,10 @@ impl SessionIndex {
         let e = self.sess.entry(sid).or_default();
         e.in_tok += s.in_tok;
         e.out_tok += s.out_tok;
+        e.cached_tok += s.cached_tok;
+        e.reasoning_tok += s.reasoning_tok;
+        e.total_tok += s.total_tok;
+        e.cost_usd_nanos += s.cost_usd_nanos;
         e.error_spans += s.error as usize;
         e.traces.insert(s.trace);
         if e.external_session.is_none() {
@@ -1136,6 +3139,10 @@ impl SessionIndex {
         if let Some(e) = self.sess.get_mut(&sid) {
             e.in_tok = e.in_tok.saturating_sub(s.in_tok);
             e.out_tok = e.out_tok.saturating_sub(s.out_tok);
+            e.cached_tok = e.cached_tok.saturating_sub(s.cached_tok);
+            e.reasoning_tok = e.reasoning_tok.saturating_sub(s.reasoning_tok);
+            e.total_tok = e.total_tok.saturating_sub(s.total_tok);
+            e.cost_usd_nanos = e.cost_usd_nanos.saturating_sub(s.cost_usd_nanos);
             e.error_spans = e.error_spans.saturating_sub(s.error as usize);
             // traces / first_trace 不在此精确回收（会话切换极罕见）；delete/upgrade 走标脏重建纠正。
         }
@@ -1151,6 +3158,24 @@ impl SessionIndex {
                 external_session: s.external_session_id.clone(),
                 in_tok: s.input_tokens.unwrap_or(0),
                 out_tok: s.output_tokens.unwrap_or(0),
+                cached_tok: s.cached_input_tokens.unwrap_or(0),
+                reasoning_tok: s.reasoning_tokens.unwrap_or(0),
+                total_tok: usage_total_tokens(
+                    s.input_tokens.unwrap_or(0),
+                    s.output_tokens.unwrap_or(0),
+                    s.cached_input_tokens.unwrap_or(0),
+                    s.reasoning_tokens.unwrap_or(0),
+                    s.total_tokens,
+                ),
+                explicit_total_tok: s.total_tokens,
+                cost_usd_nanos: usage_cost_usd_nanos(
+                    s.input_tokens.unwrap_or(0),
+                    s.output_tokens.unwrap_or(0),
+                    s.cached_input_tokens.unwrap_or(0),
+                    s.reasoning_tokens.unwrap_or(0),
+                    s.cost_usd_nanos,
+                ),
+                explicit_cost_usd_nanos: s.cost_usd_nanos,
                 error: s.status.unwrap_or(0) != 0,
                 agent: s.agent_name.clone(),
                 trace: s.trace_id,
@@ -1186,6 +3211,10 @@ impl SessionIndex {
                 turn_count: a.traces.len(),
                 input_tokens: a.in_tok,
                 output_tokens: a.out_tok,
+                cached_input_tokens: a.cached_tok,
+                reasoning_tokens: a.reasoning_tok,
+                total_tokens: a.total_tok,
+                cost_usd_nanos: a.cost_usd_nanos,
                 has_error: a.error_spans > 0,
                 first_trace_id: a.first_trace,
             })
@@ -1425,6 +3454,22 @@ impl WriteCoordinator {
         graph: Option<Arc<dyn GraphIndex>>,
         dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
+        let attr_sidecar_dir = dir.as_ref().map(|d| d.join("attr_postings"));
+        if let Some(path) = &attr_sidecar_dir {
+            let _ = std::fs::create_dir_all(path);
+        }
+        let metadata_path = dir.as_ref().map(|d| d.join("metadata.dat"));
+        let metadata_state = metadata_path
+            .as_ref()
+            .and_then(metadata::load)
+            .unwrap_or_else(|| metadata::MetadataState {
+                next_annotation_id: 1,
+                next_dataset_association_id: 1,
+                next_golden_path_id: 1,
+                next_retention_audit_id: 1,
+                next_retention_policy_id: 1,
+                ..Default::default()
+            });
         Arc::new(Self {
             write_lock: Mutex::new(()),
             current: Current::new(manifest),
@@ -1445,9 +3490,26 @@ impl WriteCoordinator {
             next_segment_id: Mutex::new(next_segment_id),
             next_chunk_id: Mutex::new(next_chunk_id),
             datasets: Mutex::new(BTreeMap::new()),
+            annotations: Mutex::new(metadata_state.annotations),
+            dataset_associations: Mutex::new(metadata_state.dataset_associations),
+            golden_paths: Mutex::new(metadata_state.golden_paths),
+            retention_audits: Mutex::new(metadata_state.retention_audits),
+            retention_policies: Mutex::new(metadata_state.retention_policies),
+            next_annotation_id: Mutex::new(metadata_state.next_annotation_id),
+            next_dataset_association_id: Mutex::new(metadata_state.next_dataset_association_id),
+            next_golden_path_id: Mutex::new(metadata_state.next_golden_path_id),
+            next_retention_audit_id: Mutex::new(metadata_state.next_retention_audit_id),
+            next_retention_policy_id: Mutex::new(metadata_state.next_retention_policy_id),
             manifest_path,
+            metadata_path,
             vector_path,
             filter_attrs: Mutex::new(HashMap::new()),
+            attr_postings: Mutex::new(AttrPostings::default()),
+            seg_attr_directory: Mutex::new(SegmentAttrDirectory::default()),
+            seg_attr_cache: Mutex::new(SegmentAttrSidecarCache::new(ATTR_SIDECAR_CACHE_MAX_BYTES)),
+            attr_sidecar_dir,
+            trace_span_keys: Mutex::new(HashMap::new()),
+            trace_trajectory_idx: Mutex::new(HashMap::new()),
             session_idx: Mutex::new(SessionIndex::default()),
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
             seg_key_bloom: Mutex::new(HashMap::new()),
@@ -1472,6 +3534,26 @@ impl WriteCoordinator {
         self.graph.flush();
     }
 
+    /// 持久化业务元数据。它不属于 manifest 版本链，但需要和 WAL/segment 一起备份和重启恢复。
+    fn persist_metadata(&self) {
+        let Some(path) = &self.metadata_path else {
+            return;
+        };
+        let state = metadata::MetadataState {
+            annotations: self.annotations.lock().unwrap().clone(),
+            dataset_associations: self.dataset_associations.lock().unwrap().clone(),
+            golden_paths: self.golden_paths.lock().unwrap().clone(),
+            retention_audits: self.retention_audits.lock().unwrap().clone(),
+            retention_policies: self.retention_policies.lock().unwrap().clone(),
+            next_annotation_id: *self.next_annotation_id.lock().unwrap(),
+            next_dataset_association_id: *self.next_dataset_association_id.lock().unwrap(),
+            next_golden_path_id: *self.next_golden_path_id.lock().unwrap(),
+            next_retention_audit_id: *self.next_retention_audit_id.lock().unwrap(),
+            next_retention_policy_id: *self.next_retention_policy_id.lock().unwrap(),
+        };
+        let _ = metadata::save(path, &state);
+    }
+
     /// 提交新 manifest 版本并（若开了持久化）落盘。所有 commit 走这里,保证段集合改动都持久。
     fn commit_and_persist(&self, draft: Manifest) {
         self.current.commit(draft);
@@ -1486,6 +3568,10 @@ impl WriteCoordinator {
     /// 把一条记录喂进**派生检索索引**：BM25 中文倒排 + 过滤属性边车。
     /// ingest、WAL 重放、从段重建索引三处共用 —— 派生索引的喂法只此一份。
     fn index_record(&self, r: &WalRecord) {
+        self.index_record_inner(r, true);
+    }
+
+    fn index_record_inner(&self, r: &WalRecord, index_live_attr_postings: bool) {
         // 中文倒排：把该 span 的**可检索文本**喂进 BM25。检索的主对象是 LLM 的输入/输出原文
         // （input_text/output_text），logs（含 span name）作补充。三者拼起来索引——真实 SDK 灌进来的
         // input/output 文本会被索引，而不是只索引 logs（否则真实数据上"中文检索"会突然失效）。
@@ -1509,9 +3595,16 @@ impl WriteCoordinator {
             self.bm25
                 .index_text(r.trace_id, r.span_id, &parts.join(" "));
         }
+        let span_key = (r.trace_id, r.span_id);
+        self.trace_span_keys
+            .lock()
+            .unwrap()
+            .entry(r.trace_id)
+            .or_default()
+            .insert(span_key);
         // 过滤属性边车：last-non-null 累积 status/agent，ts 取范围（带过滤 ANN 的 payload）。
         let mut fa = self.filter_attrs.lock().unwrap();
-        let a = fa.entry((r.trace_id, r.span_id)).or_insert(FilterAttrs {
+        let a = fa.entry(span_key).or_insert(FilterAttrs {
             min_ts: r.ts,
             max_ts: r.ts,
             ..Default::default()
@@ -1525,19 +3618,27 @@ impl WriteCoordinator {
         if r.fields.tenant_id.is_some() {
             a.tenant_id = r.fields.tenant_id;
         }
-        for (k, v) in &r.fields.attrs {
+        let mut attr_updates = Vec::new();
+        emit_indexable_attrs(&r.fields, |k, v| {
             if is_filter_attr_key(k) {
-                a.attrs.insert(k.clone(), v.clone());
+                let old = a.attrs.get(k).cloned();
+                a.attrs.insert(k.to_string(), v.to_string());
+                attr_updates.push((k.to_string(), old, v.to_string()));
             }
-        }
+        });
         a.min_ts = a.min_ts.min(r.ts);
         a.max_ts = a.max_ts.max(r.ts);
         drop(fa);
+        if index_live_attr_postings && !attr_updates.is_empty() {
+            let mut postings = self.attr_postings.lock().unwrap();
+            for (attr_key, old, new) in attr_updates {
+                postings.update(span_key, &attr_key, old.as_deref(), &new);
+            }
+        }
 
         // 会话边车：用 last-non-null 算出该 span 的新聚合，差量更新会话级（增量、O(1)/事件）。
-        let key = (r.trace_id, r.span_id);
         let mut idx = self.session_idx.lock().unwrap();
-        let mut new = idx.span.get(&key).cloned().unwrap_or_default();
+        let mut new = idx.span.get(&span_key).cloned().unwrap_or_default();
         new.trace = r.trace_id;
         if let Some(s) = r.fields.session_id {
             new.session = Some(s);
@@ -1551,6 +3652,32 @@ impl WriteCoordinator {
         if let Some(t) = r.fields.output_tokens {
             new.out_tok = t;
         }
+        if let Some(t) = r.fields.cached_input_tokens {
+            new.cached_tok = t;
+        }
+        if let Some(t) = r.fields.reasoning_tokens {
+            new.reasoning_tok = t;
+        }
+        if let Some(t) = r.fields.total_tokens {
+            new.explicit_total_tok = Some(t);
+        }
+        if let Some(c) = r.fields.cost_usd_nanos {
+            new.explicit_cost_usd_nanos = Some(c);
+        }
+        new.total_tok = usage_total_tokens(
+            new.in_tok,
+            new.out_tok,
+            new.cached_tok,
+            new.reasoning_tok,
+            new.explicit_total_tok,
+        );
+        new.cost_usd_nanos = usage_cost_usd_nanos(
+            new.in_tok,
+            new.out_tok,
+            new.cached_tok,
+            new.reasoning_tok,
+            new.explicit_cost_usd_nanos,
+        );
         if let Some(st) = r.fields.status {
             new.error = st != 0;
         }
@@ -1559,7 +3686,7 @@ impl WriteCoordinator {
                 new.agent = Some(a.clone());
             }
         }
-        idx.apply_span(key, new);
+        idx.apply_span(span_key, new);
     }
 
     /// 写入：先进 WAL（ack 后才算持久），同步进活 MemTable，再推进已提交尾。
@@ -1567,6 +3694,7 @@ impl WriteCoordinator {
     /// 整个过 write_lock 串行（单写者）。
     pub fn ingest(&self, records: Vec<WalRecord>) -> WalLsn {
         let _w = self.write_lock.lock().unwrap();
+        let dirty_traces: HashSet<u64> = records.iter().map(|r| r.trace_id).collect();
         let mut wal = self.wal.lock().unwrap();
         // 这批的起始 LSN（在 append 之前确定），逐条分配 commit_lsn。
         let first = wal.committed_tail().get() + 1;
@@ -1586,6 +3714,12 @@ impl WriteCoordinator {
         }
         let last = wal.append_committed(records);
         drop(wal);
+        if !dirty_traces.is_empty() {
+            self.trace_trajectory_idx
+                .lock()
+                .unwrap()
+                .retain(|(_, trace_id), _| !dirty_traces.contains(trace_id));
+        }
         // ack 之后才推进 committed_tail（读者据此取 live_lsn 上界）。
         self.current.advance_committed_tail(last);
 
@@ -1695,6 +3829,7 @@ impl WriteCoordinator {
         };
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, &records);
+        self.install_segment_attr_sidecar(seg, &records, true);
         // 段级 key bloom：从这批记录的 (trace,span) 建，供检索折叠定位跳过无关段。
         let bloom = KeyBloom::build(
             records.iter().map(|r| (r.trace_id, r.span_id)),
@@ -1724,6 +3859,7 @@ impl WriteCoordinator {
         self.commit_and_persist(draft);
         let gate = WalLsn::new(self.current.min_retained_watermark());
         self.memtable.lock().unwrap().evict_up_to(gate);
+        self.rebuild_live_attr_postings_from_memtable();
     }
 
     /// 读 MemTable 源：某快照可见的半开区间 `(retained_watermark, live_lsn]`（测试/折叠用）。
@@ -1778,11 +3914,218 @@ impl WriteCoordinator {
         sf
     }
 
+    fn register_segment_attr_sidecar(
+        &self,
+        seg: SegmentId,
+        sidecar: Arc<SegmentAttrSidecar>,
+        cache: bool,
+    ) {
+        self.seg_attr_directory
+            .lock()
+            .unwrap()
+            .add_segment(seg, &sidecar);
+        if cache {
+            self.seg_attr_cache.lock().unwrap().insert(seg, sidecar);
+        }
+    }
+
+    fn install_segment_attr_sidecar(&self, seg: SegmentId, records: &[WalRecord], cache: bool) {
+        let sidecar = Arc::new(SegmentAttrSidecar::build(records));
+        if let Some(dir) = &self.attr_sidecar_dir {
+            let _ = write_segment_attr_sidecar_file(dir, seg, &sidecar);
+        }
+        self.register_segment_attr_sidecar(seg, sidecar, cache);
+    }
+
+    fn segment_attr_sidecar(&self, seg: SegmentId) -> Arc<SegmentAttrSidecar> {
+        if let Some(sidecar) = self.seg_attr_cache.lock().unwrap().get(seg) {
+            return sidecar;
+        }
+        let loaded = self
+            .attr_sidecar_dir
+            .as_ref()
+            .and_then(|dir| read_segment_attr_sidecar_file(dir, seg))
+            .unwrap_or_else(|| {
+                let records = self.segments.scan_records(seg);
+                let sidecar = SegmentAttrSidecar::build(&records);
+                if let Some(dir) = &self.attr_sidecar_dir {
+                    let _ = write_segment_attr_sidecar_file(dir, seg, &sidecar);
+                }
+                sidecar
+            });
+        let sidecar = Arc::new(loaded);
+        self.register_segment_attr_sidecar(seg, sidecar.clone(), false);
+        self.seg_attr_cache.lock().unwrap().insert(seg, sidecar)
+    }
+
+    fn live_span_keys(&self) -> HashSet<SpanKey> {
+        self.memtable
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.trace_id, r.span_id))
+            .collect()
+    }
+
+    fn rebuild_live_attr_postings_from_memtable(&self) {
+        let records: Vec<WalRecord> = self
+            .memtable
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| WalRecord {
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                ts: r.ts,
+                identity: r.identity.clone(),
+                fields: r.fields.clone(),
+            })
+            .collect();
+        let mut by_span: HashMap<SpanKey, BTreeMap<String, String>> = HashMap::new();
+        let mut postings = AttrPostings::default();
+        for r in &records {
+            let span_key = (r.trace_id, r.span_id);
+            let attrs = by_span.entry(span_key).or_default();
+            emit_indexable_attrs(&r.fields, |attr_key, new| {
+                if !is_filter_attr_key(attr_key) {
+                    return;
+                }
+                let old = attrs.insert(attr_key.to_string(), new.to_string());
+                postings.update(span_key, attr_key, old.as_deref(), new);
+            });
+        }
+        *self.attr_postings.lock().unwrap() = postings;
+    }
+
     /// 带剪枝的读路径。按时间窗（段 zone-map）+ trace_id 剪枝，减少触及的段数（活 trace 读扇出上界）。
     /// 返回 (折叠出的 span, 实际扫描的段数)。所有判定只用快照里钉死的版本。
     pub fn read_spans_query(&self, snap: &Snapshot, q: &TraceQuery) -> (Vec<FoldedSpan>, usize) {
         // 普通读 / trace 详情要原文,读全列。
         self.fold_query(snap, q, None, Projection::ALL)
+    }
+
+    fn attr_matching_span_keys(
+        &self,
+        snap: &Snapshot,
+        attrs: &BTreeMap<String, String>,
+    ) -> Option<HashSet<(u64, u64)>> {
+        if attrs.is_empty() {
+            return None;
+        }
+        let mut out: Option<HashSet<SpanKey>> = None;
+        let mut used_index = false;
+        for (attr_key, expected) in attrs {
+            if !is_postings_attr_key(attr_key) {
+                continue;
+            }
+            used_index = true;
+            let mut one = self.segment_attr_candidates_for_attr(snap, attr_key, expected);
+            if let Some(live) = self.live_attr_candidates_for_attr(attr_key, expected) {
+                one.extend(live);
+            }
+            out = Some(match out {
+                None => one,
+                Some(prev) => prev.intersection(&one).copied().collect(),
+            });
+            if out.as_ref().map_or(false, HashSet::is_empty) {
+                break;
+            }
+        }
+        if used_index {
+            Some(out.unwrap_or_default())
+        } else {
+            None
+        }
+    }
+
+    fn segment_attr_candidates_for_attr(
+        &self,
+        snap: &Snapshot,
+        attr_key: &str,
+        expected: &str,
+    ) -> HashSet<SpanKey> {
+        let mut out = HashSet::new();
+        let seg_ids = self
+            .seg_attr_directory
+            .lock()
+            .unwrap()
+            .candidate_segments_for_attr(attr_key, expected)
+            .unwrap_or_default();
+        for seg_id in seg_ids {
+            let Some(entry) = snap.manifest.segments.get(&seg_id) else {
+                continue;
+            };
+            let sidecar = self.segment_attr_sidecar(entry.segment_id);
+            out.extend(sidecar.candidates_for_attr(attr_key, expected));
+        }
+        for entry in snap.manifest.segments.values() {
+            let Some(upgrade) = &entry.upgrade_ref else {
+                continue;
+            };
+            for (&span_key, fields) in upgrade.iter() {
+                if fields_attr_value(fields, attr_key)
+                    .map(|actual| attr_json_matches(actual, expected))
+                    .unwrap_or(false)
+                {
+                    out.insert(span_key);
+                }
+            }
+        }
+        out
+    }
+
+    fn live_attr_candidates_for_attr(
+        &self,
+        attr_key: &str,
+        expected: &str,
+    ) -> Option<HashSet<SpanKey>> {
+        if !is_postings_attr_key(attr_key) {
+            return None;
+        }
+        let postings = self.attr_postings.lock().unwrap();
+        if postings.key_is_complete(attr_key) {
+            Some(postings.candidates_for_attr(attr_key, expected))
+        } else {
+            drop(postings);
+            Some(self.live_span_keys())
+        }
+    }
+
+    fn span_keys_for_trace_ids(&self, trace_ids: &HashSet<u64>) -> HashSet<(u64, u64)> {
+        if trace_ids.is_empty() {
+            return HashSet::new();
+        }
+        let by_trace = self.trace_span_keys.lock().unwrap();
+        let mut out = HashSet::new();
+        for trace_id in trace_ids {
+            if let Some(keys) = by_trace.get(trace_id) {
+                out.extend(keys.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// 带 attrs 候选集的结构化查询：先用 attrs postings 缩小 span key，再走折叠读路径校验。
+    /// postings 可能因删除/compaction 返回陈旧超集，最终语义仍以 snapshot 折叠结果为准。
+    pub fn read_spans_query_for_attrs(
+        &self,
+        snap: &Snapshot,
+        q: &TraceQuery,
+        attrs: &BTreeMap<String, String>,
+    ) -> Vec<FoldedSpan> {
+        if attrs.is_empty() {
+            return self.read_spans_query(snap, q).0;
+        }
+        let candidate_keys = self.attr_matching_span_keys(snap, attrs);
+        if matches!(candidate_keys.as_ref(), Some(keys) if keys.is_empty()) {
+            return Vec::new();
+        }
+        let (mut spans, _) = match candidate_keys {
+            Some(keys) => self.fold_query(snap, q, Some(&keys), Projection::ALL),
+            None => self.read_spans_query(snap, q),
+        };
+        spans.retain(|s| folded_span_attrs_match(s, attrs));
+        spans
     }
 
     /// 折叠核心。`keys=Some(集合)` 时**只折叠命中这些 (trace,span) 的行**（检索用：先由索引拿到命中 key,
@@ -1953,43 +4296,355 @@ impl WriteCoordinator {
                 | Projection::DURATION_NS
                 | Projection::INPUT_TOKENS
                 | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST
                 | Projection::EXTERNAL_IDS,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
-        let mut by_trace: BTreeMap<u64, TraceSummary> = BTreeMap::new();
-        for s in spans {
-            let e = by_trace.entry(s.trace_id).or_insert(TraceSummary {
-                trace_id: s.trace_id,
-                external_trace_id: s.external_trace_id.clone(),
-                span_count: 0,
-                total_duration_ns: 0,
-                max_duration_ns: 0,
-                error_count: 0,
-                total_input_tokens: 0,
-                total_output_tokens: 0,
-            });
-            if e.external_trace_id.is_none() {
-                e.external_trace_id = s.external_trace_id.clone();
-            }
-            e.span_count += 1;
-            if let Some(d) = s.duration_ns {
-                e.total_duration_ns += d;
-                e.max_duration_ns = e.max_duration_ns.max(d);
-            }
-            if matches!(s.status, Some(st) if st != 0) {
-                e.error_count += 1;
-            }
-            e.total_input_tokens += s.input_tokens.unwrap_or(0);
-            e.total_output_tokens += s.output_tokens.unwrap_or(0);
+        summarize_trace_spans(spans)
+    }
+
+    /// 返回一条 trace 的物化 trajectory 摘要。miss 时按当前 snapshot 折叠一次并缓存。
+    pub fn materialized_trace_trajectory(
+        &self,
+        snap: &Snapshot,
+        trace_id: u64,
+        tenant: Option<u64>,
+    ) -> Option<TraceTrajectorySummary> {
+        let key = (tenant, trace_id);
+        if let Some(cached) = self.trace_trajectory_idx.lock().unwrap().get(&key).cloned() {
+            return Some(cached);
         }
-        by_trace.into_values().collect()
+        let mut q = TraceQuery::trace(trace_id, i64::MIN, i64::MAX);
+        q.tenant_id = tenant;
+        let proj = Projection::of(
+            Projection::STATUS
+                | Projection::DURATION_NS
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST
+                | Projection::AGENT_NAME
+                | Projection::TOOL_NAME
+                | Projection::MODEL
+                | Projection::TENANT_ID
+                | Projection::EXTERNAL_IDS
+                | Projection::ATTRS
+                | Projection::AGENTIC_FIELDS,
+        );
+        let (mut spans, _) = self.fold_query(snap, &q, None, proj);
+        if spans.is_empty() {
+            return None;
+        }
+        spans.sort_by_key(|s| s.span_id);
+        let summary = trace_trajectory_summary_from_spans(trace_id, tenant, &spans)?;
+        self.trace_trajectory_idx
+            .lock()
+            .unwrap()
+            .insert(key, summary.clone());
+        Some(summary)
+    }
+
+    /// 返回一组 trace 在当前 snapshot 内的事件时间边界。
+    ///
+    /// 这是 retention/storage stats 的底座：policy 层用 folded span 先确定租户与过滤语义，
+    /// 再用这里确认整条 trace 是否已经早于 cutoff。
+    pub fn trace_time_bounds(
+        &self,
+        snap: &Snapshot,
+        trace_ids: &HashSet<u64>,
+    ) -> BTreeMap<u64, (i64, i64)> {
+        let mut out: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
+        if trace_ids.is_empty() {
+            return out;
+        }
+        let mut update = |trace_id: u64, ts: i64| {
+            let e = out.entry(trace_id).or_insert((ts, ts));
+            e.0 = e.0.min(ts);
+            e.1 = e.1.max(ts);
+        };
+        for entry in snap.manifest.segments.values() {
+            let recs = self.segments.scan_records(entry.segment_id);
+            for (row, rec) in recs.iter().enumerate() {
+                if entry.deletion_vec.is_deleted(row as u32) || !trace_ids.contains(&rec.trace_id) {
+                    continue;
+                }
+                update(rec.trace_id, rec.ts);
+            }
+        }
+        let mt = self.memtable.lock().unwrap();
+        for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+            if trace_ids.contains(&row.trace_id) {
+                update(row.trace_id, row.ts);
+            }
+        }
+        out
+    }
+
+    /// 对一批 trace 做 segment-row 级软删除。
+    ///
+    /// 注意：仍在 MemTable/WAL tail 中的 trace 会整条跳过，避免 retention apply 后出现半条 trace。
+    /// 调用方应先用租户过滤后的 folded spans 决定 trace 集合；这里不做业务策略判断。
+    pub fn delete_segment_rows_for_traces(
+        &self,
+        snap: &Snapshot,
+        trace_ids: &HashSet<u64>,
+    ) -> RetentionDeleteResult {
+        let mut result = RetentionDeleteResult {
+            requested_trace_count: trace_ids.len(),
+            ..RetentionDeleteResult::default()
+        };
+        if trace_ids.is_empty() {
+            return result;
+        }
+
+        let mut live_trace_ids = HashSet::new();
+        {
+            let mt = self.memtable.lock().unwrap();
+            for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+                if trace_ids.contains(&row.trace_id) {
+                    live_trace_ids.insert(row.trace_id);
+                }
+            }
+        }
+
+        let deletable: HashSet<u64> = trace_ids.difference(&live_trace_ids).copied().collect();
+        result.skipped_live_trace_ids = live_trace_ids.into_iter().collect();
+        result.skipped_live_trace_ids.sort_unstable();
+        result.skipped_live_trace_count = result.skipped_live_trace_ids.len();
+
+        let mut row_targets = Vec::new();
+        let mut deleted_trace_ids = HashSet::new();
+        for entry in snap.manifest.segments.values() {
+            let recs = self.segments.scan_records(entry.segment_id);
+            for (row, rec) in recs.iter().enumerate() {
+                if entry.deletion_vec.is_deleted(row as u32) || !deletable.contains(&rec.trace_id) {
+                    continue;
+                }
+                row_targets.push((entry.segment_id, row as u32));
+                deleted_trace_ids.insert(rec.trace_id);
+            }
+        }
+
+        for (seg, row) in row_targets {
+            self.commit_delete(seg, row);
+            result.deleted_segment_row_count += 1;
+        }
+        result.deleted_trace_ids = deleted_trace_ids.into_iter().collect();
+        result.deleted_trace_ids.sort_unstable();
+        result.deleted_trace_count = result.deleted_trace_ids.len();
+        if !result.deleted_trace_ids.is_empty() {
+            let deleted: HashSet<u64> = result.deleted_trace_ids.iter().copied().collect();
+            self.trace_trajectory_idx
+                .lock()
+                .unwrap()
+                .retain(|(_, trace_id), _| !deleted.contains(trace_id));
+        }
+        result
+    }
+
+    /// 对带 deletion vector 的段做 retention 后压实。
+    ///
+    /// 这不是默认写路径：调用方通常在 retention apply 后、维护窗口或后台任务中显式触发。
+    /// 阈值用“被删行数 + 被删比例”同时限制，避免为少量删除反复重写大段。
+    pub fn compact_deleted_segments(
+        &self,
+        max_segments: usize,
+        min_deleted_rows: u32,
+        min_deleted_percent: u32,
+        reclaim_after_compact: bool,
+    ) -> RetentionCompactResult {
+        let manifest = self.current.manifest();
+        let mut result = RetentionCompactResult {
+            before_live_segment_count: manifest.segments.len(),
+            before_dead_segment_count: self.dead_count(),
+            ..RetentionCompactResult::default()
+        };
+        if max_segments == 0 {
+            result.after_live_segment_count = result.before_live_segment_count;
+            result.after_dead_segment_count = result.before_dead_segment_count;
+            return result;
+        }
+
+        let min_deleted_percent = min_deleted_percent.clamp(1, 100);
+        let mut candidates = Vec::new();
+        for entry in manifest.segments.values() {
+            let rows = self.segments.scan_records(entry.segment_id);
+            let row_count = rows.len();
+            if row_count == 0 {
+                continue;
+            }
+            let deleted_count = (entry.deletion_vec.count() as usize).min(row_count);
+            if deleted_count == 0 || deleted_count < min_deleted_rows as usize {
+                continue;
+            }
+            let deleted_percent = ((deleted_count as u64 * 100) / row_count as u64) as u32;
+            if deleted_percent < min_deleted_percent {
+                continue;
+            }
+            let live_count = row_count - deleted_count;
+            candidates.push((
+                deleted_percent,
+                deleted_count,
+                live_count,
+                entry.segment_id.get(),
+            ));
+        }
+        drop(manifest);
+
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        for (_, deleted_count, live_count, segment_id) in candidates.into_iter().take(max_segments)
+        {
+            let seg = SegmentId::new(segment_id);
+            self.commit_compaction(&[seg]);
+            result.selected_segment_ids.push(segment_id);
+            result.compacted_segment_count += 1;
+            result.dropped_deleted_row_count += deleted_count;
+            result.rewritten_live_row_count += live_count;
+        }
+        result.selected_segment_count = result.selected_segment_ids.len();
+        if reclaim_after_compact {
+            result.reclaimed_segment_count = self.reclaim();
+        }
+        let after = self.current.manifest();
+        result.after_live_segment_count = after.segments.len();
+        result.after_dead_segment_count = self.dead_count();
+        result
+    }
+
+    /// 列出 trace 摘要并按 attrs 过滤。语义与 session attrs 过滤一致：
+    /// trace 内至少一个 span 命中所有 attrs 条件，返回该 trace 的完整聚合摘要。
+    pub fn list_traces_for_tenant_and_attrs(
+        &self,
+        snap: &Snapshot,
+        tenant: Option<u64>,
+        attrs: &BTreeMap<String, String>,
+    ) -> Vec<TraceSummary> {
+        let q = match tenant {
+            Some(t) => TraceQuery::all().for_tenant(t),
+            None => TraceQuery::all(),
+        };
+        if attrs.is_empty() {
+            return self.list_traces(snap, &q);
+        }
+        let candidate_keys = self.attr_matching_span_keys(snap, attrs);
+        if matches!(candidate_keys.as_ref(), Some(keys) if keys.is_empty()) {
+            return Vec::new();
+        }
+        let attr_proj = Projection::of(Projection::ATTRS);
+        let (matching_spans, all_spans_for_slow_path) = match candidate_keys {
+            Some(keys) => (self.fold_query(snap, &q, Some(&keys), attr_proj).0, None),
+            None => {
+                let proj = Projection::of(
+                    Projection::STATUS
+                        | Projection::DURATION_NS
+                        | Projection::INPUT_TOKENS
+                        | Projection::OUTPUT_TOKENS
+                        | Projection::USAGE_COST
+                        | Projection::EXTERNAL_IDS
+                        | Projection::ATTRS,
+                );
+                let spans = self.fold_query(snap, &q, None, proj).0;
+                (spans.clone(), Some(spans))
+            }
+        };
+        let matching_traces: HashSet<u64> = matching_spans
+            .into_iter()
+            .filter(|s| folded_span_attrs_match(s, attrs))
+            .map(|s| s.trace_id)
+            .collect();
+        if matching_traces.is_empty() {
+            return Vec::new();
+        }
+        if let Some(spans) = all_spans_for_slow_path {
+            return summarize_trace_spans(
+                spans
+                    .into_iter()
+                    .filter(|s| matching_traces.contains(&s.trace_id))
+                    .collect(),
+            );
+        }
+        let trace_keys = self.span_keys_for_trace_ids(&matching_traces);
+        if trace_keys.is_empty() {
+            return Vec::new();
+        }
+        let summary_proj = Projection::of(
+            Projection::STATUS
+                | Projection::DURATION_NS
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST
+                | Projection::EXTERNAL_IDS,
+        );
+        let (spans, _) = self.fold_query(snap, &q, Some(&trace_keys), summary_proj);
+        summarize_trace_spans(spans)
+    }
+
+    /// 窄投影读取 trace attrs，用于 HTTP trace list 输出稳定的一等 fields，不读大文本。
+    pub fn trace_attr_fields_for_tenant(
+        &self,
+        snap: &Snapshot,
+        tenant: Option<u64>,
+    ) -> BTreeMap<u64, BTreeMap<String, String>> {
+        let trace_ids: HashSet<u64> = self
+            .trace_span_keys
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        self.trace_attr_fields_for_tenant_and_traces(snap, tenant, &trace_ids)
+    }
+
+    /// 窄投影读取指定 trace 的 attrs，用于列表页只给当前可见 trace 补稳定 fields。
+    pub fn trace_attr_fields_for_tenant_and_traces(
+        &self,
+        snap: &Snapshot,
+        tenant: Option<u64>,
+        trace_ids: &HashSet<u64>,
+    ) -> BTreeMap<u64, BTreeMap<String, String>> {
+        if trace_ids.is_empty() {
+            return BTreeMap::new();
+        }
+        let keys = self.span_keys_for_trace_ids(trace_ids);
+        if keys.is_empty() {
+            return BTreeMap::new();
+        }
+        let q = match tenant {
+            Some(t) => TraceQuery::all().for_tenant(t),
+            None => TraceQuery::all(),
+        };
+        let proj = Projection::of(Projection::AGENTIC_FIELDS | Projection::ATTRS);
+        let (spans, _) = self.fold_query(snap, &q, Some(&keys), proj);
+        let mut by_trace: BTreeMap<u64, BTreeMap<String, String>> = BTreeMap::new();
+        for s in spans {
+            let fields = by_trace.entry(s.trace_id).or_default();
+            for key in first_class_agentic_attr_keys() {
+                if let Some(value) = first_class_span_attr_value(&s, key) {
+                    fields
+                        .entry(key.to_string())
+                        .or_insert_with(|| first_class_agentic_attr_json(key, value));
+                }
+            }
+            for (k, v) in s.attrs {
+                if is_agentic_field_key(&k) {
+                    fields.entry(k).or_insert(v);
+                }
+            }
+        }
+        by_trace
     }
 
     /// 列出会话摘要（多轮会话视图）：按 session_id 聚合,数 trace 数/span 数/token 汇总。升序。
     pub fn list_sessions(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<SessionSummary> {
         // 按 session 聚合 token —— 只读 session_id + token,跳过文本。
         let proj = Projection::of(
-            Projection::SESSION_ID | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+            Projection::SESSION_ID
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         // session_id -> (distinct traces, span_count, in_tok, out_tok)
@@ -2057,6 +4712,33 @@ impl WriteCoordinator {
             agents.dedup();
             let input_tokens: u64 = sps.iter().map(|s| s.input_tokens.unwrap_or(0)).sum();
             let output_tokens: u64 = sps.iter().map(|s| s.output_tokens.unwrap_or(0)).sum();
+            let cached_input_tokens: u64 =
+                sps.iter().map(|s| s.cached_input_tokens.unwrap_or(0)).sum();
+            let reasoning_tokens: u64 = sps.iter().map(|s| s.reasoning_tokens.unwrap_or(0)).sum();
+            let total_tokens: u64 = sps
+                .iter()
+                .map(|s| {
+                    usage_total_tokens(
+                        s.input_tokens.unwrap_or(0),
+                        s.output_tokens.unwrap_or(0),
+                        s.cached_input_tokens.unwrap_or(0),
+                        s.reasoning_tokens.unwrap_or(0),
+                        s.total_tokens,
+                    )
+                })
+                .sum();
+            let cost_usd_nanos: u64 = sps
+                .iter()
+                .map(|s| {
+                    usage_cost_usd_nanos(
+                        s.input_tokens.unwrap_or(0),
+                        s.output_tokens.unwrap_or(0),
+                        s.cached_input_tokens.unwrap_or(0),
+                        s.reasoning_tokens.unwrap_or(0),
+                        s.cost_usd_nanos,
+                    )
+                })
+                .sum();
             let error_count = sps.iter().filter(|s| s.status.unwrap_or(0) != 0).count();
             total_in += input_tokens;
             total_out += output_tokens;
@@ -2066,9 +4748,13 @@ impl WriteCoordinator {
                 user_input,
                 agent_output,
                 agents,
-                span_count: sps.len(),
                 input_tokens,
                 output_tokens,
+                cached_input_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cost_usd_nanos,
+                span_count: sps.len(),
                 error_count,
                 eval_score,
             });
@@ -2115,8 +4801,8 @@ impl WriteCoordinator {
 
     /// 控制台用：按租户和 attrs 过滤会话。
     ///
-    /// 语义是“会话内至少一个 span 命中所有 attrs 条件”，返回该会话的完整聚合行。它不走
-    /// session_idx 快路径，因为 attrs 是 span 级属性；初版只给控制台/AgenticData 的精确筛选使用。
+    /// 语义是“会话内至少一个 span 命中所有 attrs 条件”，返回该会话的完整聚合行。attrs 命中先走
+    /// postings 候选集，再用折叠结果校验；会话行仍复用现有 session 聚合口径，避免摘要被命中 span 算少。
     pub fn console_sessions_for_tenant_and_attrs(
         &self,
         snap: &Snapshot,
@@ -2130,27 +4816,30 @@ impl WriteCoordinator {
             Some(t) => TraceQuery::all().for_tenant(t),
             None => TraceQuery::all(),
         };
-        let (spans, _) = self.read_spans_query(snap, &q);
-        let mut matching_sessions = std::collections::HashSet::new();
-        for s in &spans {
+        let candidate_keys = self.attr_matching_span_keys(snap, attrs);
+        if matches!(candidate_keys.as_ref(), Some(keys) if keys.is_empty()) {
+            return Vec::new();
+        }
+        let proj = Projection::of(Projection::SESSION_ID | Projection::ATTRS);
+        let (spans, _) = match candidate_keys {
+            Some(keys) => self.fold_query(snap, &q, Some(&keys), proj),
+            None => self.fold_query(snap, &q, None, proj),
+        };
+        let mut matching_sessions = HashSet::new();
+        for s in spans {
             let Some(session_id) = s.session_id else {
                 continue;
             };
-            if attrs.iter().all(|(k, v)| s.attrs.get(k) == Some(v)) {
+            if folded_span_attrs_match(&s, attrs) {
                 matching_sessions.insert(session_id);
             }
         }
-        let filtered: Vec<FoldedSpan> = spans
-            .into_iter()
-            .filter(|s| {
-                s.session_id
-                    .map(|session_id| matching_sessions.contains(&session_id))
-                    .unwrap_or(false)
-            })
-            .collect();
-        let mut idx = SessionIndex::default();
-        idx.rebuild(&filtered);
-        idx.rows()
+        if matching_sessions.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = self.console_sessions_for_tenant(snap, tenant);
+        rows.retain(|s| matching_sessions.contains(&s.session_id));
+        rows
     }
 
     /// 控制台用：一条 trace 的折叠 span（瀑布）。引擎不存 span 的 kind/name/起始时刻，这里**派生**：
@@ -2191,6 +4880,17 @@ impl WriteCoordinator {
                     external_span_id: s.external_span_id.clone(),
                     external_parent_span_id: s.external_parent_span_id.clone(),
                     external_session_id: s.external_session_id.clone(),
+                    project_id: s.project_id.clone(),
+                    skill: s.skill.clone(),
+                    mode: s.mode.clone(),
+                    call_site: s.call_site.clone(),
+                    task_fingerprint: s.task_fingerprint.clone(),
+                    loop_id: s.loop_id.clone(),
+                    harness_version: s.harness_version.clone(),
+                    validation_status: s.validation_status.clone(),
+                    stop_reason: s.stop_reason.clone(),
+                    phase: s.phase.clone(),
+                    validator: s.validator.clone(),
                     kind,
                     name,
                     start_ns: start,
@@ -2198,7 +4898,25 @@ impl WriteCoordinator {
                     has_error: s.status.unwrap_or(0) != 0,
                     input_tokens: s.input_tokens.unwrap_or(0),
                     output_tokens: s.output_tokens.unwrap_or(0),
+                    cached_input_tokens: s.cached_input_tokens.unwrap_or(0),
+                    reasoning_tokens: s.reasoning_tokens.unwrap_or(0),
+                    total_tokens: usage_total_tokens(
+                        s.input_tokens.unwrap_or(0),
+                        s.output_tokens.unwrap_or(0),
+                        s.cached_input_tokens.unwrap_or(0),
+                        s.reasoning_tokens.unwrap_or(0),
+                        s.total_tokens,
+                    ),
+                    cost_usd_nanos: usage_cost_usd_nanos(
+                        s.input_tokens.unwrap_or(0),
+                        s.output_tokens.unwrap_or(0),
+                        s.cached_input_tokens.unwrap_or(0),
+                        s.reasoning_tokens.unwrap_or(0),
+                        s.cost_usd_nanos,
+                    ),
                     model: s.model.clone(),
+                    provider: s.provider.clone(),
+                    cost_currency: s.cost_currency.clone(),
                     input_text: s.input_text.clone(),
                     output_text: s.output_text.clone(),
                     attrs: s.attrs.clone(),
@@ -2286,25 +5004,59 @@ impl WriteCoordinator {
     pub fn cost_by_agent(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<AgentCost> {
         // 按 agent 归因 token —— 只读 agent_name + token,跳过文本（成本下钻是典型的"只数不读原文"）。
         let proj = Projection::of(
-            Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+            Projection::AGENT_NAME
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
-        let mut acc: BTreeMap<String, (usize, u64, u64)> = BTreeMap::new();
+        let mut acc: BTreeMap<String, (usize, u64, u64, u64, u64, u64, u64)> = BTreeMap::new();
         for s in spans {
             if let Some(a) = &s.agent_name {
                 let e = acc.entry(a.clone()).or_default();
                 e.0 += 1;
                 e.1 += s.input_tokens.unwrap_or(0);
                 e.2 += s.output_tokens.unwrap_or(0);
+                e.3 += s.cached_input_tokens.unwrap_or(0);
+                e.4 += s.reasoning_tokens.unwrap_or(0);
+                e.5 += usage_total_tokens(
+                    s.input_tokens.unwrap_or(0),
+                    s.output_tokens.unwrap_or(0),
+                    s.cached_input_tokens.unwrap_or(0),
+                    s.reasoning_tokens.unwrap_or(0),
+                    s.total_tokens,
+                );
+                e.6 += usage_cost_usd_nanos(
+                    s.input_tokens.unwrap_or(0),
+                    s.output_tokens.unwrap_or(0),
+                    s.cached_input_tokens.unwrap_or(0),
+                    s.reasoning_tokens.unwrap_or(0),
+                    s.cost_usd_nanos,
+                );
             }
         }
         acc.into_iter()
             .map(
-                |(agent_name, (span_count, input_tokens, output_tokens))| AgentCost {
+                |(
+                    agent_name,
+                    (
+                        span_count,
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        reasoning_tokens,
+                        total_tokens,
+                        cost_usd_nanos,
+                    ),
+                )| AgentCost {
                     agent_name,
                     span_count,
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
+                    reasoning_tokens,
+                    total_tokens,
+                    cost_usd_nanos,
                 },
             )
             .collect()
@@ -2464,6 +5216,303 @@ impl WriteCoordinator {
             .collect()
     }
 
+    /// 给 trace/span 追加一条业务 annotation（人工 review、自动评估、最佳路径标记都走这里）。
+    /// 这层元数据独立于 trace 主存储；它记录的是“后验判断”，不参与 WAL 去重和 span 折叠。
+    pub fn add_annotation(
+        &self,
+        input: NewTraceAnnotation,
+        tenant_id: Option<u64>,
+    ) -> TraceAnnotation {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut next = self.next_annotation_id.lock().unwrap();
+        let annotation = TraceAnnotation {
+            annotation_id: *next,
+            tenant_id,
+            target: input.target.unwrap_or_else(|| {
+                if input.span_id.is_some() {
+                    AnnotationTarget::Span
+                } else {
+                    AnnotationTarget::Trace
+                }
+            }),
+            trace_id: input.trace_id,
+            span_id: input.span_id,
+            external_trace_id: input.external_trace_id,
+            external_span_id: input.external_span_id,
+            label: input.label,
+            score: input.score,
+            reason: input.reason,
+            source: input.source,
+            created_at_ns: unix_now_ns_u64(),
+            attrs: input.attrs,
+        };
+        *next += 1;
+        drop(next);
+        self.annotations.lock().unwrap().push(annotation.clone());
+        self.persist_metadata();
+        annotation
+    }
+
+    /// 查询 annotation。tenant_id 放在 filter 上，由 HTTP/Node 从鉴权上下文注入。
+    pub fn annotations(&self, filter: &TraceAnnotationFilter) -> Vec<TraceAnnotation> {
+        self.annotations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| annotation_matches(a, filter))
+            .cloned()
+            .collect()
+    }
+
+    /// 把外部 dataset item 关联到 trace/span。item 本体仍由业务系统或评测平台管理，yiTrace 只保存引用。
+    pub fn add_dataset_association(
+        &self,
+        input: NewDatasetAssociation,
+        tenant_id: Option<u64>,
+    ) -> DatasetAssociation {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut next = self.next_dataset_association_id.lock().unwrap();
+        let assoc = DatasetAssociation {
+            association_id: *next,
+            tenant_id,
+            dataset_id: input.dataset_id,
+            item_id: input.item_id,
+            trace_id: input.trace_id,
+            span_id: input.span_id,
+            external_trace_id: input.external_trace_id,
+            external_span_id: input.external_span_id,
+            snapshot_id: input.snapshot_id,
+            snapshot_hash: input.snapshot_hash,
+            eval_run_id: input.eval_run_id,
+            split: input.split,
+            label: input.label,
+            score: input.score,
+            created_at_ns: unix_now_ns_u64(),
+            attrs: input.attrs,
+        };
+        *next += 1;
+        drop(next);
+        self.dataset_associations
+            .lock()
+            .unwrap()
+            .push(assoc.clone());
+        self.persist_metadata();
+        assoc
+    }
+
+    /// 查询外部 dataset item 与 trace/span 的关联。用于“从数据集样本反查 trace”和“从 trace 找训练/回归身份”。
+    pub fn dataset_associations(
+        &self,
+        filter: &DatasetAssociationFilter,
+    ) -> Vec<DatasetAssociation> {
+        self.dataset_associations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| dataset_association_matches(a, filter))
+            .cloned()
+            .collect()
+    }
+
+    /// 保存一条 golden path 候选。这里只存源 trace/snapshot 引用，不复制 trace payload。
+    pub fn add_golden_path(
+        &self,
+        input: NewGoldenPathCandidate,
+        tenant_id: Option<u64>,
+    ) -> GoldenPathCandidate {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut next = self.next_golden_path_id.lock().unwrap();
+        let now = unix_now_ns_u64();
+        let candidate = GoldenPathCandidate {
+            golden_path_id: *next,
+            tenant_id,
+            task_fingerprint: input.task_fingerprint,
+            trajectory_signature: input.trajectory_signature,
+            source_trace_id: input.source_trace_id,
+            external_source_trace_id: input.external_source_trace_id,
+            snapshot_id: input.snapshot_id,
+            snapshot_hash: input.snapshot_hash,
+            status: input.status.unwrap_or(GoldenPathStatus::Candidate),
+            score: input.score,
+            label: input.label,
+            reason: input.reason,
+            source: input.source,
+            created_at_ns: now,
+            updated_at_ns: now,
+            attrs: input.attrs,
+            source_trajectory_steps: input.source_trajectory_steps,
+            evidence: input.evidence,
+        };
+        *next += 1;
+        drop(next);
+        self.golden_paths.lock().unwrap().push(candidate.clone());
+        self.persist_metadata();
+        candidate
+    }
+
+    /// 查询 golden path 候选/已确认路径。tenant_id 放在 filter 上，由 HTTP/Node 注入。
+    pub fn golden_paths(&self, filter: &GoldenPathFilter) -> Vec<GoldenPathCandidate> {
+        self.golden_paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| golden_path_matches(g, filter))
+            .cloned()
+            .collect()
+    }
+
+    /// 更新 golden path 状态，用于 candidate -> confirmed/rejected/deprecated。
+    pub fn update_golden_path_status(
+        &self,
+        golden_path_id: u64,
+        tenant_id: Option<u64>,
+        status: GoldenPathStatus,
+        score: Option<u32>,
+        reason: Option<String>,
+        source: Option<String>,
+    ) -> Option<GoldenPathCandidate> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut paths = self.golden_paths.lock().unwrap();
+        let path = paths
+            .iter_mut()
+            .find(|g| g.golden_path_id == golden_path_id && g.tenant_id == tenant_id)?;
+        path.status = status;
+        if score.is_some() {
+            path.score = score;
+        }
+        if reason.is_some() {
+            path.reason = reason;
+        }
+        if source.is_some() {
+            path.source = source;
+        }
+        path.updated_at_ns = unix_now_ns_u64();
+        let out = path.clone();
+        drop(paths);
+        self.persist_metadata();
+        Some(out)
+    }
+
+    /// 记录一次 retention/apply 的执行审计。审计只保存轻量摘要和 trace id 样本，不复制 trace payload。
+    pub fn add_retention_audit(
+        &self,
+        input: NewRetentionAuditRecord,
+        tenant_id: Option<u64>,
+    ) -> RetentionAuditRecord {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut next = self.next_retention_audit_id.lock().unwrap();
+        let audit = RetentionAuditRecord {
+            audit_id: *next,
+            tenant_id,
+            created_at_ns: unix_now_ns_u64(),
+            source: input.source,
+            reason: input.reason,
+            delete_before_ts: input.delete_before_ts,
+            query_json: input.query_json,
+            protect_golden_paths: input.protect_golden_paths,
+            protect_annotations: input.protect_annotations,
+            protect_dataset_associations: input.protect_dataset_associations,
+            protect_snapshots: input.protect_snapshots,
+            protect_eval_links: input.protect_eval_links,
+            protect_path_memory: input.protect_path_memory,
+            compact_requested: input.compact_requested,
+            compact_reclaim: input.compact_reclaim,
+            candidate_trace_count: input.candidate_trace_count,
+            protected_trace_count: input.protected_trace_count,
+            deletable_trace_count: input.deletable_trace_count,
+            requested_trace_count: input.requested_trace_count,
+            deleted_trace_count: input.deleted_trace_count,
+            deleted_segment_row_count: input.deleted_segment_row_count,
+            skipped_live_trace_count: input.skipped_live_trace_count,
+            compacted_segment_count: input.compacted_segment_count,
+            reclaimed_segment_count: input.reclaimed_segment_count,
+            dropped_deleted_row_count: input.dropped_deleted_row_count,
+            rewritten_live_row_count: input.rewritten_live_row_count,
+            deletable_trace_ids: input.deletable_trace_ids,
+            deleted_trace_ids: input.deleted_trace_ids,
+            skipped_live_trace_ids: input.skipped_live_trace_ids,
+            trace_id_sample_truncated: input.trace_id_sample_truncated,
+        };
+        *next += 1;
+        drop(next);
+        self.retention_audits.lock().unwrap().push(audit.clone());
+        self.persist_metadata();
+        audit
+    }
+
+    /// 查询 retention 执行审计。tenant_id 放在 filter 上，由 HTTP/Node 从鉴权上下文注入。
+    pub fn retention_audits(&self, filter: &RetentionAuditFilter) -> Vec<RetentionAuditRecord> {
+        self.retention_audits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| retention_audit_matches(a, filter))
+            .cloned()
+            .collect()
+    }
+
+    /// 保存一条 retention policy。policy 只保存查询和调度元数据；真正执行仍走 retention/apply。
+    pub fn add_retention_policy(
+        &self,
+        input: NewRetentionPolicy,
+        tenant_id: Option<u64>,
+    ) -> RetentionPolicy {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut next = self.next_retention_policy_id.lock().unwrap();
+        let now = unix_now_ns_u64();
+        let policy = RetentionPolicy {
+            policy_id: *next,
+            tenant_id,
+            name: input.name,
+            enabled: input.enabled,
+            created_at_ns: now,
+            updated_at_ns: now,
+            last_run_at_ns: None,
+            next_run_at_ns: input.next_run_at_ns,
+            interval_ns: input.interval_ns,
+            source: input.source,
+            reason: input.reason,
+            query_json: input.query_json,
+        };
+        *next += 1;
+        drop(next);
+        self.retention_policies.lock().unwrap().push(policy.clone());
+        self.persist_metadata();
+        policy
+    }
+
+    /// 查询 retention policies。tenant_id 放在 filter 上，由 HTTP/Node 注入。
+    pub fn retention_policies(&self, filter: &RetentionPolicyFilter) -> Vec<RetentionPolicy> {
+        self.retention_policies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| retention_policy_matches(p, filter))
+            .cloned()
+            .collect()
+    }
+
+    /// 记录 policy 运行成功后的水位。失败不推进 next_run，避免静默跳过清理窗口。
+    pub fn mark_retention_policy_ran(
+        &self,
+        policy_id: u64,
+        tenant_id: Option<u64>,
+        ran_at_ns: u64,
+    ) -> Option<RetentionPolicy> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut policies = self.retention_policies.lock().unwrap();
+        let policy = policies
+            .iter_mut()
+            .find(|p| p.policy_id == policy_id && p.tenant_id == tenant_id)?;
+        policy.last_run_at_ns = Some(ran_at_ns);
+        policy.next_run_at_ns = Some(ran_at_ns.saturating_add(policy.interval_ns.max(1)));
+        policy.updated_at_ns = unix_now_ns_u64();
+        let out = policy.clone();
+        drop(policies);
+        self.persist_metadata();
+        Some(out)
+    }
+
     /// 对一个数据集**现跑 scorer**,聚合成通过率/均分看板(整体 + per-agent)——回归基准:
     /// 同一数据集 + 同一 scorer 反复跑,通过率掉了就是 agent/prompt 退步了。返回 None=无此数据集。
     /// 注意:这里直接对数据集里**冻结的 span 快照**评分,不走 upgrade 写回(那是线上 trace 的事)。
@@ -2528,7 +5577,8 @@ impl WriteCoordinator {
                 | Projection::TOOL_NAME
                 | Projection::PARENT_SPAN_ID
                 | Projection::INPUT_TOKENS
-                | Projection::OUTPUT_TOKENS,
+                | Projection::OUTPUT_TOKENS
+                | Projection::USAGE_COST,
         );
         let (spans, _) = self.fold_query(
             snap,
@@ -2550,15 +5600,32 @@ impl WriteCoordinator {
 
         // span_id → 角色名，供连边时查父角色。
         let mut span_actor: HashMap<u64, String> = HashMap::new();
-        // 节点聚合：actor → (kind, span_count, in_tok, out_tok)。
-        let mut nodes: BTreeMap<String, (ActorKind, usize, u64, u64)> = BTreeMap::new();
+        // 节点聚合：actor → (kind, span_count, in_tok, out_tok, cached, reasoning, total, cost).
+        let mut nodes: BTreeMap<String, (ActorKind, usize, u64, u64, u64, u64, u64, u64)> =
+            BTreeMap::new();
         for s in &spans {
             let (name, kind) = actor_of(s);
             span_actor.insert(s.span_id, name.clone());
-            let e = nodes.entry(name).or_insert((kind, 0, 0, 0));
+            let e = nodes.entry(name).or_insert((kind, 0, 0, 0, 0, 0, 0, 0));
             e.1 += 1;
             e.2 += s.input_tokens.unwrap_or(0);
             e.3 += s.output_tokens.unwrap_or(0);
+            e.4 += s.cached_input_tokens.unwrap_or(0);
+            e.5 += s.reasoning_tokens.unwrap_or(0);
+            e.6 += usage_total_tokens(
+                s.input_tokens.unwrap_or(0),
+                s.output_tokens.unwrap_or(0),
+                s.cached_input_tokens.unwrap_or(0),
+                s.reasoning_tokens.unwrap_or(0),
+                s.total_tokens,
+            );
+            e.7 += usage_cost_usd_nanos(
+                s.input_tokens.unwrap_or(0),
+                s.output_tokens.unwrap_or(0),
+                s.cached_input_tokens.unwrap_or(0),
+                s.reasoning_tokens.unwrap_or(0),
+                s.cost_usd_nanos,
+            );
         }
 
         // 边聚合：父角色 → 子角色（跳过父不在本 trace 内 / 同角色自环）。
@@ -2582,12 +5649,28 @@ impl WriteCoordinator {
             nodes: nodes
                 .into_iter()
                 .map(
-                    |(actor, (kind, span_count, input_tokens, output_tokens))| AgentGraphNode {
+                    |(
+                        actor,
+                        (
+                            kind,
+                            span_count,
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            reasoning_tokens,
+                            total_tokens,
+                            cost_usd_nanos,
+                        ),
+                    )| AgentGraphNode {
                         actor,
                         kind,
                         span_count,
                         input_tokens,
                         output_tokens,
+                        cached_input_tokens,
+                        reasoning_tokens,
+                        total_tokens,
+                        cost_usd_nanos,
                     },
                 )
                 .collect(),
@@ -2694,14 +5777,25 @@ impl WriteCoordinator {
     /// 把"按产品维度（agent/状态/时间）过滤"翻译成 `graph.search` 认的 `Fn(u64,u64)->bool`。
     fn with_filter_pred<R>(
         &self,
+        snap: &Snapshot,
         f: &SearchFilter,
         body: impl FnOnce(&dyn Fn(u64, u64) -> bool) -> R,
     ) -> R {
+        let attr_candidates = if f.attrs.is_empty() {
+            None
+        } else {
+            self.attr_matching_span_keys(snap, &f.attrs)
+        };
         let attrs = self.filter_attrs.lock().unwrap();
         let need_attrs = f.needs_attrs();
         let pred = move |t: u64, s: u64| -> bool {
             if let Some(tid) = f.trace_id {
                 if t != tid {
+                    return false;
+                }
+            }
+            if let Some(keys) = &attr_candidates {
+                if !keys.contains(&(t, s)) {
                     return false;
                 }
             }
@@ -2725,7 +5819,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
-        let cands = self.with_filter_pred(filter, |pred| self.graph.search(query, k, pred));
+        let cands = self.with_filter_pred(snap, filter, |pred| self.graph.search(query, k, pred));
         self.join_folded(snap, cands)
     }
 
@@ -2738,7 +5832,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
-        let cands = self.with_filter_pred(filter, |pred| {
+        let cands = self.with_filter_pred(snap, filter, |pred| {
             let mut c = self.bm25.search(query, k.max(50));
             c.retain(|&(t, s, _)| pred(t, s));
             c.truncate(k);
@@ -2757,7 +5851,7 @@ impl WriteCoordinator {
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
         let pool = k.max(10);
-        let (bm, vec) = self.with_filter_pred(filter, |pred| {
+        let (bm, vec) = self.with_filter_pred(snap, filter, |pred| {
             let mut bm = self.bm25.search(text, pool);
             bm.retain(|&(t, s, _)| pred(t, s));
             let vec = self.graph.search(query_vec, pool, pred);
@@ -2805,18 +5899,24 @@ impl WriteCoordinator {
             "recover_start",
             &[("version", &self.current.version())],
         );
+        *self.attr_postings.lock().unwrap() = AttrPostings::default();
+        *self.seg_attr_directory.lock().unwrap() = SegmentAttrDirectory::default();
+        *self.seg_attr_cache.lock().unwrap() =
+            SegmentAttrSidecarCache::new(ATTR_SIDECAR_CACHE_MAX_BYTES);
+        self.trace_trajectory_idx.lock().unwrap().clear();
         // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车；顺带重建段级 key bloom。
         let m = self.current.manifest();
         let seg_count = m.segments.len();
         for entry in m.segments.values() {
             let recs = self.segments.scan_records(entry.segment_id);
+            self.install_segment_attr_sidecar(entry.segment_id, &recs, false);
             let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
             self.seg_key_bloom
                 .lock()
                 .unwrap()
                 .insert(entry.segment_id.get(), Arc::new(bloom));
             for r in &recs {
-                self.index_record(r);
+                self.index_record_inner(r, false);
             }
         }
         drop(m);
@@ -2884,6 +5984,7 @@ impl WriteCoordinator {
         let _w = self.write_lock.lock().unwrap();
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, records); // building→sealed（写完 fsync）
+        self.install_segment_attr_sidecar(seg, records, true);
         let bloom = KeyBloom::build(
             records.iter().map(|r| (r.trace_id, r.span_id)),
             records.len(),
@@ -2915,6 +6016,7 @@ impl WriteCoordinator {
         // 绝不能直接用 up_to_lsn —— 否则就是 flush-evict 漏行 bug。仍有旧读者时此值更小、不删其行。
         let gate = WalLsn::new(self.current.min_retained_watermark());
         self.memtable.lock().unwrap().evict_up_to(gate);
+        self.rebuild_live_attr_postings_from_memtable();
     }
 
     /// 删除提交：给某段换一个新的 deletion 块（deletion_seq+1），绝不原地改旧块。
@@ -2982,6 +6084,9 @@ impl WriteCoordinator {
     /// 删除/补写**不会丢**：当前 deletion_vec 把后到的删除也滤掉，当前 upgrade 块也并进新段。
     /// 返回是否发生了重读合并（输入段 seq 变了），便于观测/测试。
     pub fn compaction_finish(&self, plan: &CompactionPlan) -> bool {
+        if plan.inputs.is_empty() {
+            return false;
+        }
         let _w = self.write_lock.lock().unwrap();
         let m = self.current.manifest();
 
@@ -3013,13 +6118,6 @@ impl WriteCoordinator {
             }
         }
 
-        let new_seg = self.alloc_segment_id();
-        self.segments.flush_to_segment(new_seg, &merged);
-        let bloom = KeyBloom::build(merged.iter().map(|r| (r.trace_id, r.span_id)), merged.len());
-        self.seg_key_bloom
-            .lock()
-            .unwrap()
-            .insert(new_seg.get(), Arc::new(bloom));
         let (min_ts, max_ts) = ts_range(&merged);
         let has_upgrade = merged_upgrade.iter().next().is_some();
 
@@ -3028,20 +6126,31 @@ impl WriteCoordinator {
         for s in &plan.inputs {
             draft.segments.remove(&s.get());
         }
-        draft.segments.insert(
-            new_seg.get(),
-            SegmentEntry {
-                segment_id: new_seg,
-                level: 1,
-                state: SegState::Live,
-                min_ts,
-                max_ts,
-                deletion_vec: Arc::new(DeletionVec::empty()), // 删除已物化进 merged，新段从干净开始
-                deletion_seq: 0,
-                upgrade_ref: has_upgrade.then(|| Arc::new(merged_upgrade)),
-                upgrade_seq: 0,
-            },
-        );
+        if !merged.is_empty() {
+            let new_seg = self.alloc_segment_id();
+            self.segments.flush_to_segment(new_seg, &merged);
+            self.install_segment_attr_sidecar(new_seg, &merged, true);
+            let bloom =
+                KeyBloom::build(merged.iter().map(|r| (r.trace_id, r.span_id)), merged.len());
+            self.seg_key_bloom
+                .lock()
+                .unwrap()
+                .insert(new_seg.get(), Arc::new(bloom));
+            draft.segments.insert(
+                new_seg.get(),
+                SegmentEntry {
+                    segment_id: new_seg,
+                    level: 1,
+                    state: SegState::Live,
+                    min_ts,
+                    max_ts,
+                    deletion_vec: Arc::new(DeletionVec::empty()), // 删除已物化进 merged，新段从干净开始
+                    deletion_seq: 0,
+                    upgrade_ref: has_upgrade.then(|| Arc::new(merged_upgrade)),
+                    upgrade_seq: 0,
+                },
+            );
+        }
         self.commit_and_persist(draft);
 
         let mut dead = self.dead_set.lock().unwrap();
@@ -3106,6 +6215,14 @@ impl WriteCoordinator {
             self.segments.unlink_segment(r.seg);
             self.seg_fold_cache.lock().unwrap().remove(r.seg.get()); // 段没了，缓存失效
             self.seg_key_bloom.lock().unwrap().remove(&r.seg.get()); // bloom 同失效
+            self.seg_attr_cache.lock().unwrap().remove(r.seg);
+            self.seg_attr_directory
+                .lock()
+                .unwrap()
+                .remove_segment(r.seg);
+            if let Some(dir) = &self.attr_sidecar_dir {
+                let _ = std::fs::remove_file(attr_sidecar_path(dir, r.seg));
+            }
             if let Some(log) = gc.as_mut() {
                 // DONE 写失败：文件已删但完成标记没落盘。重启时会当成"MARK 没 DONE"补删——
                 // 文件不存在了，unlink 幂等（store 实现容忍），正确。所以这里不回滚、继续。
@@ -3134,7 +6251,8 @@ impl WriteCoordinator {
     /// 走 pin 协议拿一致快照（持有的版本不会被 GC），把所有持久文件拷到目标目录，
     /// 得到一个可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。
     ///
-    /// 拷的文件：`segments/`（目录）+ `wal.log` + `manifest.dat` + `vecindex/`（或 `vectors.dat`）+ `gc.log`。
+    /// 拷的文件：`segments/`（目录）+ `attr_postings/`（目录）+ `wal.log` + `manifest.dat`
+    /// + `metadata.dat` + `vecindex/`（或 `vectors.dat`）+ `gc.log`。
     /// 段文件是不可变的、manifest 是当前版本快照——拷的是那一刻的一致态。
     /// WAL 可能比 manifest 新（有未 flush 的事务），recover 时重放水位之后的尾巴,幂等（确定性 event_id）。
     pub fn backup_snapshot(&self, dest: impl AsRef<std::path::Path>) -> std::io::Result<()> {
@@ -3158,14 +6276,20 @@ impl WriteCoordinator {
         );
 
         std::fs::create_dir_all(dest)?;
-        // 拷贝数据文件/目录。segments/ 和 vecindex/ 是目录,其余是文件。
-        for name in ["segments", "vecindex"] {
+        // 拷贝数据文件/目录。segments/、vecindex/、attr_postings/ 是目录,其余是文件。
+        for name in ["segments", "vecindex", "attr_postings"] {
             let s = src.join(name);
             if s.exists() {
                 copy_dir_recursive(&s, &dest.join(name))?;
             }
         }
-        for name in ["wal.log", "manifest.dat", "vectors.dat", "gc.log"] {
+        for name in [
+            "wal.log",
+            "manifest.dat",
+            "metadata.dat",
+            "vectors.dat",
+            "gc.log",
+        ] {
             let s = src.join(name);
             if s.exists() {
                 std::fs::copy(&s, dest.join(name))?;
@@ -3195,9 +6319,65 @@ impl WriteCoordinator {
         let committed_tail = self.current.committed_tail();
         let flush_threshold = self.flush_threshold.load(Ordering::Relaxed);
         let filter_attrs = self.filter_attrs.lock().unwrap().len();
+        let (
+            attr_posting_keys,
+            attr_posting_entries,
+            attr_posting_estimated_bytes,
+            attr_posting_singleton_keys,
+            attr_posting_small_vec_keys,
+            attr_posting_hashset_keys,
+            attr_posting_interned_keys,
+            attr_posting_interned_values,
+            attr_posting_incomplete_keys,
+        ) = {
+            let postings = self.attr_postings.lock().unwrap();
+            let keys = postings.exact.len() + postings.array_items.len();
+            let mut singleton_keys = 0usize;
+            let mut small_vec_keys = 0usize;
+            let mut hashset_keys = 0usize;
+            for list in postings.exact.values().chain(postings.array_items.values()) {
+                if list.is_singleton() {
+                    singleton_keys += 1;
+                } else if list.is_small() {
+                    small_vec_keys += 1;
+                } else if list.is_hashset() {
+                    hashset_keys += 1;
+                }
+            }
+            (
+                keys,
+                postings.indexed_entries,
+                postings.estimated_bytes,
+                singleton_keys,
+                small_vec_keys,
+                hashset_keys,
+                postings.attr_keys.len(),
+                postings.attr_values.len(),
+                postings.incomplete_keys.len(),
+            )
+        };
+        let (
+            attr_sidecar_segments,
+            attr_sidecar_exact_terms,
+            attr_sidecar_array_terms,
+            attr_sidecar_incomplete_keys,
+        ) = self.seg_attr_directory.lock().unwrap().stats();
+        let (
+            attr_sidecar_cache_entries,
+            attr_sidecar_cache_bytes,
+            attr_sidecar_cache_byte_budget,
+            attr_sidecar_cache_hits,
+            attr_sidecar_cache_misses,
+            attr_sidecar_cache_loads,
+            attr_sidecar_cache_evictions,
+        ) = self.seg_attr_cache.lock().unwrap().stats();
         let fold_cache_entries = self.seg_fold_cache.lock().unwrap().map.len();
         let bloom_count = self.seg_key_bloom.lock().unwrap().len();
         let datasets = self.datasets.lock().unwrap().len();
+        let annotations = self.annotations.lock().unwrap().len();
+        let dataset_associations = self.dataset_associations.lock().unwrap().len();
+        let retention_audits = self.retention_audits.lock().unwrap().len();
+        let retention_policies = self.retention_policies.lock().unwrap().len();
 
         // 确定性 manifest 版本（每次 commit +1）。
         out.push_str("# HELP yt_manifest_version Manifest 版本号（每次 commit +1）。\n");
@@ -3240,6 +6420,150 @@ impl WriteCoordinator {
         out.push_str("# TYPE yt_filter_attrs gauge\n");
         out.push_str(&format!("yt_filter_attrs {filter_attrs}\n\n"));
 
+        out.push_str("# HELP yt_attr_posting_keys attrs 倒排索引 key 数。\n");
+        out.push_str("# TYPE yt_attr_posting_keys gauge\n");
+        out.push_str(&format!("yt_attr_posting_keys {attr_posting_keys}\n\n"));
+
+        out.push_str(
+            "# HELP yt_attr_posting_singleton_keys 使用单元素紧凑结构的 attrs 倒排 key 数。\n",
+        );
+        out.push_str("# TYPE yt_attr_posting_singleton_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_singleton_keys {attr_posting_singleton_keys}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_posting_small_vec_keys 使用小型有序 Vec 的 attrs 倒排 key 数。\n",
+        );
+        out.push_str("# TYPE yt_attr_posting_small_vec_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_small_vec_keys {attr_posting_small_vec_keys}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_hashset_keys 升级为 HashSet 的 attrs 倒排 key 数。\n");
+        out.push_str("# TYPE yt_attr_posting_hashset_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_hashset_keys {attr_posting_hashset_keys}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_interned_keys attrs 倒排索引字段名字典条目数。\n");
+        out.push_str("# TYPE yt_attr_posting_interned_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_interned_keys {attr_posting_interned_keys}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_interned_values attrs 倒排索引字段值字典条目数。\n");
+        out.push_str("# TYPE yt_attr_posting_interned_values gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_interned_values {attr_posting_interned_values}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_entries attrs 倒排索引 entry 数。\n");
+        out.push_str("# TYPE yt_attr_posting_entries gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_entries {attr_posting_entries}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_entry_budget attrs 倒排索引 entry 预算上限。\n");
+        out.push_str("# TYPE yt_attr_posting_entry_budget gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_entry_budget {ATTR_POSTINGS_MAX_ENTRIES}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_posting_estimated_bytes attrs 倒排索引近似内存占用字节数。\n");
+        out.push_str("# TYPE yt_attr_posting_estimated_bytes gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_estimated_bytes {attr_posting_estimated_bytes}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_posting_estimated_byte_budget attrs 倒排索引近似内存预算字节数。\n",
+        );
+        out.push_str("# TYPE yt_attr_posting_estimated_byte_budget gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_estimated_byte_budget {ATTR_POSTINGS_MAX_ESTIMATED_BYTES}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_posting_incomplete_keys 因预算或策略降级为慢路径的 attrs key 数。\n",
+        );
+        out.push_str("# TYPE yt_attr_posting_incomplete_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_posting_incomplete_keys {attr_posting_incomplete_keys}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_segments 已注册 attrs segment sidecar 的段数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_segments gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_segments {attr_sidecar_segments}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_exact_terms attrs sidecar exact term 数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_exact_terms gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_exact_terms {attr_sidecar_exact_terms}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_array_terms attrs sidecar array includes term 数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_array_terms gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_array_terms {attr_sidecar_array_terms}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_sidecar_incomplete_keys attrs sidecar 中按 segment 标记 incomplete 的 key 数。\n",
+        );
+        out.push_str("# TYPE yt_attr_sidecar_incomplete_keys gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_incomplete_keys {attr_sidecar_incomplete_keys}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_cache_entries attrs sidecar LRU cache 条目数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_cache_entries gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_entries {attr_sidecar_cache_entries}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_sidecar_cache_bytes attrs sidecar LRU cache 近似驻留字节数。\n",
+        );
+        out.push_str("# TYPE yt_attr_sidecar_cache_bytes gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_bytes {attr_sidecar_cache_bytes}\n\n"
+        ));
+
+        out.push_str(
+            "# HELP yt_attr_sidecar_cache_byte_budget attrs sidecar LRU cache 字节预算。\n",
+        );
+        out.push_str("# TYPE yt_attr_sidecar_cache_byte_budget gauge\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_byte_budget {attr_sidecar_cache_byte_budget}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_cache_hits attrs sidecar LRU cache 命中次数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_cache_hits counter\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_hits {attr_sidecar_cache_hits}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_cache_misses attrs sidecar LRU cache 未命中次数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_cache_misses counter\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_misses {attr_sidecar_cache_misses}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_cache_loads attrs sidecar 被加载进 cache 的次数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_cache_loads counter\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_loads {attr_sidecar_cache_loads}\n\n"
+        ));
+
+        out.push_str("# HELP yt_attr_sidecar_cache_evictions attrs sidecar LRU cache 驱逐次数。\n");
+        out.push_str("# TYPE yt_attr_sidecar_cache_evictions counter\n");
+        out.push_str(&format!(
+            "yt_attr_sidecar_cache_evictions {attr_sidecar_cache_evictions}\n\n"
+        ));
+
         out.push_str("# HELP yt_fold_cache_entries 段折叠缓存条目数（解码后的段）。\n");
         out.push_str("# TYPE yt_fold_cache_entries gauge\n");
         out.push_str(&format!("yt_fold_cache_entries {fold_cache_entries}\n\n"));
@@ -3250,7 +6574,27 @@ impl WriteCoordinator {
 
         out.push_str("# HELP yt_datasets 评测数据集数。\n");
         out.push_str("# TYPE yt_datasets gauge\n");
-        out.push_str(&format!("yt_datasets {datasets}\n"));
+        out.push_str(&format!("yt_datasets {datasets}\n\n"));
+
+        out.push_str("# HELP yt_annotations 业务 annotation 条目数。\n");
+        out.push_str("# TYPE yt_annotations gauge\n");
+        out.push_str(&format!("yt_annotations {annotations}\n\n"));
+
+        out.push_str(
+            "# HELP yt_dataset_associations 外部 dataset item 与 trace/span 的关联条目数。\n",
+        );
+        out.push_str("# TYPE yt_dataset_associations gauge\n");
+        out.push_str(&format!(
+            "yt_dataset_associations {dataset_associations}\n\n"
+        ));
+
+        out.push_str("# HELP yt_retention_audits retention/apply 执行审计记录数。\n");
+        out.push_str("# TYPE yt_retention_audits gauge\n");
+        out.push_str(&format!("yt_retention_audits {retention_audits}\n\n"));
+
+        out.push_str("# HELP yt_retention_policies 已保存的 retention policy 数。\n");
+        out.push_str("# TYPE yt_retention_policies gauge\n");
+        out.push_str(&format!("yt_retention_policies {retention_policies}\n"));
 
         out
     }
@@ -3517,6 +6861,236 @@ mod tests {
     }
 
     #[test]
+    fn attr_postings_intern_terms_and_keep_query_semantics() {
+        let mut postings = AttrPostings::default();
+        let project = json_string_compact("agentic-data");
+        let next_project = json_string_compact("agentic-data-next");
+        let conn_a = json_string_compact("conn-a");
+        let missing = json_string_compact("missing");
+        let connections = crate::wire::Json::Arr(vec![
+            crate::wire::Json::Str("conn-a".to_string()),
+            crate::wire::Json::Str("conn-b".to_string()),
+        ])
+        .to_compact_json();
+
+        postings.add_value((1, 10), "project_id", &project);
+        postings.add_value((1, 11), "project_id", &project);
+        postings.add_value((1, 12), "connection_ids", &connections);
+
+        assert_eq!(postings.attr_keys.len(), 2, "attr key strings are interned");
+        assert_eq!(
+            postings.attr_values.len(),
+            4,
+            "shared values are interned once across exact and array postings"
+        );
+        assert_eq!(postings.exact.len(), 2);
+        assert_eq!(postings.array_items.len(), 2);
+
+        let project_hits = postings.candidates_for_attr("project_id", &project);
+        assert!(project_hits.contains(&(1, 10)));
+        assert!(project_hits.contains(&(1, 11)));
+        let conn_hits = postings.candidates_for_attr("connection_ids", &conn_a);
+        assert_eq!(conn_hits, HashSet::from([(1, 12)]));
+
+        let value_count = postings.attr_values.len();
+        assert!(postings
+            .candidates_for_attr("connection_ids", &missing)
+            .is_empty());
+        assert_eq!(
+            postings.attr_values.len(),
+            value_count,
+            "querying an unknown value must not grow the interner"
+        );
+
+        postings.update((1, 10), "project_id", Some(&project), &next_project);
+        let old_hits = postings.candidates_for_attr("project_id", &project);
+        assert!(!old_hits.contains(&(1, 10)));
+        assert!(old_hits.contains(&(1, 11)));
+        assert_eq!(
+            postings.candidates_for_attr("project_id", &next_project),
+            HashSet::from([(1, 10)])
+        );
+    }
+
+    #[test]
+    fn segment_attr_sidecar_serves_attrs_after_flush_and_recover() {
+        let dir =
+            std::env::temp_dir().join(format!("yt_attr_sidecar_{}_{}", std::process::id(), 1));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = json_string_compact("agentic-data");
+        let conn_a = json_string_compact("conn-a");
+        let connections = crate::wire::Json::Arr(vec![
+            crate::wire::Json::Str("conn-a".to_string()),
+            crate::wire::Json::Str("conn-b".to_string()),
+        ])
+        .to_compact_json();
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            let mut r = ev(70, 1, 1, Some(0), Some(100), &["builder 盗刷"]);
+            r.fields.attrs.insert("project_id".into(), project.clone());
+            r.fields
+                .attrs
+                .insert("connection_ids".into(), connections.clone());
+            wc.ingest(vec![r]);
+            wc.flush_memtable();
+
+            assert_eq!(
+                wc.attr_postings.lock().unwrap().indexed_entries,
+                0,
+                "flush 后 live postings 不应继续持有历史 segment postings"
+            );
+            assert!(
+                dir.join("attr_postings").join("seg-1.attrs").exists(),
+                "flush 后应写出 segment-local attrs sidecar"
+            );
+            let snap = wc.pin_snapshot();
+            let attrs = BTreeMap::from([("project_id".to_string(), project.clone())]);
+            let hits = wc.read_spans_query_for_attrs(&snap, &TraceQuery::all(), &attrs);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].trace_id, 70);
+        }
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.recover();
+            assert_eq!(
+                wc.attr_postings.lock().unwrap().indexed_entries,
+                0,
+                "recover 扫历史 segment 时不应重建全局 span-level postings"
+            );
+            assert_eq!(
+                wc.seg_attr_cache.lock().unwrap().map.len(),
+                0,
+                "recover 只重建轻量目录，不预热全部 sidecar posting list"
+            );
+
+            let snap = wc.pin_snapshot();
+            let attrs = BTreeMap::from([("connection_ids".to_string(), conn_a.clone())]);
+            let hits = wc.read_spans_query_for_attrs(&snap, &TraceQuery::all(), &attrs);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].span_id, 1);
+            assert!(
+                wc.seg_attr_cache.lock().unwrap().map.len() > 0,
+                "查询时才按需加载 sidecar posting list"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_class_agentic_fields_filter_without_attrs_after_recover() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_first_class_agentic_{}_{}",
+            std::process::id(),
+            1
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = json_string_compact("agentic-data");
+        let skill = json_string_compact("review");
+        let mode = json_string_compact("auto");
+        let call_site = json_string_compact("worker.ts:10");
+        let task_fingerprint = json_string_compact("npm-native-packaging");
+        let loop_id = json_string_compact("loop-1");
+        let harness_version = json_string_compact("h1");
+        let validation_status = json_string_compact("pass");
+        let stop_reason = json_string_compact("goal_met");
+        let phase = json_string_compact("verify");
+        let validator = json_string_compact("npm test");
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            let mut r = ev(71, 1, 1, Some(0), Some(100), &["first-class fields"]);
+            r.fields.project_id = Some(project.clone());
+            r.fields.skill = Some(skill.clone());
+            r.fields.mode = Some(mode.clone());
+            r.fields.call_site = Some(call_site.clone());
+            r.fields.task_fingerprint = Some(task_fingerprint.clone());
+            r.fields.loop_id = Some(loop_id.clone());
+            r.fields.harness_version = Some(harness_version.clone());
+            r.fields.validation_status = Some(validation_status.clone());
+            r.fields.stop_reason = Some(stop_reason.clone());
+            r.fields.phase = Some(phase.clone());
+            r.fields.validator = Some(validator.clone());
+            assert!(r.fields.attrs.is_empty(), "测试必须不走 attrs 镜像路径");
+            wc.ingest(vec![r]);
+            wc.flush_memtable();
+            assert!(
+                dir.join("attr_postings").join("seg-1.attrs").exists(),
+                "一等字段也应写入 segment-local attrs sidecar"
+            );
+        }
+
+        {
+            let wc = WriteCoordinator::open_durable(&dir).unwrap();
+            wc.recover();
+            let snap = wc.pin_snapshot();
+            let attrs = BTreeMap::from([
+                ("project_id".to_string(), project.clone()),
+                ("skill".to_string(), skill.clone()),
+                ("task_fingerprint".to_string(), task_fingerprint.clone()),
+                ("validation_status".to_string(), validation_status.clone()),
+            ]);
+            let hits = wc.read_spans_query_for_attrs(&snap, &TraceQuery::all(), &attrs);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].trace_id, 71);
+            assert_eq!(hits[0].project_id.as_deref(), Some(project.as_str()));
+            assert_eq!(hits[0].skill.as_deref(), Some(skill.as_str()));
+            assert_eq!(
+                hits[0].task_fingerprint.as_deref(),
+                Some(task_fingerprint.as_str())
+            );
+            assert_eq!(
+                hits[0].validation_status.as_deref(),
+                Some(validation_status.as_str())
+            );
+            assert!(hits[0].attrs.is_empty(), "过滤不能依赖 attrs 镜像");
+
+            let trace_ids = HashSet::from([71]);
+            let fields = wc.trace_attr_fields_for_tenant_and_traces(&snap, None, &trace_ids);
+            let row = fields.get(&71).expect("trace fields");
+            assert_eq!(
+                row.get("project_id").map(String::as_str),
+                Some(project.as_str())
+            );
+            assert_eq!(row.get("skill").map(String::as_str), Some(skill.as_str()));
+            assert_eq!(row.get("mode").map(String::as_str), Some(mode.as_str()));
+            assert_eq!(
+                row.get("call_site").map(String::as_str),
+                Some(call_site.as_str())
+            );
+            assert_eq!(
+                row.get("task_fingerprint").map(String::as_str),
+                Some(task_fingerprint.as_str())
+            );
+            assert_eq!(
+                row.get("loop_id").map(String::as_str),
+                Some(loop_id.as_str())
+            );
+            assert_eq!(
+                row.get("harness_version").map(String::as_str),
+                Some(harness_version.as_str())
+            );
+            assert_eq!(
+                row.get("validation_status").map(String::as_str),
+                Some(validation_status.as_str())
+            );
+            assert_eq!(
+                row.get("stop_reason").map(String::as_str),
+                Some(stop_reason.as_str())
+            );
+            assert_eq!(row.get("phase").map(String::as_str), Some(phase.as_str()));
+            assert_eq!(
+                row.get("validator").map(String::as_str),
+                Some(validator.as_str())
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn log_events_round_trip_from_memtable_and_segment() {
         let wc = WriteCoordinator::new(Arc::new(CapturingStore::default()));
         let batch = r#"[
@@ -3721,6 +7295,30 @@ mod tests {
             2,
             "老读者快照不受后来的删除影响"
         );
+    }
+
+    #[test]
+    fn retention_compaction_drops_fully_deleted_segment_without_empty_live_segment() {
+        let store = Arc::new(CapturingStore::default());
+        let wc = WriteCoordinator::new(store.clone());
+        let row = ev(9, 10, 1, Some(0), Some(10), &[]);
+        let rows = vec![row.clone()];
+        wc.ingest(rows.clone());
+        wc.commit_flush(&rows, WalLsn::new(1)); // seg 1
+        wc.commit_delete(SegmentId::new(1), 0);
+
+        let compacted = wc.compact_deleted_segments(10, 1, 1, true);
+        assert_eq!(compacted.selected_segment_count, 1);
+        assert_eq!(compacted.compacted_segment_count, 1);
+        assert_eq!(compacted.dropped_deleted_row_count, 1);
+        assert_eq!(compacted.rewritten_live_row_count, 0);
+        assert_eq!(compacted.reclaimed_segment_count, 1);
+        assert_eq!(compacted.after_live_segment_count, 0);
+        assert_eq!(compacted.after_dead_segment_count, 0);
+
+        let snap = wc.pin_snapshot();
+        assert!(snap.manifest.segments.is_empty(), "不应留下空 live segment");
+        assert!(wc.read_spans(&snap).is_empty());
     }
 
     #[test]
@@ -4549,6 +8147,12 @@ mod tests {
                 duration_ns: None,
                 input_tokens: Some(900),
                 output_tokens: None,
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                cost_usd_nanos: None,
+                cost_currency: None,
+                provider: None,
                 session_id: None,
                 tenant_id: None,
                 external_trace_id: None,
@@ -4575,6 +8179,12 @@ mod tests {
                 duration_ns: Some(50),
                 input_tokens: None,
                 output_tokens: Some(150),
+                cached_input_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: None,
+                cost_usd_nanos: None,
+                cost_currency: None,
+                provider: None,
                 session_id: None,
                 tenant_id: None,
                 external_trace_id: None,

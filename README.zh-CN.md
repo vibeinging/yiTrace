@@ -1,9 +1,9 @@
 # yiTrace
 
-**给 AI Agent 用的单机 trace 数据库。**
+**AI Agent 的 trace-sdk 和运行回放工具。**
 
-一个 Rust 单二进制，把 Agent 的多轮对话、工具调用、多 Agent 协作 trace 灌进去，
-本地完成 trace 回放、中文检索、向量召回、成本归因和 eval，不把数据送出内网。
+先接入 SDK，把每次 Agent 运行发送到本地 yiTrace，再回放多轮对话、工具调用、
+token 成本和失败现场，不把数据送出内网。
 
 中文 · [English](README.md)
 
@@ -11,20 +11,21 @@
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![status](https://img.shields.io/badge/status-alpha-3fb950)](#项目状态)
 [![engine](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#工作原理)
-[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#从-agent-摄入)
+[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#先接-trace-sdk)
 
 打开自带控制台，可以回放多轮会话、查看 span、搜索中文 trace 文本，并下钻模型和工具调用。
 
 ![yiTrace 控制台](docs/images/console-overview.png)
 
-yiTrace 适合正在做私有化 Agent 的团队：
+yiTrace 适合正在做私有化 Agent、但不想一上来就“对接一套数据库”的团队：
 
+- 用几行 Python / TypeScript SDK 记录 Agent 运行
 - 回放多轮对话、工具调用、多 Agent 移交
 - 用中文 BM25 搜 trace，再和向量召回混合
 - 按租户、agent、状态、trace、时间过滤
 - 按 trace、session、agent 归因 token 成本
 - 把失败 span 收进 eval 数据集，持续做回归评测
-- 单目录本地运行，引擎主体只用 Rust 标准库
+- 存储引擎留在本地幕后，需要时再暴露
 
 > 状态：alpha，可本地运行。存储、WAL 恢复、OTLP 摄入、SDK、中文检索、
 > 向量召回和 eval 都有离线测试覆盖。RBAC/TLS/托管部署仍在路线图中。
@@ -96,6 +97,58 @@ curl localhost:7878/v1/traces \
   -H 'X-Tenant-Id: 1'
 ```
 
+## 先接 trace-sdk
+
+开始时不需要把 yiTrace 当成数据库对接。先启动本地 collector 或 server，接入 SDK，
+把它当作 Agent 运行的本地飞行记录器。
+
+Python：
+
+```python
+from yitrace import Tracer, HttpExporter
+
+tracer = Tracer(
+    exporter=HttpExporter(
+        "http://127.0.0.1:7878/v1/ingest",
+        tenant_id=1,
+    ),
+    node_id=1,
+)
+
+with tracer.trace("反洗钱筛查", tenant_id=1) as t:
+    with t.span("风控 Agent") as span:
+        span.log("疑似盗刷")
+        span.set_tokens(input_tokens=900, output_tokens=120)
+
+tracer.close()
+```
+
+TypeScript：
+
+```ts
+import { HttpExporter, Tracer } from "@yitrace/trace-sdk";
+
+const tracer = new Tracer(
+  new HttpExporter({
+    url: "http://127.0.0.1:7878/v1/ingest",
+    tenantId: 1,
+  }),
+  1,
+);
+
+tracer.trace("反洗钱筛查", (t) => {
+  t.span("风控 Agent", (span) => {
+    span.log("疑似盗刷");
+    span.setTokens(900, 120);
+  });
+}, undefined, 1);
+
+await tracer.close();
+```
+
+已经接了 OpenTelemetry 或 OpenInference？把 OTLP/HTTP JSON POST 到 `/v1/traces` 即可。
+yiTrace 会把 OTel GenAI `gen_ai.*` 和 OpenInference `llm.*` 属性映射到同一套 trace 存储。
+
 ## 控制台
 
 引擎可以把 React 控制台作为静态资源内嵌进二进制。从源码运行时，先构建前端并拷进引擎 crate：
@@ -118,10 +171,10 @@ cargo run -p yt-engine --example server
 
 ---
 
-## Node / Electron 嵌入式 DB
+## 高级：Node / Electron 嵌入式 DB
 
-对 Node 后端和 Electron 应用，yiTrace 也可以作为进程内嵌入式数据库使用。这不是直接读数据文件；
-它通过 Node-API 加载 Rust engine，仍然复用同一套 WAL、manifest、折叠、检索和租户过滤逻辑。
+如果 Node 后端或 Electron 应用需要本地持久化、又不想单独启动进程，yiTrace 也可以进程内运行。
+这是高级路径：它通过 Node-API 加载 Rust engine，仍然复用同一套 WAL、manifest、折叠、检索和租户过滤逻辑。
 
 ```bash
 npm install @yitrace/db
@@ -172,75 +225,26 @@ trace 和 span detail 也会返回 `logEvents`，业务侧可以直接渲染 spa
 （例如 `@yitrace/db-darwin-arm64`、`@yitrace/db-linux-x64-gnu`）。用户只需要安装
 `@yitrace/db`，npm 会按 OS/CPU 拉取匹配的二进制包，不要求用户机器安装 Rust toolchain。
 维护者打包和发布步骤见 [`yitrace-node/README.md`](yitrace-node/README.md)。
-公开 npm 发布前，可在 `yitrace-node/` 运行 `npm run pack:local` 生成可锁版本的 tarball，
-放进 AgenticData 仓库或内部 npm 源。
-
----
-
-## 从 Agent 摄入
-
-Python：
-
-```python
-from yitrace import Tracer, HttpExporter
-
-tracer = Tracer(
-    exporter=HttpExporter(
-        "http://127.0.0.1:7878/v1/ingest",
-        tenant_id=1,
-    ),
-    node_id=1,
-)
-
-with tracer.trace("反洗钱筛查", tenant_id=1) as t:
-    with t.span("风控 Agent") as span:
-        span.log("疑似盗刷")
-        span.set_tokens(input_tokens=900, output_tokens=120)
-
-tracer.close()
-```
-
-TypeScript：
-
-```ts
-import { HttpExporter, Tracer } from "@yitrace/trace-sdk";
-
-const tracer = new Tracer(
-  new HttpExporter({
-    url: "http://127.0.0.1:7878/v1/ingest",
-    tenantId: 1,
-  }),
-  1,
-);
-
-tracer.trace("反洗钱筛查", (t) => {
-  t.span("风控 Agent", (span) => {
-    span.log("疑似盗刷");
-    span.setTokens(900, 120);
-  });
-}, undefined, 1);
-
-await tracer.close();
-```
-
-已经接了 OpenTelemetry 或 OpenInference？把 OTLP/HTTP JSON POST 到 `/v1/traces` 即可。
-yiTrace 会把 OTel GenAI `gen_ai.*` 和 OpenInference `llm.*` 属性映射到同一套 trace 存储。
+公开 npm 发布前，可在 `yitrace-node/` 运行 `npm run pack:verify` 生成带 commit/label 后缀、
+可锁定的 tarball，放进 AgenticData 仓库或内部 npm 源。
 
 ---
 
 ## 为什么是 yiTrace
 
-大部分可观测性工具都能存 trace。yiTrace 的定位是：把 agent trace 当作可以检索、评测、私有化保存的数据。
+很多 tracing SDK 只负责导出，很多数据库又让第一次接入显得太重。yiTrace 先保持 SDK 形态，
+再在后面提供私有化回放、检索、成本归因和 eval 数据。
 
 | 你需要 | 更适合 |
 |---|---|
 | 托管 trace、prompt run、团队协作流程 | LangSmith / Langfuse |
 | OpenTelemetry 路由、指标和管道胶水 | OpenTelemetry Collector |
 | 超大通用事件表的 SQL 分析 | ClickHouse / DuckDB |
-| 本地/私有化 agent trace 存储 + 中文检索 + 向量召回 + eval | yiTrace |
+| SDK 优先的私有化 Agent 运行回放 + 中文检索 + 向量召回 + eval | yiTrace |
 
 不同点：
 
+- **SDK 优先接入**：先用 `@yitrace/trace-sdk` 或 Python SDK；只有需要进程内本地持久化时才用嵌入式 DB。
 - **默认私有**：一个本地进程，一个数据目录，不依赖外部服务。
 - **Agent 原生记录**：多轮 session、span 树、工具、模型、token、eval score 都是一等字段。
 - **重试安全摄入**：Rust、Python、TypeScript 都用确定性 `event_id = hash(ext_span_id, seq, event_type)`。
