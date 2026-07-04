@@ -29,6 +29,23 @@ fn json_str(s: &str) -> String {
     format!("{s:?}")
 }
 
+fn assert_json_contains(body: &str, needle: &str) {
+    assert!(body.contains(needle), "missing {needle:?} in {body}");
+}
+
+fn metric_value(metrics: &str, name: &str) -> u64 {
+    metrics
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let metric = parts.next()?;
+            let value = parts.next()?;
+            (metric == name).then(|| value.parse::<u64>().ok()).flatten()
+        })
+        .unwrap_or_else(|| panic!("missing metric {name} in:\n{metrics}"))
+}
+
 fn eval_trace(trace: u64, project: &str, output: &str, status: u8) -> Vec<WireRecord> {
     let span = 3;
     let ext = format!("{trace}-{span}");
@@ -448,6 +465,1198 @@ fn durable_attrs_sidecar_filters_eval_results_after_recover() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 索引/性能契约：attrs segment sidecar 必须是按需加载的派生索引。
+/// 这个测试不做脆弱的耗时断言，而是用指标约束查询路径：recover 不预热 posting list，
+/// 首次索引查询产生 sidecar load/miss，重复查询命中 cache；高基数字段仍能慢路径精确返回。
+#[test]
+fn attrs_sidecar_index_cache_is_lazy_and_trace_summaries_stay_complete() {
+    let dir = durable_dir("attrs_index_perf");
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord.clone());
+        let batch1 = r#"[
+          {
+            "trace_id":701,
+            "span_id":1,
+            "session_id":7701,
+            "ts":10,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"701-1",
+            "status":0,
+            "duration_ns":10,
+            "input_tokens":10,
+            "output_tokens":5,
+            "cost_usd_nanos":1000,
+            "attrs":{"project_id":"index-perf","connection_ids":["conn-a","conn-b"],"task_fingerprint":"index-task","path_memory_id":"pm-701"}
+          },
+          {
+            "trace_id":701,
+            "span_id":2,
+            "session_id":7701,
+            "ts":20,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"701-2",
+            "status":0,
+            "duration_ns":20,
+            "input_tokens":20,
+            "output_tokens":10,
+            "cost_usd_nanos":2000,
+            "attrs":{"project_id":"index-perf","task_fingerprint":"index-task"}
+          },
+          {
+            "trace_id":702,
+            "span_id":1,
+            "session_id":7702,
+            "ts":30,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"702-1",
+            "status":0,
+            "duration_ns":10,
+            "attrs":{"project_id":"other-project","connection_ids":["conn-z"],"task_fingerprint":"index-task"}
+          }
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch1, Some(16));
+        assert_eq!(status, 200, "{body}");
+        coord.flush_memtable();
+
+        let batch2 = r#"[
+          {
+            "trace_id":703,
+            "span_id":1,
+            "session_id":7703,
+            "ts":40,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"703-1",
+            "status":0,
+            "duration_ns":10,
+            "input_tokens":30,
+            "output_tokens":15,
+            "cost_usd_nanos":3000,
+            "attrs":{"project_id":"index-perf","connection_ids":["conn-a"],"task_fingerprint":"index-task","path_memory_id":"pm-703"}
+          }
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch2, Some(16));
+        assert_eq!(status, 200, "{body}");
+        coord.flush_memtable();
+
+        let sidecar_dir = dir.join("attr_postings");
+        let sidecar_files = std::fs::read_dir(&sidecar_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("attrs"))
+            .count();
+        assert!(
+            sidecar_files >= 2,
+            "two flushes should create segment-local attrs sidecars"
+        );
+    }
+
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord.clone());
+        let before = coord.metrics();
+        assert!(
+            metric_value(&before, "yt_attr_sidecar_segments") >= 2,
+            "{before}"
+        );
+        assert_eq!(
+            metric_value(&before, "yt_attr_sidecar_cache_entries"),
+            0,
+            "recover should rebuild only the sidecar directory, not prewarm posting lists"
+        );
+        assert_eq!(
+            metric_value(&before, "yt_attr_sidecar_cache_loads"),
+            0,
+            "no sidecar posting list should be loaded before the first query"
+        );
+
+        let indexed_query =
+            r#"{"filter":{"projectId":"index-perf","connectionIds":"conn-a"},"limit":10}"#;
+        let (status, indexed) =
+            api.route_with_tenant("POST", "/v1/trace-search", indexed_query, Some(16));
+        assert_eq!(status, 200, "{indexed}");
+        assert_json_contains(&indexed, r#""total":2"#);
+        assert_json_contains(&indexed, r#""traceId":"701""#);
+        assert_json_contains(&indexed, r#""traceId":"703""#);
+        assert_json_contains(&indexed, r#""index":"attrs_postings+folded_verify""#);
+
+        let after_first = coord.metrics();
+        assert!(
+            metric_value(&after_first, "yt_attr_sidecar_cache_loads") > 0,
+            "{after_first}"
+        );
+        assert!(
+            metric_value(&after_first, "yt_attr_sidecar_cache_misses") > 0,
+            "{after_first}"
+        );
+        assert!(
+            metric_value(&after_first, "yt_attr_sidecar_cache_entries") > 0,
+            "{after_first}"
+        );
+
+        let first_hits = metric_value(&after_first, "yt_attr_sidecar_cache_hits");
+        let (status, indexed_again) =
+            api.route_with_tenant("POST", "/v1/trace-search", indexed_query, Some(16));
+        assert_eq!(status, 200, "{indexed_again}");
+        assert_json_contains(&indexed_again, r#""total":2"#);
+        let after_second = coord.metrics();
+        assert!(
+            metric_value(&after_second, "yt_attr_sidecar_cache_hits") > first_hits,
+            "repeat indexed query should hit the sidecar cache\nbefore:\n{after_first}\nafter:\n{after_second}"
+        );
+
+        let (status, trace_list) =
+            api.route_with_tenant("GET", "/v1/traces?connectionIds=conn-a", "", Some(16));
+        assert_eq!(status, 200, "{trace_list}");
+        assert_json_contains(&trace_list, r#""trace_id":701"#);
+        assert_json_contains(&trace_list, r#""span_count":2"#);
+        assert_json_contains(&trace_list, r#""total_cost_usd_nanos":3000"#);
+
+        let (status, sessions) =
+            api.route_with_tenant("GET", "/v1/sessions?connectionIds=conn-a", "", Some(16));
+        assert_eq!(status, 200, "{sessions}");
+        assert_json_contains(&sessions, r#""sessionId":"7701""#);
+        assert_json_contains(&sessions, r#""sessionId":"7703""#);
+        assert_json_contains(&sessions, r#""total":2"#);
+
+        let loads_before_unindexed = metric_value(&coord.metrics(), "yt_attr_sidecar_cache_loads");
+        let (status, slow_path) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"pathMemoryId":"pm-703"}}"#,
+            Some(16),
+        );
+        assert_eq!(status, 200, "{slow_path}");
+        assert_json_contains(&slow_path, r#""total":1"#);
+        assert_json_contains(&slow_path, r#""traceId":"703""#);
+        let loads_after_unindexed = metric_value(&coord.metrics(), "yt_attr_sidecar_cache_loads");
+        assert_eq!(
+            loads_after_unindexed, loads_before_unindexed,
+            "path_memory_id is intentionally not a sidecar-postings key; query should not load new sidecar lists"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 这两天新增的 cost 查询不能只覆盖显式 cost。
+/// eval 场景里常见三种混用：上游直接报 cost、按 provider/model 估算、未知模型走默认估算。
+#[test]
+fn eval_trace_search_filters_explicit_model_and_default_cost_sources() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord.clone());
+    let batch = r#"[
+      {
+        "trace_id":301,
+        "span_id":1,
+        "ts":10,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"301-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"explicit-cost",
+        "input_tokens":20,
+        "output_tokens":10,
+        "total_tokens":30,
+        "cost_usd_nanos":5000,
+        "output_text":"显式 cost 通过",
+        "attrs":{"project_id":"eval-cost","task_fingerprint":"cost-long-tail","validation_status":"pass","path_memory_id":"pm-explicit"}
+      },
+      {
+        "trace_id":302,
+        "span_id":1,
+        "ts":20,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"302-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"model-priced",
+        "provider":"openai",
+        "model":"gpt-4o-mini",
+        "input_tokens":10,
+        "cached_input_tokens":10,
+        "output_tokens":10,
+        "output_text":"模型估算 cost 通过",
+        "attrs":{"project_id":"eval-cost","task_fingerprint":"cost-long-tail","validation_status":"pass","path_memory_id":"pm-model"}
+      },
+      {
+        "trace_id":303,
+        "span_id":1,
+        "ts":30,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"303-1",
+        "status":1,
+        "duration_ns":10,
+        "tool_name":"default-priced",
+        "provider":"unknown",
+        "model":"unknown-model",
+        "input_tokens":10,
+        "output_tokens":10,
+        "output_text":"默认估算失败，无法完成",
+        "attrs":{"project_id":"eval-cost","task_fingerprint":"cost-long-tail","validation_status":"fail","path_memory_id":"pm-default"}
+      }
+    ]"#;
+    let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(9));
+    assert_eq!(status, 200, "{body}");
+
+    let scorer = KeywordScorer::new(&["无法"]);
+    let scored = coord.eval_and_writeback(&scorer, &TraceQuery::all());
+    assert_eq!(scored.len(), 3, "三条 eval span 都应被打分");
+    assert!(scored
+        .iter()
+        .any(|s| s.trace_id == 303 && s.outcome.score == 0));
+
+    let (status, explicit) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"eval-cost","minCostUsdNanos":4000,"maxCostUsdNanos":6000}}"#,
+        Some(9),
+    );
+    assert_eq!(status, 200, "{explicit}");
+    assert_json_contains(&explicit, r#""total":1"#);
+    assert_json_contains(&explicit, r#""traceId":"301""#);
+    assert_json_contains(&explicit, r#""costUsdNanos":5000"#);
+    assert_json_contains(&explicit, r#""source":"explicit""#);
+    assert_json_contains(&explicit, r#""index":"attrs_postings+folded_verify""#);
+
+    let (status, model_priced) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"eval-cost","minCostUsd":0.000008,"maxCostUsd":0.000009,"minTokens":30,"maxTokens":30}}"#,
+        Some(9),
+    );
+    assert_eq!(status, 200, "{model_priced}");
+    assert_json_contains(&model_priced, r#""total":1"#);
+    assert_json_contains(&model_priced, r#""traceId":"302""#);
+    assert_json_contains(&model_priced, r#""costUsdNanos":8250"#);
+    assert_json_contains(&model_priced, r#""source":"estimated_model_price""#);
+
+    let (status, default_priced) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"eval-cost","minCostUsdNanos":47000,"maxCostUsdNanos":49000}}"#,
+        Some(9),
+    );
+    assert_eq!(status, 200, "{default_priced}");
+    assert_json_contains(&default_priced, r#""total":1"#);
+    assert_json_contains(&default_priced, r#""traceId":"303""#);
+    assert_json_contains(&default_priced, r#""costUsdNanos":48000"#);
+    assert_json_contains(&default_priced, r#""source":"estimated_default""#);
+
+    let (status, path_memory) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"pathMemoryId":"pm-default"}}"#,
+        Some(9),
+    );
+    assert_eq!(status, 200, "{path_memory}");
+    assert_json_contains(&path_memory, r#""total":1"#);
+    assert_json_contains(&path_memory, r#""traceId":"303""#);
+}
+
+/// 顶层 evalProfile 是 Golden Path 治理元数据，不应污染 attrs scope。
+/// 否则后续 health 会额外带上 attrs.eval_profile 过滤，导致同 scope trace 全部被筛掉。
+#[test]
+fn golden_path_eval_profile_governance_does_not_pollute_scope_filter() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord);
+    let batch = r#"[
+      {
+        "trace_id":401,
+        "span_id":1,
+        "ts":10,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"401-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "attrs":{"project_id":"eval-governance","task_fingerprint":"governance-scope","skill":"review","mode":"auto","harness_version":"h1","schema_fingerprint":"s1","phase":"plan"}
+      },
+      {
+        "trace_id":402,
+        "span_id":1,
+        "ts":20,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"402-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "attrs":{"project_id":"eval-governance","task_fingerprint":"governance-scope","skill":"review","mode":"auto","harness_version":"h1","schema_fingerprint":"s1","phase":"plan"}
+      },
+      {
+        "trace_id":403,
+        "span_id":1,
+        "ts":30,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"403-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "attrs":{"project_id":"eval-governance","task_fingerprint":"governance-scope","skill":"review","mode":"auto","harness_version":"h1","schema_fingerprint":"s1","phase":"plan"}
+      },
+      {
+        "trace_id":403,
+        "span_id":2,
+        "ts":31,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"403-2",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"validator",
+        "attrs":{"project_id":"eval-governance","task_fingerprint":"governance-scope","skill":"review","mode":"auto","harness_version":"h1","schema_fingerprint":"s1","phase":"verify","validator":"npm test"}
+      },
+      {
+        "trace_id":404,
+        "span_id":1,
+        "ts":40,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"404-1",
+        "status":1,
+        "duration_ns":10,
+        "tool_name":"fallback",
+        "attrs":{"project_id":"eval-governance","task_fingerprint":"governance-scope","skill":"review","mode":"auto","harness_version":"h1","schema_fingerprint":"s1","phase":"fallback"}
+      }
+    ]"#;
+    let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(10));
+    assert_eq!(status, 200, "{body}");
+
+    let create = r#"{
+      "sourceTraceId":401,
+      "taskFingerprint":"governance-scope",
+      "score":980,
+      "evalProfile":"release-gate",
+      "minSampleCount":4,
+      "marginScore":900,
+      "projectId":"eval-governance"
+    }"#;
+    let (status, golden) = api.route_with_tenant("POST", "/v1/golden-paths", create, Some(10));
+    assert_eq!(status, 200, "{golden}");
+    assert_json_contains(&golden, r#""evalProfile":"release-gate""#);
+    assert_json_contains(&golden, r#""project_id":"eval-governance""#);
+    assert_json_contains(
+        &golden,
+        r#""attrs":{"harness_version":"h1","mode":"auto","project_id":"eval-governance","schema_fingerprint":"s1","skill":"review","task_fingerprint":"governance-scope"}"#,
+    );
+
+    let (status, listed) = api.route_with_tenant(
+        "GET",
+        "/v1/golden-paths?taskFingerprint=governance-scope&evalProfile=release-gate",
+        "",
+        Some(10),
+    );
+    assert_eq!(status, 200, "{listed}");
+    assert_json_contains(&listed, r#""count":1"#);
+
+    let (status, health) = api.route_with_tenant(
+        "POST",
+        "/v1/golden-path-health",
+        r#"{"goldenPathId":1,"filter":{"projectId":"eval-governance"},"limit":10,"examples":10}"#,
+        Some(10),
+    );
+    assert_eq!(status, 200, "{health}");
+    assert_json_contains(&health, r#""matchingTraceTotal":3"#);
+    assert_json_contains(&health, r#""analyzedTraceTotal":3"#);
+    assert_json_contains(&health, r#""followed":1"#);
+    assert_json_contains(&health, r#""extended":1"#);
+    assert_json_contains(&health, r#""deviated":1"#);
+    assert_json_contains(&health, r#""usable":0.666667"#);
+    assert_json_contains(&health, r#""stale":true"#);
+    assert_json_contains(&health, r#""insufficient_samples""#);
+    assert_json_contains(&health, r#""health_below_margin""#);
+}
+
+/// Golden Path 只保存 source trace 的引用和轻量 trajectory。
+/// retention 可以清掉 source trace payload，但底座仍应能用保存的 trajectory 做 adherence/health。
+#[test]
+fn golden_path_adherence_survives_source_trace_retention_cleanup() {
+    let dir = durable_dir("golden_path_retention");
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord.clone());
+        let batch = r#"[
+          {
+            "trace_id":501,
+            "span_id":1,
+            "ts":10,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"501-1",
+            "status":0,
+            "duration_ns":10,
+            "tool_name":"planner",
+            "attrs":{"project_id":"retained-source","task_fingerprint":"retention-golden","phase":"plan"}
+          },
+          {
+            "trace_id":502,
+            "span_id":1,
+            "ts":2000,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"502-1",
+            "status":0,
+            "duration_ns":10,
+            "tool_name":"planner",
+            "attrs":{"project_id":"retained-source","task_fingerprint":"retention-golden","phase":"plan"}
+          }
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(11));
+        assert_eq!(status, 200, "{body}");
+        coord.flush_memtable();
+
+        let (status, golden) = api.route_with_tenant(
+            "POST",
+            "/v1/golden-paths",
+            r#"{"sourceTraceId":501,"taskFingerprint":"retention-golden","score":1000,"projectId":"retained-source","status":"confirmed"}"#,
+            Some(11),
+        );
+        assert_eq!(status, 200, "{golden}");
+        assert_json_contains(&golden, r#""source_trajectory_step_count":1"#);
+
+        let apply = r#"{
+          "filter":{"projectId":"retained-source"},
+          "deleteBeforeTs":100,
+          "protect":{"goldenPaths":false,"annotations":false,"datasetAssociations":false,"snapshots":false,"evalLinks":false,"pathMemory":false},
+          "requestedBy":"eval-retention-test"
+        }"#;
+        let (status, applied) =
+            api.route_with_tenant("POST", "/v1/retention/apply", apply, Some(11));
+        assert_eq!(status, 200, "{applied}");
+        assert_json_contains(&applied, r#""deletedTraceIds":["501"]"#);
+
+        let (status, search) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"projectId":"retained-source"}}"#,
+            Some(11),
+        );
+        assert_eq!(status, 200, "{search}");
+        assert_json_contains(&search, r#""total":1"#);
+        assert!(!search.contains(r#""traceId":"501""#), "{search}");
+        assert_json_contains(&search, r#""traceId":"502""#);
+
+        let (status, adherence) = api.route_with_tenant(
+            "POST",
+            "/v1/path-adherence",
+            r#"{"goldenPathId":1,"traceId":502}"#,
+            Some(11),
+        );
+        assert_eq!(status, 200, "{adherence}");
+        assert_json_contains(&adherence, r#""adherence":"followed""#);
+        assert_json_contains(&adherence, r#""sourceAvailable":false"#);
+        assert_json_contains(&adherence, r#""sourceRetained":true"#);
+        assert_json_contains(&adherence, r#""sameSignature":true"#);
+        assert_json_contains(&adherence, r#""storedSignatureMatchesSource":true"#);
+
+        let (status, evidence) = api.route_with_tenant(
+            "POST",
+            "/v1/golden-path-evidence",
+            r#"{"goldenPathId":1,"candidateTraceId":502}"#,
+            Some(11),
+        );
+        assert_eq!(status, 200, "{evidence}");
+        assert_json_contains(&evidence, r#""source":{"available":false"#);
+        assert_json_contains(&evidence, r#""pathAdherence":{"goldenPath""#);
+        assert_json_contains(&evidence, r#""traceDiff":null"#);
+
+        let (status, health) = api.route_with_tenant(
+            "POST",
+            "/v1/golden-path-health",
+            r#"{"goldenPathId":1,"filter":{"projectId":"retained-source"},"limit":10}"#,
+            Some(11),
+        );
+        assert_eq!(status, 200, "{health}");
+        assert_json_contains(&health, r#""sourceAvailable":false"#);
+        assert_json_contains(&health, r#""sourceRetained":true"#);
+        assert_json_contains(&health, r#""matchingTraceTotal":1"#);
+        assert_json_contains(&health, r#""followed":1"#);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// span detail 应直接返回 LOG events；eval 写回之后也不能要求业务把日志镜像进 attrs。
+#[test]
+fn span_detail_log_events_round_trip_after_eval_writeback() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord.clone());
+    let batch = r#"[
+      {
+        "trace_id":601,
+        "span_id":1,
+        "ts":10,
+        "seq":1,
+        "event_type":1,
+        "ext_span_id":"601-1",
+        "input_text":"检查打包失败",
+        "attrs":{"project_id":"log-events","task_fingerprint":"log-round-trip"}
+      },
+      {
+        "trace_id":601,
+        "span_id":1,
+        "ts":11,
+        "seq":2,
+        "event_type":4,
+        "ext_span_id":"601-1",
+        "logs":["open repo","read package.json","发现 native binding 缺失"],
+        "attrs":{"call_site":"pack.js:42","attempt":2,"nested":{"ok":true}}
+      },
+      {
+        "trace_id":601,
+        "span_id":1,
+        "ts":12,
+        "seq":3,
+        "event_type":2,
+        "ext_span_id":"601-1",
+        "status":1,
+        "duration_ns":2000,
+        "output_text":"无法加载 darwin-arm64 node binding"
+      }
+    ]"#;
+    let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(12));
+    assert_eq!(status, 200, "{body}");
+
+    let scorer = KeywordScorer::new(&["无法"]);
+    let scored = coord.eval_and_writeback(&scorer, &TraceQuery::all());
+    assert_eq!(scored.len(), 1);
+    assert_eq!(scored[0].outcome.score, 0);
+
+    let (status, detail) = api.route_with_tenant("GET", "/v1/traces/601/spans/1", "", Some(12));
+    assert_eq!(status, 200, "{detail}");
+    assert_json_contains(&detail, r#""logEvents":[{"#);
+    assert_json_contains(&detail, r#""eventOrdinal":0"#);
+    assert_json_contains(&detail, r#""eventType":4"#);
+    assert_json_contains(
+        &detail,
+        r#""messages":["open repo","read package.json","发现 native binding 缺失"]"#,
+    );
+    assert_json_contains(&detail, r#""call_site":"pack.js:42""#);
+    assert_json_contains(&detail, r#""attempt":2"#);
+    assert_json_contains(&detail, r#""nested":{"ok":true}"#);
+}
+
+/// 后验 annotation / dataset association 是 eval 和 golden path 的证据层。
+/// 它们要能反向过滤 trace/session，并在 retention 中保护仍有效的证据引用。
+#[test]
+fn eval_metadata_lifecycle_reverse_filters_and_retention_guards() {
+    let dir = durable_dir("metadata_eval");
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord.clone());
+        let batch = r#"[
+          {
+            "trace_id":"meta-run-1",
+            "span_id":"meta-span-1",
+            "session_id":"meta-session",
+            "ts":10,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"meta-span-1",
+            "status":0,
+            "duration_ns":10,
+            "agent_name":"eval-agent",
+            "output_text":"验证通过，可以沉淀为回归样本",
+            "attrs":{"project_id":"metadata-eval","skill":"review","task_fingerprint":"metadata-task"}
+          },
+          {
+            "trace_id":"meta-run-2",
+            "span_id":"meta-span-2",
+            "session_id":"meta-session",
+            "ts":20,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"meta-span-2",
+            "status":1,
+            "duration_ns":10,
+            "agent_name":"eval-agent",
+            "output_text":"无法完成验证",
+            "attrs":{"project_id":"metadata-eval","skill":"review","task_fingerprint":"metadata-task"}
+          },
+          {
+            "trace_id":"meta-run-3",
+            "span_id":"meta-span-3",
+            "session_id":"meta-session",
+            "ts":300,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"meta-span-3",
+            "status":0,
+            "duration_ns":10,
+            "agent_name":"eval-agent",
+            "output_text":"新 trace 不应被旧 TTL 清理",
+            "attrs":{"project_id":"metadata-eval","skill":"review","task_fingerprint":"metadata-task"}
+          }
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(13));
+        assert_eq!(status, 200, "{body}");
+
+        let scorer = KeywordScorer::new(&["无法"]);
+        let scored = coord.eval_and_writeback(&scorer, &TraceQuery::all());
+        assert!(scored.iter().any(|s| s.trace_id != 0 && s.outcome.score == 0));
+        coord.flush_memtable();
+
+        let (status, annotation) = api.route_with_tenant(
+            "POST",
+            "/v1/annotations",
+            r#"{"traceId":"meta-run-1","spanId":"meta-span-1","target":"span","label":"best_path","score":950,"source":"human","projectId":"metadata-eval","skill":"review"}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{annotation}");
+        assert_json_contains(&annotation, r#""annotationId":"1""#);
+        assert_json_contains(&annotation, r#""externalTraceId":"meta-run-1""#);
+
+        let (status, dataset) = api.route_with_tenant(
+            "POST",
+            "/v1/dataset-associations",
+            r#"{"datasetId":"eval-regression","itemId":"case-1","traceId":"meta-run-1","spanId":"meta-span-1","snapshotId":"snap-1","snapshotHash":"fnv1a64:meta","evalRunId":"eval-1","label":"pass","score":940,"projectId":"metadata-eval"}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{dataset}");
+        assert_json_contains(&dataset, r#""datasetId":"eval-regression""#);
+
+        let (status, bad_annotation) = api.route_with_tenant(
+            "POST",
+            "/v1/annotations",
+            r#"{"traceId":"meta-run-2","spanId":"meta-span-2","target":"span","label":"bad_answer","score":100,"source":"eval","projectId":"metadata-eval"}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{bad_annotation}");
+        assert_json_contains(&bad_annotation, r#""annotationId":"2""#);
+
+        let (status, deleted) = api.route_with_tenant(
+            "DELETE",
+            "/v1/annotations/2",
+            r#"{"reviewer":"four","reason":"superseded by fixed run"}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{deleted}");
+        assert_json_contains(&deleted, r#""status":"deleted""#);
+
+        let (status, hidden_annotation) = api.route_with_tenant(
+            "GET",
+            "/v1/annotations?traceId=meta-run-2&label=bad_answer",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{hidden_annotation}");
+        assert_json_contains(&hidden_annotation, r#""count":0"#);
+
+        let (status, deleted_annotation) = api.route_with_tenant(
+            "GET",
+            "/v1/annotations?traceId=meta-run-2&label=bad_answer&status=deleted",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{deleted_annotation}");
+        assert_json_contains(&deleted_annotation, r#""count":1"#);
+        assert_json_contains(&deleted_annotation, r#""reviewer":"four""#);
+
+        let (status, by_annotation) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"annotation":{"label":"best_path","source":"human","scoreMin":900}}}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{by_annotation}");
+        assert_json_contains(&by_annotation, r#""total":1"#);
+        assert_json_contains(&by_annotation, r#""externalSpanId":"meta-span-1""#);
+        assert_json_contains(&by_annotation, r#""index":"metadata_filter+folded_scan""#);
+
+        let (status, by_deleted_annotation) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"annotation":{"label":"bad_answer"}}}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{by_deleted_annotation}");
+        assert_json_contains(&by_deleted_annotation, r#""total":0"#);
+
+        let (status, by_dataset) = api.route_with_tenant(
+            "GET",
+            "/v1/sessions?datasetId=eval-regression&datasetLabel=pass",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{by_dataset}");
+        assert_json_contains(&by_dataset, r#""externalSessionId":"meta-session""#);
+
+        let (status, traces) = api.route_with_tenant(
+            "GET",
+            "/v1/traces?annotationLabel=best_path&annotationScoreMin=900",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{traces}");
+        assert_json_contains(&traces, r#""external_trace_id":"meta-run-1""#);
+
+        let retention_query =
+            r#"{"filter":{"projectId":"metadata-eval"},"deleteBeforeTs":100}"#;
+        let (status, plan) =
+            api.route_with_tenant("POST", "/v1/retention-plan", retention_query, Some(13));
+        assert_eq!(status, 200, "{plan}");
+        assert_json_contains(&plan, r#""candidates":{"traceCount":2"#);
+        assert_json_contains(&plan, r#""protected":{"traceCount":1"#);
+        assert_json_contains(&plan, r#""deletable":{"traceCount":1"#);
+        assert_json_contains(&plan, r#""annotation""#);
+        assert_json_contains(&plan, r#""datasetAssociation""#);
+
+        let apply = r#"{"filter":{"projectId":"metadata-eval"},"deleteBeforeTs":100,"compact":true,"requestedBy":"eval-metadata-retention","reason":"ttl cleanup"}"#;
+        let (status, applied) =
+            api.route_with_tenant("POST", "/v1/retention/apply", apply, Some(13));
+        assert_eq!(status, 200, "{applied}");
+        assert_json_contains(&applied, r#""deletedTraceCount":1"#);
+        assert_json_contains(&applied, r#""source":"eval-metadata-retention""#);
+
+        let (status, after) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"projectId":"metadata-eval"}}"#,
+            Some(13),
+        );
+        assert_eq!(status, 200, "{after}");
+        assert_json_contains(&after, r#""total":2"#);
+        assert_json_contains(&after, r#""externalTraceId":"meta-run-1""#);
+        assert_json_contains(&after, r#""externalTraceId":"meta-run-3""#);
+        assert!(!after.contains(r#""externalTraceId":"meta-run-2""#), "{after}");
+    }
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord);
+        let (status, audits) = api.route_with_tenant(
+            "GET",
+            "/v1/retention-audits?source=eval-metadata-retention",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{audits}");
+        assert_json_contains(&audits, r#""total":1"#);
+        assert_json_contains(&audits, r#""deletedTraceCount":1"#);
+
+        let (status, dataset) = api.route_with_tenant(
+            "GET",
+            "/v1/dataset-associations?datasetId=eval-regression&itemId=case-1",
+            "",
+            Some(13),
+        );
+        assert_eq!(status, 200, "{dataset}");
+        assert_json_contains(&dataset, r#""count":1"#);
+        assert_json_contains(&dataset, r#""snapshotHash":"fnv1a64:meta""#);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// loop/task/trajectory 三组 read model 都应该复用同一套高频字段、metadata 和 attrs 过滤语义。
+#[test]
+fn eval_loop_task_and_trajectory_read_models_share_filters_and_scores() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord.clone());
+    let batch = r#"[
+      {
+        "trace_id":801,
+        "span_id":1,
+        "ts":10,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"801-1",
+        "session_id":8801,
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "input_tokens":10,
+        "output_tokens":5,
+        "total_tokens":15,
+        "cost_usd_nanos":1000,
+        "output_text":"规划完成",
+        "attrs":{"project_id":"loop-eval","skill":"packaging","mode":"auto","task_fingerprint":"native-pack","loop_id":"loop-native","harness_version":"h2","validation_status":"pass","phase":"plan"}
+      },
+      {
+        "trace_id":801,
+        "span_id":2,
+        "ts":20,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"801-2",
+        "session_id":8801,
+        "status":0,
+        "duration_ns":20,
+        "tool_name":"tester",
+        "input_tokens":20,
+        "output_tokens":10,
+        "total_tokens":30,
+        "cost_usd_nanos":2000,
+        "output_text":"npm test passed",
+        "attrs":{"project_id":"loop-eval","skill":"packaging","mode":"auto","task_fingerprint":"native-pack","loop_id":"loop-native","harness_version":"h2","validation_status":"pass","phase":"verify","validator":"npm test"}
+      },
+      {
+        "trace_id":802,
+        "span_id":1,
+        "ts":30,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"802-1",
+        "session_id":8802,
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "input_tokens":15,
+        "output_tokens":5,
+        "total_tokens":20,
+        "cost_usd_nanos":1500,
+        "output_text":"规划完成",
+        "attrs":{"project_id":"loop-eval","skill":"packaging","mode":"auto","task_fingerprint":"native-pack","loop_id":"loop-native","harness_version":"h2","validation_status":"fail","phase":"plan"}
+      },
+      {
+        "trace_id":802,
+        "span_id":2,
+        "ts":40,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"802-2",
+        "session_id":8802,
+        "status":1,
+        "duration_ns":30,
+        "tool_name":"fallback",
+        "input_tokens":30,
+        "output_tokens":10,
+        "total_tokens":40,
+        "cost_usd_nanos":3000,
+        "output_text":"无法找到 native binding",
+        "attrs":{"project_id":"loop-eval","skill":"packaging","mode":"auto","task_fingerprint":"native-pack","loop_id":"loop-native","harness_version":"h2","validation_status":"fail","stop_reason":"error","phase":"fallback"}
+      },
+      {
+        "trace_id":803,
+        "span_id":1,
+        "ts":50,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"803-1",
+        "session_id":8803,
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "attrs":{"project_id":"loop-eval","skill":"review","mode":"manual","task_fingerprint":"other-task","loop_id":"loop-other","validation_status":"pass","phase":"plan"}
+      }
+    ]"#;
+    let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(14));
+    assert_eq!(status, 200, "{body}");
+
+    let scorer = KeywordScorer::new(&["无法"]);
+    let scored = coord.eval_and_writeback(&scorer, &TraceQuery::all());
+    assert!(scored.iter().any(|s| s.trace_id == 802 && s.outcome.score == 0));
+
+    let (status, annotation) = api.route_with_tenant(
+        "POST",
+        "/v1/annotations",
+        r#"{"traceId":801,"label":"best_path","score":960,"source":"human","projectId":"loop-eval"}"#,
+        Some(14),
+    );
+    assert_eq!(status, 200, "{annotation}");
+    let (status, dataset) = api.route_with_tenant(
+        "POST",
+        "/v1/dataset-associations",
+        r#"{"datasetId":"loop-regression","itemId":"native-pack-pass","traceId":801,"label":"pass","score":940,"projectId":"loop-eval"}"#,
+        Some(14),
+    );
+    assert_eq!(status, 200, "{dataset}");
+
+    let (status, loops) = api.route_with_tenant(
+        "GET",
+        "/v1/loops?taskFingerprint=native-pack&projectId=loop-eval",
+        "",
+        Some(14),
+    );
+    assert_eq!(status, 200, "{loops}");
+    assert_json_contains(&loops, r#""total":1"#);
+    assert_json_contains(&loops, r#""loopId":"loop-native""#);
+    assert_json_contains(&loops, r#""traceCount":2"#);
+    assert_json_contains(&loops, r#""errorCount":1"#);
+    assert_json_contains(&loops, r#""phases":["fallback","plan","verify"]"#);
+
+    let (status, loop_detail) =
+        api.route_with_tenant("GET", "/v1/loops/loop-native", "", Some(14));
+    assert_eq!(status, 200, "{loop_detail}");
+    assert_json_contains(&loop_detail, r#""summary":{"loopId":"loop-native""#);
+    assert_json_contains(&loop_detail, r#""traceId":"801""#);
+    assert_json_contains(&loop_detail, r#""traceId":"802""#);
+
+    let (status, task_traces) = api.route_with_tenant(
+        "GET",
+        "/v1/tasks/native-pack/traces?validationStatus=pass&projectId=loop-eval",
+        "",
+        Some(14),
+    );
+    assert_eq!(status, 200, "{task_traces}");
+    assert_json_contains(&task_traces, r#""total":1"#);
+    assert_json_contains(&task_traces, r#""traceId":"801""#);
+    assert!(!task_traces.contains(r#""traceId":"802""#), "{task_traces}");
+
+    let (status, trajectories) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-trajectories",
+        r#"{"filter":{"taskFingerprint":"native-pack","projectId":"loop-eval"},"limit":10}"#,
+        Some(14),
+    );
+    assert_eq!(status, 200, "{trajectories}");
+    assert_json_contains(&trajectories, r#""total":2"#);
+    assert_json_contains(&trajectories, r#""spanTotal":4"#);
+    assert_json_contains(&trajectories, r#""index":"materialized""#);
+    assert_json_contains(&trajectories, r#""trajectory":{"signature":"fnv1a64:"#);
+
+    let (status, groups) = api.route_with_tenant(
+        "POST",
+        "/v1/trajectory-groups",
+        r#"{"filter":{"taskFingerprint":"native-pack","projectId":"loop-eval"},"sort":"best","limit":10}"#,
+        Some(14),
+    );
+    assert_eq!(status, 200, "{groups}");
+    assert_json_contains(&groups, r#""total":2"#);
+    assert_json_contains(&groups, r#""traceTotal":2"#);
+    assert_json_contains(&groups, r#""spanTotal":4"#);
+    assert_json_contains(&groups, r#""index":"attrs_postings+folded_verify""#);
+    assert_json_contains(&groups, r#""trajectoryIndex":"materialized_cache""#);
+    assert_json_contains(&groups, r#""annotation":{"count":1,"avg":960"#);
+    assert_json_contains(&groups, r#""dataset":{"count":1,"avg":940"#);
+}
+
+/// Golden Path 需要覆盖完整候选资产生命周期：确认、challenger、evidence、export 和 health。
+#[test]
+fn eval_golden_path_full_lifecycle_exports_evidence_and_challenger_health() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord);
+    let batch = r#"[
+      {
+        "trace_id":901,
+        "span_id":1,
+        "ts":10,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"901-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"plan"}
+      },
+      {
+        "trace_id":901,
+        "span_id":2,
+        "ts":20,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"901-2",
+        "status":0,
+        "duration_ns":20,
+        "tool_name":"tester",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"verify","validator":"npm test"}
+      },
+      {
+        "trace_id":902,
+        "span_id":1,
+        "ts":30,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"902-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"plan"}
+      },
+      {
+        "trace_id":902,
+        "span_id":2,
+        "ts":40,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"902-2",
+        "status":0,
+        "duration_ns":20,
+        "tool_name":"tester",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"verify","validator":"npm test"}
+      },
+      {
+        "trace_id":903,
+        "span_id":1,
+        "ts":50,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"903-1",
+        "status":0,
+        "duration_ns":10,
+        "tool_name":"planner",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"plan"}
+      },
+      {
+        "trace_id":903,
+        "span_id":2,
+        "ts":60,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"903-2",
+        "status":0,
+        "duration_ns":20,
+        "tool_name":"tester",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"verify","validator":"npm test"}
+      },
+      {
+        "trace_id":903,
+        "span_id":3,
+        "ts":70,
+        "seq":1,
+        "event_type":2,
+        "ext_span_id":"903-3",
+        "status":0,
+        "duration_ns":15,
+        "tool_name":"exporter",
+        "model":"qwen",
+        "provider":"openai",
+        "attrs":{"project_id":"golden-eval","skill":"review","mode":"auto","task_fingerprint":"golden-task","harness_version":"h3","schema_fingerprint":"s3","phase":"export"}
+      }
+    ]"#;
+    let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(15));
+    assert_eq!(status, 200, "{body}");
+
+    let (status, annotation) = api.route_with_tenant(
+        "POST",
+        "/v1/annotations",
+        r#"{"traceId":901,"label":"golden_source","score":980,"source":"human","projectId":"golden-eval"}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{annotation}");
+    let (status, dataset) = api.route_with_tenant(
+        "POST",
+        "/v1/dataset-associations",
+        r#"{"datasetId":"golden-regression","itemId":"golden-case","traceId":901,"label":"pass","score":970,"projectId":"golden-eval"}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{dataset}");
+
+    let create = r#"{
+      "sourceTraceId":901,
+      "taskFingerprint":"golden-task",
+      "score":980,
+      "label":"stable path",
+      "source":"eval_harness",
+      "evalProfile":"release-gate",
+      "minSampleCount":2,
+      "marginScore":900,
+      "comparisonWindowNs":1000,
+      "projectId":"golden-eval"
+    }"#;
+    let (status, golden) = api.route_with_tenant("POST", "/v1/golden-paths", create, Some(15));
+    assert_eq!(status, 200, "{golden}");
+    assert_json_contains(&golden, r#""goldenPathId":"1""#);
+    assert_json_contains(&golden, r#""sourceTrajectory":{"signature":"fnv1a64:"#);
+    assert_json_contains(&golden, r#""source_trajectory_step_count":2"#);
+
+    let (status, confirmed) = api.route_with_tenant(
+        "POST",
+        "/v1/golden-paths/1/status",
+        r#"{"status":"confirmed","reason":"accepted by eval","source":"eval_harness"}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{confirmed}");
+    assert_json_contains(&confirmed, r#""status":"confirmed""#);
+
+    let challenger = r#"{
+      "sourceTraceId":903,
+      "taskFingerprint":"golden-task",
+      "score":960,
+      "label":"extended challenger",
+      "challengerOf":1,
+      "evalProfile":"release-gate",
+      "projectId":"golden-eval"
+    }"#;
+    let (status, challenger_body) =
+        api.route_with_tenant("POST", "/v1/golden-paths", challenger, Some(15));
+    assert_eq!(status, 200, "{challenger_body}");
+    assert_json_contains(&challenger_body, r#""goldenPathId":"2""#);
+    assert_json_contains(&challenger_body, r#""challengerOf":"1""#);
+
+    let (status, challengers) = api.route_with_tenant(
+        "GET",
+        "/v1/golden-paths?challengerOf=1&evalProfile=release-gate",
+        "",
+        Some(15),
+    );
+    assert_eq!(status, 200, "{challengers}");
+    assert_json_contains(&challengers, r#""count":1"#);
+    assert_json_contains(&challengers, r#""goldenPathId":"2""#);
+
+    let (status, adherence) = api.route_with_tenant(
+        "POST",
+        "/v1/path-adherence",
+        r#"{"goldenPathId":1,"traceId":902}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{adherence}");
+    assert_json_contains(&adherence, r#""adherence":"followed""#);
+    assert_json_contains(&adherence, r#""sameSignature":true"#);
+
+    let (status, evidence) = api.route_with_tenant(
+        "POST",
+        "/v1/golden-path-evidence",
+        r#"{"goldenPathId":1,"candidateTraceId":903}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{evidence}");
+    assert_json_contains(&evidence, r#""source":{"available":true"#);
+    assert_json_contains(&evidence, r#""annotationCount":1"#);
+    assert_json_contains(&evidence, r#""datasetAssociationCount":1"#);
+    assert_json_contains(&evidence, r#""adherence":"extended""#);
+    assert_json_contains(&evidence, r#""traceDiff":{"left""#);
+
+    let (status, export_page) = api.route_with_tenant(
+        "POST",
+        "/v1/golden-path-export",
+        r#"{"filter":{"taskFingerprint":"golden-task","projectId":"golden-eval"},"limit":10}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{export_page}");
+    assert_json_contains(&export_page, r#""schemaVersion":"yitrace.golden_path_export.v1""#);
+    assert_json_contains(&export_page, r#""count":1"#);
+    assert_json_contains(&export_page, r#""recordType":"golden_path""#);
+    assert_json_contains(&export_page, r#""jsonl":"{\"schemaVersion\":\"yitrace.golden_path_export.v1\""#);
+
+    let (status, health) = api.route_with_tenant(
+        "POST",
+        "/v1/golden-path-health",
+        r#"{"goldenPathId":1,"filter":{"projectId":"golden-eval"},"limit":10,"examples":10}"#,
+        Some(15),
+    );
+    assert_eq!(status, 200, "{health}");
+    assert_json_contains(&health, r#""matchingTraceTotal":2"#);
+    assert_json_contains(&health, r#""followed":1"#);
+    assert_json_contains(&health, r#""extended":1"#);
+    assert_json_contains(&health, r#""usable":1.000000"#);
+    assert_json_contains(&health, r#""governance":{"evalProfile":"release-gate""#);
 }
 
 // ───────────────────────── 会话级（多轮）评测 ─────────────────────────
