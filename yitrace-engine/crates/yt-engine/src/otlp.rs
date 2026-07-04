@@ -416,11 +416,45 @@ fn agentic_attrs_from_otlp(attrs: &[Json]) -> BTreeMap<String, String> {
             ][..],
         ),
         (
+            "schema_fingerprint",
+            &[
+                "yitrace.schema_fingerprint",
+                "schema.fingerprint",
+                "schema_fingerprint",
+            ][..],
+        ),
+        (
+            "intent_signature",
+            &[
+                "yitrace.intent_signature",
+                "task.intent_signature",
+                "intent.signature",
+                "intent_signature",
+            ][..],
+        ),
+        (
             "validation_status",
             &[
                 "yitrace.validation_status",
                 "validation.status",
                 "validation_status",
+            ][..],
+        ),
+        (
+            "review_status",
+            &["yitrace.review_status", "review.status", "review_status"][..],
+        ),
+        (
+            "eval_status",
+            &["yitrace.eval_status", "eval.status", "eval_status"][..],
+        ),
+        (
+            "path_memory_id",
+            &[
+                "yitrace.path_memory_id",
+                "agent.path_memory_id",
+                "path_memory.id",
+                "path_memory_id",
             ][..],
         ),
         (

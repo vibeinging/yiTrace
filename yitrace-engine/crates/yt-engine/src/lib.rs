@@ -46,11 +46,11 @@ pub use segstore::FileSegmentStore;
 mod metadata;
 mod persist;
 pub use metadata::{
-    AnnotationTarget, DatasetAssociation, DatasetAssociationFilter, GoldenPathCandidate,
-    GoldenPathFilter, GoldenPathStatus, NewDatasetAssociation, NewGoldenPathCandidate,
-    NewRetentionAuditRecord, NewRetentionPolicy, NewTraceAnnotation, RetentionAuditFilter,
-    RetentionAuditRecord, RetentionPolicy, RetentionPolicyFilter, TraceAnnotation,
-    TraceAnnotationFilter,
+    AnnotationStatus, AnnotationTarget, DatasetAssociation, DatasetAssociationFilter,
+    GoldenPathCandidate, GoldenPathFilter, GoldenPathStatus, NewDatasetAssociation,
+    NewGoldenPathCandidate, NewRetentionAuditRecord, NewRetentionPolicy, NewTraceAnnotation,
+    RetentionAuditFilter, RetentionAuditRecord, RetentionPolicy, RetentionPolicyFilter,
+    TraceAnnotation, TraceAnnotationFilter, UpdateTraceAnnotation,
 };
 
 mod vecstore;
@@ -1777,6 +1777,13 @@ fn metadata_attrs_match(
 }
 
 fn annotation_matches(a: &TraceAnnotation, f: &TraceAnnotationFilter) -> bool {
+    if let Some(status) = f.status {
+        if a.status != status {
+            return false;
+        }
+    } else if !f.include_deleted && a.status == AnnotationStatus::Deleted {
+        return false;
+    }
     if let Some(tenant_id) = f.tenant_id {
         if a.tenant_id != Some(tenant_id) {
             return false;
@@ -1880,6 +1887,16 @@ fn golden_path_matches(g: &GoldenPathCandidate, f: &GoldenPathFilter) -> bool {
             return false;
         }
     }
+    if let Some(challenger_of) = f.challenger_of {
+        if g.challenger_of != Some(challenger_of) {
+            return false;
+        }
+    }
+    if let Some(eval_profile) = &f.eval_profile {
+        if g.eval_profile.as_deref() != Some(eval_profile.as_str()) {
+            return false;
+        }
+    }
     if let Some(status) = f.status {
         if g.status != status {
             return false;
@@ -1950,7 +1967,12 @@ fn first_class_attr_value<'a>(fields: &'a yt_core::fold::SpanFields, key: &str) 
         "task_fingerprint" => fields.task_fingerprint.as_deref(),
         "loop_id" => fields.loop_id.as_deref(),
         "harness_version" => fields.harness_version.as_deref(),
+        "schema_fingerprint" => fields.schema_fingerprint.as_deref(),
+        "intent_signature" => fields.intent_signature.as_deref(),
         "validation_status" => fields.validation_status.as_deref(),
+        "review_status" => fields.review_status.as_deref(),
+        "eval_status" => fields.eval_status.as_deref(),
+        "path_memory_id" => fields.path_memory_id.as_deref(),
         "stop_reason" => fields.stop_reason.as_deref(),
         "phase" => fields.phase.as_deref(),
         "validator" => fields.validator.as_deref(),
@@ -1969,7 +1991,12 @@ pub(crate) fn first_class_span_attr_value<'a>(s: &'a FoldedSpan, key: &str) -> O
         "task_fingerprint" => s.task_fingerprint.as_deref(),
         "loop_id" => s.loop_id.as_deref(),
         "harness_version" => s.harness_version.as_deref(),
+        "schema_fingerprint" => s.schema_fingerprint.as_deref(),
+        "intent_signature" => s.intent_signature.as_deref(),
         "validation_status" => s.validation_status.as_deref(),
+        "review_status" => s.review_status.as_deref(),
+        "eval_status" => s.eval_status.as_deref(),
+        "path_memory_id" => s.path_memory_id.as_deref(),
         "stop_reason" => s.stop_reason.as_deref(),
         "phase" => s.phase.as_deref(),
         "validator" => s.validator.as_deref(),
@@ -1988,7 +2015,12 @@ pub(crate) fn first_class_console_attr_value<'a>(s: &'a ConsoleSpan, key: &str) 
         "task_fingerprint" => s.task_fingerprint.as_deref(),
         "loop_id" => s.loop_id.as_deref(),
         "harness_version" => s.harness_version.as_deref(),
+        "schema_fingerprint" => s.schema_fingerprint.as_deref(),
+        "intent_signature" => s.intent_signature.as_deref(),
         "validation_status" => s.validation_status.as_deref(),
+        "review_status" => s.review_status.as_deref(),
+        "eval_status" => s.eval_status.as_deref(),
+        "path_memory_id" => s.path_memory_id.as_deref(),
         "stop_reason" => s.stop_reason.as_deref(),
         "phase" => s.phase.as_deref(),
         "validator" => s.validator.as_deref(),
@@ -2102,7 +2134,12 @@ fn first_class_agentic_attr_keys() -> &'static [&'static str] {
         "task_fingerprint",
         "loop_id",
         "harness_version",
+        "schema_fingerprint",
+        "intent_signature",
         "validation_status",
+        "review_status",
+        "eval_status",
+        "path_memory_id",
         "stop_reason",
         "phase",
         "validator",
@@ -2167,12 +2204,14 @@ fn summarize_trace_spans(spans: Vec<FoldedSpan>) -> Vec<TraceSummary> {
             s.reasoning_tokens.unwrap_or(0),
             s.total_tokens,
         );
-        e.total_cost_usd_nanos += usage_cost_usd_nanos(
+        e.total_cost_usd_nanos += usage_cost_usd_nanos_for_model(
             s.input_tokens.unwrap_or(0),
             s.output_tokens.unwrap_or(0),
             s.cached_input_tokens.unwrap_or(0),
             s.reasoning_tokens.unwrap_or(0),
             s.cost_usd_nanos,
+            s.provider.as_deref(),
+            s.model.as_deref(),
         );
     }
     by_trace.into_values().collect()
@@ -2226,12 +2265,14 @@ fn trace_trajectory_summary_from_spans(
             s.reasoning_tokens.unwrap_or(0),
             s.total_tokens,
         );
-        out.cost_usd_nanos += usage_cost_usd_nanos(
+        out.cost_usd_nanos += usage_cost_usd_nanos_for_model(
             s.input_tokens.unwrap_or(0),
             s.output_tokens.unwrap_or(0),
             s.cached_input_tokens.unwrap_or(0),
             s.reasoning_tokens.unwrap_or(0),
             s.cost_usd_nanos,
+            s.provider.as_deref(),
+            s.model.as_deref(),
         );
         for key in first_class_agentic_attr_keys() {
             if let Some(value) = first_class_span_attr_value(s, key) {
@@ -2244,12 +2285,7 @@ fn trace_trajectory_summary_from_spans(
                     .or_insert_with(|| value.to_string());
             }
         }
-        for key in [
-            "schema_fingerprint",
-            "eval_profile",
-            "tool_version",
-            "intent_signature",
-        ] {
+        for key in ["eval_profile", "tool_version"] {
             if let Some(value) = first_class_span_attr_value(s, key) {
                 out.fields
                     .entry(key.to_string())
@@ -2266,6 +2302,7 @@ fn trace_trajectory_summary_from_spans(
 
 pub const DEFAULT_INPUT_TOKEN_COST_USD_NANOS: u64 = 800;
 pub const DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS: u64 = 4_000;
+pub const DEFAULT_CACHED_INPUT_TOKEN_COST_USD_NANOS: u64 = 0;
 
 pub fn usage_total_tokens(
     input_tokens: u64,
@@ -2285,12 +2322,111 @@ pub fn usage_cost_usd_nanos(
     reasoning_tokens: u64,
     explicit_cost_usd_nanos: Option<u64>,
 ) -> u64 {
+    estimate_usage_cost_usd_nanos(
+        input_tokens,
+        output_tokens,
+        0,
+        reasoning_tokens,
+        explicit_cost_usd_nanos,
+        DEFAULT_INPUT_TOKEN_COST_USD_NANOS,
+        DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS,
+        DEFAULT_CACHED_INPUT_TOKEN_COST_USD_NANOS,
+    )
+}
+
+pub fn usage_cost_usd_nanos_for_model(
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    explicit_cost_usd_nanos: Option<u64>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> u64 {
+    if let Some(explicit) = explicit_cost_usd_nanos {
+        return explicit;
+    }
+    let (input_rate, output_rate, cached_rate) =
+        model_token_prices(provider, model).unwrap_or((
+            DEFAULT_INPUT_TOKEN_COST_USD_NANOS,
+            DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS,
+            DEFAULT_CACHED_INPUT_TOKEN_COST_USD_NANOS,
+        ));
+    estimate_usage_cost_usd_nanos(
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+        None,
+        input_rate,
+        output_rate,
+        cached_rate,
+    )
+}
+
+pub fn usage_cost_source(
+    explicit_cost_usd_nanos: Option<u64>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> &'static str {
+    if explicit_cost_usd_nanos.is_some() {
+        "explicit"
+    } else if model_token_prices(provider, model).is_some() {
+        "estimated_model_price"
+    } else {
+        "estimated_default"
+    }
+}
+
+fn estimate_usage_cost_usd_nanos(
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    explicit_cost_usd_nanos: Option<u64>,
+    input_rate: u64,
+    output_rate: u64,
+    cached_input_rate: u64,
+) -> u64 {
     explicit_cost_usd_nanos.unwrap_or_else(|| {
-        input_tokens.saturating_mul(DEFAULT_INPUT_TOKEN_COST_USD_NANOS)
+        input_tokens.saturating_mul(input_rate)
+            + cached_input_tokens.saturating_mul(cached_input_rate)
             + output_tokens
                 .saturating_add(reasoning_tokens)
-                .saturating_mul(DEFAULT_OUTPUT_TOKEN_COST_USD_NANOS)
+                .saturating_mul(output_rate)
     })
+}
+
+fn model_token_prices(
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<(u64, u64, u64)> {
+    let provider = provider.unwrap_or("").to_ascii_lowercase();
+    let model = model.unwrap_or("").to_ascii_lowercase();
+    if model.is_empty() {
+        return None;
+    }
+    let is_provider = |name: &str| provider.is_empty() || provider == name;
+    if is_provider("openai") {
+        if model.contains("gpt-4o-mini") {
+            return Some((150, 600, 75));
+        }
+        if model.contains("gpt-4o") {
+            return Some((2_500, 10_000, 1_250));
+        }
+        if model.contains("o3-mini") {
+            return Some((1_100, 4_400, 550));
+        }
+    }
+    if is_provider("anthropic") {
+        if model.contains("claude-3-5-sonnet") || model.contains("claude-3.5-sonnet") {
+            return Some((3_000, 15_000, 300));
+        }
+        if model.contains("claude-3-haiku") {
+            return Some((250, 1_250, 25));
+        }
+    }
+    None
 }
 
 /// 一条 trace 的摘要（web 控制台列表视图用）。
@@ -2513,7 +2649,12 @@ pub struct ConsoleSpan {
     pub task_fingerprint: Option<String>,
     pub loop_id: Option<String>,
     pub harness_version: Option<String>,
+    pub schema_fingerprint: Option<String>,
+    pub intent_signature: Option<String>,
     pub validation_status: Option<String>,
+    pub review_status: Option<String>,
+    pub eval_status: Option<String>,
+    pub path_memory_id: Option<String>,
     pub stop_reason: Option<String>,
     pub phase: Option<String>,
     pub validator: Option<String>,
@@ -2767,7 +2908,12 @@ impl WireRecord {
         let task_fingerprint = self.attrs.get("task_fingerprint").cloned();
         let loop_id = self.attrs.get("loop_id").cloned();
         let harness_version = self.attrs.get("harness_version").cloned();
+        let schema_fingerprint = self.attrs.get("schema_fingerprint").cloned();
+        let intent_signature = self.attrs.get("intent_signature").cloned();
         let validation_status = self.attrs.get("validation_status").cloned();
+        let review_status = self.attrs.get("review_status").cloned();
+        let eval_status = self.attrs.get("eval_status").cloned();
+        let path_memory_id = self.attrs.get("path_memory_id").cloned();
         let stop_reason = self.attrs.get("stop_reason").cloned();
         let phase = self.attrs.get("phase").cloned();
         let validator = self.attrs.get("validator").cloned();
@@ -2805,7 +2951,12 @@ impl WireRecord {
                 task_fingerprint,
                 loop_id,
                 harness_version,
+                schema_fingerprint,
+                intent_signature,
                 validation_status,
+                review_status,
+                eval_status,
+                path_memory_id,
                 stop_reason,
                 phase,
                 validator,
@@ -3168,12 +3319,14 @@ impl SessionIndex {
                     s.total_tokens,
                 ),
                 explicit_total_tok: s.total_tokens,
-                cost_usd_nanos: usage_cost_usd_nanos(
+                cost_usd_nanos: usage_cost_usd_nanos_for_model(
                     s.input_tokens.unwrap_or(0),
                     s.output_tokens.unwrap_or(0),
                     s.cached_input_tokens.unwrap_or(0),
                     s.reasoning_tokens.unwrap_or(0),
                     s.cost_usd_nanos,
+                    s.provider.as_deref(),
+                    s.model.as_deref(),
                 ),
                 explicit_cost_usd_nanos: s.cost_usd_nanos,
                 error: s.status.unwrap_or(0) != 0,
@@ -3671,12 +3824,14 @@ impl WriteCoordinator {
             new.reasoning_tok,
             new.explicit_total_tok,
         );
-        new.cost_usd_nanos = usage_cost_usd_nanos(
+        new.cost_usd_nanos = usage_cost_usd_nanos_for_model(
             new.in_tok,
             new.out_tok,
             new.cached_tok,
             new.reasoning_tok,
             new.explicit_cost_usd_nanos,
+            r.fields.provider.as_deref(),
+            r.fields.model.as_deref(),
         );
         if let Some(st) = r.fields.status {
             new.error = st != 0;
@@ -4730,12 +4885,14 @@ impl WriteCoordinator {
             let cost_usd_nanos: u64 = sps
                 .iter()
                 .map(|s| {
-                    usage_cost_usd_nanos(
+                    usage_cost_usd_nanos_for_model(
                         s.input_tokens.unwrap_or(0),
                         s.output_tokens.unwrap_or(0),
                         s.cached_input_tokens.unwrap_or(0),
                         s.reasoning_tokens.unwrap_or(0),
                         s.cost_usd_nanos,
+                        s.provider.as_deref(),
+                        s.model.as_deref(),
                     )
                 })
                 .sum();
@@ -4887,7 +5044,12 @@ impl WriteCoordinator {
                     task_fingerprint: s.task_fingerprint.clone(),
                     loop_id: s.loop_id.clone(),
                     harness_version: s.harness_version.clone(),
+                    schema_fingerprint: s.schema_fingerprint.clone(),
+                    intent_signature: s.intent_signature.clone(),
                     validation_status: s.validation_status.clone(),
+                    review_status: s.review_status.clone(),
+                    eval_status: s.eval_status.clone(),
+                    path_memory_id: s.path_memory_id.clone(),
                     stop_reason: s.stop_reason.clone(),
                     phase: s.phase.clone(),
                     validator: s.validator.clone(),
@@ -4907,12 +5069,14 @@ impl WriteCoordinator {
                         s.reasoning_tokens.unwrap_or(0),
                         s.total_tokens,
                     ),
-                    cost_usd_nanos: usage_cost_usd_nanos(
+                    cost_usd_nanos: usage_cost_usd_nanos_for_model(
                         s.input_tokens.unwrap_or(0),
                         s.output_tokens.unwrap_or(0),
                         s.cached_input_tokens.unwrap_or(0),
                         s.reasoning_tokens.unwrap_or(0),
                         s.cost_usd_nanos,
+                        s.provider.as_deref(),
+                        s.model.as_deref(),
                     ),
                     model: s.model.clone(),
                     provider: s.provider.clone(),
@@ -5026,12 +5190,14 @@ impl WriteCoordinator {
                     s.reasoning_tokens.unwrap_or(0),
                     s.total_tokens,
                 );
-                e.6 += usage_cost_usd_nanos(
+                e.6 += usage_cost_usd_nanos_for_model(
                     s.input_tokens.unwrap_or(0),
                     s.output_tokens.unwrap_or(0),
                     s.cached_input_tokens.unwrap_or(0),
                     s.reasoning_tokens.unwrap_or(0),
                     s.cost_usd_nanos,
+                    s.provider.as_deref(),
+                    s.model.as_deref(),
                 );
             }
         }
@@ -5225,6 +5391,7 @@ impl WriteCoordinator {
     ) -> TraceAnnotation {
         let _guard = self.write_lock.lock().unwrap();
         let mut next = self.next_annotation_id.lock().unwrap();
+        let now = unix_now_ns_u64();
         let annotation = TraceAnnotation {
             annotation_id: *next,
             tenant_id,
@@ -5243,7 +5410,10 @@ impl WriteCoordinator {
             score: input.score,
             reason: input.reason,
             source: input.source,
-            created_at_ns: unix_now_ns_u64(),
+            created_at_ns: now,
+            updated_at_ns: now,
+            status: input.status.unwrap_or(AnnotationStatus::Active),
+            reviewer: input.reviewer,
             attrs: input.attrs,
         };
         *next += 1;
@@ -5262,6 +5432,73 @@ impl WriteCoordinator {
             .filter(|a| annotation_matches(a, filter))
             .cloned()
             .collect()
+    }
+
+    /// 更新 annotation 的 review 状态或业务字段。删除也是状态变更，不物理移除记录。
+    pub fn update_annotation(
+        &self,
+        annotation_id: u64,
+        tenant_id: Option<u64>,
+        input: UpdateTraceAnnotation,
+    ) -> Option<TraceAnnotation> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut annotations = self.annotations.lock().unwrap();
+        let item = annotations.iter_mut().find(|a| {
+            a.annotation_id == annotation_id && tenant_id.map_or(true, |t| a.tenant_id == Some(t))
+        })?;
+        if let Some(label) = input.label {
+            item.label = label;
+        }
+        if let Some(score) = input.score {
+            item.score = score;
+        }
+        if let Some(reason) = input.reason {
+            item.reason = reason;
+        }
+        if let Some(source) = input.source {
+            item.source = source;
+        }
+        if let Some(status) = input.status {
+            item.status = status;
+        }
+        if let Some(reviewer) = input.reviewer {
+            item.reviewer = reviewer;
+        }
+        if let Some(attrs) = input.attrs {
+            if input.merge_attrs {
+                for (key, value) in attrs {
+                    item.attrs.insert(key, value);
+                }
+            } else {
+                item.attrs = attrs;
+            }
+        }
+        item.updated_at_ns = unix_now_ns_u64();
+        let out = item.clone();
+        drop(annotations);
+        self.persist_metadata();
+        Some(out)
+    }
+
+    /// 软删除 annotation：进入 deleted 状态，默认查询和反向过滤不再命中。
+    pub fn delete_annotation(
+        &self,
+        annotation_id: u64,
+        tenant_id: Option<u64>,
+        reviewer: Option<String>,
+        reason: Option<String>,
+    ) -> Option<TraceAnnotation> {
+        self.update_annotation(
+            annotation_id,
+            tenant_id,
+            UpdateTraceAnnotation {
+                status: Some(AnnotationStatus::Deleted),
+                reviewer: Some(reviewer),
+                reason: reason.map(Some),
+                merge_attrs: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// 把外部 dataset item 关联到 trace/span。item 本体仍由业务系统或评测平台管理，yiTrace 只保存引用。
@@ -5342,6 +5579,14 @@ impl WriteCoordinator {
             attrs: input.attrs,
             source_trajectory_steps: input.source_trajectory_steps,
             evidence: input.evidence,
+            challenger_of: input.challenger_of,
+            eval_profile: input.eval_profile,
+            min_sample_count: input.min_sample_count,
+            margin_score: input.margin_score,
+            comparison_window_ns: input.comparison_window_ns,
+            promoted_from: input.promoted_from,
+            deprecation_reason: input.deprecation_reason,
+            stale_reasons: input.stale_reasons,
         };
         *next += 1;
         drop(next);
@@ -5619,12 +5864,14 @@ impl WriteCoordinator {
                 s.reasoning_tokens.unwrap_or(0),
                 s.total_tokens,
             );
-            e.7 += usage_cost_usd_nanos(
+            e.7 += usage_cost_usd_nanos_for_model(
                 s.input_tokens.unwrap_or(0),
                 s.output_tokens.unwrap_or(0),
                 s.cached_input_tokens.unwrap_or(0),
                 s.reasoning_tokens.unwrap_or(0),
                 s.cost_usd_nanos,
+                s.provider.as_deref(),
+                s.model.as_deref(),
             );
         }
 
@@ -6994,7 +7241,12 @@ mod tests {
         let task_fingerprint = json_string_compact("npm-native-packaging");
         let loop_id = json_string_compact("loop-1");
         let harness_version = json_string_compact("h1");
+        let schema_fingerprint = json_string_compact("schema-v1");
+        let intent_signature = json_string_compact("refund-review");
         let validation_status = json_string_compact("pass");
+        let review_status = json_string_compact("approved");
+        let eval_status = json_string_compact("pass");
+        let path_memory_id = json_string_compact("pm-1");
         let stop_reason = json_string_compact("goal_met");
         let phase = json_string_compact("verify");
         let validator = json_string_compact("npm test");
@@ -7009,7 +7261,12 @@ mod tests {
             r.fields.task_fingerprint = Some(task_fingerprint.clone());
             r.fields.loop_id = Some(loop_id.clone());
             r.fields.harness_version = Some(harness_version.clone());
+            r.fields.schema_fingerprint = Some(schema_fingerprint.clone());
+            r.fields.intent_signature = Some(intent_signature.clone());
             r.fields.validation_status = Some(validation_status.clone());
+            r.fields.review_status = Some(review_status.clone());
+            r.fields.eval_status = Some(eval_status.clone());
+            r.fields.path_memory_id = Some(path_memory_id.clone());
             r.fields.stop_reason = Some(stop_reason.clone());
             r.fields.phase = Some(phase.clone());
             r.fields.validator = Some(validator.clone());
@@ -7030,7 +7287,9 @@ mod tests {
                 ("project_id".to_string(), project.clone()),
                 ("skill".to_string(), skill.clone()),
                 ("task_fingerprint".to_string(), task_fingerprint.clone()),
+                ("schema_fingerprint".to_string(), schema_fingerprint.clone()),
                 ("validation_status".to_string(), validation_status.clone()),
+                ("path_memory_id".to_string(), path_memory_id.clone()),
             ]);
             let hits = wc.read_spans_query_for_attrs(&snap, &TraceQuery::all(), &attrs);
             assert_eq!(hits.len(), 1);
@@ -7044,6 +7303,14 @@ mod tests {
             assert_eq!(
                 hits[0].validation_status.as_deref(),
                 Some(validation_status.as_str())
+            );
+            assert_eq!(
+                hits[0].schema_fingerprint.as_deref(),
+                Some(schema_fingerprint.as_str())
+            );
+            assert_eq!(
+                hits[0].path_memory_id.as_deref(),
+                Some(path_memory_id.as_str())
             );
             assert!(hits[0].attrs.is_empty(), "过滤不能依赖 attrs 镜像");
 
@@ -7073,8 +7340,28 @@ mod tests {
                 Some(harness_version.as_str())
             );
             assert_eq!(
+                row.get("schema_fingerprint").map(String::as_str),
+                Some(schema_fingerprint.as_str())
+            );
+            assert_eq!(
+                row.get("intent_signature").map(String::as_str),
+                Some(intent_signature.as_str())
+            );
+            assert_eq!(
                 row.get("validation_status").map(String::as_str),
                 Some(validation_status.as_str())
+            );
+            assert_eq!(
+                row.get("review_status").map(String::as_str),
+                Some(review_status.as_str())
+            );
+            assert_eq!(
+                row.get("eval_status").map(String::as_str),
+                Some(eval_status.as_str())
+            );
+            assert_eq!(
+                row.get("path_memory_id").map(String::as_str),
+                Some(path_memory_id.as_str())
             );
             assert_eq!(
                 row.get("stop_reason").map(String::as_str),

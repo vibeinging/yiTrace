@@ -29,6 +29,8 @@ export declare class NativeYiTraceDB {
   taskTracesJson(taskFingerprint: string, cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string
   createAnnotationJson(annotationJson: string, tenantId?: string | undefined | null): string
   annotationsJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
+  updateAnnotationJson(annotationId: string, updateJson: string, tenantId?: string | undefined | null): string
+  deleteAnnotationJson(annotationId: string, deleteJson?: string | undefined | null, tenantId?: string | undefined | null): string
   createDatasetAssociationJson(associationJson: string, tenantId?: string | undefined | null): string
   datasetAssociationsJson(query?: string | undefined | null, tenantId?: string | undefined | null): string
   tracesJson(attrsJson?: string | undefined | null, metadataQuery?: string | undefined | null, tenantId?: string | undefined | null): string

@@ -16,10 +16,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::{
-    parse_wire_batch, AnnotationTarget, DatasetAssociationFilter, GoldenPathFilter,
-    GoldenPathStatus, NewDatasetAssociation, NewGoldenPathCandidate, NewRetentionAuditRecord,
-    NewRetentionPolicy, NewTraceAnnotation, RetentionAuditFilter, RetentionPolicyFilter,
-    TraceAnnotationFilter, TraceQuery, WriteCoordinator,
+    parse_wire_batch, AnnotationStatus, AnnotationTarget, DatasetAssociationFilter,
+    GoldenPathFilter, GoldenPathStatus, NewDatasetAssociation, NewGoldenPathCandidate,
+    NewRetentionAuditRecord, NewRetentionPolicy, NewTraceAnnotation, RetentionAuditFilter,
+    RetentionPolicyFilter, TraceAnnotationFilter, TraceQuery, UpdateTraceAnnotation,
+    WriteCoordinator,
 };
 use yt_core::fold::FoldedSpan;
 
@@ -439,6 +440,11 @@ impl EngineJsonApi {
             | ("GET", ["v1", "task", fingerprint, "traces"]) => {
                 (200, self.task_traces_json(fingerprint, query, tenant))
             }
+            ("PATCH", ["v1", "annotations", id])
+            | ("POST", ["v1", "annotations", id, "status"]) => {
+                self.update_annotation_json(id, body, tenant)
+            }
+            ("DELETE", ["v1", "annotations", id]) => self.delete_annotation_json(id, body, tenant),
             ("POST", ["v1", "golden-paths", id, "status"]) => {
                 self.update_golden_path_status_json(id, body, tenant)
             }
@@ -563,7 +569,7 @@ impl EngineJsonApi {
         sort_trace_search_spans(&mut spans, &sort_by, desc);
 
         let total = spans.len();
-        let end = (cursor + limit).min(total);
+        let end = cursor.saturating_add(limit).min(total);
         let page = if cursor < total {
             &spans[cursor..end]
         } else {
@@ -582,10 +588,11 @@ impl EngineJsonApi {
         (
             200,
             format!(
-                r#"{{"items":[{}],"nextCursor":{},"total":{}}}"#,
+                r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}"}}"#,
                 items.join(","),
                 next,
-                total
+                total,
+                trace_search_index_label(&request),
             ),
         )
     }
@@ -641,10 +648,11 @@ impl EngineJsonApi {
         (
             200,
             format!(
-                r#"{{"items":[{}],"total":{},"spanTotal":{}}}"#,
+                r#"{{"items":[{}],"total":{},"spanTotal":{},"index":"{}","aggregationIndex":"folded_snapshot"}}"#,
                 items.join(","),
                 total,
-                spans.len()
+                spans.len(),
+                trace_search_index_label(&request),
             ),
         )
     }
@@ -738,8 +746,12 @@ impl EngineJsonApi {
         (
             200,
             format!(
-                r#"{{"items":[{}],"total":{},"traceTotal":{},"spanTotal":{}}}"#,
-                items, total, trace_total, span_total
+                r#"{{"items":[{}],"total":{},"traceTotal":{},"spanTotal":{},"index":"{}","trajectoryIndex":"materialized_cache"}}"#,
+                items,
+                total,
+                trace_total,
+                span_total,
+                trace_search_index_label(&request),
             ),
         )
     }
@@ -777,7 +789,7 @@ impl EngineJsonApi {
             .collect();
         trace_ids.sort_by(|a, b| b.cmp(a));
         let total = trace_ids.len();
-        let end = (cursor + limit).min(total);
+        let end = cursor.saturating_add(limit).min(total);
         let page = if cursor < total {
             &trace_ids[cursor..end]
         } else {
@@ -1195,7 +1207,7 @@ impl EngineJsonApi {
                 .then_with(|| b.audit_id.cmp(&a.audit_id))
         });
         let total = items.len();
-        let end = (cursor + limit).min(total);
+        let end = cursor.saturating_add(limit).min(total);
         let page = if cursor < total {
             &items[cursor..end]
         } else {
@@ -1714,6 +1726,14 @@ impl EngineJsonApi {
         if label.is_empty() {
             return (400, r#"{"error":"missing label"}"#.to_string());
         }
+        let status = if let Some(status_value) = json_raw_field_alias(&v, &["status"]) {
+            let Some(status) = status_value.as_str().and_then(AnnotationStatus::parse) else {
+                return (400, r#"{"error":"invalid status"}"#.to_string());
+            };
+            Some(status)
+        } else {
+            None
+        };
         let target = json_field_alias(&v, &["target", "target_type", "targetType"])
             .and_then(crate::wire::Json::as_str)
             .and_then(AnnotationTarget::parse);
@@ -1742,6 +1762,10 @@ impl EngineJsonApi {
                 source: json_field_alias(&v, &["source", "created_by", "createdBy"])
                     .and_then(crate::wire::Json::as_str)
                     .map(ToString::to_string),
+                status,
+                reviewer: json_field_alias(&v, &["reviewer", "reviewed_by", "reviewedBy"])
+                    .and_then(crate::wire::Json::as_str)
+                    .map(ToString::to_string),
                 attrs,
             },
             tenant,
@@ -1755,8 +1779,12 @@ impl EngineJsonApi {
             tenant_id: tenant,
             ..Default::default()
         };
+        let mut cursor = 0usize;
+        let mut limit = 50usize;
         for (k, v) in query_pairs(query) {
             match k.as_str() {
+                "cursor" | "offset" => cursor = v.parse::<usize>().unwrap_or(0),
+                "limit" => limit = v.parse::<usize>().unwrap_or(50).clamp(1, 500),
                 "target" | "target_type" | "targetType" => {
                     filter.target = AnnotationTarget::parse(&v);
                 }
@@ -1764,20 +1792,137 @@ impl EngineJsonApi {
                 "span_id" | "spanId" => filter.span_id = parse_id_or_hash(&v),
                 "label" => filter.label = Some(v),
                 "source" => filter.source = Some(v),
+                "status" => filter.status = AnnotationStatus::parse(&v),
+                "includeDeleted" | "include_deleted" => {
+                    filter.include_deleted = query_bool(&v);
+                }
                 "attrs" => collect_attr_query_json(&v, &mut filter.attrs),
                 _ => collect_attr_query_pair(&k, &v, &mut filter.attrs),
             }
         }
-        let items = self.coord.annotations(&filter);
-        let body = items
+        let mut items = self.coord.annotations(&filter);
+        items.sort_by(|a, b| {
+            b.created_at_ns
+                .cmp(&a.created_at_ns)
+                .then_with(|| b.annotation_id.cmp(&a.annotation_id))
+        });
+        let total = items.len();
+        let end = cursor.saturating_add(limit).min(total);
+        let page = if cursor < total {
+            &items[cursor..end]
+        } else {
+            &[]
+        };
+        let next_cursor = if end < total {
+            end.to_string()
+        } else {
+            "null".to_string()
+        };
+        let body = page
             .iter()
             .map(json_annotation)
             .collect::<Vec<_>>()
             .join(",");
         (
             200,
-            format!(r#"{{"items":[{}],"count":{}}}"#, body, items.len()),
+            format!(
+                r#"{{"items":[{}],"count":{},"total":{},"pageCount":{},"nextCursor":{}}}"#,
+                body,
+                total,
+                total,
+                page.len(),
+                next_cursor
+            ),
         )
+    }
+
+    /// PATCH /v1/annotations/:id：更新 annotation 的 review 状态或业务字段。
+    fn update_annotation_json(&self, id: &str, body: &str, tenant: Option<u64>) -> (u16, String) {
+        let Ok(annotation_id) = id.parse::<u64>() else {
+            return (400, r#"{"error":"invalid annotation_id"}"#.to_string());
+        };
+        let v = match parse_json_body_or_empty(body) {
+            Ok(v) => v,
+            Err(e) => return (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
+        };
+        let mut update = UpdateTraceAnnotation {
+            merge_attrs: !json_bool_alias(&v, &["replaceAttrs", "replace_attrs"]).unwrap_or(false),
+            ..Default::default()
+        };
+        if let Some(label) = json_field_alias(&v, &["label", "name"])
+            .and_then(crate::wire::Json::as_str)
+            .map(|s| s.trim().to_string())
+        {
+            if label.is_empty() {
+                return (400, r#"{"error":"empty label"}"#.to_string());
+            }
+            update.label = Some(label);
+        }
+        if let Some(score) = optional_score_patch(&v, &["score", "eval_score", "evalScore"]) {
+            update.score = Some(score);
+        }
+        if let Some(reason) = optional_string_patch(&v, &["reason", "comment", "note"]) {
+            update.reason = Some(reason);
+        }
+        if let Some(source) = optional_string_patch(
+            &v,
+            &[
+                "source",
+                "updated_by",
+                "updatedBy",
+                "created_by",
+                "createdBy",
+            ],
+        ) {
+            update.source = Some(source);
+        }
+        if let Some(status_value) = json_raw_field_alias(&v, &["status"]) {
+            let Some(status) = status_value.as_str().and_then(AnnotationStatus::parse) else {
+                return (400, r#"{"error":"invalid status"}"#.to_string());
+            };
+            update.status = Some(status);
+        }
+        if let Some(reviewer) =
+            optional_string_patch(&v, &["reviewer", "reviewed_by", "reviewedBy"])
+        {
+            update.reviewer = Some(reviewer);
+        }
+        let mut attrs = std::collections::BTreeMap::new();
+        collect_attr_map(&v, &mut attrs);
+        if !attrs.is_empty()
+            || json_raw_field_alias(&v, &["attrs"]).is_some()
+            || json_bool_alias(&v, &["replaceAttrs", "replace_attrs"]).unwrap_or(false)
+        {
+            update.attrs = Some(attrs);
+        }
+        match self.coord.update_annotation(annotation_id, tenant, update) {
+            Some(annotation) => (200, json_annotation(&annotation)),
+            None => (404, r#"{"error":"annotation not found"}"#.to_string()),
+        }
+    }
+
+    /// DELETE /v1/annotations/:id：软删除 annotation，默认查询不再返回。
+    fn delete_annotation_json(&self, id: &str, body: &str, tenant: Option<u64>) -> (u16, String) {
+        let Ok(annotation_id) = id.parse::<u64>() else {
+            return (400, r#"{"error":"invalid annotation_id"}"#.to_string());
+        };
+        let v = match parse_json_body_or_empty(body) {
+            Ok(v) => v,
+            Err(e) => return (400, format!(r#"{{"error":"{}"}}"#, e.replace('"', "'"))),
+        };
+        let reviewer = json_field_alias(&v, &["reviewer", "reviewed_by", "reviewedBy", "source"])
+            .and_then(crate::wire::Json::as_str)
+            .map(ToString::to_string);
+        let reason = json_field_alias(&v, &["reason", "comment", "note"])
+            .and_then(crate::wire::Json::as_str)
+            .map(ToString::to_string);
+        match self
+            .coord
+            .delete_annotation(annotation_id, tenant, reviewer, reason)
+        {
+            Some(annotation) => (200, json_annotation(&annotation)),
+            None => (404, r#"{"error":"annotation not found"}"#.to_string()),
+        }
     }
 
     /// POST /v1/dataset-associations：把 trace/span 绑定到外部 dataset item。
@@ -1858,8 +2003,12 @@ impl EngineJsonApi {
             tenant_id: tenant,
             ..Default::default()
         };
+        let mut cursor = 0usize;
+        let mut limit = 50usize;
         for (k, v) in query_pairs(query) {
             match k.as_str() {
+                "cursor" | "offset" => cursor = v.parse::<usize>().unwrap_or(0),
+                "limit" => limit = v.parse::<usize>().unwrap_or(50).clamp(1, 500),
                 "dataset_id" | "datasetId" | "dataset" => filter.dataset_id = Some(v),
                 "item_id" | "itemId" | "dataset_item_id" | "datasetItemId" => {
                     filter.item_id = Some(v)
@@ -1873,15 +2022,39 @@ impl EngineJsonApi {
                 _ => collect_attr_query_pair(&k, &v, &mut filter.attrs),
             }
         }
-        let items = self.coord.dataset_associations(&filter);
-        let body = items
+        let mut items = self.coord.dataset_associations(&filter);
+        items.sort_by(|a, b| {
+            b.created_at_ns
+                .cmp(&a.created_at_ns)
+                .then_with(|| b.association_id.cmp(&a.association_id))
+        });
+        let total = items.len();
+        let end = (cursor + limit).min(total);
+        let page = if cursor < total {
+            &items[cursor..end]
+        } else {
+            &[]
+        };
+        let next_cursor = if end < total {
+            end.to_string()
+        } else {
+            "null".to_string()
+        };
+        let body = page
             .iter()
             .map(json_dataset_association)
             .collect::<Vec<_>>()
             .join(",");
         (
             200,
-            format!(r#"{{"items":[{}],"count":{}}}"#, body, items.len()),
+            format!(
+                r#"{{"items":[{}],"count":{},"total":{},"pageCount":{},"nextCursor":{}}}"#,
+                body,
+                total,
+                total,
+                page.len(),
+                next_cursor
+            ),
         )
     }
 
@@ -1936,6 +2109,7 @@ impl EngineJsonApi {
             .and_then(GoldenPathStatus::parse);
         let mut attrs = std::collections::BTreeMap::new();
         collect_attr_map(&v, &mut attrs);
+        remove_top_level_golden_path_governance_attrs(&v, &mut attrs);
         collect_golden_path_scope_attrs(&spans, &mut attrs);
         let evidence = golden_path_evidence_summary_from_json(&v, &spans);
         let candidate = self.coord.add_golden_path(
@@ -1972,6 +2146,46 @@ impl EngineJsonApi {
                 attrs,
                 source_trajectory_steps: source_steps,
                 evidence,
+                challenger_of: json_field_alias(
+                    &v,
+                    &[
+                        "challenger_of",
+                        "challengerOf",
+                        "baselineGoldenPathId",
+                        "baseline_golden_path_id",
+                    ],
+                )
+                .and_then(json_internal_id),
+                eval_profile: json_field_alias(&v, &["eval_profile", "evalProfile"])
+                    .and_then(crate::wire::Json::as_str)
+                    .map(ToString::to_string),
+                min_sample_count: json_field_alias(
+                    &v,
+                    &["min_sample_count", "minSampleCount", "min_samples", "minSamples"],
+                )
+                .and_then(crate::wire::Json::as_u64),
+                margin_score: json_field_alias(&v, &["margin_score", "marginScore", "margin"])
+                    .and_then(crate::wire::Json::as_u64)
+                    .map(score_u64),
+                comparison_window_ns: json_field_alias(
+                    &v,
+                    &[
+                        "comparison_window_ns",
+                        "comparisonWindowNs",
+                        "window_ns",
+                        "windowNs",
+                    ],
+                )
+                .and_then(crate::wire::Json::as_u64),
+                promoted_from: json_field_alias(&v, &["promoted_from", "promotedFrom"])
+                    .and_then(json_internal_id),
+                deprecation_reason: json_field_alias(
+                    &v,
+                    &["deprecation_reason", "deprecationReason"],
+                )
+                .and_then(crate::wire::Json::as_str)
+                .map(ToString::to_string),
+                stale_reasons: json_string_list_alias(&v, &["stale_reasons", "staleReasons"]),
             },
             tenant,
         );
@@ -1998,6 +2212,9 @@ impl EngineJsonApi {
                 "trace_id" | "traceId" | "sourceTraceId" | "source_trace_id" => {
                     filter.source_trace_id = parse_id_or_hash(&v)
                 }
+                "challenger_of" | "challengerOf" | "baselineGoldenPathId"
+                | "baseline_golden_path_id" => filter.challenger_of = parse_id_or_hash(&v),
+                "eval_profile" | "evalProfile" => filter.eval_profile = Some(v),
                 "status" => filter.status = GoldenPathStatus::parse(&v),
                 "attrs" => collect_attr_query_json(&v, &mut filter.attrs),
                 "model" | "provider" => {
@@ -2517,11 +2734,17 @@ impl EngineJsonApi {
             }
         }
 
+        let stale_reasons = golden_path_stale_reasons(
+            &golden_path,
+            stored_signature_matches_source,
+            analyzed_trace_total,
+            followed + extended,
+        );
         let examples_json = examples.join(",");
         (
             200,
             format!(
-                r#"{{"goldenPath":{},"sourceAvailable":{},"sourceRetained":{},"storedSignatureMatchesSource":{},"goldenTrajectory":{},"sourceTrajectory":{},"window":{{"limit":{},"includeSource":{},"spanTotal":{},"matchingTraceTotal":{},"analyzedTraceTotal":{}}},"counts":{{"total":{},"followed":{},"extended":{},"partial":{},"deviated":{},"unknown":{}}},"rates":{{"followed":{},"usable":{},"deviated":{},"unknown":{}}},"coverage":{{"commonStepCount":{},"goldenStepCount":{},"traceStepCount":{},"goldenCoverage":{},"traceCoverage":{}}},"examples":[{}]}}"#,
+                r#"{{"goldenPath":{},"sourceAvailable":{},"sourceRetained":{},"storedSignatureMatchesSource":{},"goldenTrajectory":{},"sourceTrajectory":{},"window":{{"limit":{},"includeSource":{},"spanTotal":{},"matchingTraceTotal":{},"analyzedTraceTotal":{}}},"counts":{{"total":{},"followed":{},"extended":{},"partial":{},"deviated":{},"unknown":{}}},"rates":{{"followed":{},"usable":{},"deviated":{},"unknown":{}}},"coverage":{{"commonStepCount":{},"goldenStepCount":{},"traceStepCount":{},"goldenCoverage":{},"traceCoverage":{}}},"governance":{{"evalProfile":{},"challengerOf":{},"minSampleCount":{},"marginScore":{},"comparisonWindowNs":{},"stale":{},"staleReasons":{}}},"examples":[{}]}}"#,
                 json_golden_path(&golden_path),
                 json_bool(source_available),
                 json_bool(source_retained),
@@ -2557,6 +2780,15 @@ impl EngineJsonApi {
                 trace_step_count,
                 ratio_json(common_step_count, golden_step_count),
                 ratio_json(common_step_count, trace_step_count),
+                json_opt_str(golden_path.eval_profile.as_deref()),
+                json_opt_u64_string(golden_path.challenger_of),
+                json_opt_u64_string(golden_path.min_sample_count),
+                golden_path
+                    .margin_score
+                    .map_or("null".to_string(), |score| score.to_string()),
+                json_opt_u64_string(golden_path.comparison_window_ns),
+                json_bool(!stale_reasons.is_empty()),
+                json_string_array(&stale_reasons),
                 examples_json,
             ),
         )
@@ -2579,6 +2811,8 @@ impl EngineJsonApi {
                 target: annotation_spec.target,
                 label: annotation_spec.label.clone(),
                 source: annotation_spec.source.clone(),
+                status: annotation_spec.status,
+                include_deleted: annotation_spec.include_deleted,
                 attrs: annotation_spec.attrs.clone(),
                 ..Default::default()
             });
@@ -3229,6 +3463,10 @@ struct TraceSearchSpec {
     input_contains: Option<String>,
     output_contains: Option<String>,
     log_contains: Option<String>,
+    min_cost_usd_nanos: Option<u64>,
+    max_cost_usd_nanos: Option<u64>,
+    min_total_tokens: Option<u64>,
+    max_total_tokens: Option<u64>,
     attrs: std::collections::BTreeMap<String, String>,
 }
 
@@ -3238,6 +3476,8 @@ struct TraceSearchAnnotationSpec {
     target: Option<AnnotationTarget>,
     label: Option<String>,
     source: Option<String>,
+    status: Option<AnnotationStatus>,
+    include_deleted: bool,
     score_min: Option<u32>,
     score_max: Option<u32>,
     attrs: std::collections::BTreeMap<String, String>,
@@ -3273,6 +3513,16 @@ struct TraceSearchRequest {
     spec: TraceSearchSpec,
     annotation: TraceSearchAnnotationSpec,
     dataset: TraceSearchDatasetSpec,
+}
+
+fn trace_search_index_label(request: &TraceSearchRequest) -> &'static str {
+    if !request.spec.attrs.is_empty() {
+        "attrs_postings+folded_verify"
+    } else if request.annotation.active || request.dataset.active {
+        "metadata_filter+folded_scan"
+    } else {
+        "folded_scan"
+    }
 }
 
 #[derive(Clone)]
@@ -3699,6 +3949,27 @@ fn json_field_alias<'a>(
     names.iter().find_map(|name| crate::wire::field(obj, name))
 }
 
+fn json_raw_field_alias<'a>(
+    obj: &'a crate::wire::Json,
+    names: &[&str],
+) -> Option<&'a crate::wire::Json> {
+    names.iter().find_map(|name| obj.get(name))
+}
+
+fn optional_string_patch(obj: &crate::wire::Json, names: &[&str]) -> Option<Option<String>> {
+    json_raw_field_alias(obj, names).and_then(|value| match value {
+        crate::wire::Json::Null => Some(None),
+        _ => value.as_str().map(|s| Some(s.to_string())),
+    })
+}
+
+fn optional_score_patch(obj: &crate::wire::Json, names: &[&str]) -> Option<Option<u32>> {
+    json_raw_field_alias(obj, names).and_then(|value| match value {
+        crate::wire::Json::Null => Some(None),
+        _ => value.as_u64().map(|n| Some(n.min(u32::MAX as u64) as u32)),
+    })
+}
+
 fn json_bool_alias(obj: &crate::wire::Json, names: &[&str]) -> Option<bool> {
     json_field_alias(obj, names).and_then(|value| match value {
         crate::wire::Json::Bool(v) => Some(*v),
@@ -3713,6 +3984,54 @@ fn json_bool_alias(obj: &crate::wire::Json, names: &[&str]) -> Option<bool> {
         }
         _ => None,
     })
+}
+
+fn json_cost_nanos_alias(
+    obj: &crate::wire::Json,
+    nanos_names: &[&str],
+    usd_names: &[&str],
+) -> Option<u64> {
+    json_field_alias(obj, nanos_names)
+        .and_then(crate::wire::Json::as_u64)
+        .or_else(|| {
+            json_field_alias(obj, usd_names)
+                .and_then(crate::wire::Json::as_f64)
+                .and_then(|value| {
+                    if value.is_finite() && value >= 0.0 {
+                        Some((value * 1_000_000_000.0).round().min(u64::MAX as f64) as u64)
+                    } else {
+                        None
+                    }
+                })
+        })
+}
+
+fn json_string_list_alias(obj: &crate::wire::Json, names: &[&str]) -> Vec<String> {
+    let Some(value) = json_field_alias(obj, names) else {
+        return Vec::new();
+    };
+    match value {
+        crate::wire::Json::Arr(items) => items
+            .iter()
+            .filter_map(crate::wire::Json::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        crate::wire::Json::Str(s) if !s.trim().is_empty() => {
+            s.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn query_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
 }
 
 fn trace_search_request_from_json(
@@ -3776,6 +4095,52 @@ fn trace_search_request_from_json(
         log_contains: json_field_alias(f, &["log_text", "logText", "logContains"])
             .and_then(Json::as_str)
             .map(|s| s.to_string()),
+        min_cost_usd_nanos: json_cost_nanos_alias(
+            f,
+            &["min_cost_usd_nanos", "minCostUsdNanos", "costUsdNanosMin"],
+            &["min_cost_usd", "minCostUsd", "costUsdMin"],
+        )
+        .or_else(|| {
+            json_cost_nanos_alias(
+                v,
+                &["min_cost_usd_nanos", "minCostUsdNanos", "costUsdNanosMin"],
+                &["min_cost_usd", "minCostUsd", "costUsdMin"],
+            )
+        }),
+        max_cost_usd_nanos: json_cost_nanos_alias(
+            f,
+            &["max_cost_usd_nanos", "maxCostUsdNanos", "costUsdNanosMax"],
+            &["max_cost_usd", "maxCostUsd", "costUsdMax"],
+        )
+        .or_else(|| {
+            json_cost_nanos_alias(
+                v,
+                &["max_cost_usd_nanos", "maxCostUsdNanos", "costUsdNanosMax"],
+                &["max_cost_usd", "maxCostUsd", "costUsdMax"],
+            )
+        }),
+        min_total_tokens: json_field_alias(
+            f,
+            &["min_total_tokens", "minTotalTokens", "totalTokensMin", "minTokens"],
+        )
+        .or_else(|| {
+            json_field_alias(
+                v,
+                &["min_total_tokens", "minTotalTokens", "totalTokensMin", "minTokens"],
+            )
+        })
+        .and_then(Json::as_u64),
+        max_total_tokens: json_field_alias(
+            f,
+            &["max_total_tokens", "maxTotalTokens", "totalTokensMax", "maxTokens"],
+        )
+        .or_else(|| {
+            json_field_alias(
+                v,
+                &["max_total_tokens", "maxTotalTokens", "totalTokensMax", "maxTokens"],
+            )
+        })
+        .and_then(Json::as_u64),
         attrs,
     };
     TraceSearchRequest {
@@ -3879,6 +4244,28 @@ fn trace_search_match(
             return false;
         }
     }
+    let cost_usd_nanos = folded_cost_usd_nanos(s);
+    if let Some(min) = spec.min_cost_usd_nanos {
+        if cost_usd_nanos < min {
+            return false;
+        }
+    }
+    if let Some(max) = spec.max_cost_usd_nanos {
+        if cost_usd_nanos > max {
+            return false;
+        }
+    }
+    let total_tokens = folded_total_tokens(s);
+    if let Some(min) = spec.min_total_tokens {
+        if total_tokens < min {
+            return false;
+        }
+    }
+    if let Some(max) = spec.max_total_tokens {
+        if total_tokens > max {
+            return false;
+        }
+    }
     trace_search_metadata_match(s, metadata)
 }
 
@@ -3944,6 +4331,18 @@ fn trace_search_annotation_spec(f: &crate::wire::Json) -> TraceSearchAnnotationS
         .or_else(|| json_field_alias(f, &["annotation_source", "annotationSource"]))
         .and_then(crate::wire::Json::as_str)
         .map(ToString::to_string);
+    let status = json_field_alias(obj, &["status"])
+        .or_else(|| json_field_alias(f, &["annotation_status", "annotationStatus"]))
+        .and_then(crate::wire::Json::as_str)
+        .and_then(AnnotationStatus::parse);
+    let include_deleted = json_bool_alias(obj, &["includeDeleted", "include_deleted"])
+        .or_else(|| {
+            json_bool_alias(
+                f,
+                &["annotation_include_deleted", "annotationIncludeDeleted"],
+            )
+        })
+        .unwrap_or(false);
     let score_min = json_field_alias(obj, &["score_min", "scoreMin", "minScore"])
         .or_else(|| json_field_alias(f, &["annotation_score_min", "annotationScoreMin"]))
         .and_then(crate::wire::Json::as_u64)
@@ -3956,6 +4355,8 @@ fn trace_search_annotation_spec(f: &crate::wire::Json) -> TraceSearchAnnotationS
         || target.is_some()
         || label.is_some()
         || source.is_some()
+        || status.is_some()
+        || include_deleted
         || score_min.is_some()
         || score_max.is_some()
         || !attrs.is_empty();
@@ -3964,6 +4365,8 @@ fn trace_search_annotation_spec(f: &crate::wire::Json) -> TraceSearchAnnotationS
         target,
         label,
         source,
+        status,
+        include_deleted,
         score_min,
         score_max,
         attrs,
@@ -4060,6 +4463,14 @@ fn trace_search_annotation_spec_from_query(
             }
             "annotation_source" | "annotationSource" => {
                 spec.source = Some(v.clone());
+                spec.active = true;
+            }
+            "annotation_status" | "annotationStatus" => {
+                spec.status = AnnotationStatus::parse(v);
+                spec.active = spec.status.is_some();
+            }
+            "annotation_include_deleted" | "annotationIncludeDeleted" => {
+                spec.include_deleted = query_bool(v);
                 spec.active = true;
             }
             "annotation_score_min" | "annotationScoreMin" => {
@@ -4179,7 +4590,12 @@ fn folded_contains(s: &FoldedSpan, needle: &str) -> bool {
             "task_fingerprint",
             "loop_id",
             "harness_version",
+            "schema_fingerprint",
+            "intent_signature",
             "validation_status",
+            "review_status",
+            "eval_status",
+            "path_memory_id",
             "stop_reason",
             "phase",
             "validator",
@@ -4304,9 +4720,29 @@ fn trace_aggregate_group_field(name: &str) -> Option<TraceAggregateGroupField> {
             "harness_version".to_string(),
             TraceAggregateGroupKind::Attr("harness_version".to_string()),
         ),
+        "schemafingerprint" => (
+            "schema_fingerprint".to_string(),
+            TraceAggregateGroupKind::Attr("schema_fingerprint".to_string()),
+        ),
+        "intentsignature" => (
+            "intent_signature".to_string(),
+            TraceAggregateGroupKind::Attr("intent_signature".to_string()),
+        ),
         "validationstatus" => (
             "validation_status".to_string(),
             TraceAggregateGroupKind::Attr("validation_status".to_string()),
+        ),
+        "reviewstatus" => (
+            "review_status".to_string(),
+            TraceAggregateGroupKind::Attr("review_status".to_string()),
+        ),
+        "evalstatus" => (
+            "eval_status".to_string(),
+            TraceAggregateGroupKind::Attr("eval_status".to_string()),
+        ),
+        "pathmemoryid" => (
+            "path_memory_id".to_string(),
+            TraceAggregateGroupKind::Attr("path_memory_id".to_string()),
         ),
         "stopreason" => (
             "stop_reason".to_string(),
@@ -4902,7 +5338,12 @@ fn normalize_storage_group_key(raw: &str) -> String {
         "callsite" => "call_site".to_string(),
         "loopid" => "loop_id".to_string(),
         "harnessversion" => "harness_version".to_string(),
+        "schemafingerprint" => "schema_fingerprint".to_string(),
+        "intentsignature" => "intent_signature".to_string(),
         "validationstatus" => "validation_status".to_string(),
+        "reviewstatus" => "review_status".to_string(),
+        "evalstatus" => "eval_status".to_string(),
+        "pathmemoryid" => "path_memory_id".to_string(),
         "stopreason" => "stop_reason".to_string(),
         "sessionid" => "session_id".to_string(),
         "traceid" => "trace_id".to_string(),
@@ -5962,11 +6403,7 @@ fn trace_diff_span_json(s: &FoldedSpan) -> String {
         cost_detail_json(
             folded_cost_usd_nanos(s),
             s.cost_currency.as_deref(),
-            if s.cost_usd_nanos.is_some() {
-                "explicit"
-            } else {
-                "estimated"
-            },
+            folded_cost_source(s),
         ),
         s.eval_score
             .map_or("null".to_string(), |score| score.to_string()),
@@ -6335,11 +6772,7 @@ fn json_trace_search_span(s: &FoldedSpan, rank: usize) -> String {
         cost_detail_json(
             folded_cost_usd_nanos(s),
             s.cost_currency.as_deref(),
-            if s.cost_usd_nanos.is_some() {
-                "explicit"
-            } else {
-                "estimated"
-            },
+            folded_cost_source(s),
         ),
         folded_usage_json(s),
         s.input_tokens.unwrap_or(0),
@@ -6558,13 +6991,19 @@ fn cost_detail_json(nanos: u64, currency: Option<&str>, source: &str) -> String 
 }
 
 fn folded_cost_usd_nanos(s: &FoldedSpan) -> u64 {
-    crate::usage_cost_usd_nanos(
+    crate::usage_cost_usd_nanos_for_model(
         s.input_tokens.unwrap_or(0),
         s.output_tokens.unwrap_or(0),
         s.cached_input_tokens.unwrap_or(0),
         s.reasoning_tokens.unwrap_or(0),
         s.cost_usd_nanos,
+        s.provider.as_deref(),
+        s.model.as_deref(),
     )
+}
+
+fn folded_cost_source(s: &FoldedSpan) -> &'static str {
+    crate::usage_cost_source(s.cost_usd_nanos, s.provider.as_deref(), s.model.as_deref())
 }
 
 fn folded_total_tokens(s: &FoldedSpan) -> u64 {
@@ -6678,6 +7117,19 @@ fn golden_path_filter_from_json(
     )
     .and_then(json_id_with_external)
     .map(|(id, _)| id);
+    filter.challenger_of = json_field_alias(
+        f,
+        &[
+            "challenger_of",
+            "challengerOf",
+            "baselineGoldenPathId",
+            "baseline_golden_path_id",
+        ],
+    )
+    .and_then(json_internal_id);
+    filter.eval_profile = json_field_alias(f, &["eval_profile", "evalProfile"])
+        .and_then(crate::wire::Json::as_str)
+        .map(ToString::to_string);
     let status_value = json_field_alias(f, &["status"]);
     let explicit_status = status_value.is_some();
     if let Some(value) = status_value {
@@ -6687,6 +7139,7 @@ fn golden_path_filter_from_json(
         filter.status = Some(status);
     }
     collect_attr_map(f, &mut filter.attrs);
+    remove_top_level_golden_path_governance_attrs(f, &mut filter.attrs);
     for key in ["model", "provider"] {
         if let Some(value) = crate::wire::field(f, key).and_then(crate::wire::Json::as_str) {
             filter
@@ -6721,7 +7174,7 @@ fn json_attrs(attrs: &std::collections::BTreeMap<String, String>) -> String {
 
 fn json_annotation(a: &crate::TraceAnnotation) -> String {
     format!(
-        r#"{{"annotationId":"{}","tenantId":{},"target":"{}","traceId":"{}","spanId":{},"externalTraceId":{},"externalSpanId":{},"label":"{}","score":{},"reason":{},"source":{},"createdAtNs":"{}","attrs":{}}}"#,
+        r#"{{"annotationId":"{}","tenantId":{},"target":"{}","traceId":"{}","spanId":{},"externalTraceId":{},"externalSpanId":{},"label":"{}","score":{},"reason":{},"source":{},"status":"{}","reviewer":{},"createdAtNs":"{}","updatedAtNs":"{}","attrs":{}}}"#,
         a.annotation_id,
         json_opt_u64_string(a.tenant_id),
         a.target.as_str(),
@@ -6733,7 +7186,10 @@ fn json_annotation(a: &crate::TraceAnnotation) -> String {
         a.score.map_or("null".to_string(), |s| s.to_string()),
         json_opt_str(a.reason.as_deref()),
         json_opt_str(a.source.as_deref()),
+        a.status.as_str(),
+        json_opt_str(a.reviewer.as_deref()),
         a.created_at_ns,
+        a.updated_at_ns,
         json_attrs(&a.attrs),
     )
 }
@@ -6762,7 +7218,7 @@ fn json_dataset_association(a: &crate::DatasetAssociation) -> String {
 
 fn json_golden_path(g: &crate::GoldenPathCandidate) -> String {
     format!(
-        r#"{{"goldenPathId":"{}","tenantId":{},"taskFingerprint":"{}","trajectorySignature":"{}","sourceTraceId":"{}","externalSourceTraceId":{},"snapshotId":{},"snapshotHash":{},"status":"{}","score":{},"label":{},"reason":{},"source":{},"createdAtNs":"{}","updatedAtNs":"{}","attrs":{},"sourceTrajectory":{},"evidenceSummary":{}}}"#,
+        r#"{{"goldenPathId":"{}","tenantId":{},"taskFingerprint":"{}","trajectorySignature":"{}","sourceTraceId":"{}","externalSourceTraceId":{},"snapshotId":{},"snapshotHash":{},"status":"{}","score":{},"label":{},"reason":{},"source":{},"challengerOf":{},"evalProfile":{},"minSampleCount":{},"marginScore":{},"comparisonWindowNs":{},"promotedFrom":{},"deprecationReason":{},"staleReasons":{},"governance":{{"challengerOf":{},"evalProfile":{},"minSampleCount":{},"marginScore":{},"comparisonWindowNs":{},"promotedFrom":{},"deprecationReason":{},"staleReasons":{}}},"createdAtNs":"{}","updatedAtNs":"{}","attrs":{},"sourceTrajectory":{},"evidenceSummary":{}}}"#,
         g.golden_path_id,
         json_opt_u64_string(g.tenant_id),
         json_escape(&g.task_fingerprint),
@@ -6776,12 +7232,65 @@ fn json_golden_path(g: &crate::GoldenPathCandidate) -> String {
         json_opt_str(g.label.as_deref()),
         json_opt_str(g.reason.as_deref()),
         json_opt_str(g.source.as_deref()),
+        json_opt_u64_string(g.challenger_of),
+        json_opt_str(g.eval_profile.as_deref()),
+        json_opt_u64_string(g.min_sample_count),
+        g.margin_score.map_or("null".to_string(), |s| s.to_string()),
+        json_opt_u64_string(g.comparison_window_ns),
+        json_opt_u64_string(g.promoted_from),
+        json_opt_str(g.deprecation_reason.as_deref()),
+        json_string_array(&g.stale_reasons),
+        json_opt_u64_string(g.challenger_of),
+        json_opt_str(g.eval_profile.as_deref()),
+        json_opt_u64_string(g.min_sample_count),
+        g.margin_score.map_or("null".to_string(), |s| s.to_string()),
+        json_opt_u64_string(g.comparison_window_ns),
+        json_opt_u64_string(g.promoted_from),
+        json_opt_str(g.deprecation_reason.as_deref()),
+        json_string_array(&g.stale_reasons),
         g.created_at_ns,
         g.updated_at_ns,
         json_attrs(&g.attrs),
         trajectory_summary_json_with_signature(&g.source_trajectory_steps, &g.trajectory_signature),
         json_attrs(&g.evidence),
     )
+}
+
+fn golden_path_stale_reasons(
+    g: &crate::GoldenPathCandidate,
+    stored_signature_matches_source: Option<bool>,
+    analyzed_trace_total: usize,
+    usable_trace_total: usize,
+) -> Vec<String> {
+    let mut reasons = g.stale_reasons.clone();
+    if matches!(g.status, GoldenPathStatus::Deprecated) {
+        push_unique_reason(&mut reasons, "deprecated");
+    }
+    if g.deprecation_reason.is_some() {
+        push_unique_reason(&mut reasons, "deprecation_reason");
+    }
+    if stored_signature_matches_source == Some(false) {
+        push_unique_reason(&mut reasons, "source_signature_changed");
+    }
+    if let Some(min_sample) = g.min_sample_count {
+        if analyzed_trace_total < min_sample as usize {
+            push_unique_reason(&mut reasons, "insufficient_samples");
+        }
+    }
+    if analyzed_trace_total > 0 {
+        let usable_score = (usable_trace_total as u128 * 1000) / analyzed_trace_total as u128;
+        let threshold = g.margin_score.unwrap_or(800) as u128;
+        if usable_score < threshold {
+            push_unique_reason(&mut reasons, "health_below_margin");
+        }
+    }
+    reasons
+}
+
+fn push_unique_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|item| item == reason) {
+        reasons.push(reason.to_string());
+    }
 }
 
 fn json_path_adherence(
@@ -7053,6 +7562,15 @@ fn collect_golden_path_scope_attrs(
         if let Some(value) = spans.iter().find_map(|s| golden_path_scope_value(s, key)) {
             attrs.insert((*key).to_string(), json_string_value(&value));
         }
+    }
+}
+
+fn remove_top_level_golden_path_governance_attrs(
+    f: &crate::wire::Json,
+    attrs: &mut std::collections::BTreeMap<String, String>,
+) {
+    if json_raw_field_alias(f, &["eval_profile", "evalProfile"]).is_some() {
+        attrs.remove("eval_profile");
     }
 }
 
@@ -7495,6 +8013,47 @@ mod tests {
                     .0,
                 200
             );
+            let second_annotation =
+                r#"{"traceId":"run-uuid","label":"needs_review","projectId":"agentic-data"}"#;
+            assert_eq!(
+                api.route_with_tenant("POST", "/v1/annotations", second_annotation, Some(1))
+                    .0,
+                200
+            );
+            let third_annotation =
+                r#"{"traceId":"run-uuid","label":"bad_answer","projectId":"agentic-data"}"#;
+            assert_eq!(
+                api.route_with_tenant("POST", "/v1/annotations", third_annotation, Some(1))
+                    .0,
+                200
+            );
+
+            let second_link = r#"{
+              "datasetId":"best-path-regression",
+              "itemId":"case-2",
+              "traceId":"run-uuid",
+              "spanId":"span-uuid",
+              "label":"review",
+              "projectId":"agentic-data"
+            }"#;
+            assert_eq!(
+                api.route_with_tenant("POST", "/v1/dataset-associations", second_link, Some(1))
+                    .0,
+                200
+            );
+            let third_link = r#"{
+              "datasetId":"best-path-regression",
+              "itemId":"case-3",
+              "traceId":"run-uuid",
+              "spanId":"span-uuid",
+              "label":"fail",
+              "projectId":"agentic-data"
+            }"#;
+            assert_eq!(
+                api.route_with_tenant("POST", "/v1/dataset-associations", third_link, Some(1))
+                    .0,
+                200
+            );
 
             let (status, body) = api.route_with_tenant(
                 "GET",
@@ -7503,9 +8062,48 @@ mod tests {
                 Some(1),
             );
             assert_eq!(status, 200, "{body}");
-            assert!(body.contains(r#""count":1"#), "{body}");
+            assert!(body.contains(r#""count":3"#), "{body}");
             assert!(body.contains(r#""label":"best_path""#), "{body}");
             assert!(!body.contains("wrong_tenant"), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&projectId=agentic-data&limit=2",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":3"#), "{body}");
+            assert!(body.contains(r#""pageCount":2"#), "{body}");
+            assert!(body.contains(r#""nextCursor":2"#), "{body}");
+            assert!(body.contains(r#""label":"bad_answer""#), "{body}");
+            assert!(body.contains(r#""label":"needs_review""#), "{body}");
+            assert!(!body.contains(r#""label":"best_path""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&projectId=agentic-data&cursor=2&limit=2",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""pageCount":1"#), "{body}");
+            assert!(body.contains(r#""nextCursor":null"#), "{body}");
+            assert!(body.contains(r#""label":"best_path""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/dataset-associations?datasetId=best-path-regression&limit=2",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":3"#), "{body}");
+            assert!(body.contains(r#""pageCount":2"#), "{body}");
+            assert!(body.contains(r#""nextCursor":2"#), "{body}");
+            assert!(body.contains(r#""itemId":"case-3""#), "{body}");
+            assert!(body.contains(r#""itemId":"case-2""#), "{body}");
+            assert!(!body.contains(r#""itemId":"case-1""#), "{body}");
 
             let (status, body) = api.route_with_tenant(
                 "POST",
@@ -7555,6 +8153,83 @@ mod tests {
             );
             assert_eq!(status, 200, "{body}");
             assert!(body.contains(r#""total":0"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "PATCH",
+                "/v1/annotations/1",
+                r#"{"status":"resolved","reviewer":"four","reason":"review accepted","attrs":{"review_round":1}}"#,
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""status":"resolved""#), "{body}");
+            assert!(body.contains(r#""reviewer":"four""#), "{body}");
+            assert!(body.contains(r#""review_round":1"#), "{body}");
+            assert!(body.contains(r#""updatedAtNs":"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&label=best_path&status=resolved",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":1"#), "{body}");
+            assert!(body.contains(r#""reviewer":"four""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "PATCH",
+                "/v1/annotations/1",
+                r#"{"status":"rejected"}"#,
+                Some(2),
+            );
+            assert_eq!(status, 404, "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "DELETE",
+                "/v1/annotations/1",
+                r#"{"reviewer":"four","reason":"superseded"}"#,
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""status":"deleted""#), "{body}");
+            assert!(body.contains(r#""reason":"superseded""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&label=best_path",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":0"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&label=best_path&status=deleted",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":1"#), "{body}");
+            assert!(body.contains(r#""status":"deleted""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "POST",
+                "/v1/trace-search",
+                r#"{"filter":{"annotation":{"label":"best_path"}}}"#,
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""total":0"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "POST",
+                "/v1/trace-search",
+                r#"{"filter":{"annotation":{"label":"best_path","status":"deleted"}}}"#,
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""total":1"#), "{body}");
         }
         {
             let coord = WriteCoordinator::open_durable(&dir).unwrap();
@@ -7567,7 +8242,18 @@ mod tests {
                 Some(1),
             );
             assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":0"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/annotations?traceId=run-uuid&label=best_path&status=deleted",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
             assert!(body.contains(r#""count":1"#), "{body}");
+            assert!(body.contains(r#""status":"deleted""#), "{body}");
+            assert!(body.contains(r#""reviewer":"four""#), "{body}");
 
             let (status, body) = api.route_with_tenant(
                 "GET",
@@ -7997,6 +8683,11 @@ mod tests {
               "label":"fast path",
               "reason":"stable winner",
               "source":"human",
+              "evalProfile":"release-gate",
+              "minSampleCount":3,
+              "marginScore":1001,
+              "comparisonWindowNs":1000,
+              "staleReasons":["manual_review"],
               "projectId":"agentic-data"
             }"#;
             let (status, body) = api.route_with_tenant("POST", "/v1/golden-paths", create, Some(1));
@@ -8013,8 +8704,8 @@ mod tests {
             );
             assert!(body.contains(r#""sourceTrajectory":{"#), "{body}");
             assert!(
-                body.contains(r#""evidenceSummary":{"source_cost_usd_nanos""#)
-                    || body.contains(r#""evidenceSummary":{"source_duration_ns""#),
+                body.contains(r#""source_cost_usd_nanos""#)
+                    || body.contains(r#""source_duration_ns""#),
                 "{body}"
             );
             assert!(
@@ -8024,6 +8715,11 @@ mod tests {
             assert!(body.contains(r#""project_id":"agentic-data""#), "{body}");
             assert!(body.contains(r#""model":"qwen""#), "{body}");
             assert!(body.contains(r#""provider":"openai""#), "{body}");
+            assert!(body.contains(r#""evalProfile":"release-gate""#), "{body}");
+            assert!(body.contains(r#""minSampleCount":"3""#), "{body}");
+            assert!(body.contains(r#""marginScore":1001"#), "{body}");
+            assert!(body.contains(r#""comparisonWindowNs":"1000""#), "{body}");
+            assert!(body.contains(r#""staleReasons":["manual_review"]"#), "{body}");
 
             let (status, body) = api.route_with_tenant(
                 "POST",
@@ -8058,6 +8754,44 @@ mod tests {
             );
             assert_eq!(status, 200, "{body}");
             assert!(body.contains(r#""count":1"#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/golden-paths?taskFingerprint=refund-dispute&evalProfile=release-gate",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":1"#), "{body}");
+
+            let challenger = r#"{
+              "sourceTraceId":"gold-run-3",
+              "taskFingerprint":"refund-dispute",
+              "score":930,
+              "label":"challenger path",
+              "challengerOf":"1",
+              "evalProfile":"release-gate",
+              "minSampleCount":2,
+              "marginScore":20,
+              "comparisonWindowNs":5000,
+              "projectId":"agentic-data"
+            }"#;
+            let (status, body) =
+                api.route_with_tenant("POST", "/v1/golden-paths", challenger, Some(1));
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""goldenPathId":"2""#), "{body}");
+            assert!(body.contains(r#""challengerOf":"1""#), "{body}");
+            assert!(body.contains(r#""evalProfile":"release-gate""#), "{body}");
+
+            let (status, body) = api.route_with_tenant(
+                "GET",
+                "/v1/golden-paths?challengerOf=1&evalProfile=release-gate",
+                "",
+                Some(1),
+            );
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(r#""count":1"#), "{body}");
+            assert!(body.contains(r#""goldenPathId":"2""#), "{body}");
 
             let (status, body) = api.route_with_tenant(
                 "POST",
@@ -8156,6 +8890,10 @@ mod tests {
             assert!(body.contains(r#""followed":1"#), "{body}");
             assert!(body.contains(r#""extended":1"#), "{body}");
             assert!(body.contains(r#""usable":1.000000"#), "{body}");
+            assert!(body.contains(r#""stale":true"#), "{body}");
+            assert!(body.contains(r#""manual_review""#), "{body}");
+            assert!(body.contains(r#""insufficient_samples""#), "{body}");
+            assert!(body.contains(r#""health_below_margin""#), "{body}");
             assert!(body.contains(r#""adherence":"extended""#), "{body}");
 
             let (status, body) = api.route_with_tenant(
@@ -8301,6 +9039,24 @@ mod tests {
             "total_tokens":200,
             "cost_usd_nanos":9999,
             "attrs":{"project_id":"other","skill":"build","mode":"auto"}
+          },
+          {
+            "trace_id":104,
+            "span_id":1,
+            "ts":130,
+            "seq":1,
+            "event_type":2,
+            "ext_span_id":"104-1",
+            "session_id":9004,
+            "status":0,
+            "duration_ns":40,
+            "tool_name":"priced",
+            "provider":"openai",
+            "model":"gpt-4o-mini",
+            "input_tokens":10,
+            "cached_input_tokens":10,
+            "output_tokens":10,
+            "attrs":{"project_id":"priced","skill":"cost","mode":"auto"}
           }
         ]"#;
         let (status, body) = s.route_with_tenant("POST", "/v1/ingest", batch, Some(1));
@@ -8323,6 +9079,14 @@ mod tests {
         assert!(body.contains(r#""sum":30"#), "{body}");
         assert!(body.contains(r#""totalTokens":30"#), "{body}");
         assert!(body.contains(r#""costUsdNanos":3000"#), "{body}");
+        assert!(
+            body.contains(r#""index":"attrs_postings+folded_verify""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#""aggregationIndex":"folded_snapshot""#),
+            "{body}"
+        );
 
         let (status, body) = s.route_with_tenant(
             "POST",
@@ -8333,6 +9097,35 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         assert!(body.contains(r#""toolName":"planner""#), "{body}");
         assert!(body.contains(r#""spanTotal":1"#), "{body}");
+
+        let (status, body) = s.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"projectId":"agentic-data","minCostUsdNanos":1500,"maxCostUsdNanos":2500,"minTotalTokens":10,"maxTotalTokens":20}}"#,
+            Some(1),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""total":1"#), "{body}");
+        assert!(body.contains(r#""traceId":"102""#), "{body}");
+        assert!(
+            body.contains(r#""index":"attrs_postings+folded_verify""#),
+            "{body}"
+        );
+
+        let (status, body) = s.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"filter":{"projectId":"priced","minCostUsd":0.000008,"maxCostUsd":0.000009}}"#,
+            Some(1),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""total":1"#), "{body}");
+        assert!(body.contains(r#""traceId":"104""#), "{body}");
+        assert!(body.contains(r#""costUsdNanos":8250"#), "{body}");
+        assert!(
+            body.contains(r#""source":"estimated_model_price""#),
+            "{body}"
+        );
     }
 
     #[test]

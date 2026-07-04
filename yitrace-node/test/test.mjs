@@ -118,13 +118,17 @@ try {
     taskFingerprint: "npm-native-packaging",
     loopId: "loop-builder",
     harnessVersion: "h1",
+    schemaFingerprint: "schema-v1",
+    intentSignature: "refund-review",
     validationStatus: "pass",
+    reviewStatus: "approved",
+    evalStatus: "pass",
+    pathMemoryId: "pm-builder",
     stopReason: "goal_met",
     phase: "verify",
     validator: "npm test",
     attrs: {
       connection_ids: ["conn-a", "conn-b"],
-      path_memory_id: "pm-builder",
     },
   });
   builder.startSpan({
@@ -157,7 +161,12 @@ try {
   assert.equal(builtEvents[1].attrs.call_site, "builder.ts:1");
   assert.equal(builtEvents[0].attrs.task_fingerprint, "npm-native-packaging");
   assert.equal(builtEvents[0].attrs.loop_id, "loop-builder");
+  assert.equal(builtEvents[0].attrs.schema_fingerprint, "schema-v1");
+  assert.equal(builtEvents[0].attrs.intent_signature, "refund-review");
   assert.equal(builtEvents[0].attrs.validation_status, "pass");
+  assert.equal(builtEvents[0].attrs.review_status, "approved");
+  assert.equal(builtEvents[0].attrs.eval_status, "pass");
+  assert.equal(builtEvents[0].attrs.path_memory_id, "pm-builder");
   assert.equal(builtEvents[0].attrs.phase, "verify");
   assert.equal(builtEvents[0].attrs.validator, "npm test");
   await builder.ingest(db);
@@ -184,6 +193,11 @@ try {
   const unindexedAttrHits = await db.search({ text: "builder", filter: { attrs: { path_memory_id: "pm-builder" } } });
   assert.equal(unindexedAttrHits.length, 1);
   assert.equal(unindexedAttrHits[0].attrs.path_memory_id, "pm-builder");
+  assert.equal(unindexedAttrHits[0].fields.path_memory_id, "pm-builder");
+  assert.equal(unindexedAttrHits[0].fields.schema_fingerprint, "schema-v1");
+  assert.equal(unindexedAttrHits[0].fields.intent_signature, "refund-review");
+  assert.equal(unindexedAttrHits[0].fields.review_status, "approved");
+  assert.equal(unindexedAttrHits[0].fields.eval_status, "pass");
 
   const attrMisses = await db.search({ text: "builder", filter: { project_id: "agentic-data", skill: "review" } });
   assert.equal(attrMisses.length, 0);
@@ -196,6 +210,8 @@ try {
   const tracesByUnindexedAttr = await db.traces({ attrs: { path_memory_id: "pm-builder" } });
   assert.equal(tracesByUnindexedAttr.length, 1);
   assert.equal(tracesByUnindexedAttr[0].external_trace_id, "builder-run");
+  assert.equal(tracesByUnindexedAttr[0].fields.path_memory_id, "pm-builder");
+  assert.equal(tracesByUnindexedAttr[0].fields.schema_fingerprint, "schema-v1");
 
   const filteredSessions = await db.sessions({ attrs: { project_id: "agentic-data", skill: "builder", connection_ids: "conn-a" } });
   assert.equal(filteredSessions.items.length, 1);
@@ -224,6 +240,19 @@ try {
   assert.equal(traceSearch.items[0].usage.totalTokens, 170);
   assert.equal(traceSearch.items[0].costDetail.costUsdNanos, 420000);
 
+  const traceSearchByCost = await db.traceSearch({
+    filter: {
+      projectId: "agentic-data",
+      minCostUsdNanos: 400000,
+      maxCostUsdNanos: 430000,
+      minTotalTokens: 160,
+      maxTotalTokens: 180,
+    },
+  });
+  assert.equal(traceSearchByCost.total, 1);
+  assert.equal(traceSearchByCost.items[0].externalSpanId, "builder-span");
+  assert.equal(traceSearchByCost.index, "attrs_postings+folded_verify");
+
   const traceSearchByUnindexedAttr = await db.traceSearch({
     filter: { attrs: { path_memory_id: "pm-builder" } },
   });
@@ -240,9 +269,20 @@ try {
   assert.equal(traceSearchByTask.total, 1);
   assert.equal(traceSearchByTask.items[0].fields.task_fingerprint, "npm-native-packaging");
   assert.equal(traceSearchByTask.items[0].fields.validation_status, "pass");
+  assert.equal(traceSearchByTask.items[0].fields.schema_fingerprint, "schema-v1");
+  assert.equal(traceSearchByTask.items[0].fields.path_memory_id, "pm-builder");
 
   const traceAggregate = await db.traceAggregate({
-    groupBy: ["skill", "mode", "toolName", "taskFingerprint", "validationStatus"],
+    groupBy: [
+      "skill",
+      "mode",
+      "toolName",
+      "taskFingerprint",
+      "validationStatus",
+      "schemaFingerprint",
+      "reviewStatus",
+      "evalStatus",
+    ],
     filter: { attrs: { project_id: "agentic-data", path_memory_id: "pm-builder" } },
   });
   assert.equal(traceAggregate.total, 1);
@@ -250,6 +290,9 @@ try {
   assert.equal(traceAggregate.items[0].key.skill, "builder");
   assert.equal(traceAggregate.items[0].key.mode, "auto");
   assert.equal(traceAggregate.items[0].key.toolName, "builder-tool");
+  assert.equal(traceAggregate.items[0].key.schema_fingerprint, "schema-v1");
+  assert.equal(traceAggregate.items[0].key.review_status, "approved");
+  assert.equal(traceAggregate.items[0].key.eval_status, "pass");
   assert.equal(traceAggregate.items[0].key.task_fingerprint, "npm-native-packaging");
   assert.equal(traceAggregate.items[0].key.validation_status, "pass");
   assert.equal(traceAggregate.items[0].spanCount, 1);
@@ -358,7 +401,11 @@ try {
     taskFingerprint: "npm-native-packaging",
     loopId: "loop-builder",
     harnessVersion: "h1",
+    schemaFingerprint: "schema-v1",
+    intentSignature: "refund-review",
     validationStatus: "pass",
+    reviewStatus: "approved",
+    evalStatus: "pass",
     stopReason: "goal_met",
     phase: "verify",
     validator: "npm test",
@@ -415,6 +462,11 @@ try {
     label: "fast packaging path",
     reason: "best observed route",
     source: "human",
+    evalProfile: "release-gate",
+    minSampleCount: 3,
+    marginScore: 800,
+    comparisonWindowNs: "1000",
+    staleReasons: ["manual_review"],
     projectId: "agentic-data",
     skill: "builder",
   });
@@ -426,6 +478,11 @@ try {
   assert.equal(goldenPath.attrs.model, "qwen");
   assert.equal(goldenPath.evidenceSummary.source_trajectory_step_count, 1);
   assert.equal(goldenPath.evidenceSummary.source_status, "ok");
+  assert.equal(goldenPath.evalProfile, "release-gate");
+  assert.equal(goldenPath.minSampleCount, "3");
+  assert.equal(goldenPath.marginScore, 800);
+  assert.equal(goldenPath.comparisonWindowNs, "1000");
+  assert.deepEqual(goldenPath.staleReasons, ["manual_review"]);
 
   const confirmedGoldenPath = await db.updateGoldenPathStatus(goldenPath.goldenPathId, {
     status: "confirmed",
@@ -522,7 +579,11 @@ try {
     taskFingerprint: "npm-native-packaging",
     loopId: "loop-builder",
     harnessVersion: "h1",
+    schemaFingerprint: "schema-v1",
+    intentSignature: "refund-review",
     validationStatus: "pass",
+    reviewStatus: "approved",
+    evalStatus: "pass",
     stopReason: "goal_met",
     phase: "verify",
     validator: "npm test",
@@ -554,6 +615,10 @@ try {
   assert.equal(health.counts.followed, 1);
   assert.equal(health.counts.deviated, 1);
   assert.equal(health.rates.usable, 0.5);
+  assert.equal(health.governance.stale, true);
+  assert.ok(health.governance.staleReasons.includes("manual_review"));
+  assert.ok(health.governance.staleReasons.includes("insufficient_samples"));
+  assert.ok(health.governance.staleReasons.includes("health_below_margin"));
   assert.ok(health.examples.some((item) => item.adherence === "deviated"));
 
   const healthWithSource = await db.goldenPathHealth(goldenPath.goldenPathId, {
@@ -621,6 +686,89 @@ try {
   const hiddenAnnotations = await db.annotations({ traceId: "builder-run" }, { tenantId: 999 });
   assert.equal(hiddenAnnotations.count, 0);
 
+  const pageBuilder = createSpanEventBuilder({
+    traceId: "pagination-run",
+    sessionId: "pagination-session",
+    projectId: "pagination-demo",
+    taskFingerprint: "pagination-task",
+    skill: "review",
+  });
+  pageBuilder.startSpan({
+    spanId: "pagination-span",
+    name: "pagination span",
+    toolName: "pager",
+    inputText: "pagination input",
+  });
+  pageBuilder.endSpan({ spanId: "pagination-span", status: 0, durationNs: 1, outputText: "pagination output" });
+  await pageBuilder.ingest(db);
+  await db.annotate({ traceId: "pagination-run", label: "oldest", projectId: "pagination-demo" });
+  await db.annotate({ traceId: "pagination-run", label: "middle", projectId: "pagination-demo" });
+  await db.annotate({ traceId: "pagination-run", label: "newest", projectId: "pagination-demo" });
+  await db.linkDatasetItem({ datasetId: "pagination-dataset", itemId: "case-1", traceId: "pagination-run", label: "oldest", projectId: "pagination-demo" });
+  await db.linkDatasetItem({ datasetId: "pagination-dataset", itemId: "case-2", traceId: "pagination-run", label: "middle", projectId: "pagination-demo" });
+  await db.linkDatasetItem({ datasetId: "pagination-dataset", itemId: "case-3", traceId: "pagination-run", label: "newest", projectId: "pagination-demo" });
+
+  const annotationPage1 = await db.annotations({ projectId: "pagination-demo", limit: 2 });
+  assert.equal(annotationPage1.count, 3);
+  assert.equal(annotationPage1.total, 3);
+  assert.equal(annotationPage1.pageCount, 2);
+  assert.equal(annotationPage1.nextCursor, 2);
+  assert.deepEqual(annotationPage1.items.map((item) => item.label), ["newest", "middle"]);
+  const annotationPage2 = await db.annotations({ projectId: "pagination-demo", cursor: annotationPage1.nextCursor, limit: 2 });
+  assert.equal(annotationPage2.pageCount, 1);
+  assert.equal(annotationPage2.nextCursor, null);
+  assert.deepEqual(annotationPage2.items.map((item) => item.label), ["oldest"]);
+  assert.equal(annotationPage2.items[0].status, "active");
+
+  const updatedAnnotation = await db.updateAnnotation(annotationPage2.items[0].annotationId, {
+    status: "resolved",
+    reviewer: "four",
+    reason: "accepted for review",
+    attrs: { review_round: 1 },
+  });
+  assert.equal(updatedAnnotation.status, "resolved");
+  assert.equal(updatedAnnotation.reviewer, "four");
+  assert.equal(updatedAnnotation.attrs.review_round, 1);
+  assert.ok(BigInt(updatedAnnotation.updatedAtNs) >= BigInt(updatedAnnotation.createdAtNs));
+  const resolvedAnnotations = await db.annotations({ projectId: "pagination-demo", status: "resolved" });
+  assert.equal(resolvedAnnotations.count, 1);
+  assert.equal(resolvedAnnotations.items[0].label, "oldest");
+  await assert.rejects(
+    () => db.updateAnnotation(annotationPage2.items[0].annotationId, { status: "rejected" }, { tenantId: 999 }),
+    /status=404/,
+  );
+  const deletedAnnotation = await db.deleteAnnotation(annotationPage2.items[0].annotationId, {
+    reviewer: "four",
+    reason: "superseded",
+  });
+  assert.equal(deletedAnnotation.status, "deleted");
+  assert.equal(deletedAnnotation.reason, "superseded");
+  const activeAnnotationsAfterDelete = await db.annotations({ projectId: "pagination-demo" });
+  assert.equal(activeAnnotationsAfterDelete.count, 2);
+  assert.deepEqual(activeAnnotationsAfterDelete.items.map((item) => item.label), ["newest", "middle"]);
+  const deletedAnnotations = await db.annotations({ projectId: "pagination-demo", status: "deleted" });
+  assert.equal(deletedAnnotations.count, 1);
+  assert.equal(deletedAnnotations.items[0].label, "oldest");
+  const deletedAnnotationHiddenSearch = await db.traceSearch({
+    filter: { annotation: { label: "oldest" } },
+  });
+  assert.equal(deletedAnnotationHiddenSearch.total, 0);
+  const deletedAnnotationExplicitSearch = await db.traceSearch({
+    filter: { annotation: { label: "oldest", status: "deleted" } },
+  });
+  assert.equal(deletedAnnotationExplicitSearch.total, 1);
+
+  const datasetPage1 = await db.datasetAssociations({ datasetId: "pagination-dataset", limit: 2 });
+  assert.equal(datasetPage1.count, 3);
+  assert.equal(datasetPage1.total, 3);
+  assert.equal(datasetPage1.pageCount, 2);
+  assert.equal(datasetPage1.nextCursor, 2);
+  assert.deepEqual(datasetPage1.items.map((item) => item.itemId), ["case-3", "case-2"]);
+  const datasetPage2 = await db.datasetAssociations({ datasetId: "pagination-dataset", cursor: datasetPage1.nextCursor, limit: 2 });
+  assert.equal(datasetPage2.pageCount, 1);
+  assert.equal(datasetPage2.nextCursor, null);
+  assert.deepEqual(datasetPage2.items.map((item) => item.itemId), ["case-1"]);
+
   const builderTrace = await db.trace("builder-run");
   assert.equal(builderTrace.spans[0].spanOrdinal, 0);
   assert.equal(builderTrace.spans[0].logEvents[0].eventOrdinal, 0);
@@ -645,14 +793,19 @@ try {
 
   const reopened = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
   const recovered = await reopened.traces();
-  assert.equal(recovered.length, 5);
+  assert.equal(recovered.length, 6);
   assert.equal(recovered.find((t) => t.external_trace_id === "run-uuid")?.external_trace_id, "run-uuid");
+  assert.equal(recovered.find((t) => t.external_trace_id === "pagination-run")?.external_trace_id, "pagination-run");
   const recoveredAttrHits = await reopened.search({ text: "builder", filter: { attrs: { connection_ids: "conn-a" } } });
   assert.equal(recoveredAttrHits.length, 1);
   assert.equal(recoveredAttrHits[0].external_span_id, "builder-span");
   const recoveredAnnotations = await reopened.annotations({ traceId: "builder-run", projectId: "agentic-data" });
   assert.equal(recoveredAnnotations.count, 1);
   assert.equal(recoveredAnnotations.items[0].label, "best_path");
+  const recoveredDeletedAnnotations = await reopened.annotations({ projectId: "pagination-demo", status: "deleted" });
+  assert.equal(recoveredDeletedAnnotations.count, 1);
+  assert.equal(recoveredDeletedAnnotations.items[0].label, "oldest");
+  assert.equal(recoveredDeletedAnnotations.items[0].reviewer, "four");
   const recoveredDatasetLinks = await reopened.datasetAssociations({ datasetId: "best-path-regression", itemId: "case-1" });
   assert.equal(recoveredDatasetLinks.count, 1);
   assert.equal(recoveredDatasetLinks.items[0].snapshotHash, "fnv1a64:builder");

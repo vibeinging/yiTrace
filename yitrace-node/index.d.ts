@@ -163,6 +163,10 @@ export interface AnnotationInput extends MetadataAttrs {
   source?: string | null;
   createdBy?: string | null;
   created_by?: string | null;
+  status?: AnnotationStatus | string;
+  reviewer?: string | null;
+  reviewedBy?: string | null;
+  reviewed_by?: string | null;
   evalProfile?: string | null;
   eval_profile?: string | null;
   sampleCount?: number | null;
@@ -178,16 +182,51 @@ export interface AnnotationInput extends MetadataAttrs {
   evidence_summary?: Record<string, unknown>;
 }
 
+export type AnnotationStatus = "active" | "resolved" | "rejected" | "deleted";
+
+export interface AnnotationUpdate extends MetadataAttrs {
+  label?: string;
+  score?: number | null;
+  reason?: string | null;
+  comment?: string | null;
+  note?: string | null;
+  source?: string | null;
+  updatedBy?: string | null;
+  updated_by?: string | null;
+  status?: AnnotationStatus | string;
+  reviewer?: string | null;
+  reviewedBy?: string | null;
+  reviewed_by?: string | null;
+  replaceAttrs?: boolean;
+  replace_attrs?: boolean;
+}
+
+export interface AnnotationDeleteOptions extends TenantOptions {
+  reason?: string | null;
+  comment?: string | null;
+  note?: string | null;
+  reviewer?: string | null;
+  reviewedBy?: string | null;
+  reviewed_by?: string | null;
+  source?: string | null;
+}
+
 export interface AnnotationFilter extends MetadataAttrs {
   traceId?: TenantId;
   trace_id?: TenantId;
   spanId?: TenantId;
   span_id?: TenantId;
+  cursor?: number;
+  offset?: number;
+  limit?: number;
   target?: "trace" | "span" | string;
   targetType?: "trace" | "span" | string;
   target_type?: "trace" | "span" | string;
   label?: string;
   source?: string;
+  status?: AnnotationStatus | string;
+  includeDeleted?: boolean;
+  include_deleted?: boolean;
 }
 
 export interface TraceAnnotation {
@@ -202,14 +241,20 @@ export interface TraceAnnotation {
   score?: number | null;
   reason?: string | null;
   source?: string | null;
+  status: AnnotationStatus | string;
+  reviewer?: string | null;
   createdAtNs: string;
+  updatedAtNs: string;
   attrs: Record<string, unknown>;
   [key: string]: unknown;
 }
 
 export interface AnnotationPage<T = TraceAnnotation> {
   items: T[];
+  total?: number;
   count: number;
+  pageCount?: number;
+  nextCursor?: number | null;
   [key: string]: unknown;
 }
 
@@ -248,6 +293,9 @@ export interface DatasetAssociationFilter extends MetadataAttrs {
   trace_id?: TenantId;
   spanId?: TenantId;
   span_id?: TenantId;
+  cursor?: number;
+  offset?: number;
+  limit?: number;
   evalRunId?: string;
   eval_run_id?: string;
   split?: string;
@@ -276,7 +324,10 @@ export interface DatasetAssociation {
 
 export interface DatasetAssociationPage<T = DatasetAssociation> {
   items: T[];
+  total?: number;
   count: number;
+  pageCount?: number;
+  nextCursor?: number | null;
   [key: string]: unknown;
 }
 
@@ -312,6 +363,29 @@ export interface GoldenPathCandidateInput extends MetadataAttrs {
   source?: string | null;
   createdBy?: string | null;
   created_by?: string | null;
+  challengerOf?: TenantId | null;
+  challenger_of?: TenantId | null;
+  baselineGoldenPathId?: TenantId | null;
+  baseline_golden_path_id?: TenantId | null;
+  evalProfile?: string | null;
+  eval_profile?: string | null;
+  minSampleCount?: number | null;
+  min_sample_count?: number | null;
+  minSamples?: number | null;
+  min_samples?: number | null;
+  marginScore?: number | null;
+  margin_score?: number | null;
+  margin?: number | null;
+  comparisonWindowNs?: WireNumber | null;
+  comparison_window_ns?: WireNumber | null;
+  windowNs?: WireNumber | null;
+  window_ns?: WireNumber | null;
+  promotedFrom?: TenantId | null;
+  promoted_from?: TenantId | null;
+  deprecationReason?: string | null;
+  deprecation_reason?: string | null;
+  staleReasons?: string[] | string;
+  stale_reasons?: string[] | string;
 }
 
 export interface GoldenPathFilter extends MetadataAttrs {
@@ -329,7 +403,26 @@ export interface GoldenPathFilter extends MetadataAttrs {
   source_trace_id?: TenantId;
   traceId?: TenantId;
   trace_id?: TenantId;
+  challengerOf?: TenantId;
+  challenger_of?: TenantId;
+  baselineGoldenPathId?: TenantId;
+  baseline_golden_path_id?: TenantId;
+  evalProfile?: string;
+  eval_profile?: string;
   status?: GoldenPathStatus;
+}
+
+export interface GoldenPathGovernance {
+  challengerOf?: string | null;
+  evalProfile?: string | null;
+  minSampleCount?: string | null;
+  marginScore?: number | null;
+  comparisonWindowNs?: string | null;
+  promotedFrom?: string | null;
+  deprecationReason?: string | null;
+  stale?: boolean;
+  staleReasons: string[];
+  [key: string]: unknown;
 }
 
 export interface GoldenPathCandidate {
@@ -346,6 +439,15 @@ export interface GoldenPathCandidate {
   label?: string | null;
   reason?: string | null;
   source?: string | null;
+  challengerOf?: string | null;
+  evalProfile?: string | null;
+  minSampleCount?: string | null;
+  marginScore?: number | null;
+  comparisonWindowNs?: string | null;
+  promotedFrom?: string | null;
+  deprecationReason?: string | null;
+  staleReasons?: string[];
+  governance?: GoldenPathGovernance;
   createdAtNs: string;
   updatedAtNs: string;
   attrs: Record<string, unknown>;
@@ -545,6 +647,7 @@ export interface GoldenPathHealthResult {
   counts: GoldenPathHealthCounts;
   rates: GoldenPathHealthRates;
   coverage: GoldenPathHealthCoverage;
+  governance: GoldenPathGovernance;
   examples: GoldenPathHealthExample[];
   [key: string]: unknown;
 }
@@ -574,7 +677,7 @@ export interface CostDetail {
   costUsd: number;
   costUsdNanos: number | string;
   currency: string;
-  source: "explicit" | "estimated" | "mixed" | string;
+  source: "explicit" | "estimated" | "estimated_model_price" | "estimated_default" | "mixed" | string;
   [key: string]: unknown;
 }
 
@@ -826,6 +929,26 @@ export interface TraceSearchQuery {
     inputContains?: string;
     outputContains?: string;
     logContains?: string;
+    minCostUsdNanos?: WireNumber;
+    min_cost_usd_nanos?: WireNumber;
+    costUsdNanosMin?: WireNumber;
+    maxCostUsdNanos?: WireNumber;
+    max_cost_usd_nanos?: WireNumber;
+    costUsdNanosMax?: WireNumber;
+    minCostUsd?: number;
+    min_cost_usd?: number;
+    costUsdMin?: number;
+    maxCostUsd?: number;
+    max_cost_usd?: number;
+    costUsdMax?: number;
+    minTotalTokens?: number;
+    min_total_tokens?: number;
+    totalTokensMin?: number;
+    minTokens?: number;
+    maxTotalTokens?: number;
+    max_total_tokens?: number;
+    totalTokensMax?: number;
+    maxTokens?: number;
     annotation?: AnnotationFilter & {
       scoreMin?: number;
       score_min?: number;
@@ -887,6 +1010,7 @@ export interface TraceSearchPage<T = TraceSpan> {
   items: T[];
   nextCursor: number | null;
   total: number;
+  index?: string;
   [key: string]: unknown;
 }
 
@@ -974,6 +1098,8 @@ export interface TraceAggregatePage<T = TraceAggregateBucket> {
   items: T[];
   total: number;
   spanTotal: number;
+  index?: string;
+  aggregationIndex?: string;
   [key: string]: unknown;
 }
 
@@ -1404,6 +1530,8 @@ export interface TrajectoryGroupPage<T = TrajectoryGroupBucket> {
   total: number;
   traceTotal: number;
   spanTotal: number;
+  index?: string;
+  trajectoryIndex?: string;
   [key: string]: unknown;
 }
 
@@ -1816,6 +1944,8 @@ export declare class YiTraceDB {
   loop<T = LoopDetail>(loopId: string, options?: LoopDetailOptions): Promise<T | null>;
   taskTraces<T = TaskTracePage>(taskFingerprint: string, options?: TaskTracesOptions): Promise<T>;
   annotate<T = TraceAnnotation>(annotation: AnnotationInput, options?: TenantOptions): Promise<T>;
+  updateAnnotation<T = TraceAnnotation>(annotationId: TenantId, update?: AnnotationUpdate, options?: TenantOptions): Promise<T>;
+  deleteAnnotation<T = TraceAnnotation>(annotationId: TenantId, options?: AnnotationDeleteOptions): Promise<T>;
   annotations<T = AnnotationPage>(filter?: AnnotationFilter, options?: TenantOptions): Promise<T>;
   linkDatasetItem<T = DatasetAssociation>(association: DatasetAssociationInput, options?: TenantOptions): Promise<T>;
   datasetAssociations<T = DatasetAssociationPage>(filter?: DatasetAssociationFilter, options?: TenantOptions): Promise<T>;

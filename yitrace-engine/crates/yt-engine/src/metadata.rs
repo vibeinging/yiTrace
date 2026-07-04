@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::olog;
 
 const MAGIC: u32 = 0x5954_4D44; // "YTMD"
-const FORMAT_VER: u32 = 6;
+const FORMAT_VER: u32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnotationTarget {
@@ -35,6 +35,54 @@ impl AnnotationTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationStatus {
+    Active,
+    Resolved,
+    Rejected,
+    Deleted,
+}
+
+impl AnnotationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnnotationStatus::Active => "active",
+            AnnotationStatus::Resolved => "resolved",
+            AnnotationStatus::Rejected => "rejected",
+            AnnotationStatus::Deleted => "deleted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "active" | "open" => Some(AnnotationStatus::Active),
+            "resolved" | "accepted" | "done" => Some(AnnotationStatus::Resolved),
+            "rejected" | "dismissed" => Some(AnnotationStatus::Rejected),
+            "deleted" | "removed" | "archived" => Some(AnnotationStatus::Deleted),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            AnnotationStatus::Active => 0,
+            AnnotationStatus::Resolved => 1,
+            AnnotationStatus::Rejected => 2,
+            AnnotationStatus::Deleted => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(AnnotationStatus::Active),
+            1 => Some(AnnotationStatus::Resolved),
+            2 => Some(AnnotationStatus::Rejected),
+            3 => Some(AnnotationStatus::Deleted),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceAnnotation {
     pub annotation_id: u64,
@@ -49,6 +97,9 @@ pub struct TraceAnnotation {
     pub reason: Option<String>,
     pub source: Option<String>,
     pub created_at_ns: u64,
+    pub updated_at_ns: u64,
+    pub status: AnnotationStatus,
+    pub reviewer: Option<String>,
     pub attrs: BTreeMap<String, String>,
 }
 
@@ -63,7 +114,21 @@ pub struct NewTraceAnnotation {
     pub score: Option<u32>,
     pub reason: Option<String>,
     pub source: Option<String>,
+    pub status: Option<AnnotationStatus>,
+    pub reviewer: Option<String>,
     pub attrs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateTraceAnnotation {
+    pub label: Option<String>,
+    pub score: Option<Option<u32>>,
+    pub reason: Option<Option<String>>,
+    pub source: Option<Option<String>>,
+    pub status: Option<AnnotationStatus>,
+    pub reviewer: Option<Option<String>>,
+    pub attrs: Option<BTreeMap<String, String>>,
+    pub merge_attrs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -74,6 +139,8 @@ pub struct TraceAnnotationFilter {
     pub span_id: Option<u64>,
     pub label: Option<String>,
     pub source: Option<String>,
+    pub status: Option<AnnotationStatus>,
+    pub include_deleted: bool,
     pub attrs: BTreeMap<String, String>,
 }
 
@@ -176,6 +243,14 @@ pub struct GoldenPathCandidate {
     pub attrs: BTreeMap<String, String>,
     pub source_trajectory_steps: Vec<String>,
     pub evidence: BTreeMap<String, String>,
+    pub challenger_of: Option<u64>,
+    pub eval_profile: Option<String>,
+    pub min_sample_count: Option<u64>,
+    pub margin_score: Option<u32>,
+    pub comparison_window_ns: Option<u64>,
+    pub promoted_from: Option<u64>,
+    pub deprecation_reason: Option<String>,
+    pub stale_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -194,6 +269,14 @@ pub struct NewGoldenPathCandidate {
     pub attrs: BTreeMap<String, String>,
     pub source_trajectory_steps: Vec<String>,
     pub evidence: BTreeMap<String, String>,
+    pub challenger_of: Option<u64>,
+    pub eval_profile: Option<String>,
+    pub min_sample_count: Option<u64>,
+    pub margin_score: Option<u32>,
+    pub comparison_window_ns: Option<u64>,
+    pub promoted_from: Option<u64>,
+    pub deprecation_reason: Option<String>,
+    pub stale_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -203,6 +286,8 @@ pub struct GoldenPathFilter {
     pub task_fingerprint: Option<String>,
     pub trajectory_signature: Option<String>,
     pub source_trace_id: Option<u64>,
+    pub challenger_of: Option<u64>,
+    pub eval_profile: Option<String>,
     pub status: Option<GoldenPathStatus>,
     pub attrs: BTreeMap<String, String>,
 }
@@ -527,6 +612,9 @@ pub(crate) fn encode(state: &MetadataState) -> Vec<u8> {
         put_opt_str(&mut b, a.reason.as_deref());
         put_opt_str(&mut b, a.source.as_deref());
         put_u64(&mut b, a.created_at_ns);
+        put_u64(&mut b, a.updated_at_ns);
+        put_u8(&mut b, a.status.code());
+        put_opt_str(&mut b, a.reviewer.as_deref());
         put_map(&mut b, &a.attrs);
     }
     put_u64(&mut b, state.dataset_associations.len() as u64);
@@ -576,6 +664,14 @@ pub(crate) fn encode(state: &MetadataState) -> Vec<u8> {
         put_map(&mut b, &g.attrs);
         put_str_vec(&mut b, &g.source_trajectory_steps);
         put_map(&mut b, &g.evidence);
+        put_opt_u64(&mut b, g.challenger_of);
+        put_opt_str(&mut b, g.eval_profile.as_deref());
+        put_opt_u64(&mut b, g.min_sample_count);
+        put_opt_u32(&mut b, g.margin_score);
+        put_opt_u64(&mut b, g.comparison_window_ns);
+        put_opt_u64(&mut b, g.promoted_from);
+        put_opt_str(&mut b, g.deprecation_reason.as_deref());
+        put_str_vec(&mut b, &g.stale_reasons);
     }
     put_u64(&mut b, state.retention_audits.len() as u64);
     for a in &state.retention_audits {
@@ -669,19 +765,40 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<MetadataState> {
             1 => AnnotationTarget::Span,
             _ => return None,
         };
+        let trace_id = c.u64()?;
+        let span_id = c.opt_u64()?;
+        let external_trace_id = c.opt_str()?;
+        let external_span_id = c.opt_str()?;
+        let label = c.str()?;
+        let score = c.opt_u32()?;
+        let reason = c.opt_str()?;
+        let source = c.opt_str()?;
+        let created_at_ns = c.u64()?;
+        let (updated_at_ns, status, reviewer) = if ver >= 7 {
+            (
+                c.u64()?,
+                AnnotationStatus::from_code(c.u8()?)?,
+                c.opt_str()?,
+            )
+        } else {
+            (created_at_ns, AnnotationStatus::Active, None)
+        };
         state.annotations.push(TraceAnnotation {
             annotation_id,
             tenant_id,
             target,
-            trace_id: c.u64()?,
-            span_id: c.opt_u64()?,
-            external_trace_id: c.opt_str()?,
-            external_span_id: c.opt_str()?,
-            label: c.str()?,
-            score: c.opt_u32()?,
-            reason: c.opt_str()?,
-            source: c.opt_str()?,
-            created_at_ns: c.u64()?,
+            trace_id,
+            span_id,
+            external_trace_id,
+            external_span_id,
+            label,
+            score,
+            reason,
+            source,
+            created_at_ns,
+            updated_at_ns,
+            status,
+            reviewer,
             attrs: c.map()?,
         });
     }
@@ -733,6 +850,29 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<MetadataState> {
             let attrs = c.map()?;
             let source_trajectory_steps = if ver >= 3 { c.str_vec()? } else { Vec::new() };
             let evidence = if ver >= 3 { c.map()? } else { BTreeMap::new() };
+            let (
+                challenger_of,
+                eval_profile,
+                min_sample_count,
+                margin_score,
+                comparison_window_ns,
+                promoted_from,
+                deprecation_reason,
+                stale_reasons,
+            ) = if ver >= 8 {
+                (
+                    c.opt_u64()?,
+                    c.opt_str()?,
+                    c.opt_u64()?,
+                    c.opt_u32()?,
+                    c.opt_u64()?,
+                    c.opt_u64()?,
+                    c.opt_str()?,
+                    c.str_vec()?,
+                )
+            } else {
+                (None, None, None, None, None, None, None, Vec::new())
+            };
             state.golden_paths.push(GoldenPathCandidate {
                 golden_path_id,
                 tenant_id,
@@ -752,6 +892,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<MetadataState> {
                 attrs,
                 source_trajectory_steps,
                 evidence,
+                challenger_of,
+                eval_profile,
+                min_sample_count,
+                margin_score,
+                comparison_window_ns,
+                promoted_from,
+                deprecation_reason,
+                stale_reasons,
             });
         }
     }
@@ -930,6 +1078,9 @@ mod tests {
                 reason: Some("人工确认".to_string()),
                 source: Some("human".to_string()),
                 created_at_ns: 123,
+                updated_at_ns: 124,
+                status: AnnotationStatus::Resolved,
+                reviewer: Some("four".to_string()),
                 attrs: attrs.clone(),
             }],
             dataset_associations: vec![DatasetAssociation {
@@ -972,6 +1123,14 @@ mod tests {
                     ("sample_count".to_string(), "5".to_string()),
                     ("success_rate".to_string(), "0.800000".to_string()),
                 ]),
+                challenger_of: Some(1),
+                eval_profile: Some("release-gate".to_string()),
+                min_sample_count: Some(5),
+                margin_score: Some(25),
+                comparison_window_ns: Some(86_400_000_000_000),
+                promoted_from: Some(2),
+                deprecation_reason: Some("schema changed".to_string()),
+                stale_reasons: vec!["schema_fingerprint_changed".to_string()],
             }],
             retention_audits: vec![RetentionAuditRecord {
                 audit_id: 13,

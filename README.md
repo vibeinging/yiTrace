@@ -231,10 +231,21 @@ Direct ingest accepts numeric IDs or external string IDs such as UUIDs. String
 IDs are hashed into stable internal `u64` keys for indexing while the original
 values are returned as `external_*` fields. `attrs` is persisted and returned on
 search, trace, and span detail responses. Exact attrs filtering is supported for
-`project_id`, `skill`, `mode`, and `call_site`. `OpenOptions.readOnly` is not
+`project_id`, `skill`, `mode`, `call_site`, `task_fingerprint`, `loop_id`,
+`harness_version`, `schema_fingerprint`, `intent_signature`,
+`validation_status`, `review_status`, `eval_status`, `path_memory_id`,
+`stop_reason`, `phase`, and `validator`; these keys are promoted as engine
+fields with attrs fallback. `path_memory_id` remains off the default postings
+allowlist to avoid high-cardinality index growth. `OpenOptions.readOnly` is not
 exposed until the engine has a true read-only open path. Trace and span detail
 responses also return `logEvents`, so apps can render span-level process logs
 without copying them into `attrs.event_logs`.
+Structured trace queries support cost/token range filters and expose an `index`
+label that tells callers whether attrs postings, metadata filters, or folded
+scan were used. Golden Path records also carry Best/Challenger governance
+metadata such as `challengerOf`, `evalProfile`, `minSampleCount`, and
+`marginScore`; yiTrace stores the evidence but does not automatically decide the
+winner.
 
 `@yitrace/db` is distributed as a small JavaScript entry package plus optional
 native platform packages (`@yitrace/db-darwin-arm64`,

@@ -117,7 +117,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `duration_ns` | u64? | 耗时纳秒（SpanEnd 时给） |
 | `input_tokens`/`output_tokens` | u64? | token 计数 |
 | `cached_input_tokens` / `reasoning_tokens` / `total_tokens` | u64? | cache 命中输入、推理 token、上游总 token；缺 `total_tokens` 时响应按各 token 字段派生 |
-| `cost_usd` / `cost_usd_nanos` / `cost_currency` | number/string? | 显式成本。落盘使用 `cost_usd_nanos` 整数；传 `cost_usd` 时会转换成 nano USD |
+| `cost_usd` / `cost_usd_nanos` / `cost_currency` | number/string? | 显式成本。落盘使用 `cost_usd_nanos` 整数；传 `cost_usd` 时会转换成 nano USD；未显式传成本时，查询层会优先按 provider/model 内置价格表估算，再回退默认单价 |
 | `session_id` | u64 或 string? | 会话归属；字符串原文保存在 `external_session_id` |
 | `tenant_id` | u64? | 租户归属；HTTP 服务会被 `X-Tenant-Id` 覆盖 |
 | `agent_name`/`tool_name`/`model`/`provider` | string? | 标注 |
@@ -125,7 +125,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `logs` | string[] | 日志行 |
 | `attrs` | object? | 原始/扩展属性；贯穿折叠、WAL/segment/manifest 和查询输出，同 key 后到覆盖 |
 
-`attrs.project_id` / `attrs.skill` / `attrs.mode` / `attrs.call_site` / `attrs.task_fingerprint` / `attrs.loop_id` / `attrs.harness_version` / `attrs.validation_status` / `attrs.stop_reason` / `attrs.phase` / `attrs.validator` 会在摄入时 schema-on-write 提升为折叠后的一等字段，并继续保留在 `attrs` 中用于 round-trip。旧数据或手写引擎记录即使只带 `attrs`，查询也会回退读取 attrs；新数据即使只写一等字段、不镜像 attrs，也能被过滤和返回。
+`attrs.project_id` / `attrs.skill` / `attrs.mode` / `attrs.call_site` / `attrs.task_fingerprint` / `attrs.loop_id` / `attrs.harness_version` / `attrs.schema_fingerprint` / `attrs.intent_signature` / `attrs.validation_status` / `attrs.review_status` / `attrs.eval_status` / `attrs.path_memory_id` / `attrs.stop_reason` / `attrs.phase` / `attrs.validator` 会在摄入时 schema-on-write 提升为折叠后的一等字段，并继续保留在 `attrs` 中用于 round-trip。旧数据或手写引擎记录即使只带 `attrs`，查询也会回退读取 attrs；新数据即使只写一等字段、不镜像 attrs，也能被过滤和返回。
 
 **响应**：`200 {"ingested":N}`（N=实际灌入条数）。
 
@@ -137,7 +137,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 - value 可为 string / number / bool / null / array / object。
 - yiTrace 会校验并保存 value 的 JSON 字面量；search、trace、span detail 返回时恢复成相同 JSON 形态。
 - 同一 span 多个事件写同一个 attr key 时，后到事件覆盖先到事件。
-- `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`validation_status`、`stop_reason`、`phase`、`validator` 是一等字段；`connection_ids`、`data_source_ids`、`schema_fingerprint`、`intent_signature`、`review_status`、`eval_status` 默认进入过滤 sidecar。其他 attrs 会持久化并返回，但可能退回折叠校验慢路径。
+- `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`schema_fingerprint`、`intent_signature`、`validation_status`、`review_status`、`eval_status`、`path_memory_id`、`stop_reason`、`phase`、`validator` 是一等字段；`connection_ids`、`data_source_ids`、`schema_fingerprint`、`intent_signature`、`review_status`、`eval_status` 默认进入过滤 sidecar。`path_memory_id` 虽然是一等字段，但默认不进 postings，以免高基数字段撑大索引；它仍可通过折叠校验精确过滤。其他 attrs 会持久化并返回，但可能退回折叠校验慢路径。
 
 ### POST /v1/traces  —— OTLP/HTTP 标准端点（生态入口 / 原始 API）
 
@@ -169,7 +169,12 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `yitrace.task_fingerprint` / `agent.task_fingerprint` / `task.fingerprint` / `task_fingerprint` | `attrs.task_fingerprint`，摄入后提升为一等字段 |
 | `yitrace.loop_id` / `agent.loop_id` / `loop.id` / `loop_id` | `attrs.loop_id`，摄入后提升为一等字段 |
 | `yitrace.harness_version` / `agent.harness_version` / `harness.version` / `harness_version` | `attrs.harness_version`，摄入后提升为一等字段 |
+| `yitrace.schema_fingerprint` / `schema.fingerprint` / `schema_fingerprint` | `attrs.schema_fingerprint`，摄入后提升为一等字段 |
+| `yitrace.intent_signature` / `task.intent_signature` / `intent.signature` / `intent_signature` | `attrs.intent_signature`，摄入后提升为一等字段 |
 | `yitrace.validation_status` / `validation.status` / `validation_status` | `attrs.validation_status`，摄入后提升为一等字段 |
+| `yitrace.review_status` / `review.status` / `review_status` | `attrs.review_status`，摄入后提升为一等字段 |
+| `yitrace.eval_status` / `eval.status` / `eval_status` | `attrs.eval_status`，摄入后提升为一等字段 |
+| `yitrace.path_memory_id` / `agent.path_memory_id` / `path_memory.id` / `path_memory_id` | `attrs.path_memory_id`，摄入后提升为一等字段；默认不建 postings |
 | `yitrace.stop_reason` / `agent.stop_reason` / `stop.reason` / `stop_reason` | `attrs.stop_reason`，摄入后提升为一等字段 |
 | `yitrace.phase` / `agent.phase` / `loop.phase` / `phase` | `attrs.phase`，摄入后提升为一等字段 |
 | `yitrace.validator` / `validation.validator` / `validator` | `attrs.validator`，摄入后提升为一等字段 |
@@ -187,7 +192,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | 参数 | 说明 |
 |---|---|
 | `attrs` | URL 编码 JSON object，如 `{"project_id":"agentic-data"}` |
-| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `validationStatus` / `validation_status` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `schemaFingerprint` / `schema_fingerprint` / `intentSignature` / `intent_signature` / `validationStatus` / `validation_status` / `reviewStatus` / `review_status` / `evalStatus` / `eval_status` / `pathMemoryId` / `path_memory_id` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
 | `annotationLabel` / `annotationSource` / `annotationTarget` / `annotationScoreMin` / `annotationScoreMax` | 按 annotation 反向过滤 trace |
 | `datasetId` / `itemId` / `evalRunId` / `datasetLabel` / `datasetScoreMin` / `datasetScoreMax` | 按 dataset association 反向过滤 trace |
 
@@ -286,7 +291,12 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
 | `filter.task_fingerprint` / `filter.taskFingerprint` | JSON value? | 否 | 精确匹配一等字段 `task_fingerprint`，兼容 attrs.task_fingerprint |
 | `filter.loop_id` / `filter.loopId` | JSON value? | 否 | 精确匹配一等字段 `loop_id`，兼容 attrs.loop_id |
 | `filter.harness_version` / `filter.harnessVersion` | JSON value? | 否 | 精确匹配一等字段 `harness_version`，兼容 attrs.harness_version |
+| `filter.schema_fingerprint` / `filter.schemaFingerprint` | JSON value? | 否 | 精确匹配一等字段 `schema_fingerprint`，兼容 attrs.schema_fingerprint |
+| `filter.intent_signature` / `filter.intentSignature` | JSON value? | 否 | 精确匹配一等字段 `intent_signature`，兼容 attrs.intent_signature |
 | `filter.validation_status` / `filter.validationStatus` | JSON value? | 否 | 精确匹配一等字段 `validation_status`，兼容 attrs.validation_status |
+| `filter.review_status` / `filter.reviewStatus` | JSON value? | 否 | 精确匹配一等字段 `review_status`，兼容 attrs.review_status |
+| `filter.eval_status` / `filter.evalStatus` | JSON value? | 否 | 精确匹配一等字段 `eval_status`，兼容 attrs.eval_status |
+| `filter.path_memory_id` / `filter.pathMemoryId` | JSON value? | 否 | 精确匹配一等字段 `path_memory_id`，兼容 attrs.path_memory_id；默认不走 postings |
 | `filter.stop_reason` / `filter.stopReason` | JSON value? | 否 | 精确匹配一等字段 `stop_reason`，兼容 attrs.stop_reason |
 | `filter.phase` / `filter.validator` | JSON value? | 否 | 精确匹配一等字段 `phase` / `validator`，兼容 attrs fallback |
 | `filter.attrs.<key>` | JSON value? | 否 | 与上面字段等价，也可传任意扩展 attrs filter |
@@ -354,13 +364,15 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
 | `filter.sessionId` / `traceId` / `spanId` | 内部数字 id 或外部字符串 id |
 | `filter.status` / `kind` / `agentName` / `toolName` / `model` | span 结构化字段 |
 | `filter.inputContains` / `outputContains` / `logContains` / 顶层 `text` | 文本 contains 过滤 |
-| `filter.attrs` 或 `projectId` / `skill` / `mode` / `callSite` / `taskFingerprint` / `loopId` / `harnessVersion` / `validationStatus` / `stopReason` / `phase` / `validator` | attrs 精确过滤；这些 key 已提升为一等字段并保留 attrs fallback |
-| `filter.annotation` | 嵌套对象，支持 `target`、`label`、`source`、`scoreMin`、`scoreMax`、`attrs` |
-| `filter.annotationLabel` / `annotationSource` / `annotationScoreMin` | annotation 常用顶层别名 |
+| `filter.minCostUsdNanos` / `maxCostUsdNanos` / `minCostUsd` / `maxCostUsd` | 成本范围过滤；`costUsd` 会转换成 nano USD 比较 |
+| `filter.minTotalTokens` / `maxTotalTokens` / `minTokens` / `maxTokens` | total token 范围过滤；未传 `total_tokens` 时按 input+output+cached+reasoning 派生 |
+| `filter.attrs` 或 `projectId` / `skill` / `mode` / `callSite` / `taskFingerprint` / `loopId` / `harnessVersion` / `schemaFingerprint` / `intentSignature` / `validationStatus` / `reviewStatus` / `evalStatus` / `pathMemoryId` / `stopReason` / `phase` / `validator` | attrs 精确过滤；这些 key 已提升为一等字段并保留 attrs fallback |
+| `filter.annotation` | 嵌套对象，支持 `target`、`label`、`source`、`status`、`includeDeleted`、`scoreMin`、`scoreMax`、`attrs` |
+| `filter.annotationLabel` / `annotationSource` / `annotationStatus` / `annotationScoreMin` | annotation 常用顶层别名 |
 | `filter.dataset` | 嵌套对象，支持 `datasetId`、`itemId`、`evalRunId`、`split`、`label`、`scoreMin`、`scoreMax`、`attrs` |
 | `filter.datasetId` / `itemId` / `evalRunId` / `datasetLabel` | dataset association 常用顶层别名 |
 
-annotation / dataset association 的反向过滤规则：trace 级记录命中整条 trace；span 级记录只命中对应 span。tenant 仍由 `X-Tenant-Id` 强制注入。
+annotation / dataset association 的反向过滤规则：trace 级记录命中整条 trace；span 级记录只命中对应 span。`status="deleted"` 的 annotation 默认不参与反向过滤；显式传 `status:"deleted"` 或 `includeDeleted:true` 才会命中。tenant 仍由 `X-Tenant-Id` 强制注入。
 
 **响应**：
 
@@ -406,9 +418,12 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
     }
   ],
   "nextCursor": null,
-  "total": 1
+  "total": 1,
+  "index": "attrs_postings+folded_verify"
 }
 ```
+
+`index` 用于观测本次查询的候选收窄路径：`attrs_postings+folded_verify` 表示先用 attrs postings / segment sidecar 收窄，再用 folded span 校验；`metadata_filter+folded_scan` 表示使用 annotation/dataset 元数据过滤；`folded_scan` 表示当前仍是折叠快照扫描。
 
 ### POST /v1/trace-aggregate  —— 跨 session group-by 聚合（控制台/产品 API，camelCase 响应）
 
@@ -502,7 +517,9 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
     }
   ],
   "total": 1,
-  "spanTotal": 12
+  "spanTotal": 12,
+  "index": "attrs_postings+folded_verify",
+  "aggregationIndex": "folded_snapshot"
 }
 ```
 
@@ -566,7 +583,9 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
   ],
   "total": 1,
   "traceTotal": 2,
-  "spanTotal": 4
+  "spanTotal": 4,
+  "index": "attrs_postings+folded_verify",
+  "trajectoryIndex": "materialized_cache"
 }
 ```
 
@@ -645,7 +664,7 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
 }
 ```
 
-`groupBy` 支持 camelCase / snake_case，常用值包括 `projectId`、`skill`、`mode`、`taskFingerprint`、`validationStatus`、`sessionId`、`time`。`time` 使用 trace 最早事件时间按 `timeBucketNs` 分桶。
+`groupBy` 支持 camelCase / snake_case，常用值包括 `projectId`、`skill`、`mode`、`taskFingerprint`、`schemaFingerprint`、`intentSignature`、`validationStatus`、`reviewStatus`、`evalStatus`、`pathMemoryId`、`sessionId`、`time`。`time` 使用 trace 最早事件时间按 `timeBucketNs` 分桶。
 
 **响应**：
 
@@ -709,7 +728,7 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
 
 ### POST /v1/retention-plan / POST /v1/retention/apply  —— Retention planning and segment-row delete（控制台/产品 API，camelCase 响应）
 
-`retention-plan` 是 dry-run：按 `/v1/trace-search` 过滤和 `deleteBeforeTs` 找候选 trace，默认保护已被 annotation、dataset association、active Golden Path（candidate/confirmed）、snapshot 引用、eval link、path memory 引用的 trace。`retention/apply` 执行删除，但只软删除已经 flush 到 segment 的行；仍在 MemTable/WAL tail 的热 trace 会整条跳过，避免半删。
+`retention-plan` 是 dry-run：按 `/v1/trace-search` 过滤和 `deleteBeforeTs` 找候选 trace，默认保护已被非 deleted annotation、dataset association、active Golden Path（candidate/confirmed）、snapshot 引用、eval link、path memory 引用的 trace。`retention/apply` 执行删除，但只软删除已经 flush 到 segment 的行；仍在 MemTable/WAL tail 的热 trace 会整条跳过，避免半删。
 
 **请求体**：
 
@@ -1008,6 +1027,12 @@ curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=2
   "label": "fast packaging path",
   "reason": "best observed route",
   "source": "human",
+  "evalProfile": "release-gate",
+  "challengerOf": null,
+  "minSampleCount": 5,
+  "marginScore": 800,
+  "comparisonWindowNs": 86400000000000,
+  "staleReasons": [],
   "projectId": "agentic-data"
 }
 ```
@@ -1018,12 +1043,14 @@ curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=2
 - `taskFingerprint` 必填；未传时会尝试从 source trace 的 `task_fingerprint` 字段推断。
 - `trajectorySignature` 可选；未传时由 source trace 的 folded spans 自动计算 `fnv1a64:*`。
 - `status` 可选，默认 `candidate`；可用值：`candidate` / `confirmed` / `rejected` / `deprecated`。
-- `projectId`、`skill`、`mode`、`callSite`、`evalProfile`、`model`、`provider`、`toolVersion` 等一等 attrs 会写入 `attrs`，用于后续过滤。
+- `projectId`、`skill`、`mode`、`callSite`、`model`、`provider`、`toolVersion` 等一等 attrs 会写入 `attrs`，用于后续过滤；顶层 `evalProfile` 是 Golden Path 治理字段，不会自动污染 trace scope filter，除非同时放进 `attrs`。
+- `challengerOf` / `evalProfile` / `minSampleCount` / `marginScore` / `comparisonWindowNs` 是 Best/Challenger 治理底座。yiTrace 只记录比较窗口和阈值证据，不自动 promote/deprecate。
+- `deprecationReason` / `staleReasons` 可由产品层写入；`goldenPathHealth()` 也会基于样本数、health 和 source signature 输出派生 stale reasons。
 - `evidence` / `evidenceSummary` 可传入产品层证据摘要，例如 `sampleCount`、`successRate`、`avgCostUsdNanos`、`p95DurationNs`；系统也会补 `source_span_count`、`source_status`、`source_total_tokens`、`source_cost_usd_nanos`、`source_trajectory_signature` 等 source 摘要。
 
 **查询：`GET /v1/golden-paths?taskFingerprint=...&status=confirmed&projectId=...`**
 
-支持按 `goldenPathId`、`taskFingerprint`、`trajectorySignature`、`sourceTraceId`、`status` 和 attrs 精确过滤；tenant 从 `X-Tenant-Id` 注入。
+支持按 `goldenPathId`、`taskFingerprint`、`trajectorySignature`、`sourceTraceId`、`challengerOf`、`evalProfile`、`status` 和 attrs 精确过滤；tenant 从 `X-Tenant-Id` 注入。
 
 **确认/拒绝/废弃：`POST /v1/golden-paths/:id/status`**
 
@@ -1050,6 +1077,20 @@ curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=2
   "label": "fast packaging path",
   "reason": "manual accept",
   "source": "reviewer",
+  "evalProfile": "release-gate",
+  "challengerOf": null,
+  "minSampleCount": "5",
+  "marginScore": 800,
+  "comparisonWindowNs": "86400000000000",
+  "staleReasons": [],
+  "governance": {
+    "challengerOf": null,
+    "evalProfile": "release-gate",
+    "minSampleCount": "5",
+    "marginScore": 800,
+    "comparisonWindowNs": "86400000000000",
+    "staleReasons": []
+  },
   "attrs": {
     "project_id": "agentic-data",
     "task_fingerprint": "npm-native-packaging",
@@ -1233,6 +1274,7 @@ curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=2
 - `rates.usable`: `followed + extended` 的比例，用来观察旧路径是否仍被后续 trace 覆盖。
 - `coverage`: 聚合 common/golden/trace step coverage。
 - `sourceRetained`: 使用 Golden Path 元数据里保留的 source trajectory 时也会为 `true`，避免 raw source trace 被清理后 health 直接退化为 unknown。
+- `governance`: 返回 `evalProfile`、`challengerOf`、`minSampleCount`、`marginScore`、`comparisonWindowNs` 和 `staleReasons`。常见 stale reason 包括 `insufficient_samples`、`health_below_margin`、`source_signature_changed`、`deprecated`。
 - `examples`: 轻量 trace 摘要和 trajectory，不包含大字段正文。
 
 ```json
@@ -1267,6 +1309,15 @@ curl "localhost:7878/v1/retention-audits?source=nightly-retention-policy&limit=2
     "traceStepCount": 40,
     "goldenCoverage": 0.833333,
     "traceCoverage": 0.75
+  },
+  "governance": {
+    "evalProfile": "release-gate",
+    "challengerOf": null,
+    "minSampleCount": "5",
+    "marginScore": 800,
+    "comparisonWindowNs": "86400000000000",
+    "stale": false,
+    "staleReasons": []
   },
   "examples": [
     {
@@ -1369,7 +1420,7 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
 
 按 `loop_id` 聚合 folded spans，给 Loop Health / Path Mining 页直接用。它不做自动诊断，只返回稳定读模型。
 
-查询参数：`cursor` / `limit` 分页，`filter` / `text` / `q` 做 contains；`attrs`、`projectId`、`skill`、`mode`、`taskFingerprint`、`validationStatus` 等一等字段可精确过滤；annotation / dataset 反向过滤参数与 `traceSearch` 相同。
+查询参数：`cursor` / `limit` 分页，`filter` / `text` / `q` 做 contains；`attrs`、`projectId`、`skill`、`mode`、`taskFingerprint`、`schemaFingerprint`、`intentSignature`、`validationStatus`、`reviewStatus`、`evalStatus`、`pathMemoryId` 等一等字段可精确过滤；annotation / dataset 反向过滤参数与 `traceSearch` 相同。
 
 响应：
 
@@ -1461,6 +1512,8 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
   "score": 920,
   "reason": "人工确认这次路径最短",
   "source": "human",
+  "status": "active",
+  "reviewer": "four",
   "projectId": "agentic-data",
   "skill": "review"
 }
@@ -1475,6 +1528,8 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
 | `score` | u32? | 否 | 建议沿用千分制 0–1000 |
 | `reason` / `comment` / `note` | string? | 否 | 判断原因 |
 | `source` / `createdBy` | string? | 否 | `human` / `rule` / `eval` / `model` 等 |
+| `status` | `active` / `resolved` / `rejected` / `deleted` | 否 | 默认 `active`；`deleted` 是软删除状态 |
+| `reviewer` / `reviewedBy` | string? | 否 | 人工或自动 review 操作者 |
 | `attrs` 或顶层 attrs 别名 | object / JSON value | 否 | `projectId`、`skill`、`mode`、`callSite` 等会保存为 attrs，用于过滤 |
 
 **响应**：
@@ -1492,12 +1547,35 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
   "score": 920,
   "reason": "人工确认这次路径最短",
   "source": "human",
+  "status": "active",
+  "reviewer": "four",
   "createdAtNs": "1783000000000000000",
+  "updatedAtNs": "1783000000000000000",
   "attrs": {
     "project_id": "agentic-data",
     "skill": "review"
   }
 }
+```
+
+### PATCH /v1/annotations/:annotationId
+
+更新 annotation 的 review 状态或业务字段。`annotationId` 是 yiTrace 返回的内部 id，不是 trace id。支持字段：`label`、`score`、`reason` / `comment` / `note`、`source` / `updatedBy`、`status`、`reviewer` / `reviewedBy`、`attrs`。`score`、`reason`、`source`、`reviewer` 传 `null` 会清空；`attrs` 默认 merge，传 `replaceAttrs:true` 会整体替换 attrs。
+
+```bash
+curl -XPATCH localhost:7878/v1/annotations/1 \
+  -d '{"status":"resolved","reviewer":"four","reason":"人工确认","attrs":{"review_round":1}}'
+```
+
+响应字段同 `POST /v1/annotations`。
+
+### DELETE /v1/annotations/:annotationId
+
+软删除 annotation：记录会保留在 `metadata.dat` 中，状态变为 `deleted`，默认查询和 annotation 反向过滤不再命中。body 可为空，也可带 `reason` / `comment` / `note`、`reviewer` / `source`。
+
+```bash
+curl -XDELETE localhost:7878/v1/annotations/1 \
+  -d '{"reviewer":"four","reason":"superseded"}'
 ```
 
 ### GET /v1/annotations
@@ -1513,10 +1591,14 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
 | `target` | `trace` / `span` |
 | `label` | 精确匹配 |
 | `source` | 精确匹配 |
+| `status` | `active` / `resolved` / `rejected` / `deleted` 精确匹配 |
+| `includeDeleted` / `include_deleted` | 不传时默认过滤掉 `deleted`；显式传 true 且不传 `status` 时返回所有状态 |
 | `attrs` | URL 编码 JSON object，如 `{"project_id":"agentic-data"}` |
-| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `validationStatus` / `validation_status` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `schemaFingerprint` / `schema_fingerprint` / `intentSignature` / `intent_signature` / `validationStatus` / `validation_status` / `reviewStatus` / `review_status` / `evalStatus` / `eval_status` / `pathMemoryId` / `path_memory_id` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+| `cursor` / `offset` | offset 游标；上一页 `nextCursor` 可直接透传 |
+| `limit` | 页大小，默认 50，clamp 1-500 |
 
-响应：`{"items":[...],"count":N}`。
+响应：`{"items":[...],"count":total,"total":total,"pageCount":items.length,"nextCursor":number|null}`。结果按 `createdAtNs` 倒序排列，同一时间按 `annotationId` 倒序。默认不返回 `status="deleted"` 的记录；传 `status=deleted` 或 `includeDeleted=true` 可查看软删除记录。
 
 ### POST /v1/dataset-associations
 
@@ -1557,7 +1639,23 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
 
 按 dataset/item、trace/span、evalRunId、split、label、attrs 查询关联。别名 `/v1/dataset-links` 也可用。
 
-响应：`{"items":[...],"count":N}`。
+**查询参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `dataset_id` / `datasetId` / `dataset` | 外部 dataset id |
+| `item_id` / `itemId` / `datasetItemId` | 外部 dataset item id |
+| `trace_id` / `traceId` | 内部数字 id 或外部字符串 id |
+| `span_id` / `spanId` | 内部数字 id 或外部字符串 id |
+| `evalRunId` / `eval_run_id` | 精确匹配 |
+| `split` | 精确匹配 |
+| `label` | 精确匹配 |
+| `attrs` | URL 编码 JSON object，如 `{"project_id":"agentic-data"}` |
+| `projectId` / `project_id` / `skill` / `mode` / `callSite` / `taskFingerprint` / `task_fingerprint` / `loopId` / `loop_id` / `harnessVersion` / `harness_version` / `schemaFingerprint` / `schema_fingerprint` / `intentSignature` / `intent_signature` / `validationStatus` / `validation_status` / `reviewStatus` / `review_status` / `evalStatus` / `eval_status` / `pathMemoryId` / `path_memory_id` / `stopReason` / `stop_reason` / `phase` / `validator` | attrs 字符串精确过滤便捷参数 |
+| `cursor` / `offset` | offset 游标；上一页 `nextCursor` 可直接透传 |
+| `limit` | 页大小，默认 50，clamp 1-500 |
+
+响应：`{"items":[...],"count":total,"total":total,"pageCount":items.length,"nextCursor":number|null}`。结果按 `createdAtNs` 倒序排列，同一时间按 `associationId` 倒序。
 
 ---
 
@@ -1575,8 +1673,8 @@ trace id 支持数字 id 或外部字符串 id。字段别名：`leftTraceId` / 
 | `limit` | usize | 50 | 页大小（clamp 1–500） |
 | `filter` | string | 空 | 按标题 / sessionId 子串过滤（URL 编码，支持中文） |
 | `attrs` | JSON object string | 空 | URL 编码后的 attrs 精确过滤，如 `{"project_id":"agentic-data","skill":"review"}` |
-| `project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `validation_status` / `stop_reason` / `phase` / `validator` | string | 空 | attrs 字符串精确过滤的便捷查询参数 |
-| `annotationLabel` / `annotationSource` / `annotationScoreMin` | string / number | 空 | 会话内任一 trace/span 有匹配 annotation 时返回该会话 |
+| `project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `schema_fingerprint` / `intent_signature` / `validation_status` / `review_status` / `eval_status` / `path_memory_id` / `stop_reason` / `phase` / `validator` | string | 空 | attrs 字符串精确过滤的便捷查询参数 |
+| `annotationLabel` / `annotationSource` / `annotationStatus` / `annotationScoreMin` / `annotationIncludeDeleted` | string / number / bool | 空 | 会话内任一 trace/span 有匹配 annotation 时返回该会话；deleted 默认不命中 |
 | `datasetId` / `itemId` / `evalRunId` / `datasetLabel` | string | 空 | 会话内任一 trace/span 有匹配 dataset association 时返回该会话 |
 
 attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回该会话，返回值仍是完整 session 聚合行。
@@ -1653,7 +1751,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `name` | string | 轮标题（取 user_input 截断） |
 | `durMs` | u64 | 该轮总耗时毫秒 |
 | `cost` | f64 | 旧兼容成本字段 |
-| `costUsd` / `costDetail` | object | 标准化成本；`costDetail.source` 为 `explicit` / `estimated` / `mixed` |
+| `costUsd` / `costDetail` | object | 标准化成本；`costDetail.source` 为 `explicit` / `estimated_model_price` / `estimated_default` / `mixed` |
 | `usage` | object | 标准 token 用量，含 input/output/cached/reasoning/total |
 | `inTok`/`outTok` | u64 | 输入/输出 token |
 | `spanCount` | u32 | span 数 |
@@ -1733,7 +1831,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `durMs` | i64 | 耗时 |
 | `status` | string | `"ok"`/`error`/`run` |
 | `cost` | f64 | 旧兼容成本字段 |
-| `costUsd` / `costDetail` | object | 标准化成本；显式 `cost_usd` 优先，否则按默认单价估算 |
+| `costUsd` / `costDetail` | object | 标准化成本；显式 `cost_usd` 优先，否则按 provider/model 内置价格表估算，再回退默认单价 |
 | `usage` | object | 标准 token 用量 |
 | `inTok`/`outTok` | u64? | token（仅 llm） |
 | `model` | string? | 模型名（仅 llm） |

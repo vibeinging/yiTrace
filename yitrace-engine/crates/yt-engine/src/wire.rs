@@ -282,8 +282,18 @@ fn wire_attr_aliases() -> &'static [(&'static str, &'static str)] {
         ("loopId", "loop_id"),
         ("harness_version", "harness_version"),
         ("harnessVersion", "harness_version"),
+        ("schema_fingerprint", "schema_fingerprint"),
+        ("schemaFingerprint", "schema_fingerprint"),
+        ("intent_signature", "intent_signature"),
+        ("intentSignature", "intent_signature"),
         ("validation_status", "validation_status"),
         ("validationStatus", "validation_status"),
+        ("review_status", "review_status"),
+        ("reviewStatus", "review_status"),
+        ("eval_status", "eval_status"),
+        ("evalStatus", "eval_status"),
+        ("path_memory_id", "path_memory_id"),
+        ("pathMemoryId", "path_memory_id"),
         ("stop_reason", "stop_reason"),
         ("stopReason", "stop_reason"),
         ("phase", "phase"),
@@ -518,7 +528,7 @@ mod tests {
 
     #[test]
     fn hashes_external_ids_and_preserves_attrs() {
-        let body = r#"[{"trace_id":"run-uuid","span_id":"span-uuid","parent_span_id":"parent-uuid","session_id":"session-uuid","ts":100,"seq":1,"event_type":1,"ext_span_id":"span-uuid","taskFingerprint":"npm-native-packaging","loopId":"loop-1","harnessVersion":"h1","validationStatus":"pass","stopReason":"goal_met","phase":"verify","validator":"npm test","attrs":{"external_run_id":"run-uuid","project_id":7,"nested":{"ok":true},"skill":"review"}}]"#;
+        let body = r#"[{"trace_id":"run-uuid","span_id":"span-uuid","parent_span_id":"parent-uuid","session_id":"session-uuid","ts":100,"seq":1,"event_type":1,"ext_span_id":"span-uuid","taskFingerprint":"npm-native-packaging","loopId":"loop-1","harnessVersion":"h1","schemaFingerprint":"schema-v1","intentSignature":"refund-review","validationStatus":"pass","reviewStatus":"approved","evalStatus":"pass","pathMemoryId":"pm-1","stopReason":"goal_met","phase":"verify","validator":"npm test","attrs":{"external_run_id":"run-uuid","project_id":7,"nested":{"ok":true},"skill":"review"}}]"#;
         let recs = parse_wire_batch(body).unwrap();
         let r = &recs[0];
         assert_eq!(r.trace_id, fnv1a64(b"run-uuid"));
@@ -547,8 +557,28 @@ mod tests {
             Some("\"h1\"")
         );
         assert_eq!(
+            r.attrs.get("schema_fingerprint").map(String::as_str),
+            Some("\"schema-v1\"")
+        );
+        assert_eq!(
+            r.attrs.get("intent_signature").map(String::as_str),
+            Some("\"refund-review\"")
+        );
+        assert_eq!(
             r.attrs.get("validation_status").map(String::as_str),
             Some("\"pass\"")
+        );
+        assert_eq!(
+            r.attrs.get("review_status").map(String::as_str),
+            Some("\"approved\"")
+        );
+        assert_eq!(
+            r.attrs.get("eval_status").map(String::as_str),
+            Some("\"pass\"")
+        );
+        assert_eq!(
+            r.attrs.get("path_memory_id").map(String::as_str),
+            Some("\"pm-1\"")
         );
         assert_eq!(
             r.attrs.get("stop_reason").map(String::as_str),

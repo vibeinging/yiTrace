@@ -394,6 +394,36 @@ impl NativeYiTraceDb {
         self.route("GET", &path, "", tenant_id)
     }
 
+    #[napi(js_name = "updateAnnotationJson")]
+    pub fn update_annotation_json(
+        &self,
+        annotation_id: String,
+        update_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route(
+            "PATCH",
+            &format!("/v1/annotations/{annotation_id}"),
+            &update_json,
+            tenant_id,
+        )
+    }
+
+    #[napi(js_name = "deleteAnnotationJson")]
+    pub fn delete_annotation_json(
+        &self,
+        annotation_id: String,
+        delete_json: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route(
+            "DELETE",
+            &format!("/v1/annotations/{annotation_id}"),
+            delete_json.as_deref().unwrap_or(""),
+            tenant_id,
+        )
+    }
+
     #[napi(js_name = "createDatasetAssociationJson")]
     pub fn create_dataset_association_json(
         &self,

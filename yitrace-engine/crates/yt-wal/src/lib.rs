@@ -258,7 +258,7 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
 fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_u64(b, SPAN_FIELDS_MAGIC_V2);
-    put_u64(b, 5);
+    put_u64(b, 6);
     put_opt_u8(b, f.status);
     put_opt_u64(b, f.duration_ns);
     put_opt_u64(b, f.parent_span_id);
@@ -277,7 +277,12 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_opt_str(b, &f.task_fingerprint);
     put_opt_str(b, &f.loop_id);
     put_opt_str(b, &f.harness_version);
+    put_opt_str(b, &f.schema_fingerprint);
+    put_opt_str(b, &f.intent_signature);
     put_opt_str(b, &f.validation_status);
+    put_opt_str(b, &f.review_status);
+    put_opt_str(b, &f.eval_status);
+    put_opt_str(b, &f.path_memory_id);
     put_opt_str(b, &f.stop_reason);
     put_opt_str(b, &f.phase);
     put_opt_str(b, &f.validator);
@@ -307,7 +312,7 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
 
 fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
     let ver = c.u64()?;
-    if !(2..=5).contains(&ver) {
+    if !(2..=6).contains(&ver) {
         return None;
     }
     let status = c.opt_u8()?;
@@ -330,11 +335,16 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
         task_fingerprint,
         loop_id,
         harness_version,
+        schema_fingerprint,
+        intent_signature,
         validation_status,
+        review_status,
+        eval_status,
+        path_memory_id,
         stop_reason,
         phase,
         validator,
-    ) = if ver >= 5 {
+    ) = if ver >= 6 {
         (
             c.opt_str()?,
             c.opt_str()?,
@@ -343,9 +353,31 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
             c.opt_str()?,
             c.opt_str()?,
             c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+        )
+    } else if ver >= 5 {
+        (
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
+            None,
+            None,
+            c.opt_str()?,
+            None,
+            None,
+            None,
+            c.opt_str()?,
+            c.opt_str()?,
+            c.opt_str()?,
         )
     } else {
-        (None, None, None, None, None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None, None,
+        )
     };
     let agent_name = c.opt_str()?;
     let tool_name = c.opt_str()?;
@@ -408,7 +440,12 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
         task_fingerprint,
         loop_id,
         harness_version,
+        schema_fingerprint,
+        intent_signature,
         validation_status,
+        review_status,
+        eval_status,
+        path_memory_id,
         stop_reason,
         phase,
         validator,
@@ -767,7 +804,12 @@ mod tests {
             task_fingerprint: Some("\"npm-native-packaging\"".into()),
             loop_id: Some("\"loop-1\"".into()),
             harness_version: Some("\"h1\"".into()),
+            schema_fingerprint: Some("\"schema-v1\"".into()),
+            intent_signature: Some("\"refund-review\"".into()),
             validation_status: Some("\"pass\"".into()),
+            review_status: Some("\"approved\"".into()),
+            eval_status: Some("\"pass\"".into()),
+            path_memory_id: Some("\"pm-1\"".into()),
             stop_reason: Some("\"goal_met\"".into()),
             phase: Some("\"verify\"".into()),
             validator: Some("\"npm test\"".into()),
@@ -793,7 +835,15 @@ mod tests {
         );
         assert_eq!(decoded.loop_id.as_deref(), Some("\"loop-1\""));
         assert_eq!(decoded.harness_version.as_deref(), Some("\"h1\""));
+        assert_eq!(decoded.schema_fingerprint.as_deref(), Some("\"schema-v1\""));
+        assert_eq!(
+            decoded.intent_signature.as_deref(),
+            Some("\"refund-review\"")
+        );
         assert_eq!(decoded.validation_status.as_deref(), Some("\"pass\""));
+        assert_eq!(decoded.review_status.as_deref(), Some("\"approved\""));
+        assert_eq!(decoded.eval_status.as_deref(), Some("\"pass\""));
+        assert_eq!(decoded.path_memory_id.as_deref(), Some("\"pm-1\""));
         assert_eq!(decoded.stop_reason.as_deref(), Some("\"goal_met\""));
         assert_eq!(decoded.phase.as_deref(), Some("\"verify\""));
         assert_eq!(decoded.validator.as_deref(), Some("\"npm test\""));

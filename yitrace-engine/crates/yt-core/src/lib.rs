@@ -441,8 +441,18 @@ pub mod fold {
         pub loop_id: Option<String>,
         /// workflow / prompt / harness 版本。保存 compact JSON 字面量，用于回归和对比。
         pub harness_version: Option<String>,
+        /// 数据源 schema 指纹。保存 compact JSON 字面量，用于跨 schema 隔离 golden path / eval / 检索。
+        pub schema_fingerprint: Option<String>,
+        /// 任务意图签名。保存 compact JSON 字面量，用于同类问题聚合和路径复用。
+        pub intent_signature: Option<String>,
         /// 验证结果。保存 compact JSON 字面量，例如 `"pass"` / `"fail"`。
         pub validation_status: Option<String>,
+        /// 人工/自动 review 状态。保存 compact JSON 字面量，例如 `"approved"` / `"needs_review"`。
+        pub review_status: Option<String>,
+        /// eval 流程状态。保存 compact JSON 字面量，例如 `"pass"` / `"fail"` / `"pending"`。
+        pub eval_status: Option<String>,
+        /// Agent Memory 侧路径记忆 id。保存 compact JSON 字面量；默认不进 postings，以避免高基数字段撑大倒排。
+        pub path_memory_id: Option<String>,
         /// loop 停止原因。保存 compact JSON 字面量，例如 `"goal_met"` / `"budget_exceeded"`。
         pub stop_reason: Option<String>,
         /// agent loop 阶段。保存 compact JSON 字面量，例如 `"plan"` / `"act"` / `"verify"`。
@@ -568,11 +578,46 @@ pub mod fold {
                 self.harness_version = Some(v.clone());
             }
             if let Some(v) = other
+                .schema_fingerprint
+                .as_ref()
+                .or_else(|| other.attrs.get("schema_fingerprint"))
+            {
+                self.schema_fingerprint = Some(v.clone());
+            }
+            if let Some(v) = other
+                .intent_signature
+                .as_ref()
+                .or_else(|| other.attrs.get("intent_signature"))
+            {
+                self.intent_signature = Some(v.clone());
+            }
+            if let Some(v) = other
                 .validation_status
                 .as_ref()
                 .or_else(|| other.attrs.get("validation_status"))
             {
                 self.validation_status = Some(v.clone());
+            }
+            if let Some(v) = other
+                .review_status
+                .as_ref()
+                .or_else(|| other.attrs.get("review_status"))
+            {
+                self.review_status = Some(v.clone());
+            }
+            if let Some(v) = other
+                .eval_status
+                .as_ref()
+                .or_else(|| other.attrs.get("eval_status"))
+            {
+                self.eval_status = Some(v.clone());
+            }
+            if let Some(v) = other
+                .path_memory_id
+                .as_ref()
+                .or_else(|| other.attrs.get("path_memory_id"))
+            {
+                self.path_memory_id = Some(v.clone());
             }
             if let Some(v) = other
                 .stop_reason
@@ -662,7 +707,12 @@ pub mod fold {
         pub task_fingerprint: Option<String>,
         pub loop_id: Option<String>,
         pub harness_version: Option<String>,
+        pub schema_fingerprint: Option<String>,
+        pub intent_signature: Option<String>,
         pub validation_status: Option<String>,
+        pub review_status: Option<String>,
+        pub eval_status: Option<String>,
+        pub path_memory_id: Option<String>,
         pub stop_reason: Option<String>,
         pub phase: Option<String>,
         pub validator: Option<String>,
@@ -764,11 +814,46 @@ pub mod fold {
                 self.harness_version = Some(v.clone());
             }
             if let Some(v) = p
+                .schema_fingerprint
+                .as_ref()
+                .or_else(|| p.attrs.get("schema_fingerprint"))
+            {
+                self.schema_fingerprint = Some(v.clone());
+            }
+            if let Some(v) = p
+                .intent_signature
+                .as_ref()
+                .or_else(|| p.attrs.get("intent_signature"))
+            {
+                self.intent_signature = Some(v.clone());
+            }
+            if let Some(v) = p
                 .validation_status
                 .as_ref()
                 .or_else(|| p.attrs.get("validation_status"))
             {
                 self.validation_status = Some(v.clone());
+            }
+            if let Some(v) = p
+                .review_status
+                .as_ref()
+                .or_else(|| p.attrs.get("review_status"))
+            {
+                self.review_status = Some(v.clone());
+            }
+            if let Some(v) = p
+                .eval_status
+                .as_ref()
+                .or_else(|| p.attrs.get("eval_status"))
+            {
+                self.eval_status = Some(v.clone());
+            }
+            if let Some(v) = p
+                .path_memory_id
+                .as_ref()
+                .or_else(|| p.attrs.get("path_memory_id"))
+            {
+                self.path_memory_id = Some(v.clone());
             }
             if let Some(v) = p
                 .stop_reason
@@ -858,7 +943,12 @@ pub mod fold {
             let mut task_fingerprint: Option<String> = None;
             let mut loop_id: Option<String> = None;
             let mut harness_version: Option<String> = None;
+            let mut schema_fingerprint: Option<String> = None;
+            let mut intent_signature: Option<String> = None;
             let mut validation_status: Option<String> = None;
+            let mut review_status: Option<String> = None;
+            let mut eval_status: Option<String> = None;
+            let mut path_memory_id: Option<String> = None;
             let mut stop_reason: Option<String> = None;
             let mut phase: Option<String> = None;
             let mut validator: Option<String> = None;
@@ -982,11 +1072,51 @@ pub mod fold {
                 }
                 if let Some(v) = e
                     .fields
+                    .schema_fingerprint
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("schema_fingerprint"))
+                {
+                    schema_fingerprint = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .intent_signature
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("intent_signature"))
+                {
+                    intent_signature = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
                     .validation_status
                     .as_ref()
                     .or_else(|| e.fields.attrs.get("validation_status"))
                 {
                     validation_status = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .review_status
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("review_status"))
+                {
+                    review_status = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .eval_status
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("eval_status"))
+                {
+                    eval_status = Some(v.clone());
+                }
+                if let Some(v) = e
+                    .fields
+                    .path_memory_id
+                    .as_ref()
+                    .or_else(|| e.fields.attrs.get("path_memory_id"))
+                {
+                    path_memory_id = Some(v.clone());
                 }
                 if let Some(v) = e
                     .fields
@@ -1069,7 +1199,12 @@ pub mod fold {
                 task_fingerprint,
                 loop_id,
                 harness_version,
+                schema_fingerprint,
+                intent_signature,
                 validation_status,
+                review_status,
+                eval_status,
+                path_memory_id,
                 stop_reason,
                 phase,
                 validator,

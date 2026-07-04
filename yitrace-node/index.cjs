@@ -115,6 +115,10 @@ const LIST_METADATA_KEYS = new Set([
   "annotation_label",
   "annotationSource",
   "annotation_source",
+  "annotationStatus",
+  "annotation_status",
+  "annotationIncludeDeleted",
+  "annotation_include_deleted",
   "annotationTarget",
   "annotation_target",
   "annotationScoreMin",
@@ -159,6 +163,9 @@ function setNestedMetadataParam(params, group, key, value) {
           target_type: "annotationTarget",
           label: "annotationLabel",
           source: "annotationSource",
+          status: "annotationStatus",
+          includeDeleted: "annotationIncludeDeleted",
+          include_deleted: "annotationIncludeDeleted",
           scoreMin: "annotationScoreMin",
           score_min: "annotationScoreMin",
           minScore: "annotationScoreMin",
@@ -628,6 +635,18 @@ class YiTraceDB {
   async annotate(annotation, options = {}) {
     this.#ensureOpen();
     const response = this.#native.createAnnotationJson(JSON.stringify(annotation ?? {}), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async updateAnnotation(annotationId, update = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.updateAnnotationJson(String(annotationId), JSON.stringify(update ?? {}), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async deleteAnnotation(annotationId, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.deleteAnnotationJson(String(annotationId), JSON.stringify(options ?? {}), tenantId(options) ?? this.#tenantId);
     return parseJson(response);
   }
 

@@ -218,6 +218,24 @@ const item = page.items[0];
 console.log(item.usage.totalTokens, item.costDetail.costUsd);
 ```
 
+Explicit `costUsd` / `costUsdNanos` always wins. If no explicit cost is
+ingested, yiTrace estimates from a small built-in provider/model price table
+when `provider` and `model` are known, then falls back to the default token
+price. `costDetail.source` is one of `explicit`, `estimated_model_price`,
+`estimated_default`, or `mixed` for aggregates. Structured search also supports
+cost/token ranges:
+
+```ts
+const expensive = await db.traceSearch({
+  filter: {
+    projectId: "agentic-data",
+    minCostUsdNanos: 400_000,
+    maxCostUsd: 0.01,
+    minTotalTokens: 100,
+  },
+});
+```
+
 Search supports attrs filters for the high-cardinality dimensions used by
 AgenticData trace pages:
 
@@ -251,13 +269,14 @@ under `fields`, so product code can read stable dimensions without scanning the
 full extension object.
 
 `project_id`, `skill`, `mode`, `call_site`, `task_fingerprint`, `loop_id`,
-`harness_version`, `validation_status`, `stop_reason`, `phase`, and `validator`
-are promoted inside the engine as schema-on-write fields. Passing them through
-`attrs`, builder defaults, or the top-level builder aliases gives the same query
-behavior; the original `attrs` object is still returned unchanged for round-trip
-compatibility. Other stable keys such as `connection_ids` and `path_memory_id`
-remain extension attrs that can be filtered through the sidecar/folded
-verification path and surfaced under `fields`.
+`harness_version`, `schema_fingerprint`, `intent_signature`,
+`validation_status`, `review_status`, `eval_status`, `path_memory_id`,
+`stop_reason`, `phase`, and `validator` are promoted inside the engine as
+schema-on-write fields. Passing them through `attrs`, builder defaults, or the
+top-level builder aliases gives the same query behavior; the original `attrs`
+object is still returned unchanged for round-trip compatibility. Stable array
+keys such as `connection_ids` remain extension attrs that can be filtered through
+the sidecar/folded verification path and surfaced under `fields`.
 
 Internally, attrs filters use segment-local postings sidecars to narrow
 candidate spans before folded snapshot verification. Durable data dirs contain
@@ -265,7 +284,8 @@ derived `attr_postings/seg-*.attrs` files; they are rebuilt from segment data if
 missing. The final result still goes through tenant, deletion, and attrs
 validation, so stale candidates cannot leak data. Stable high-frequency keys are
 indexed by default, while very high-cardinality keys such as `external_run_id`
-or `path_memory_id` remain queryable through folded verification. Only a light
+or `path_memory_id` remain queryable through folded verification without default
+postings. Only a light
 term-to-segment directory and a bounded LRU cache of hot posting lists stay in
 memory; live WAL tail data uses a small in-memory overlay.
 
@@ -300,6 +320,7 @@ const page = await db.traceSearch({
     attrs: { project_id: "agentic-data", connection_ids: "conn-a" },
   },
 });
+console.log(page.index);
 ```
 
 Use `traceAggregate()` when a product page needs grouped stats before drilling
@@ -317,6 +338,7 @@ const stats = await db.traceAggregate({
 });
 
 console.log(stats.items[0]?.key, stats.items[0]?.errorRate);
+console.log(stats.index, stats.aggregationIndex);
 ```
 
 Use `trajectoryGroups()` when a product page needs to find repeated successful
@@ -334,6 +356,7 @@ const candidates = await db.trajectoryGroups({
 
 console.log(candidates.items[0]?.signature, candidates.items[0]?.successRate);
 console.log(candidates.items[0]?.steps);
+console.log(candidates.index, candidates.trajectoryIndex);
 ```
 
 Use `traceTrajectories()` when a page or export job needs one row per trace
@@ -460,6 +483,12 @@ const golden = await db.createGoldenPath({
   label: "fast packaging path",
   reason: "best observed route",
   source: "human",
+  evalProfile: "release-gate",
+  challengerOf: null,
+  minSampleCount: 5,
+  marginScore: 800,
+  comparisonWindowNs: "86400000000000",
+  staleReasons: [],
   projectId: "agentic-data",
 });
 
@@ -477,7 +506,15 @@ const goldenPaths = await db.goldenPaths({
 console.log(goldenPaths.items[0]?.trajectorySignature);
 console.log(goldenPaths.items[0]?.sourceTrajectory.steps);
 console.log(goldenPaths.items[0]?.evidenceSummary);
+console.log(goldenPaths.items[0]?.governance);
 ```
+
+The Golden Path governance fields are evidence only: `challengerOf`,
+`evalProfile`, `minSampleCount`, `marginScore`, and `comparisonWindowNs` help a
+product layer run Best/Challenger workflows, but yiTrace does not automatically
+promote or deprecate a path. Top-level `evalProfile` is stored as Golden Path
+metadata; it is not added to trace scope filters unless you also put it inside
+`attrs`.
 
 Use `pathAdherence()` to compare a new run against a golden path without
 letting the database decide what is "best". It returns deterministic trajectory
@@ -542,6 +579,7 @@ const health = await db.goldenPathHealth({
 });
 console.log(health.counts, health.rates.usable);
 console.log(health.sourceRetained);
+console.log(health.governance.stale, health.governance.staleReasons);
 
 const healthWithSource = await db.goldenPathHealth(golden.goldenPathId, {
   includeSource: true,
@@ -611,8 +649,21 @@ const annotations = await db.annotations({
   traceId: "run-uuid",
   label: "best_path",
   projectId: "agentic-data",
+  limit: 50,
 });
-console.log(annotations.count, annotations.items[0]?.reason);
+console.log(annotations.count, annotations.nextCursor, annotations.items[0]?.reason);
+
+const reviewed = await db.updateAnnotation(annotations.items[0].annotationId, {
+  status: "resolved",
+  reviewer: "four",
+  reason: "accepted by manual review",
+  attrs: { review_round: 1 },
+});
+
+await db.deleteAnnotation(reviewed.annotationId, {
+  reviewer: "four",
+  reason: "superseded by a newer judgment",
+});
 ```
 
 To connect trace evidence to an external eval or training dataset, store a
@@ -637,8 +688,18 @@ await db.linkDatasetItem({
 const links = await db.datasetAssociations({
   datasetId: "best-path-regression",
   itemId: "case-1",
+  limit: 50,
 });
 ```
+
+`db.annotations()` and `db.datasetAssociations()` return stable pages ordered by
+`createdAtNs` descending, then id descending. Use `nextCursor` as the next
+request's `cursor`; `count` and `total` are the full matched total, while
+`pageCount` is the current page size.
+Annotation status is `active` by default and can move to `resolved`, `rejected`,
+or `deleted`. Deleted annotations are soft-deleted: they stay in `metadata.dat`
+for audit, but default list/search filters ignore them unless you pass
+`status: "deleted"` or `includeDeleted: true`.
 
 Those metadata records can also drive product search pages:
 

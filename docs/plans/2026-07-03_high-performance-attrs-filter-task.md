@@ -23,6 +23,7 @@
 - [x] `/v1/search` 的 attrs 谓词也用 postings 做预过滤，最终仍由过滤边车验证。
 - [x] `fields` 输出只为当前 trace list 可见 trace 做窄投影补全。
 - [x] `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`validation_status`、`stop_reason`、`phase`、`validator` 从 attrs schema-on-write 提升为折叠后的一等字段，并保留 attrs fallback。
+- [x] 第二批业务字段 `schema_fingerprint`、`intent_signature`、`review_status`、`eval_status`、`path_memory_id` 提升为折叠后的一等字段，并保留 attrs fallback。
 
 ## 当前实现
 
@@ -36,7 +37,7 @@
 - 持久 segment 现在生成 segment-local attrs sidecar，文件位于持久 data dir 的 `attr_postings/seg-<id>.attrs`。内存只常驻 term → segment ids 的轻量目录；具体 posting list 由 LRU cache 按需加载。
 - `attr_postings` 现在是 live overlay，只覆盖 MemTable/WAL tail；flush 后会根据仍被旧快照 pin 住的 MemTable 行重建，不再长期持有历史 segment 的 span-level postings。
 - segment sidecar 缺失或损坏时可从 segment 原始记录重建；sidecar 是派生索引，不是事实源。
-- `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`validation_status`、`stop_reason`、`phase`、`validator` 已进入 `SpanFields` / `FoldedSpan` / WAL+segment 共享编码 v5；查询和 `fields` 输出优先读一等字段，回退 attrs。这样新数据即使不镜像 attrs，也能被 attrs filter 和 trace list 命中。
+- `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`validation_status`、`stop_reason`、`phase`、`validator` 已进入 `SpanFields` / `FoldedSpan` / WAL+segment 共享编码 v5；`schema_fingerprint`、`intent_signature`、`review_status`、`eval_status`、`path_memory_id` 已进入共享编码 v6。查询和 `fields` 输出优先读一等字段，回退 attrs。这样新数据即使不镜像 attrs，也能被 attrs filter 和 trace list 命中。
 - trace list 采用两段式读取：候选 span 找匹配 trace，再扩展为整条 trace 的 span keys 做完整摘要。
 - session list 采用两段式读取：候选 span 找匹配 session，再复用现有 session 聚合行过滤。
 - 新增 `yt_attr_posting_keys` / `yt_attr_posting_singleton_keys` / `yt_attr_posting_small_vec_keys` / `yt_attr_posting_hashset_keys` / `yt_attr_posting_interned_keys` / `yt_attr_posting_interned_values` / `yt_attr_posting_entries` / `yt_attr_posting_entry_budget` / `yt_attr_posting_estimated_bytes` / `yt_attr_posting_estimated_byte_budget` / `yt_attr_posting_incomplete_keys` 指标观察 live postings 规模、字符串字典规模和降级状态。
@@ -63,7 +64,7 @@
 - [x] postings 内部结构压缩第三步：key/value interning。
 - [x] segment-local attrs postings sidecar + LRU index cache，降低常驻内存。
 - [x] 第一批高频字段（project/skill/mode/call_site/task/loop/validation）物理入列。
-- [ ] 第二批业务字段按稳定度继续物理入列，减少 JSON parse 和内存 sidecar 压力。
+- [x] 第二批业务字段按稳定度继续物理入列，减少 JSON parse 和内存 sidecar 压力。
 - [ ] segment-level attrs zone-map / bloom skip，降低 cold scan。
 - [ ] trace/session 级预聚合索引，避免 tenant session list 二次聚合。
 - [ ] postings 持久化，避免大库重启后从 WAL/segment 全量重建成本过高。

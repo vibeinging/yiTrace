@@ -62,13 +62,13 @@ AgenticData 后续要做 trace review、eval draft、golden path、训练/回归
 
 ## 当前边界
 
-- 暂不提供分页；当前返回 `{ items, count }`，为后续增加 cursor/limit 留出响应结构。
+- 分页基础版已补齐：当前返回 `{ items, count, total, pageCount, nextCursor }`，按 `createdAtNs`/id 倒序。
 - 暂不做完整 dataset item 管理。yiTrace 只保存 source link 和 snapshot identity，dataset item 本体仍由外部 eval/training 系统管理。
-- 暂不做 annotation 更新/删除。第一版用 append-only 记录，后续需要 review workflow 时再补状态变更模型。
+- annotation 更新/删除状态机基础版已补齐：支持 `active/resolved/rejected/deleted`、PATCH 更新和 DELETE 软删除；完整审批历史仍留给后续。
 - `traceSearch()` / `traces()` / `sessions()` 已支持反向过滤。
 
 ## 后续
 
-- annotation 增加 severity/status/reviewer 字段或统一 attrs contract。
+- annotation 后续可继续补 severity、审批历史和批量 review workflow。
 - dataset association 增加 eval_status/result_score/assertion_type 的一等字段。
-- metadata store 加分页索引，避免 annotation 规模增长后全量扫描。
+- metadata store 后续补索引，避免 annotation 规模增长后全量扫描。
