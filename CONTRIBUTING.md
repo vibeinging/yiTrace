@@ -18,6 +18,8 @@ yiTrace/
 ├── yitrace-tokenizer-jieba/     # cppjieba FFI(可选;引擎默认用纯 Rust 分词)
 ├── yitrace-vecindex-graph/      # graph_index FFI(可选;引擎默认用自研 HNSW)
 ├── yitrace-node/                # @yitrace/db Node/Electron 嵌入式 DB
+├── yitrace-db-python/           # yitrace-db Python 嵌入式 DB
+├── yitrace-db-rs/               # yitrace-db Rust 嵌入式 DB crate
 ├── yitrace-sdk/                 # Python / TypeScript 打点 SDK
 │   ├── python/
 │   └── typescript/
@@ -44,6 +46,33 @@ yiTrace/
 - **Python ≥ 3.10**(代码用了 `int | None` union 语法)
 - 纯标准库,**零第三方依赖**(不依赖 pytest;`python3 tests/test_sdk.py` 直接跑)
 
+### Python Embedded DB(`yitrace-db-python/`)
+
+- **Python ≥ 3.8**，构建走 maturin + PyO3 abi3。
+- 这是嵌入式 DB 包 `yitrace-db`，import 名是 `yitrace_db`；不要和纯打点 SDK `yitrace` 混淆。
+- 只允许通过 Rust `EngineJsonApi` 打开和查询数据目录，不允许 Python 直接解析 WAL / manifest / segment 文件。
+- 改这里至少跑：
+
+```bash
+cd yitrace-db-python
+python -m pip install -e .
+python -m pytest
+python -m pip install maturin
+python -m maturin build --release --interpreter "$(command -v python)"  # 本机 wheel
+```
+
+### Rust Embedded DB(`yitrace-db-rs/`)
+
+- **Rust ≥ 1.80**。
+- 这是对外 Rust crate `yitrace-db`，import 名是 `yitrace_db`。
+- 应用侧使用 `YiTraceDb` / `SpanEventBuilder` / `SearchQuery` / `route_json()`，不要直接依赖内部 `WriteCoordinator`。
+- 改这里至少跑：
+
+```bash
+cd yitrace-db-rs
+cargo test --offline
+```
+
 ### TypeScript SDK(`yitrace-sdk/typescript/`)
 
 - **Node ≥ 18**(用了原生 test runner `node --test`)
@@ -69,8 +98,17 @@ cd ../yitrace-vecindex-graph && cargo test      # 4 测试(mock)
 cd ../yitrace-sdk/python
 python3 tests/test_sdk.py               # 8 测试(需 Python ≥ 3.10)
 
-# 5. TypeScript SDK
-cd ../typescript
+# 5. Python embedded DB
+cd ../../yitrace-db-python
+python -m pip install -e .
+python -m pytest
+
+# 6. Rust embedded DB
+cd ../yitrace-db-rs
+cargo test --offline
+
+# 7. TypeScript SDK
+cd ../yitrace-sdk/typescript
 npm install                             # 首次
 npx tsx --test test/test_sdk.ts         # 8 测试(需 Node ≥ 18)
 ```

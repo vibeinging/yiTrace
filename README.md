@@ -1,11 +1,12 @@
 # yiTrace
 
-**A TraceDB for AI agents. Local-first, shardable when one process is not enough.**
+**A local-first TraceDB for AI agents.**
 
-yiTrace records agent runs, folds raw events into replayable spans, searches
-the traces, mines stable trajectories, and keeps the evidence local. Start with
-an SDK or OTLP. Run it as a single private server, embed it inside Node/Electron,
-or put a gateway in front of multiple shards.
+yiTrace turns raw agent events into searchable evidence. Replay multi-turn runs,
+inspect tool calls, search Chinese and English trace text, track token/cost/eval
+signals, and export path evidence for Agent Memory. Use it in-process with
+`@yitrace/db`, `yitrace-db`, or Rust `yitrace-db`, as a private server, or
+behind a shard gateway.
 
 [中文](README.zh-CN.md) · English
 
@@ -17,21 +18,73 @@ or put a gateway in front of multiple shards.
 
 ![yiTrace console](docs/images/console-overview.png)
 
-yiTrace is built for agent teams that need more than hosted trace screenshots:
+yiTrace is built for agent teams that need trace data to be private, queryable,
+and useful after the run is over:
 
-- replay multi-turn conversations, tool calls, and multi-agent handoffs
-- search Chinese and English trace text with BM25, field domains, and filters
-- blend keyword search with vector recall and trajectory similarity
-- attribute tokens and cost by trace, session, agent, model, provider, and tool
-- annotate traces, bind them to eval datasets, and track regressions
+- keep agent traces local instead of sending prompts and tool output to a hosted service
+- replay conversations, tool calls, retries, errors, and multi-agent handoffs
+- search traces with BM25, attrs filters, vector recall, and trajectory similarity
+- track token usage, cost, eval results, annotations, and dataset links
 - mine repeated task paths and export Golden Path evidence for Agent Memory
-- run private by default, then shard reads/writes through a gateway when needed
 
 > Status: alpha, runnable today. The storage engine, WAL recovery, SDK ingest,
 > OTLP ingest, Node/Electron package, read-model indexes, retention, and
 > distributed gateway primitives are covered by offline tests. This is not yet a
 > managed production cluster: automatic failover, fencing, background replication
 > scheduling, TLS/RBAC, and enterprise hardening are still roadmap items.
+
+---
+
+## Start Here
+
+Embed yiTrace in Node.js or Electron:
+
+```bash
+npm install @yitrace/db
+```
+
+```ts
+import { YiTraceDB } from "@yitrace/db";
+
+const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
+const hits = await db.search({ text: "card fraud", k: 10 });
+```
+
+Embed yiTrace in Python:
+
+```bash
+pip install yitrace-db
+```
+
+```python
+from yitrace_db import YiTraceDB
+
+db = YiTraceDB.open("./data", tenant_id=1)
+hits = db.search(text="card fraud", k=10)
+```
+
+Embed yiTrace in Rust:
+
+```toml
+[dependencies]
+yitrace-db = { path = "yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+let hits = db.search(&SearchQuery::text("card fraud").k(10))?;
+```
+
+Or run the local server and bundled console:
+
+```bash
+./scripts/demo_all.sh
+```
+
+Open `http://127.0.0.1:7878`, search for `盗刷`, and inspect the span input,
+output, logs, token usage, cost, and eval evidence.
 
 ---
 
@@ -42,10 +95,12 @@ yiTrace is built for agent teams that need more than hosted trace screenshots:
 | SDK + local server | You want private trace capture and console replay | `cargo run -p yt-engine --example server`, HTTP JSON API, embedded console |
 | Durable single server | You want one private data directory with restart recovery | `server_durable`, WAL, manifest, immutable segments, disk vector index |
 | Node / Electron embedded DB | You want `import { YiTraceDB } from "@yitrace/db"` and no extra process | Node-API package, ESM/CJS, optional native packages, same Rust engine in-process |
+| Python embedded DB | You want `from yitrace_db import YiTraceDB` inside a Python agent | PyO3/maturin package, same `EngineJsonApi` in-process boundary |
+| Rust embedded DB | You want `use yitrace_db::YiTraceDb` in a Rust agent/backend | Thin Rust crate over `EngineJsonApi`, no N-API/PyO3 layer |
 | Sharded gateway | You have multiple shard servers or want the distributed path | route table, write routing, read fanout, partial/strict consistency, follower read targets |
 | Replicated shard | You want leader/follower primitives | replication status, WAL export/apply, one-shot follower pull, lag/health diagnostics |
 
-The important distinction: yiTrace is no longer "just single-node". The storage
+The important distinction: yiTrace is no longer just a one-process tool. The storage
 core is still single-writer per shard because that is the correct failure model.
 Cluster-level scale comes from routing, fanout, snapshots, and replication around
 those shards.
@@ -377,7 +432,7 @@ materialized path or fell back to a slower proof path.
 
 ---
 
-## Embedded Node / Electron
+## Embedded Node / Python / Rust / Electron
 
 For Node backends and Electron apps that want local persistence without a
 separate process:
@@ -426,6 +481,65 @@ engine through Node-API and calls the in-process `EngineJsonApi`, so WAL
 recovery, manifest snapshots, folding, tenant filtering, BM25, vector search,
 metadata, retention, and Golden Path evidence use the same code as the server.
 
+Python agents can use the same embedded model:
+
+```bash
+pip install yitrace-db
+```
+
+```python
+from yitrace_db import YiTraceDB, create_span_event_builder
+
+with YiTraceDB.open("./data", tenant_id=1) as db:
+    events = create_span_event_builder({
+        "trace_id": "run-uuid",
+        "session_id": "session-uuid",
+        "attrs": {"project_id": "agentic-data", "skill": "review"},
+    })
+    events.start_span(span_id="span-uuid", name="risk review", input_text="possible card fraud")
+    events.log("possible card fraud", span_id="span-uuid")
+    events.end_span(span_id="span-uuid", status=0, duration_ns=12_000_000)
+    events.ingest(db)
+
+    hits = db.search(text="fraud", k=10)
+```
+
+`yitrace-db` does not parse database files in Python either. It embeds the Rust
+engine through PyO3 and calls the same `EngineJsonApi` in-process boundary as
+the Node package. Use the existing `yitrace` Python package when you only need
+SDK instrumentation to a running yiTrace service; use `yitrace-db` when a Python
+app needs an embedded local TraceDB.
+
+Rust agents and backends can use the same boundary without a native language
+bridge:
+
+```toml
+[dependencies]
+yitrace-db = { path = "yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, SpanEndOptions, SpanEventBuilder, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+
+let mut events = SpanEventBuilder::new("run-uuid");
+events
+    .session_id("session-uuid")
+    .attr("project_id", "agentic-data")
+    .attr("skill", "review")
+    .start_span("span-uuid", "risk review")
+    .log("span-uuid", "possible card fraud")
+    .end_span_with("span-uuid", SpanEndOptions::ok().duration_ns(12_000_000));
+
+db.ingest_builder(&events)?;
+let hits = db.search(&SearchQuery::text("fraud").k(10).attr("project_id", "agentic-data"))?;
+```
+
+The Rust crate is deliberately thin: common helpers are typed, and
+`route_json()` remains available for every `/v1/*` API that has not yet grown a
+typed wrapper.
+
 Direct `db.ingest()` accepts numeric IDs and external string IDs such as UUIDs.
 String IDs are hashed into stable internal `u64` keys for indexing while the
 original values are returned as `external_*` fields. `attrs` round-trips as
@@ -446,7 +560,7 @@ read [yitrace-node/README.md](yitrace-node/README.md) before publishing.
 yiTrace scales by keeping each shard simple and making the gateway explicit.
 
 ```text
-SDKs / OTLP / @yitrace/db clients
+SDKs / OTLP / @yitrace/db / yitrace-db clients
         |
         v
   yiTrace gateway
@@ -565,6 +679,7 @@ traits.
 | SDK and OTLP ingest | Done | Python, TypeScript, custom wire JSON, OTLP/OpenInference |
 | HTTP API and console | Usable | console uses public `/v1/*` APIs |
 | Node / Electron embedded DB | Usable | ESM/CJS, native packages, clean consumer pack verification |
+| Python embedded DB | Usable | PyO3 package, `YiTraceDB.open`, builder, ingest/search/session/span tests |
 | Chinese tokenizer and BM25 | Done in pure Rust | dictionary DAG, embedded jieba dictionary, user dict support |
 | Vector recall | Done in engine | disk-backed HNSW plus vector namespace flat index; high-performance namespace ANN still pending |
 | Read-model indexes | First production shape | attrs postings, metadata sidecar, traceAggregate rollup, loop/task sidecar, text domains |
@@ -601,6 +716,8 @@ yitrace-engine/              # Rust engine workspace, std-only core
     yt-memtable              # live rows and gated eviction
     yt-engine                # coordinator, search, eval, HTTP, OTLP, gateway, console assets
 yitrace-node/                # @yitrace/db Node/Electron embedded package
+yitrace-db-python/           # yitrace-db Python embedded package
+yitrace-db-rs/               # yitrace-db Rust embedded package
 yitrace-console/             # React console
 yitrace-sdk/
   python/                    # Python tracing SDK

@@ -45,6 +45,8 @@ yitrace-sdk/                 # 打点 SDK
 │   └── typescript/              # @yitrace/trace-sdk（tsconfig + build 已配）
 yitrace-node/                # @yitrace/db：Node/Electron 嵌入式 DB（N-API，独立于 engine workspace）
 │   └── npm/                     # NAPI-RS optional platform packages（darwin/linux/win）
+yitrace-db-python/           # yitrace-db：Python 嵌入式 DB（PyO3/maturin，独立于 engine workspace）
+yitrace-db-rs/               # yitrace-db：Rust 嵌入式 DB crate（EngineJsonApi 轻封装）
 yitrace-console/             # 控制台前端（React + Vite + TS，构建产物内嵌进引擎单二进制）
 docs/                        # 设计文档 / 现状索引 / 分析
 ```
@@ -120,6 +122,27 @@ npm publish npm/win32-x64-msvc --access public
 npm publish --access public
 ```
 
+**Python 嵌入式 DB（`yitrace-db`）：**
+
+```bash
+cd yitrace-db-python
+python -m pip install -e .      # maturin editable build，生成 PyO3 native extension
+python -m pytest                # 打开 embedded DB、ingest/search/session/span/lock 测试
+python -m pip install maturin
+python -m maturin build --release --interpreter "$(command -v python)"  # 本机 wheel；正式发布需要多平台 wheel matrix
+```
+
+`yitrace-db` 和 `@yitrace/db` 一样，只通过 Rust engine API 打开数据目录，不允许 Python 直接解析 WAL/manifest/segment 文件。它调用 `EngineJsonApi` 进程内边界，不启动本地 HTTP server、不走 TCP socket。`yitrace` 仍是纯 Python 打点 SDK；`yitrace-db` 是嵌入式数据库包。
+
+**Rust 嵌入式 DB（`yitrace-db` crate）：**
+
+```bash
+cd yitrace-db-rs
+cargo test --offline          # 打开 embedded DB、ingest/search/trace/span/lock 测试
+```
+
+Rust crate 是 `EngineJsonApi` 的轻封装：应用侧用 `YiTraceDb`、`SpanEventBuilder`、`SearchQuery`，不要直接依赖 `WriteCoordinator`。它不引入新的 engine 依赖，也不启动本地 HTTP server。
+
 **前端：**
 
 ```bash
@@ -134,8 +157,10 @@ VITE_API=http npm run build                          # 构建对接真实引擎�
 - **Rust**：edition 2021，`#![allow(dead_code)]` 在骨架 crate 里是刻意的（接缝实现待替换）。模块用中文 doc-comment 解释"为什么这么设计"，改代码要延续这个习惯（写清意图，不只是 what）。
 - **零依赖**：要在 `yt-engine` 引入外部 crate，先想清楚能不能放进独立的外部 crate。引擎本体只 std。
 - **测试是承重的**：每个不变量都有"真会失败的测试"（崩溃重放、召回对标、确定性 event_id 跨语言对账）。改逻辑前先看相关测试，改完跑全量。
-- **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 包 `yitrace`，TS 包 `@yitrace/trace-sdk`，嵌入式 DB 包 `@yitrace/db`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
+- **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 打点 SDK 包 `yitrace`，Python 嵌入式 DB 包 `yitrace-db`（import `yitrace_db`），Rust 嵌入式 DB crate `yitrace-db`（import `yitrace_db`），TS 包 `@yitrace/trace-sdk`，Node/Electron 嵌入式 DB 包 `@yitrace/db`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
 - **N-API 包隔离**：`yitrace-node/` 可以依赖 NAPI-RS；这些依赖不得进入 `yt-engine`。`@yitrace/db` 只通过 Rust engine API 打开数据目录，不允许 JS 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
+- **PyO3 包隔离**：`yitrace-db-python/` 可以依赖 PyO3/maturin；这些依赖不得进入 `yt-engine`。`yitrace-db` 只通过 Rust engine API 打开数据目录，不允许 Python 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
+- **Rust DB crate 边界**：`yitrace-db-rs/` 是对外 Rust 包，允许依赖 `yt-engine`，但对应用侧只暴露 `YiTraceDb` / builder / query helper / `route_json`，不要把 `WriteCoordinator` 作为公开使用入口。
 - **npm 发布**：`@yitrace/db` root 包只放 JS 入口（ESM + CommonJS）和类型声明；native binary 放在 `npm/*` 平台 optional packages。正式发布前必须跑 `npm run release:artifacts` + `npm run release:prepublish` + `npm run pack:check`，并先发布平台包再发布 root 包。
 - **提交信息**：纯净的中文/英文描述，首行简短，body 说清 what + why。不带 AI 工具名。
 
@@ -319,5 +344,7 @@ Golden Path scope 已包含 `project_id` / `task_fingerprint` / `skill` / `mode`
 3. **改 event 编码 / 折叠逻辑 / 检索算子**，必须更新或新增对应测试（这些是承重不变量）。
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
 5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
-6. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
-7. **提交信息不带 AI 工具名**，写清 what + why。
+6. **改了 `yitrace-db-python/`**，至少跑 `python -m pip install -e . && python -m pytest`；如果影响发布结构，同步更新 `yitrace-db-python/README.md` 和本文件。
+7. **改了 `yitrace-db-rs/`**，至少跑 `cargo test --offline`；如果影响公开 API，同步更新 `yitrace-db-rs/README.md` 和本文件。
+8. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
+9. **提交信息不带 AI 工具名**，写清 what + why。

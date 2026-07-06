@@ -43,13 +43,13 @@ or an internal package registry, then depend on exact `file:` tarballs:
 ```json
 {
   "dependencies": {
-    "@yitrace/db": "file:vendor/yitrace-db-0.0.1-g1a2b3c4d5e6f.tgz",
-    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.0.1-g1a2b3c4d5e6f.tgz"
+    "@yitrace/db": "file:vendor/yitrace-db-0.1.0-g1a2b3c4d5e6f.tgz",
+    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.1.0-g1a2b3c4d5e6f.tgz"
   }
 }
 ```
 
-Do not keep overwriting a shared `yitrace-db-0.0.1.tgz`. If the payload changes,
+Do not keep overwriting a shared `yitrace-db-0.1.0.tgz`. If the payload changes,
 the filename or registry version must change too, so lockfiles and rollbacks can
 identify the exact native binary.
 

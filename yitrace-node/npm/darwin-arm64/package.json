@@ -1,6 +1,6 @@
 {
   "name": "@yitrace/db-darwin-arm64",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "cpu": [
     "arm64"
   ],
@@ -8,15 +8,22 @@
   "files": [
     "yitrace-db.darwin-arm64.node"
   ],
-  "description": "Embedded yiTrace database for Node.js and Electron",
+  "description": "Native binding for @yitrace/db on macOS arm64",
   "keywords": [
-    "ai",
-    "agent",
-    "observability",
-    "trace",
-    "database",
+    "ai-agent",
+    "tracedb",
+    "trace-database",
+    "agent-observability",
+    "ai-observability",
+    "llm-observability",
+    "opentelemetry",
+    "openinference",
     "electron",
-    "node-api"
+    "node-api",
+    "vector-search",
+    "bm25",
+    "agent-memory",
+    "evals"
   ],
   "homepage": "https://github.com/vibeinging/yiTrace#readme",
   "license": "MIT",

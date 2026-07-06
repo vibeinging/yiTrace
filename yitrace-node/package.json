@@ -1,17 +1,24 @@
 {
   "name": "@yitrace/db",
-  "version": "0.0.1",
-  "description": "Embedded yiTrace database for Node.js and Electron",
+  "version": "0.1.0",
+  "description": "Embedded local-first TraceDB for AI agents, Node.js, and Electron apps",
   "type": "module",
   "license": "MIT",
   "keywords": [
-    "ai",
-    "agent",
-    "observability",
-    "trace",
-    "database",
+    "ai-agent",
+    "tracedb",
+    "trace-database",
+    "agent-observability",
+    "ai-observability",
+    "llm-observability",
+    "opentelemetry",
+    "openinference",
     "electron",
-    "node-api"
+    "node-api",
+    "vector-search",
+    "bm25",
+    "agent-memory",
+    "evals"
   ],
   "homepage": "https://github.com/vibeinging/yiTrace#readme",
   "bugs": {
@@ -73,10 +80,10 @@
     "@napi-rs/cli": "^3.7.2"
   },
   "optionalDependencies": {
-    "@yitrace/db-darwin-x64": "0.0.1",
-    "@yitrace/db-darwin-arm64": "0.0.1",
-    "@yitrace/db-linux-x64-gnu": "0.0.1",
-    "@yitrace/db-linux-arm64-gnu": "0.0.1",
-    "@yitrace/db-win32-x64-msvc": "0.0.1"
+    "@yitrace/db-darwin-x64": "0.1.0",
+    "@yitrace/db-darwin-arm64": "0.1.0",
+    "@yitrace/db-linux-x64-gnu": "0.1.0",
+    "@yitrace/db-linux-arm64-gnu": "0.1.0",
+    "@yitrace/db-win32-x64-msvc": "0.1.0"
   }
 }

@@ -1,6 +1,6 @@
 # yiTrace 当前态（唯一权威现状索引）
 
-> 更新：2026-07-06
+> 更新：2026-07-07
 > 这篇是**现状的唯一权威入口**。docs/ 下文档很多（41+ 篇，含多轮红队过程产物），新读者从这里看，不要被历史过程文档带偏。
 > 一句话：**项目走过一次大转向（openGauss 扩展 → 自研 Rust 引擎），当前承重的是 Rust 引擎；仓库里两套代码并存，本文讲清哪套是当前态。**
 
@@ -18,10 +18,14 @@
 | `yitrace-vecindex-graph/` | **团队 graph_index 向量 ANN 接入**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 接缝 + ABI 契约（带过滤回调）+ 离线 mock 测试绿（4 测）；真库在构建机 `--features link` 接 |
 | `yitrace-sdk/python`、`yitrace-sdk/typescript` | 打点 SDK，确定性 event_id 与引擎逐字节一致。 | 可用，各带测试 |
 | `yitrace-node/` | `@yitrace/db` Node/Electron 嵌入式 DB（N-API），通过进程内 `EngineJsonApi` 调 Rust 引擎，不读文件、不起本地 HTTP server。 | 可用：ESM/CJS、native load、ingest/search/textDomains/traces/sessions/trace detail/snapshot/logEvents/attrs filter/traceAggregate/traceTrajectories/trajectoryGroups/traceDiff/goldenPaths/storageStats/retentionPlan/retentionAudits/retentionPolicies/annotation/dataset association/indexVector/searchVector 测试绿 |
+| `yitrace-db-python/` | `yitrace-db` Python 嵌入式 DB（PyO3/maturin），通过进程内 `EngineJsonApi` 调 Rust 引擎，不读文件、不起本地 HTTP server。 | 可用：`YiTraceDB.open`、单写锁、builder、ingest/search/sessions/span detail、通用 `route_json` 测试绿 |
+| `yitrace-db-rs/` | `yitrace-db` Rust 嵌入式 DB crate，通过进程内 `EngineJsonApi` 调 Rust 引擎，不暴露 `WriteCoordinator` 给应用侧。 | 可用：`YiTraceDb::open`、单写锁、`SpanEventBuilder`、`SearchQuery`、ingest/search/trace/span detail、通用 `route_json` 测试绿 |
 
 ### 2026-07-03 关键增量
 
 - `@yitrace/db` 支持 Node/Electron 嵌入式打开 durable data dir，root 包 + per-platform optional native packages 的发布/本地 tarball 验证流程已成型。
+- `yitrace-db` 支持 Python 嵌入式打开 durable data dir，PyO3 extension 调同一个 `EngineJsonApi` 进程内边界；它和纯 Python `yitrace` 打点 SDK 是两个包。
+- `yitrace-db` Rust crate 支持 Rust Agent/后端嵌入式打开 durable data dir；它是 `EngineJsonApi` 的轻封装，常用 helper typed，完整 API 可用 `route_json()` 兜底。
 - direct ingest 支持外部字符串 id（UUID 等）：内部稳定 hash 成 u64，原始 id 保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`。
 - `attrs` 已贯穿 wire、WAL/segment、fold、查询输出和 Node 包；string/number/bool/null/array/object 按 JSON 形态 round-trip。
 - `project_id` / `skill` / `mode` / `call_site` / `task_fingerprint` / `loop_id` / `harness_version` / `schema_fingerprint` / `intent_signature` / `validation_status` / `review_status` / `eval_status` / `path_memory_id` / `stop_reason` / `phase` / `validator` 已从 attrs schema-on-write 提升为折叠后的一等字段，并保留 attrs fallback；这批字段可用于 search、traces、sessions、traceSearch、traceAggregate、loops、taskTraces 和 Golden Path scope 过滤/分组。`path_memory_id` 因高基数风险默认不进 postings，但仍能走折叠校验精确过滤。

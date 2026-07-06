@@ -1,10 +1,11 @@
 # yiTrace
 
-**给 AI Agent 用的 TraceDB。本地优先，需要时可以分片。**
+**给 AI Agent 用的本地优先 TraceDB。**
 
-yiTrace 记录 Agent 运行，把原始事件折叠成可回放的 span，支持检索、轨迹挖掘、成本归因、
-eval 证据和 Golden Path 证据。开始可以只接 SDK 或 OTLP。后续可以跑成单个私有服务，
-嵌进 Node / Electron，也可以在多个 shard 前面放 gateway。
+yiTrace 把 Agent 的原始事件变成可查询证据。你可以回放多轮运行、查看工具调用、
+搜索中文/英文 trace、分析 token/成本/eval，并把路径证据导出给 Agent Memory。
+它可以通过 `@yitrace/db` 嵌进 Node / Electron，也可以通过 `yitrace-db` 嵌进 Python
+或 Rust，还可以跑成私有服务，后续再放到分片 gateway 后面。
 
 中文 · [English](README.md)
 
@@ -16,19 +17,70 @@ eval 证据和 Golden Path 证据。开始可以只接 SDK 或 OTLP。后续可�
 
 ![yiTrace 控制台](docs/images/console-overview.png)
 
-yiTrace 适合正在做 Agent 的团队，尤其是那些不想把 trace、prompt、工具输出和内部错误送到托管服务里的团队：
+yiTrace 适合正在做 Agent 的团队，尤其是那些希望 trace 数据私有、可查、后续还能复用的团队：
 
-- 回放多轮对话、工具调用、多 Agent 移交
-- 用中文/英文 BM25、字段域和过滤条件搜索 trace
-- 把关键词检索、向量召回和 trajectory 相似召回放在同一个底座里
-- 按 trace、session、agent、model、provider、tool 归因 token 和成本
-- 给 trace/span 做 annotation，绑定外部 eval dataset，持续做回归
-- 发现重复任务里的稳定执行路径，导出 Golden Path 证据给 Agent Memory 使用
-- 默认私有部署，需要扩展时通过 gateway 做分片读写
+- 把 prompt、工具输出和内部错误留在本地或内网，不交给托管服务
+- 回放对话、工具调用、重试、错误和多 Agent 移交
+- 用 BM25、attrs 过滤、向量召回和 trajectory 相似召回搜索 trace
+- 跟踪 token、成本、eval、annotation 和 dataset 关联
+- 发现重复任务里的稳定路径，导出 Golden Path 证据给 Agent Memory
 
 > 状态：alpha，可运行。存储引擎、WAL 恢复、SDK 摄入、OTLP 摄入、Node/Electron 包、
 > 读模型索引、retention 和分布式 gateway 原语都有离线测试覆盖。它还不是完整托管式生产集群：
 > 自动 failover、fencing、后台复制调度、TLS/RBAC 和企业安全加固仍在路线图中。
+
+---
+
+## 先跑起来
+
+嵌进 Node.js 或 Electron：
+
+```bash
+npm install @yitrace/db
+```
+
+```ts
+import { YiTraceDB } from "@yitrace/db";
+
+const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
+const hits = await db.search({ text: "盗刷", k: 10 });
+```
+
+嵌进 Python：
+
+```bash
+pip install yitrace-db
+```
+
+```python
+from yitrace_db import YiTraceDB
+
+db = YiTraceDB.open("./data", tenant_id=1)
+hits = db.search(text="盗刷", k=10)
+```
+
+嵌进 Rust：
+
+```toml
+[dependencies]
+yitrace-db = { path = "yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+let hits = db.search(&SearchQuery::text("盗刷").k(10))?;
+```
+
+或者启动本地服务和内嵌控制台：
+
+```bash
+./scripts/demo_all.sh
+```
+
+打开 `http://127.0.0.1:7878`，搜索 `盗刷`，点开 span，看 input、output、log、
+token、成本和 eval 证据。
 
 ---
 
@@ -39,6 +91,8 @@ yiTrace 适合正在做 Agent 的团队，尤其是那些不想把 trace、promp
 | SDK + 本地服务 | 先把 Agent trace 私有化收起来，并打开控制台回放 | `cargo run -p yt-engine --example server`、HTTP JSON API、内嵌控制台 |
 | 持久化单服务 | 一个私有 data dir，重启后数据还在 | `server_durable`、WAL、manifest、不可变段、磁盘向量索引 |
 | Node / Electron 嵌入式 DB | 想写 `import { YiTraceDB } from "@yitrace/db"`，不想单独起进程 | Node-API、ESM/CJS、optional native packages、同一套 Rust 引擎 |
+| Python 嵌入式 DB | 想在 Python Agent 里写 `from yitrace_db import YiTraceDB` | PyO3/maturin 包，同样走进程内 `EngineJsonApi` |
+| Rust 嵌入式 DB | 想在 Rust Agent/后端里写 `use yitrace_db::YiTraceDb` | `EngineJsonApi` 的轻封装，没有 N-API/PyO3 这一层 |
 | 分片 gateway | 有多个 shard，或者要走分布式演进路径 | route table、写路由、读 fanout、partial/strict、一致性读目标 |
 | shard 主从复制 | 同一个 shard 内要 leader/follower 原语 | replication status、WAL 导出/应用、one-shot follower pull、lag/health 诊断 |
 
@@ -354,7 +408,7 @@ ipcMain.handle("trace-search", async (_event, query) => {
 
 ---
 
-## Node / Electron 嵌入式
+## Node / Python / Rust / Electron 嵌入式
 
 Node 后端或 Electron 应用如果要本地持久化，又不想单独起进程：
 
@@ -401,6 +455,61 @@ await db.close();
 再调用进程内 `EngineJsonApi`。所以 WAL 恢复、manifest snapshot、折叠、租户过滤、
 BM25、向量检索、metadata、retention、Golden Path 证据都走同一套数据库引擎。
 
+Python Agent 也可以走同样的嵌入式模型：
+
+```bash
+pip install yitrace-db
+```
+
+```python
+from yitrace_db import YiTraceDB, create_span_event_builder
+
+with YiTraceDB.open("./data", tenant_id=1) as db:
+    events = create_span_event_builder({
+        "trace_id": "run-uuid",
+        "session_id": "session-uuid",
+        "attrs": {"project_id": "agentic-data", "skill": "review"},
+    })
+    events.start_span(span_id="span-uuid", name="风控研判", input_text="疑似盗刷")
+    events.log("疑似盗刷", span_id="span-uuid")
+    events.end_span(span_id="span-uuid", status=0, duration_ns=12_000_000)
+    events.ingest(db)
+
+    hits = db.search(text="盗刷", k=10)
+```
+
+`yitrace-db` 也不是 Python 直接读数据库文件。它通过 PyO3 把 Rust engine 嵌进 Python 进程，
+调用和 Node 包相同的 `EngineJsonApi` 进程内边界。只需要打点到已运行服务时，用现有
+`yitrace` Python SDK；需要 Python 应用本地打开 TraceDB 时，用 `yitrace-db`。
+
+Rust Agent 和后端可以直接走同一个进程内边界，不需要 native bridge：
+
+```toml
+[dependencies]
+yitrace-db = { path = "yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, SpanEndOptions, SpanEventBuilder, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+
+let mut events = SpanEventBuilder::new("run-uuid");
+events
+    .session_id("session-uuid")
+    .attr("project_id", "agentic-data")
+    .attr("skill", "review")
+    .start_span("span-uuid", "风控研判")
+    .log("span-uuid", "疑似盗刷")
+    .end_span_with("span-uuid", SpanEndOptions::ok().duration_ns(12_000_000));
+
+db.ingest_builder(&events)?;
+let hits = db.search(&SearchQuery::text("盗刷").k(10).attr("project_id", "agentic-data"))?;
+```
+
+Rust crate 刻意保持很薄：常用入口有 typed helper，没包到的 `/v1/*` API 仍然可以用
+`route_json()` 调。
+
 direct `db.ingest()` 支持数字 ID，也支持 UUID 这类外部字符串 ID。字符串 ID 会稳定 hash 成内部
 `u64` key 用于索引，原文以 `external_*` 字段返回。`attrs` 按 JSON round-trip；
 `project_id`、`skill`、`mode`、`task_fingerprint`、`loop_id`、`validation_status`、
@@ -418,7 +527,7 @@ Electron 应用建议在 main process 打开 `YiTraceDB`，renderer 只通过窄
 yiTrace 的扩展方式是：每个 shard 保持简单，gateway 显式负责路由和 fanout。
 
 ```text
-SDK / OTLP / @yitrace/db clients
+SDK / OTLP / @yitrace/db / yitrace-db clients
         |
         v
   yiTrace gateway
@@ -524,6 +633,7 @@ read-time fold
 | SDK 和 OTLP 摄入 | 已实现 | Python、TypeScript、自定义 wire JSON、OTLP/OpenInference |
 | HTTP API 和控制台 | 可用 | 控制台走公开 `/v1/*` API |
 | Node / Electron 嵌入式 DB | 可用 | ESM/CJS、native package、clean consumer pack 验证 |
+| Python 嵌入式 DB | 可用 | PyO3 包、`YiTraceDB.open`、builder、ingest/search/session/span 测试 |
 | 中文分词与 BM25 | 已实现，纯 Rust | 词典 DAG、内嵌 jieba 词典、用户词典 |
 | 向量召回 | 引擎内已实现 | 磁盘 HNSW + vector namespace flat index；namespace 高性能 ANN 仍待做 |
 | 读模型索引 | 第一版已落地 | attrs postings、metadata sidecar、traceAggregate rollup、loop/task sidecar、text domains |
@@ -560,6 +670,8 @@ yitrace-engine/              # Rust 引擎 workspace，主体 std-only
     yt-memtable              # 活数据和 gated eviction
     yt-engine                # 协调器、检索、eval、HTTP、OTLP、gateway、控制台资源
 yitrace-node/                # @yitrace/db Node/Electron 嵌入式包
+yitrace-db-python/           # yitrace-db Python 嵌入式包
+yitrace-db-rs/               # yitrace-db Rust 嵌入式包
 yitrace-console/             # React 控制台
 yitrace-sdk/
   python/                    # Python 打点 SDK

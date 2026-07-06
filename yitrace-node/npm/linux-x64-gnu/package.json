@@ -1,6 +1,6 @@
 {
   "name": "@yitrace/db-linux-x64-gnu",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "cpu": [
     "x64"
   ],
@@ -8,15 +8,22 @@
   "files": [
     "yitrace-db.linux-x64-gnu.node"
   ],
-  "description": "Embedded yiTrace database for Node.js and Electron",
+  "description": "Native binding for @yitrace/db on Linux x64 glibc",
   "keywords": [
-    "ai",
-    "agent",
-    "observability",
-    "trace",
-    "database",
+    "ai-agent",
+    "tracedb",
+    "trace-database",
+    "agent-observability",
+    "ai-observability",
+    "llm-observability",
+    "opentelemetry",
+    "openinference",
     "electron",
-    "node-api"
+    "node-api",
+    "vector-search",
+    "bm25",
+    "agent-memory",
+    "evals"
   ],
   "homepage": "https://github.com/vibeinging/yiTrace#readme",
   "license": "MIT",
