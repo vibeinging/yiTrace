@@ -20,8 +20,8 @@ use std::sync::Arc;
 use yt_core::fold::FoldedSpan;
 
 use crate::{
-    AgentCost, EvalSummary, KeywordScorer, SessionTimeline, SessionTurn, TraceQuery, WireRecord,
-    WriteCoordinator,
+    AgentCost, EngineJsonApi, EvalSummary, KeywordScorer, SessionTimeline, SessionTurn, TraceQuery,
+    WireRecord, WriteCoordinator,
 };
 
 // ───────────────────────── 确定性伪随机（std-only） ─────────────────────────
@@ -543,6 +543,136 @@ pub fn print_report(r: &HarnessReport) {
         strict * 100.0
     );
     println!();
+}
+
+// ───────────────────────── 通用 eval case ─────────────────────────
+
+/// 通用 eval check 的结果。它用于把合同测试、错误输入测试、读模型测试统一成 eval 报告。
+#[derive(Debug, Clone)]
+pub struct EvalCheckReport {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+/// 一个 eval case 的报告。
+#[derive(Debug, Clone)]
+pub struct EvalCaseReport {
+    pub name: String,
+    pub category: String,
+    pub checks: Vec<EvalCheckReport>,
+}
+
+impl EvalCaseReport {
+    pub fn passed(&self) -> bool {
+        self.checks.iter().all(|check| check.passed)
+    }
+}
+
+/// 一个 eval suite 的报告。
+#[derive(Debug, Clone)]
+pub struct EvalSuiteReport {
+    pub name: String,
+    pub cases: Vec<EvalCaseReport>,
+}
+
+impl EvalSuiteReport {
+    pub fn passed(&self) -> bool {
+        self.cases.iter().all(EvalCaseReport::passed)
+    }
+
+    pub fn failure_report(&self) -> String {
+        let mut out = format!("eval suite '{}' failed", self.name);
+        for case in &self.cases {
+            for check in &case.checks {
+                if !check.passed {
+                    out.push_str(&format!(
+                        "\n- [{}] {} :: {} => {}",
+                        case.category, case.name, check.name, check.detail
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// HTTP/进程内 API eval 的一个真实执行步骤。
+///
+/// 每一步都会调用 `EngineJsonApi::route_with_tenant`，也就是引擎的真实 API 边界。
+/// 需要数据的 case 应先放 ingest / metadata 写入步骤，再放查询验证步骤。
+#[derive(Debug, Clone)]
+pub struct ApiEvalStep {
+    pub name: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+    pub tenant: Option<u64>,
+    pub body: &'static str,
+    pub expect_status: u16,
+    pub expect_contains: &'static [&'static str],
+    pub reject_contains: &'static [&'static str],
+}
+
+/// HTTP/进程内 API 合同 eval case。
+#[derive(Debug, Clone)]
+pub struct ApiEvalCase {
+    pub name: &'static str,
+    pub category: &'static str,
+    pub steps: Vec<ApiEvalStep>,
+}
+
+/// 跑一组 API eval case。每个 step 都走 `EngineJsonApi` 真实边界；
+/// 真 socket / 真进程可以作为另一类 step runner 接进来，但不能用 mock 结果替代。
+pub fn run_api_eval_suite(
+    suite_name: &str,
+    api: &EngineJsonApi,
+    cases: &[ApiEvalCase],
+) -> EvalSuiteReport {
+    let mut reports = Vec::with_capacity(cases.len());
+    for case in cases {
+        let mut checks = Vec::new();
+        if case.steps.is_empty() {
+            checks.push(EvalCheckReport {
+                name: "has real api steps".to_string(),
+                passed: false,
+                detail: "eval case 必须至少有一个真实 API 执行步骤".to_string(),
+            });
+        }
+
+        for step in &case.steps {
+            let (status, body) =
+                api.route_with_tenant(step.method, step.path, step.body, step.tenant);
+            let step_name = format!("{} {} {}", step.name, step.method, step.path);
+            checks.push(EvalCheckReport {
+                name: format!("{step_name} status"),
+                passed: status == step.expect_status,
+                detail: format!("got {status}, expected {}, body={body}", step.expect_status),
+            });
+            for needle in step.expect_contains {
+                checks.push(EvalCheckReport {
+                    name: format!("{step_name} body contains {needle:?}"),
+                    passed: body.contains(needle),
+                    detail: body.clone(),
+                });
+            }
+            for needle in step.reject_contains {
+                checks.push(EvalCheckReport {
+                    name: format!("{step_name} body rejects {needle:?}"),
+                    passed: !body.contains(needle),
+                    detail: body.clone(),
+                });
+            }
+        }
+        reports.push(EvalCaseReport {
+            name: case.name.to_string(),
+            category: case.category.to_string(),
+            checks,
+        });
+    }
+    EvalSuiteReport {
+        name: suite_name.to_string(),
+        cases: reports,
+    }
 }
 
 // ───────────────────────── 会话级评测（多轮专属） ─────────────────────────

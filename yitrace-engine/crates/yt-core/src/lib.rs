@@ -172,6 +172,41 @@ pub mod event {
     mod tests {
         use super::*;
 
+        fn event_type_from_fixture(name: &str) -> EventType {
+            match name {
+                "SPAN_START" => EventType::SpanStart,
+                "SPAN_END" => EventType::SpanEnd,
+                "ATTR" => EventType::Attr,
+                "LOG" => EventType::Log,
+                "ERROR" => EventType::Error,
+                other => panic!("unknown event_type in fixture: {}", other),
+            }
+        }
+
+        #[test]
+        fn event_id_matches_shared_cross_language_fixture() {
+            let fixture = include_str!("../../../../tests/fixtures/event_id_cases.tsv");
+            for (line_no, line) in fixture.lines().enumerate() {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let cols: Vec<&str> = line.split('\t').collect();
+                assert_eq!(cols.len(), 4, "bad fixture columns at line {}", line_no + 1);
+                let identity = EventIdentity {
+                    ext_span_id: cols[0].to_string(),
+                    seq: cols[1].parse::<u64>().unwrap(),
+                    event_type: event_type_from_fixture(cols[2]),
+                };
+                let expected = cols[3].parse::<u64>().unwrap();
+                assert_eq!(
+                    identity.event_id().0,
+                    expected,
+                    "event_id fixture mismatch at line {}",
+                    line_no + 1
+                );
+            }
+        }
+
         #[test]
         fn event_id_is_deterministic_and_seq_sensitive() {
             let a = EventIdentity {

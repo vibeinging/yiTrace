@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use yt_engine::{HttpIngestServer, RemoteShardGateway, WriteCoordinator};
+use yt_engine::{
+    evalkit::{EvalCaseReport, EvalCheckReport, EvalSuiteReport},
+    HttpIngestServer, RemoteShardGateway, WriteCoordinator,
+};
 
 const CHILD_ENV: &str = "YT_DISTRIBUTED_EVAL_CHILD";
 const CHILD_DIR_ENV: &str = "YT_DISTRIBUTED_EVAL_DIR";
@@ -150,6 +153,69 @@ fn assert_http_contains(
         "missing {needle:?} from {method} {addr}{path}: {response}"
     );
     response
+}
+
+fn eval_check(
+    checks: &mut Vec<EvalCheckReport>,
+    name: impl Into<String>,
+    passed: bool,
+    detail: impl Into<String>,
+) {
+    checks.push(EvalCheckReport {
+        name: name.into(),
+        passed,
+        detail: detail.into(),
+    });
+}
+
+fn eval_http_request(
+    checks: &mut Vec<EvalCheckReport>,
+    name: &str,
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    tenant: Option<u64>,
+    expect_status: u16,
+) -> String {
+    match http_request(addr, method, path, body, tenant) {
+        Ok((status, response)) => {
+            eval_check(
+                checks,
+                format!("{name} status"),
+                status == expect_status,
+                format!("got {status}, expected {expect_status}, body={response}"),
+            );
+            response
+        }
+        Err(err) => {
+            eval_check(
+                checks,
+                format!("{name} request"),
+                false,
+                format!("request failed: {err}"),
+            );
+            String::new()
+        }
+    }
+}
+
+fn eval_contains(checks: &mut Vec<EvalCheckReport>, name: &str, body: &str, needle: &str) {
+    eval_check(
+        checks,
+        format!("{name} contains {needle:?}"),
+        body.contains(needle),
+        body.to_string(),
+    );
+}
+
+fn eval_rejects(checks: &mut Vec<EvalCheckReport>, name: &str, body: &str, needle: &str) {
+    eval_check(
+        checks,
+        format!("{name} rejects {needle:?}"),
+        !body.contains(needle),
+        body.to_string(),
+    );
 }
 
 fn json_u64_field(body: &str, field: &str) -> u64 {
@@ -811,6 +877,208 @@ fn gateway_process_query_reports_partial_shard_failure() {
     }
 }
 
+/// 真 gateway 恢复 eval：后端 shard 宕机后，原 data dir 原端口重启，gateway 下一次查询能恢复全量。
+#[test]
+fn gateway_process_recovers_after_backend_shard_restart() {
+    let mut checks = Vec::new();
+    let dirs = [
+        durable_dir("gateway_recover_shard_0"),
+        durable_dir("gateway_recover_shard_1"),
+        durable_dir("gateway_recover_shard_2"),
+    ];
+    let shard_addrs = [free_addr(), free_addr(), free_addr()];
+    let mut shards: Vec<RunningShard> = dirs
+        .iter()
+        .zip(shard_addrs.iter())
+        .map(|(dir, addr)| spawn_shard(dir, addr))
+        .collect();
+    let gateway_addr = free_addr();
+    let shard_addr_vec: Vec<String> = shards.iter().map(|shard| shard.addr.clone()).collect();
+    let gateway = spawn_gateway(&gateway_addr, &shard_addr_vec);
+    eval_check(
+        &mut checks,
+        "creates 3 shard processes plus 1 gateway process",
+        shards.len() == 3,
+        format!("live shard processes={}, gateway processes=1", shards.len()),
+    );
+
+    let s0 = session_for_gateway_shard(752, 0, 3);
+    let s1 = session_for_gateway_shard(752, 1, 3);
+    let s2 = session_for_gateway_shard(752, 2, 3);
+    let body = gateway_batch_with_sessions(&[(75_200, s0, 0), (75_201, s1, 1), (75_202, s2, 2)]);
+    let ingest = eval_http_request(
+        &mut checks,
+        "gateway ingest before restart",
+        &gateway.addr,
+        "POST",
+        "/v1/ingest",
+        &body,
+        Some(752),
+        200,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway ingest before restart",
+        &ingest,
+        r#""ingested":3"#,
+    );
+
+    let restarted_addr = shards[1].addr.clone();
+    drop(shards.remove(1));
+    eval_check(
+        &mut checks,
+        "one backend shard is stopped before degraded query",
+        shards.len() == 2,
+        format!("live shard processes={}, gateway processes=1", shards.len()),
+    );
+
+    let degraded = eval_http_request(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &gateway.addr,
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"process-distributed-eval"},"limit":10}"#,
+        Some(752),
+        200,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""degraded":true"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""okShards":2"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""total":2"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""traceId":"75200""#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""traceId":"75202""#,
+    );
+    eval_rejects(
+        &mut checks,
+        "gateway degraded query while shard down",
+        &degraded,
+        r#""traceId":"75201""#,
+    );
+
+    let restarted = spawn_shard(&dirs[1], &restarted_addr);
+    eval_check(
+        &mut checks,
+        "stopped backend shard restarts from same durable dir and port",
+        shards.len() == 2,
+        format!("live shard processes before reinserting restarted shard={}, restarted_addr={restarted_addr}", shards.len()),
+    );
+
+    let recovered = eval_http_request(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &gateway.addr,
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"process-distributed-eval"},"limit":10}"#,
+        Some(752),
+        200,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""degraded":false"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""okShards":3"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""total":3"#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""traceId":"75200""#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""traceId":"75201""#,
+    );
+    eval_contains(
+        &mut checks,
+        "gateway recovered query after shard restart",
+        &recovered,
+        r#""traceId":"75202""#,
+    );
+
+    let direct = eval_http_request(
+        &mut checks,
+        "restarted shard direct durable read",
+        &restarted.addr,
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"projectId":"process-distributed-eval","mode":"shard-1"},"limit":10}"#,
+        Some(752),
+        200,
+    );
+    eval_contains(
+        &mut checks,
+        "restarted shard direct durable read",
+        &direct,
+        r#""total":1"#,
+    );
+    eval_contains(
+        &mut checks,
+        "restarted shard direct durable read",
+        &direct,
+        r#""traceId":"75201""#,
+    );
+
+    shards.insert(1, restarted);
+    let report = EvalSuiteReport {
+        name: "distributed_process_gateway_recovery".to_string(),
+        cases: vec![EvalCaseReport {
+            name: "gateway recovers after backend shard restart".to_string(),
+            category: "distributed_process".to_string(),
+            checks,
+        }],
+    };
+    let passed = report.passed();
+    let failure_report = report.failure_report();
+
+    drop(gateway);
+    for shard in shards {
+        drop(shard);
+    }
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    assert!(passed, "{failure_report}");
+}
+
 /// 真网络复制 eval：两个独立 shard 进程通过 HTTP WAL batch 做 leader→follower catch-up。
 ///
 /// 覆盖分布式底座的关键边界：
@@ -921,22 +1189,19 @@ fn network_wal_replication_between_processes_is_idempotent_and_gap_checked() {
         Some(770),
         r#""ingested":1"#,
     );
-    let delta_path = format!("/v1/replication/wal?afterLsn={follower_tail}");
-    let delta = assert_http_contains(
-        &leader.addr,
-        "GET",
-        &delta_path,
-        "",
-        None,
-        r#""recordCount":1"#,
-    );
-    assert_http_contains(
+    let pull_body = format!(r#"{{"leaderAddr":"http://{}"}}"#, leader.addr);
+    let pulled = assert_http_contains(
         &follower.addr,
         "POST",
-        "/v1/replication/wal",
-        &delta,
+        "/v1/replication/pull",
+        &pull_body,
         None,
-        r#""applied":true"#,
+        r#""pulled":true"#,
+    );
+    assert!(pulled.contains(r#""recordCount":1"#), "{pulled}");
+    assert!(
+        pulled.contains(&format!(r#""fromLsn":{follower_tail}"#)),
+        "{pulled}"
     );
     let caught_up = assert_http_contains(
         &follower.addr,

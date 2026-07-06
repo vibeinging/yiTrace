@@ -1,3 +1,8 @@
+use self::snapshot_helpers::{
+    snapshot_lease_deadline_ns, snapshot_lease_ttl_ns_from_body, snapshot_now_ns,
+    DEFAULT_SNAPSHOT_LEASE_TTL_NS,
+};
+
 #[derive(Debug)]
 struct RemoteGatewaySnapshotLeaseBook {
     next_seq: u64,
@@ -9,6 +14,7 @@ struct RemoteGatewaySnapshotLeaseBook {
 struct RemoteGatewaySnapshotLeaseEntry {
     snapshot: RemoteGatewaySnapshot,
     last_used_seq: u64,
+    expires_at_ns: u128,
 }
 
 impl Default for RemoteGatewaySnapshotLeaseBook {
@@ -22,16 +28,22 @@ impl Default for RemoteGatewaySnapshotLeaseBook {
 }
 
 impl RemoteGatewaySnapshotLeaseBook {
-    fn insert(&mut self, mut snapshot: RemoteGatewaySnapshot) -> RemoteGatewaySnapshot {
+    fn insert(
+        &mut self,
+        mut snapshot: RemoteGatewaySnapshot,
+        ttl_ns: u128,
+    ) -> (RemoteGatewaySnapshot, u128) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         let lease_id = format!("remote-lease-{seq}");
         snapshot.lease_id = Some(lease_id.clone());
+        let expires_at_ns = snapshot_lease_deadline_ns(ttl_ns);
         self.leases.insert(
             lease_id.clone(),
             RemoteGatewaySnapshotLeaseEntry {
                 snapshot: snapshot.clone(),
                 last_used_seq: seq,
+                expires_at_ns,
             },
         );
         while self.leases.len() > self.max_entries.max(1) {
@@ -46,35 +58,51 @@ impl RemoteGatewaySnapshotLeaseBook {
             };
             self.leases.remove(&evict_id);
         }
-        snapshot
+        (snapshot, expires_at_ns)
     }
 
     fn lookup(&mut self, lease_id: &str) -> Option<RemoteGatewaySnapshot> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        self.purge_expired();
         let entry = self.leases.get_mut(lease_id)?;
         entry.last_used_seq = seq;
         Some(entry.snapshot.clone())
     }
 
-    fn replace(&mut self, lease_id: &str, mut snapshot: RemoteGatewaySnapshot) -> bool {
+    fn replace(
+        &mut self,
+        lease_id: &str,
+        mut snapshot: RemoteGatewaySnapshot,
+        ttl_ns: u128,
+    ) -> Option<u128> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        self.purge_expired();
         snapshot.lease_id = Some(lease_id.to_string());
         let Some(entry) = self.leases.get_mut(lease_id) else {
-            return false;
+            return None;
         };
+        let expires_at_ns = snapshot_lease_deadline_ns(ttl_ns);
         entry.snapshot = snapshot;
         entry.last_used_seq = seq;
-        true
+        entry.expires_at_ns = expires_at_ns;
+        Some(expires_at_ns)
     }
 
     fn release(&mut self, lease_id: &str) -> Option<RemoteGatewaySnapshot> {
+        self.purge_expired();
         self.leases.remove(lease_id).map(|entry| entry.snapshot)
     }
 
     fn clear(&mut self) {
         self.leases.clear();
+    }
+
+    fn purge_expired(&mut self) {
+        let now = snapshot_now_ns();
+        self.leases
+            .retain(|_, entry| entry.expires_at_ns > now);
     }
 }
 
@@ -97,6 +125,7 @@ impl RemoteShardGateway {
     }
 
     fn remote_snapshot_lease_json(&self, body: &str, tenant: Option<u64>) -> (u16, String) {
+        let ttl_ns = snapshot_lease_ttl_ns_from_body(body).unwrap_or(DEFAULT_SNAPSHOT_LEASE_TTL_NS);
         let force_leader = remote_snapshot_lease_requires_leader(body);
         let targets = match self.read_targets_snapshot(force_leader, None) {
             Ok(targets) => targets,
@@ -155,8 +184,8 @@ impl RemoteShardGateway {
             route_table_version: self.route_table_version(),
             shards,
         };
-        let leased = match self.remote_snapshot_leases.lock() {
-            Ok(mut leases) => leases.insert(snapshot),
+        let (leased, expires_at_ns) = match self.remote_snapshot_leases.lock() {
+            Ok(mut leases) => leases.insert(snapshot, ttl_ns),
             Err(_) => {
                 return (
                     503,
@@ -167,9 +196,10 @@ impl RemoteShardGateway {
         (
             200,
             format!(
-                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","readTargets":[{}]}}"#,
+                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","expiresAtNs":"{}","readTargets":[{}]}}"#,
                 remote_gateway_snapshot_json(&leased),
                 json_opt_str(leased.lease_id.as_deref()),
+                expires_at_ns,
                 remote_read_targets_json(&targets)
             ),
         )
@@ -182,6 +212,7 @@ impl RemoteShardGateway {
                 r#"{"error":"leaseId is required","code":"bad_snapshot_lease"}"#.to_string(),
             );
         };
+        let ttl_ns = snapshot_lease_ttl_ns_from_body(body).unwrap_or(DEFAULT_SNAPSHOT_LEASE_TTL_NS);
         let snapshot = match self.remote_snapshot_lookup(&lease_id) {
             Ok(snapshot) => snapshot,
             Err(error) => return error,
@@ -211,8 +242,9 @@ impl RemoteShardGateway {
                 continue;
             };
             let renew_body = format!(
-                r#"{{"leaseId":"{}"}}"#,
-                gateway_json_escape(&local_lease_id)
+                r#"{{"leaseId":"{}","ttlNs":{}}}"#,
+                gateway_json_escape(&local_lease_id),
+                ttl_ns
             );
             match target.client.route_json_with_tenant(
                 "POST",
@@ -270,21 +302,26 @@ impl RemoteShardGateway {
             route_table_version: self.route_table_version(),
             shards: renewed_shards,
         };
-        if let Ok(mut leases) = self.remote_snapshot_leases.lock() {
-            if !leases.replace(&lease_id, renewed.clone()) {
-                return remote_snapshot_error(
-                    409,
-                    "snapshot_expired",
-                    "remote gateway snapshot lease is expired or released",
-                );
-            }
-        }
+        let expires_at_ns = match self.remote_snapshot_leases.lock() {
+            Ok(mut leases) => match leases.replace(&lease_id, renewed.clone(), ttl_ns) {
+                Some(expires_at_ns) => expires_at_ns,
+                None => {
+                    return remote_snapshot_error(
+                        409,
+                        "snapshot_expired",
+                        "remote gateway snapshot lease is expired or released",
+                    )
+                }
+            },
+            Err(_) => snapshot_lease_deadline_ns(ttl_ns),
+        };
         (
             200,
             format!(
-                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","readTargets":[{}]}}"#,
+                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","expiresAtNs":"{}","readTargets":[{}]}}"#,
                 remote_gateway_snapshot_json(&renewed),
                 json_opt_str(Some(&lease_id)),
+                expires_at_ns,
                 remote_read_targets_json(&targets)
             ),
         )

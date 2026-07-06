@@ -1,10 +1,11 @@
 # yiTrace
 
-**Trace SDK and run replay for AI agents.**
+**A TraceDB for AI agents. Local-first, shardable when one process is not enough.**
 
-Add the SDK, send agent runs to a local yiTrace collector, and replay every
-multi-turn conversation, tool call, token cost, and failure without sending data
-to a hosted observability service.
+yiTrace records agent runs, folds raw events into replayable spans, searches
+the traces, mines stable trajectories, and keeps the evidence local. Start with
+an SDK or OTLP. Run it as a single private server, embed it inside Node/Electron,
+or put a gateway in front of multiple shards.
 
 [中文](README.zh-CN.md) · English
 
@@ -12,27 +13,42 @@ to a hosted observability service.
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![status](https://img.shields.io/badge/status-alpha-3fb950)](#project-status)
 [![engine](https://img.shields.io/badge/engine-std--only%20zero--dep-4b7fd1)](#how-it-works)
-[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#start-with-the-trace-sdk)
-
-Open the bundled console to replay multi-turn sessions, inspect spans, search
-Chinese trace text, and drill into model/tool calls.
+[![OTLP](https://img.shields.io/badge/ingest-OTLP%20%2F%20OpenInference-7c3aed)](#ingest-agent-runs)
 
 ![yiTrace console](docs/images/console-overview.png)
 
-yiTrace is for teams building agents that want tracing to feel like adding an
-SDK, not adopting a database:
+yiTrace is built for agent teams that need more than hosted trace screenshots:
 
-- add Python or TypeScript tracing with a few lines of code
 - replay multi-turn conversations, tool calls, and multi-agent handoffs
-- search Chinese trace text with BM25, then blend it with vector recall
-- filter search by tenant, agent, status, trace, and time
-- attribute token cost per trace, session, and agent
-- collect failed spans into eval datasets and track regressions
-- keep the storage engine local and hidden until you need it
+- search Chinese and English trace text with BM25, field domains, and filters
+- blend keyword search with vector recall and trajectory similarity
+- attribute tokens and cost by trace, session, agent, model, provider, and tool
+- annotate traces, bind them to eval datasets, and track regressions
+- mine repeated task paths and export Golden Path evidence for Agent Memory
+- run private by default, then shard reads/writes through a gateway when needed
 
-> Status: alpha, runnable today. Storage, WAL recovery, OTLP ingest, SDKs,
-> Chinese search, vector recall, and evals are covered by offline tests.
-> RBAC/TLS/hosted deployment are roadmap items.
+> Status: alpha, runnable today. The storage engine, WAL recovery, SDK ingest,
+> OTLP ingest, Node/Electron package, read-model indexes, retention, and
+> distributed gateway primitives are covered by offline tests. This is not yet a
+> managed production cluster: automatic failover, fencing, background replication
+> scheduling, TLS/RBAC, and enterprise hardening are still roadmap items.
+
+---
+
+## Run Modes
+
+| Mode | Use it when | What exists today |
+|---|---|---|
+| SDK + local server | You want private trace capture and console replay | `cargo run -p yt-engine --example server`, HTTP JSON API, embedded console |
+| Durable single server | You want one private data directory with restart recovery | `server_durable`, WAL, manifest, immutable segments, disk vector index |
+| Node / Electron embedded DB | You want `import { YiTraceDB } from "@yitrace/db"` and no extra process | Node-API package, ESM/CJS, optional native packages, same Rust engine in-process |
+| Sharded gateway | You have multiple shard servers or want the distributed path | route table, write routing, read fanout, partial/strict consistency, follower read targets |
+| Replicated shard | You want leader/follower primitives | replication status, WAL export/apply, one-shot follower pull, lag/health diagnostics |
+
+The important distinction: yiTrace is no longer "just single-node". The storage
+core is still single-writer per shard because that is the correct failure model.
+Cluster-level scale comes from routing, fanout, snapshots, and replication around
+those shards.
 
 ---
 
@@ -46,9 +62,8 @@ One-command local demo:
 ./scripts/demo_all.sh
 ```
 
-This builds the console, starts the engine, ingests a sample trace, and prints
-ready-to-run search commands. Set `YT_DEMO_OPEN=1` to open the console
-automatically.
+This builds the console, starts the engine, ingests sample traces, and prints
+ready-to-run search commands. Set `YT_DEMO_OPEN=1` to open the console.
 
 Docker:
 
@@ -58,14 +73,14 @@ docker compose up --build
 
 Then open `http://127.0.0.1:7878`.
 
-Manual path:
+Manual server:
 
 ```bash
 cd yitrace-engine
 cargo run -p yt-engine --example server
 ```
 
-The server listens on `http://127.0.0.1:7878` and seeds demo eval data.
+The demo server listens on `http://127.0.0.1:7878` and seeds eval data.
 
 In another terminal:
 
@@ -84,12 +99,19 @@ curl -XPOST localhost:7878/v1/search \
   -d '{"text":"fraud","k":10}'
 ```
 
-For Chinese search:
+Chinese search:
 
 ```bash
 curl -XPOST localhost:7878/v1/search \
   -H 'Content-Type: application/json' \
   -d '{"text":"盗刷","k":10,"filter":{"agent_name":"风控","status":1}}'
+```
+
+Durable server:
+
+```bash
+cd yitrace-engine
+YT_BIND=127.0.0.1:7879 cargo run -p yt-engine --example server_durable -- ./data/yitrace
 ```
 
 Optional auth:
@@ -102,11 +124,12 @@ curl localhost:7878/v1/traces \
   -H 'X-Tenant-Id: 1'
 ```
 
-## Start With The Trace SDK
+---
 
-You do not need to adopt yiTrace as a database to begin. Run the local collector
-or server, add the SDK, and treat yiTrace like a private flight recorder for
-agent runs.
+## Ingest Agent Runs
+
+You do not need to adopt yiTrace as a database on day one. Run the collector,
+add the SDK, and treat it like a private flight recorder for agent runs.
 
 Python:
 
@@ -114,10 +137,7 @@ Python:
 from yitrace import Tracer, HttpExporter
 
 tracer = Tracer(
-    exporter=HttpExporter(
-        "http://127.0.0.1:7878/v1/ingest",
-        tenant_id=1,
-    ),
+    exporter=HttpExporter("http://127.0.0.1:7878/v1/ingest", tenant_id=1),
     node_id=1,
 )
 
@@ -156,35 +176,211 @@ Already have OpenTelemetry or OpenInference spans? POST OTLP/HTTP JSON to
 `/v1/traces`. yiTrace maps OTel GenAI `gen_ai.*` and OpenInference `llm.*`
 attributes into the same trace store.
 
-## Console
+---
 
-The engine can serve the React console as embedded static assets. From source,
-build it once and copy it into the engine crate before starting the server:
+## Agent Recipes
 
-```bash
-cd yitrace-console
-npm install
-VITE_API=http npm run build
-rm -rf ../yitrace-engine/crates/yt-engine/console_dist
-cp -r dist ../yitrace-engine/crates/yt-engine/console_dist
+These are the common ways agent systems use yiTrace. They are patterns, not
+separate products.
 
-cd ../yitrace-engine
-cargo run -p yt-engine --example server
+### 1. Give an agent memory backed by real runs
+
+Before planning, search previous task traces by task fingerprint, project, and
+schema. After the run, store an embedding for the task or trajectory. yiTrace
+does not call an embedding model; your agent or memory pipeline provides
+`taskEmbedding`.
+
+```ts
+const similarTasks = await db.searchVector({
+  namespace: "task",
+  vector: taskEmbedding,
+  k: 5,
+  filter: {
+    attrs: {
+      project_id: "agentic-data",
+      schema_fingerprint: "schema-v1",
+    },
+  },
+});
+
+const priorRuns = await db.traceSearch({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    validationStatus: "pass",
+    attrs: { project_id: "agentic-data" },
+  },
+  limit: 20,
+});
+
+await db.indexVector({
+  namespace: "task",
+  key: "npm-native-packaging",
+  vector: taskEmbedding,
+  traceId: "builder-run-42",
+  attrs: {
+    project_id: "agentic-data",
+    schema_fingerprint: "schema-v1",
+    embedding_model: "text-embedding-3-large",
+  },
+});
 ```
 
-Then open `http://127.0.0.1:7878/`.
+The memory is grounded in trace evidence: what the agent did, which tools it
+called, how much it cost, whether validation passed, and what changed later.
 
-The console has no private API. It talks to the same `/v1/*` JSON endpoints as
-any other UI. See [HTTP API Reference](docs/API_REFERENCE.md).
+### 2. Debug a loop that keeps failing
+
+When a user asks the same question many times, trace data can show which route
+kept looping and which attempt finally worked.
+
+```bash
+curl -XPOST localhost:7878/v1/trajectory-groups \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "filter": {
+      "taskFingerprint": "refund-risk-review",
+      "attrs": { "project_id": "agentic-data" }
+    },
+    "sort": "best",
+    "limit": 10
+  }'
+```
+
+Use this for agent debugging pages: repeated failed routes, common tool
+sequences, success rate, duration, token cost, and example traces.
+
+### 3. Turn the best observed run into a Golden Path
+
+yiTrace does not decide what is best. It stores the evidence so the product or
+eval layer can decide.
+
+```ts
+const candidates = await db.trajectoryGroups({
+  filter: {
+    taskFingerprint: "npm-native-packaging",
+    validationStatus: "pass",
+    attrs: { project_id: "agentic-data" },
+  },
+  sort: "best",
+  limit: 5,
+});
+
+const sourceTraceId = candidates.items[0]?.examples[0]?.traceId;
+if (!sourceTraceId) throw new Error("no golden path candidate");
+
+const golden = await db.createGoldenPath({
+  sourceTraceId,
+  taskFingerprint: "npm-native-packaging",
+  score: 960,
+  label: "fast packaging path",
+  reason: "best observed validated route",
+  source: "human-review",
+  projectId: "agentic-data",
+});
+
+await db.updateGoldenPathStatus(golden.goldenPathId, {
+  status: "confirmed",
+  reason: "accepted for regression baseline",
+  source: "reviewer",
+});
+```
+
+Later runs can be compared against that path:
+
+```ts
+const adherence = await db.pathAdherence(golden.goldenPathId, "builder-run-43");
+console.log(adherence.adherence, adherence.missingSteps, adherence.extraSteps);
+```
+
+### 4. Build an eval regression inbox
+
+Use annotations and dataset links to turn failures into regression cases. The
+agent team can review spans, label root causes, and rerun the same dataset after
+a prompt, tool, or model change.
+
+```ts
+await db.annotate({
+  traceId: "builder-run-42",
+  spanId: "tool-call-7",
+  label: "regression",
+  source: "human",
+  score: 900,
+  projectId: "agentic-data",
+});
+
+await db.linkDatasetItem({
+  datasetId: "release-gate",
+  itemId: "case-184",
+  traceId: "builder-run-42",
+  spanId: "tool-call-7",
+});
+
+const regressions = await db.traceSearch({
+  filter: {
+    annotation: { label: "regression" },
+    dataset: { datasetId: "release-gate" },
+  },
+});
+```
+
+### 5. Put a private trace store inside an agent desktop app
+
+Electron apps can keep traces on the user's machine. Open `YiTraceDB` in the
+main process, expose narrow IPC calls, and let the renderer show sessions,
+span details, log events, and search results.
+
+```ts
+// main process
+const db = await YiTraceDB.open({ dataDir: app.getPath("userData"), tenantId: 1 });
+
+ipcMain.handle("trace-search", async (_event, query) => {
+  return db.traceSearch({
+    ...query,
+    filter: {
+      ...(query.filter ?? {}),
+      attrs: { project_id: "desktop-agent" },
+    },
+  });
+});
+```
+
+This is useful for coding agents, analyst workbenches, support copilots, and any
+agent that handles data users do not want to send to a hosted observability
+service.
 
 ---
 
-## Advanced: Embedded Node / Electron
+## Query The TraceDB
 
-For Node backends and Electron apps that want local persistence without running
-a separate process, yiTrace can also run in-process. This is the advanced path:
-it loads the Rust engine through Node-API and uses the same WAL, manifest,
-folding, search, and tenant filtering code as the server.
+The console has no private API. It calls the same `/v1/*` JSON endpoints that
+your own UI or backend can call. See [HTTP API Reference](docs/API_REFERENCE.md)
+for the full contract.
+
+Core endpoints:
+
+| Endpoint | What it gives you |
+|---|---|
+| `POST /v1/search` | BM25, vector, and hybrid retrieval with tenant/attrs filters |
+| `POST /v1/trace-search` | structured span search with pagination, sort, token/cost ranges, annotations, datasets |
+| `POST /v1/trace-aggregate` | group-by rollups for inbox stats, task stats, path mining |
+| `POST /v1/trajectory-groups` | stable path buckets for Golden Path candidates |
+| `POST /v1/trace-trajectories` | per-trace materialized trajectory summaries |
+| `POST /v1/storage-stats` | storage and metadata reference estimates before retention |
+| `POST /v1/retention-plan` / `POST /v1/retention/apply` | dry-run and apply soft-delete plans |
+| `POST /v1/golden-paths` / `POST /v1/golden-path-health` | store path evidence and monitor adherence |
+| `POST /v1/vector-index` / `POST /v1/vector-search` | task/span/trajectory vector namespace recall |
+
+Most product APIs return an index label such as `attrs_postings`,
+`segment_rollup_tail_overlay`, `metadata_sidecar+verify`, or
+`folded_scan`. That is intentional. Callers can see whether the query hit a
+materialized path or fell back to a slower proof path.
+
+---
+
+## Embedded Node / Electron
+
+For Node backends and Electron apps that want local persistence without a
+separate process:
 
 ```bash
 npm install @yitrace/db
@@ -203,6 +399,7 @@ const events = createSpanEventBuilder({
     skill: "review",
     mode: "auto",
     call_site: "worker.ts:10",
+    task_fingerprint: "npm-native-packaging",
   },
 });
 
@@ -218,97 +415,141 @@ const hits = await db.search({
   filter: { attrs: { project_id: "agentic-data", skill: "review" } },
 });
 const trace = await db.trace("run-uuid");
-const logEvents = trace?.spans?.flatMap((span) => span.logEvents ?? []) ?? [];
+const span = await db.span("run-uuid", "span-uuid");
+const logEvents = span?.logEvents ?? [];
+
 await db.close();
 ```
 
-The package lives in `yitrace-node/` while it is being stabilized. Electron
-apps should open `YiTraceDB` in the main process and expose narrow IPC methods
-to renderers. Both ESM `import` and CommonJS `require` are supported.
-Internally this path calls the engine's in-process `EngineJsonApi`; it does not
-start a local HTTP server or use TCP sockets.
-Direct ingest accepts numeric IDs or external string IDs such as UUIDs. String
-IDs are hashed into stable internal `u64` keys for indexing while the original
-values are returned as `external_*` fields. `attrs` is persisted and returned on
-search, trace, and span detail responses. Exact attrs filtering is supported for
-`project_id`, `skill`, `mode`, `call_site`, `task_fingerprint`, `loop_id`,
-`harness_version`, `schema_fingerprint`, `intent_signature`,
-`validation_status`, `review_status`, `eval_status`, `path_memory_id`,
-`stop_reason`, `phase`, and `validator`; these keys are promoted as engine
-fields with attrs fallback. `path_memory_id` remains off the default postings
-allowlist to avoid high-cardinality index growth. `OpenOptions.readOnly` is not
-exposed until the engine has a true read-only open path. Trace and span detail
-responses also return `logEvents`, so apps can render span-level process logs
-without copying them into `attrs.event_logs`.
-Structured trace queries support cost/token range filters and expose an `index`
-label that tells callers whether attrs postings, metadata filters, or folded
-scan were used. Golden Path records also carry Best/Challenger governance
-metadata such as `challengerOf`, `evalProfile`, `minSampleCount`, and
-`marginScore`; yiTrace stores the evidence but does not automatically decide the
-winner.
+`@yitrace/db` does not parse database files in JavaScript. It embeds the Rust
+engine through Node-API and calls the in-process `EngineJsonApi`, so WAL
+recovery, manifest snapshots, folding, tenant filtering, BM25, vector search,
+metadata, retention, and Golden Path evidence use the same code as the server.
 
-`@yitrace/db` is distributed as a small JavaScript entry package plus optional
-native platform packages (`@yitrace/db-darwin-arm64`,
-`@yitrace/db-linux-x64-gnu`, and so on). This keeps the user-facing install to a
-single command while avoiding a Rust toolchain requirement on the user's
-machine. Maintainer packaging and publish steps are documented in
-[`yitrace-node/README.md`](yitrace-node/README.md).
-Before the public npm release, teams can use `npm run pack:verify` in
-`yitrace-node/` to produce immutable commit-labeled tarballs and lock those
-tarballs in a consumer repository or internal npm registry.
+Direct `db.ingest()` accepts numeric IDs and external string IDs such as UUIDs.
+String IDs are hashed into stable internal `u64` keys for indexing while the
+original values are returned as `external_*` fields. `attrs` round-trips as
+JSON and high-frequency keys such as `project_id`, `skill`, `mode`,
+`task_fingerprint`, `loop_id`, `validation_status`, and `eval_status` are
+promoted into filterable engine fields.
+
+Electron apps should open `YiTraceDB` in the main process and expose narrow IPC
+methods to renderers. A data directory still has one writer. The package uses a
+small JS root package plus optional native platform packages such as
+`@yitrace/db-darwin-arm64` and `@yitrace/db-linux-x64-gnu`; maintainers should
+read [yitrace-node/README.md](yitrace-node/README.md) before publishing.
+
+---
+
+## Distributed Path
+
+yiTrace scales by keeping each shard simple and making the gateway explicit.
+
+```text
+SDKs / OTLP / @yitrace/db clients
+        |
+        v
+  yiTrace gateway
+        |
+        +--> shard A leader ---- WAL ----> shard A follower
+        |
+        +--> shard B leader ---- WAL ----> shard B follower
+        |
+        +--> shard C leader ---- WAL ----> shard C follower
+```
+
+What exists now:
+
+- route table v1 and v2, including logical shards and replicas
+- one writable replica per logical shard, rejected if a route table tries dual writers
+- route table hot reload via JSON body or file path
+- write routing by tenant/session/trace
+- read fanout and global merge for search, traceSearch, aggregate, trajectory, storage, metadata, retention, and vector APIs
+- `partial` and `strict` consistency policies
+- bounded-stale read targets, with follower lag checks
+- remote snapshot tokens and explicit snapshot leases with TTL
+- network WAL tail export/apply and one-shot follower pull
+- health, heartbeat, retry, timeout, and circuit breaker primitives
+
+Example route table:
+
+```json
+{
+  "routeTableVersion": 51,
+  "shards": [
+    {
+      "shardId": "logical-a",
+      "replicas": [
+        { "replicaId": "a-primary", "addr": "127.0.0.1:7901", "role": "leader", "readable": true, "writable": true },
+        { "replicaId": "a-follower", "addr": "127.0.0.1:7902", "role": "follower", "readable": true, "writable": false, "maxLagLsn": 10 }
+      ]
+    }
+  ]
+}
+```
+
+Important boundary: this is a verified distributed data path, not a full
+production control plane. Still missing: background route-table watcher,
+automatic failover, fencing, scheduled replication worker, snapshot bootstrap,
+and remote syncing for sealed segments, sidecars, metadata, and GC logs. The
+tests already start real shard and gateway processes, but deployment automation
+is still yours.
 
 ---
 
 ## Why yiTrace
 
-Most tracing SDKs stop at export, and most databases feel too heavy for first
-contact. yiTrace keeps the first step SDK-shaped, then gives you private replay,
-search, cost attribution, and eval data behind it.
+Most tracing systems stop at export. Most databases ask you to model agent
+execution yourself. yiTrace is the middle path: an agent-native TraceDB that is
+easy to start, but not trapped in a single process forever.
 
 | You need | Use |
 |---|---|
-| Hosted tracing, prompt runs, team workflows | LangSmith / Langfuse |
-| OpenTelemetry routing, metrics, and pipeline glue | OpenTelemetry Collector |
-| SQL analytics over large general-purpose event tables | ClickHouse / DuckDB |
-| SDK-first private agent run replay with Chinese search, vector recall, and evals | yiTrace |
+| Hosted prompt/run tracing and SaaS team workflow | LangSmith / Langfuse |
+| OpenTelemetry routing, metrics, and vendor pipelines | OpenTelemetry Collector |
+| General SQL analytics over huge event tables | ClickHouse / DuckDB |
+| Private Agent TraceDB with replay, Chinese search, eval evidence, and shardable storage | yiTrace |
 
 What is different:
 
-- **SDK-first adoption**: start with `@yitrace/trace-sdk` or the Python SDK; use
-  the embedded DB only when you need in-process local persistence.
-- **Private by default**: one local process, one data directory, no external services.
-- **Agent-native records**: multi-turn sessions, span trees, tools, models, tokens, eval scores.
-- **Retry-safe ingest**: deterministic `event_id = hash(ext_span_id, seq, event_type)` across Rust, Python, and TypeScript.
-- **Search built in**: Chinese BM25, filtered vector recall, and hybrid RRF.
-- **Tenant-aware API**: tenant comes from `X-Tenant-Id`, not from untrusted request bodies.
+- **Agent-native records**: sessions, spans, tools, models, logs, tokens, cost,
+  eval scores, annotations, datasets, and trajectories are first-class.
+- **Retry-safe ingest**: deterministic `event_id = hash(ext_span_id, seq, event_type)`
+  is shared by Rust, Python, and TypeScript.
+- **Search built in**: Chinese word-level BM25, field-domain search, vector
+  namespaces, attrs filters, and hybrid RRF.
+- **Storage governance**: retention dry-run, soft delete, compaction, audits,
+  and protection for annotations, datasets, snapshots, eval links, and path memory.
+- **Distributed without pretending**: shard-level single writer for correctness,
+  gateway-level routing/fanout for scale, clear labels when a query is degraded.
 
 ---
 
 ## How It Works
 
 ```text
-SDKs / OTLP
-    |
-    v
-HTTP ingest gateway
-    |
-    v
-WAL + memtable --flush--> immutable segments
-    |                         |
-    v                         v
-BM25 / vector / attr indexes  read-time fold
-    |                         |
-    +---------- search / replay / cost / eval
+events
+  |
+  v
+WAL + memtable ---- flush ----> immutable segments
+  |                                  |
+  |                                  +--> attrs postings / rollups / text domains
+  |                                  +--> vector namespace records
+  v
+read-time fold
+  |
+  +--> replay / search / aggregate / retention / eval / Golden Path evidence
 ```
 
 Three mechanisms carry the design:
 
-- **Events, not mutable spans**: a span is written as `SpanStart`, `SpanEnd`, logs,
-  and late attribute updates. Readers fold events into one complete span.
-- **Content-derived identity**: event identity is deterministic, so retransmit and
-  crash replay do not double-count tokens or cost.
-- **Four-source fold**: a snapshot merges memtable, immutable segments, delete
-  bitmaps, and late-write blocks by `event_id`.
+- **Events, not mutable spans**: a span is written as start, end, logs, usage,
+  cost, and late attribute updates. Readers fold events into one complete span.
+- **Content-derived identity**: event identity is deterministic, so retransmit
+  and crash replay do not double-count tokens or cost.
+- **Derived indexes are rebuildable**: rollups, metadata indexes, attrs postings,
+  text domains, and vector namespaces are acceleration paths. The truth remains
+  WAL + segments + manifest + metadata.
 
 The engine body is std-only Rust. Heavier integrations, such as Vortex columnar
 segments, jieba FFI, and external graph indexes, live in separate crates behind
@@ -320,17 +561,19 @@ traits.
 
 | Area | Status | Notes |
 |---|---|---|
-| Storage, WAL, snapshots, restart recovery | Done, tested | `cargo test --offline` covers crash replay, compaction, GC, backup, and restart |
-| HTTP API and OTLP/OpenInference ingest | Done | `/v1/ingest`, `/v1/traces`, `/v1/search`, `/v1/sessions`, `/v1/metrics` |
-| Python and TypeScript SDKs | Done | deterministic event id parity with the Rust engine |
-| Chinese tokenizer and BM25 | Done in pure Rust | dictionary DAG + max-probability DP, embedded jieba dictionary, user dict support |
-| Vector recall | Done in engine | disk-backed multi-layer HNSW, filtered search, L2/Cosine/IP |
-| Console | Usable | React app can be embedded into the engine binary |
-| Eval loop | Alpha | rule scorer today, LLM judge is roadmap |
+| Storage, WAL, snapshots, restart recovery | Done, tested | crash replay, compaction, GC, online backup, restart |
+| SDK and OTLP ingest | Done | Python, TypeScript, custom wire JSON, OTLP/OpenInference |
+| HTTP API and console | Usable | console uses public `/v1/*` APIs |
+| Node / Electron embedded DB | Usable | ESM/CJS, native packages, clean consumer pack verification |
+| Chinese tokenizer and BM25 | Done in pure Rust | dictionary DAG, embedded jieba dictionary, user dict support |
+| Vector recall | Done in engine | disk-backed HNSW plus vector namespace flat index; high-performance namespace ANN still pending |
+| Read-model indexes | First production shape | attrs postings, metadata sidecar, traceAggregate rollup, loop/task sidecar, text domains |
+| Eval and Golden Path evidence | Alpha | rule scorer, annotations, datasets, trajectory groups, export, health |
+| Distributed gateway path | Alpha but tested | real process evals, route tables, fanout, follower read, leases, WAL replication primitives |
 | Production security | Roadmap | TLS, RBAC, encryption, rate limits, persistent audit logs |
-| Query engine | Roadmap | hand-written query paths today, DataFusion integration pending |
+| Managed distributed control plane | Roadmap | automatic failover, fencing, scheduled replication, bootstrap, sidecar sync |
 
-Run the verification suite:
+Run the engine suite:
 
 ```bash
 cd yitrace-engine
@@ -340,9 +583,9 @@ cargo test --offline
 Optional crates:
 
 ```bash
-cd yitrace-segstore-vortex && cargo build      # Vortex columnar segment store
-cd yitrace-tokenizer-jieba && cargo test       # jieba FFI wrapper, mock by default
-cd yitrace-vecindex-graph && cargo test        # graph_index FFI wrapper, mock by default
+cd yitrace-segstore-vortex && cargo build
+cd yitrace-tokenizer-jieba && cargo test
+cd yitrace-vecindex-graph && cargo test
 ```
 
 ---
@@ -356,7 +599,8 @@ yitrace-engine/              # Rust engine workspace, std-only core
     yt-manifest              # reader pin protocol and reclamation watermark
     yt-wal                   # crash-safe WAL frames
     yt-memtable              # live rows and gated eviction
-    yt-engine                # coordinator, search, eval, HTTP, OTLP, console assets
+    yt-engine                # coordinator, search, eval, HTTP, OTLP, gateway, console assets
+yitrace-node/                # @yitrace/db Node/Electron embedded package
 yitrace-console/             # React console
 yitrace-sdk/
   python/                    # Python tracing SDK
@@ -364,11 +608,13 @@ yitrace-sdk/
 yitrace-segstore-vortex/     # optional Vortex segment store
 yitrace-tokenizer-jieba/     # optional jieba FFI tokenizer
 yitrace-vecindex-graph/      # optional graph_index FFI vector index
-docs/                        # design notes, API reference, current-state index
+docs/                        # current state, API reference, design notes, research
 ```
 
 Start with [Current State](docs/CURRENT_STATE.md) if you want the engineering
 truth, including what is verified, what is alpha, and what is still roadmap.
+Use [HTTP API Reference](docs/API_REFERENCE.md) when integrating another UI or
+backend.
 
 ## License
 

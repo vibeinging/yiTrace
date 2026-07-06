@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -162,6 +162,52 @@ struct CaptureServer {
     handle: Option<JoinHandle<()>>,
 }
 
+fn read_http_request(stream: &mut TcpStream, max_bytes: usize) -> String {
+    let mut raw = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while raw.len() < max_bytes && Instant::now() < deadline {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if http_request_complete(&raw) {
+                    break;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if http_request_complete(&raw) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&raw).to_string()
+}
+
+fn http_request_complete(raw: &[u8]) -> bool {
+    let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let header_text = String::from_utf8_lossy(&raw[..header_end]);
+    let content_len = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    raw.len() >= header_end + 4 + content_len
+}
+
 impl CaptureServer {
     fn spawn(max_requests: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -176,9 +222,7 @@ impl CaptureServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-                        let mut request = [0u8; 8192];
-                        let n = stream.read(&mut request).unwrap_or(0);
-                        let raw = String::from_utf8_lossy(&request[..n]).to_string();
+                        let raw = read_http_request(&mut stream, 16 * 1024);
                         thread_requests.lock().unwrap().push(raw.clone());
                         let body = if raw.contains("POST /v1/ingest ") {
                             let request_body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -515,6 +559,75 @@ fn remote_gateway_route_table_v2_manual_promote_switches_writable_replica() {
     assert_contains(&cluster, r#""routeTableVersion":51"#);
     assert_contains(&cluster, r#""replicaId":"a-follower""#);
     assert_contains(&cluster, r#""priority":20"#);
+}
+
+#[test]
+fn remote_gateway_route_table_reload_file_switches_writer() {
+    let primary = CaptureServer::spawn(4);
+    let follower = CaptureServer::spawn(4);
+    let route_dir = std::env::temp_dir().join(format!(
+        "yt_route_table_file_{}_{}",
+        std::process::id(),
+        primary.addr.replace([':', '.'], "_")
+    ));
+    let _ = std::fs::remove_dir_all(&route_dir);
+    std::fs::create_dir_all(&route_dir).unwrap();
+    let route_path = route_dir.join("routes.json");
+    let table_v1 = format!(
+        r#"{{
+          "routeTableVersion":90,
+          "shards":[
+            {{
+              "shardId":"file-logical-a",
+              "replicas":[
+                {{"replicaId":"file-primary","addr":"http://{}","role":"leader","readable":true,"writable":true}},
+                {{"replicaId":"file-follower","addr":"http://{}","role":"follower","readable":true,"writable":false}}
+              ]
+            }}
+          ]
+        }}"#,
+        primary.addr, follower.addr
+    );
+    let gateway = RemoteShardGateway::from_route_table_json(&table_v1).unwrap();
+    let first = r#"[{"trace_id":90001,"span_id":1,"session_id":900,"ts":10,"seq":1,"event_type":2,"ext_span_id":"90001-1","attrs":{"project_id":"file-route"}}]"#;
+    let (status, written) = gateway.route_with_tenant("POST", "/v1/ingest", first, Some(900));
+    assert_eq!(status, 200, "{written}");
+    assert_eq!(primary.ingest_count(), 1);
+    assert_eq!(follower.ingest_count(), 0);
+
+    let table_v2 = format!(
+        r#"{{
+          "routeTableVersion":91,
+          "shards":[
+            {{
+              "shardId":"file-logical-a",
+              "replicas":[
+                {{"replicaId":"file-primary","addr":"http://{}","role":"follower","readable":true,"writable":false}},
+                {{"replicaId":"file-follower","addr":"http://{}","role":"leader","readable":true,"writable":true}}
+              ]
+            }}
+          ]
+        }}"#,
+        primary.addr, follower.addr
+    );
+    std::fs::write(&route_path, table_v2).unwrap();
+    let reload_body = format!(r#"{{"path":"{}"}}"#, route_path.display());
+    let (status, reloaded) = gateway.route_with_tenant(
+        "POST",
+        "/v1/cluster/route-table/reload-file",
+        &reload_body,
+        None,
+    );
+    assert_eq!(status, 200, "{reloaded}");
+    assert_contains(&reloaded, r#""routeTableVersion":91"#);
+    assert_contains(&reloaded, r#""source":"file""#);
+
+    let second = r#"[{"trace_id":90002,"span_id":1,"session_id":900,"ts":20,"seq":1,"event_type":2,"ext_span_id":"90002-1","attrs":{"project_id":"file-route"}}]"#;
+    let (status, written) = gateway.route_with_tenant("POST", "/v1/ingest", second, Some(900));
+    assert_eq!(status, 200, "{written}");
+    assert_eq!(primary.ingest_count(), 1);
+    assert_eq!(follower.ingest_count(), 1);
+    let _ = std::fs::remove_dir_all(route_dir);
 }
 
 #[test]

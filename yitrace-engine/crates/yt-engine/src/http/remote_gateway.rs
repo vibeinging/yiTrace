@@ -28,6 +28,9 @@ impl RemoteShardGateway {
                     format!(r#"{{"error":"{}"}}"#, gateway_json_escape(&error)),
                 ),
             },
+            ("POST", "/v1/cluster/route-table/reload-file")
+            | ("POST", "/v1/cluster/route-table/watch")
+            | ("POST", "/v1/route-table/reload-file") => self.reload_route_table_file_json(body),
             ("POST", "/v1/ingest") => self.ingest_json(body, tenant),
             ("POST", "/v1/snapshots/lease") => self.remote_snapshot_lease_json(body, tenant),
             ("POST", "/v1/snapshots/renew") => self.remote_snapshot_renew_json(body, tenant),

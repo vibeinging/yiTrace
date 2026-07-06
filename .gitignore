@@ -13,6 +13,7 @@ venv/
 # Node / TypeScript
 node_modules/
 dist/
+.test-dist/
 *.tsbuildinfo
 yitrace-node/artifacts/
 

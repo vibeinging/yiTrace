@@ -111,13 +111,22 @@ impl NamedVectorIndex {
         );
     }
 
-    fn search(&self, query: &[f32], k: usize, filter: &VectorSearchFilter) -> Vec<VectorSearchHit> {
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &VectorSearchFilter,
+        mut is_live: impl FnMut(&NamedVectorRecord) -> bool,
+    ) -> Vec<VectorSearchHit> {
         if query.is_empty() || k == 0 {
             return Vec::new();
         }
         let mut out = Vec::new();
         for record in self.records.values() {
-            if !named_vector_matches(record, filter) || record.embedding.len() != query.len() {
+            if !named_vector_matches(record, filter)
+                || record.embedding.len() != query.len()
+                || !is_live(record)
+            {
                 continue;
             }
             let distance = named_vector_l2_distance(query, &record.embedding);
@@ -164,7 +173,14 @@ impl WriteCoordinator {
         k: usize,
         filter: &VectorSearchFilter,
     ) -> Vec<VectorSearchHit> {
-        self.named_vectors.lock().unwrap().search(query, k, filter)
+        let snap = self.pin_snapshot();
+        let mut live_cache = BTreeMap::<(Option<u64>, u64), bool>::new();
+        self.named_vectors
+            .lock()
+            .unwrap()
+            .search(query, k, filter, |record| {
+                self.named_vector_record_is_live(&snap, record, &mut live_cache)
+            })
     }
 
     fn load_named_vectors_from_disk(&self) {
@@ -175,6 +191,32 @@ impl WriteCoordinator {
         for input in load_named_vectors(path) {
             self.named_vectors.lock().unwrap().upsert(input);
         }
+    }
+
+    fn named_vector_record_is_live(
+        &self,
+        snap: &Snapshot,
+        record: &NamedVectorRecord,
+        cache: &mut BTreeMap<(Option<u64>, u64), bool>,
+    ) -> bool {
+        // trajectory 向量是路径资产，source trace 被 retention 清理后仍可用于召回。
+        if record.namespace == VectorNamespace::Trajectory {
+            return true;
+        }
+        let Some(trace_id) = record.trace_id else {
+            return true;
+        };
+        let key = (record.tenant_id, trace_id);
+        if let Some(live) = cache.get(&key) {
+            return *live;
+        }
+        let mut query = TraceQuery::trace(trace_id, i64::MIN, i64::MAX);
+        if let Some(tenant_id) = record.tenant_id {
+            query.tenant_id = Some(tenant_id);
+        }
+        let live = !self.read_spans_query(snap, &query).0.is_empty();
+        cache.insert(key, live);
+        live
     }
 }
 

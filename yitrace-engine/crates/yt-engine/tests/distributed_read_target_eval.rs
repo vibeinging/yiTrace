@@ -188,6 +188,30 @@ fn remote_gateway_explicit_snapshot_lease_renew_release_and_replay() {
     assert_contains(&replay_after_release, r#""code":"snapshot_expired""#);
 }
 
+#[test]
+fn remote_gateway_snapshot_lease_ttl_expires_without_release() {
+    let shard_a = ReadTargetServer::spawn(10, 95_101, "ttl-a", 2);
+    let shard_b = ReadTargetServer::spawn(10, 95_102, "ttl-b", 2);
+    let gateway = RemoteShardGateway::new(vec![
+        format!("http://{}", shard_a.addr),
+        format!("http://{}", shard_b.addr),
+    ])
+    .unwrap();
+
+    let (status, lease) =
+        gateway.route_with_tenant("POST", "/v1/snapshots/lease", r#"{"ttlNs":1}"#, Some(95));
+    assert_eq!(status, 200, "{lease}");
+    assert_contains(&lease, r#""leaseId":"remote-lease-1""#);
+    assert_contains(&lease, r#""expiresAtNs":"#);
+
+    std::thread::sleep(Duration::from_millis(2));
+    let compact_snapshot = r#"{"snapshot":{"mode":"remote_gateway","leaseId":"remote-lease-1","shards":[]},"limit":10}"#;
+    let (status, expired) =
+        gateway.route_with_tenant("POST", "/v1/trace-search", compact_snapshot, Some(95));
+    assert_eq!(status, 409, "{expired}");
+    assert_contains(&expired, r#""code":"snapshot_expired""#);
+}
+
 impl Drop for ReadTargetServer {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {

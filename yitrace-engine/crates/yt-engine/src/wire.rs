@@ -156,13 +156,14 @@ fn parse_opt_id(obj: &Json, key: &str) -> (Option<u64>, Option<String>) {
         .unwrap_or((None, None))
 }
 
-fn attrs_map(v: Option<&Json>) -> BTreeMap<String, String> {
+fn attrs_map(i: usize, v: Option<&Json>) -> Result<BTreeMap<String, String>, String> {
     match v {
-        Some(Json::Obj(kvs)) => kvs
+        Some(Json::Obj(kvs)) => Ok(kvs
             .iter()
             .map(|(k, v)| (k.clone(), v.to_compact_json()))
-            .collect(),
-        _ => BTreeMap::new(),
+            .collect::<BTreeMap<_, _>>()),
+        Some(Json::Null) | None => Ok(BTreeMap::new()),
+        Some(_) => Err(format!("第{i}条 attrs 必须是对象")),
     }
 }
 
@@ -201,13 +202,32 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
                 .and_then(Json::as_i64)
                 .ok_or_else(|| format!("第{i}条缺/坏字段 {k}"))
         };
+        let req_u8 = |k: &str| {
+            let value = req_u64(k)?;
+            if value <= u8::MAX as u64 {
+                Ok(value as u8)
+            } else {
+                Err(format!("第{i}条字段 {k} 超出 u8 范围"))
+            }
+        };
         let opt_u64 = |k: &str| field(obj, k).and_then(Json::as_u64);
+        let opt_u8 = |k: &str| {
+            opt_u64(k)
+                .map(|value| {
+                    if value <= u8::MAX as u64 {
+                        Ok(value as u8)
+                    } else {
+                        Err(format!("第{i}条字段 {k} 超出 u8 范围"))
+                    }
+                })
+                .transpose()
+        };
         let opt_str = |k: &str| field(obj, k).and_then(Json::as_str).map(|s| s.to_string());
         let (trace_id, trace_ext_from_id) = parse_req_id(obj, "trace_id", i)?;
         let (span_id, span_ext_from_id) = parse_req_id(obj, "span_id", i)?;
         let (parent_span_id, parent_ext_from_id) = parse_opt_id(obj, "parent_span_id");
         let (session_id, session_ext_from_id) = parse_opt_id(obj, "session_id");
-        let mut attrs = attrs_map(field(obj, "attrs"));
+        let mut attrs = attrs_map(i, field(obj, "attrs"))?;
         for (alias, key) in wire_attr_aliases() {
             if let Some(value) = field(obj, alias) {
                 attrs.insert((*key).to_string(), value.to_compact_json());
@@ -218,13 +238,13 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             span_id,
             ts: req_i64("ts")?,
             seq: req_u64("seq")?,
-            event_type_tag: req_u64("event_type")? as u8,
+            event_type_tag: req_u8("event_type")?,
             ext_span_id: field(obj, "ext_span_id")
                 .and_then(Json::as_str)
                 .ok_or_else(|| format!("第{i}条缺 ext_span_id"))?
                 .to_string(),
             parent_span_id,
-            status: opt_u64("status").map(|v| v as u8),
+            status: opt_u8("status")?,
             duration_ns: opt_u64("duration_ns"),
             input_tokens: opt_u64("input_tokens"),
             output_tokens: opt_u64("output_tokens"),

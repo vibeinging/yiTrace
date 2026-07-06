@@ -118,6 +118,38 @@ impl RemoteShardGateway {
         Ok(version)
     }
 
+    pub fn reload_route_table_file(&self, path: impl AsRef<std::path::Path>) -> Result<u64, String> {
+        let path = path.as_ref();
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| format!("read route table file {}: {e}", path.display()))?;
+        self.reload_route_table_json(&body)
+    }
+
+    fn reload_route_table_file_json(&self, body: &str) -> (u16, String) {
+        let path = match route_table_file_path_from_body(body) {
+            Some(path) => path,
+            None => {
+                return (
+                    400,
+                    r#"{"error":"route table file path is required"}"#.to_string(),
+                )
+            }
+        };
+        match self.reload_route_table_file(&path) {
+            Ok(version) => (
+                200,
+                format!(
+                    r#"{{"ok":true,"routeTableVersion":{version},"source":"file","path":"{}"}}"#,
+                    gateway_json_escape(&path)
+                ),
+            ),
+            Err(error) => (
+                400,
+                format!(r#"{{"error":"{}"}}"#, gateway_json_escape(&error)),
+            ),
+        }
+    }
+
     pub fn shard_count(&self) -> usize {
         self.shards_snapshot().len()
     }
@@ -343,6 +375,24 @@ impl RemoteShardGateway {
             shard_items.join(",")
         )
     }
+}
+
+fn route_table_file_path_from_body(body: &str) -> Option<String> {
+    crate::wire::parse(body).ok().and_then(|value| {
+        json_field_alias(
+            &value,
+            &[
+                "path",
+                "file",
+                "routeTablePath",
+                "route_table_path",
+                "watchPath",
+                "watch_path",
+            ],
+        )
+        .and_then(crate::wire::Json::as_str)
+        .map(ToString::to_string)
+    })
 }
 
 fn route_replicas_json(

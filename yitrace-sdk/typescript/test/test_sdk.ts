@@ -1,4 +1,5 @@
 // SDK 测试。`node test/test_sdk.ts`（Node 23+ 原生跑 .ts）。
+import { readFileSync } from "node:fs";
 import { BatchExporter, CollectingExporter, EventType, HttpExporter, Tracer, eventId, toWire, type Exporter, type SpanEvent } from "../src/index.ts";
 
 let passed = 0;
@@ -11,11 +12,29 @@ function test(name: string, fn: () => void): void {
   console.log("OK  " + name);
 }
 
-// 引擎基准值：cargo run -p yt-core --example print_event_id
-test("event_id 与引擎逐字节一致（含中文）", () => {
-  check(eventId("demo-span", 7n, EventType.SpanEnd) === 16098495313036060864n, "demo-span");
-  check(eventId("1002-1", 1n, EventType.SpanStart) === 3941713543033365492n, "1002-1");
-  check(eventId("反洗钱-1", 3n, EventType.Attr) === 13462389519714918643n, "反洗钱");
+const eventTypeByName: Record<string, EventType> = {
+  SPAN_START: EventType.SpanStart,
+  SPAN_END: EventType.SpanEnd,
+  ATTR: EventType.Attr,
+  LOG: EventType.Log,
+  ERROR: EventType.Error,
+};
+
+function eventIdCases(): Array<{ lineNo: number; extSpanId: string; seq: bigint; eventType: EventType; expected: bigint }> {
+  const fixture = new URL("../../../tests/fixtures/event_id_cases.tsv", import.meta.url);
+  return readFileSync(fixture, "utf8")
+    .split(/\r?\n/)
+    .flatMap((line, index) => {
+      if (!line || line.startsWith("#")) return [];
+      const [extSpanId, seq, eventType, expected] = line.split("\t");
+      return [{ lineNo: index + 1, extSpanId, seq: BigInt(seq), eventType: eventTypeByName[eventType], expected: BigInt(expected) }];
+    });
+}
+
+test("event_id 与引擎逐字节一致（含中文和边界值）", () => {
+  for (const c of eventIdCases()) {
+    check(eventId(c.extSpanId, c.seq, c.eventType) === c.expected, `fixture line ${c.lineNo}`);
+  }
 });
 
 test("event_id 确定且敏感", () => {

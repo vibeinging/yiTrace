@@ -12,16 +12,16 @@ yiTrace/
 │   │   ├── yt-manifest/            # 并发正确性:pin 协议 / 回收水位
 │   │   ├── yt-wal/                 # 写前日志:fsync / 崩溃安全帧
 │   │   ├── yt-memtable/            # 活内存表:双水位 / 自动刷盘
-│   │   └── yt-engine/              # 主引擎:协调器 / HTTP / 检索 / eval / 多租户
-│   └── examples/                    # demo / server / bench_qps / eval_harness
+│   │   └── yt-engine/              # 主引擎:协调器 / HTTP / 检索 / eval / 多租户 / gateway
+│   └── examples/                    # demo / server / server_durable / bench_qps / eval_harness
 ├── yitrace-segstore-vortex/     # Vortex 列式段(工作区外,隔离重依赖)
 ├── yitrace-tokenizer-jieba/     # cppjieba FFI(可选;引擎默认用纯 Rust 分词)
 ├── yitrace-vecindex-graph/      # graph_index FFI(可选;引擎默认用自研 HNSW)
+├── yitrace-node/                # @yitrace/db Node/Electron 嵌入式 DB
 ├── yitrace-sdk/                 # Python / TypeScript 打点 SDK
 │   ├── python/
 │   └── typescript/
-├── yitrace-console/             # (占位)Web 控制台
-├── tracevault-extension/            # 历史方案(openGauss 扩展),非当前态,保留参考
+├── yitrace-console/             # Web 控制台
 └── docs/                            # 设计 / 分析 / 调研文档
 ```
 
@@ -29,8 +29,9 @@ yiTrace/
 
 ### Rust 引擎
 
-- **Rust ≥ 1.82**(edition 2021;用了 `OnceLock` 等稳定 API)
+- **Rust ≥ 1.80**(edition 2021;以 `yitrace-engine/Cargo.toml` 的 `rust-version` 为准)
 - 引擎工作区 `yitrace-engine/` **零外部依赖**,`cargo test --offline` 离线可过
+- 分布式能力在 `yt-engine` 的 HTTP/gateway 层实现：route table、remote shard client、fanout merge、snapshot lease、replication API 都必须保持 std-only。
 
 ### Vortex 列式段 crate(`yitrace-segstore-vortex/`)
 
@@ -54,7 +55,7 @@ yiTrace/
 ```bash
 # 1. Rust 引擎(零依赖,离线可跑)
 cd yitrace-engine
-cargo test --offline                    # 129 测试(9+105+6+3+2+4)
+cargo test --offline                    # 引擎全量测试,含分布式 eval
 
 # 2. Vortex 列式段 crate(首次联网)
 cd ../yitrace-segstore-vortex
@@ -91,6 +92,9 @@ cargo run -p yt-engine --example server
 
 # 真实 QPS 压测(release 模式才有意义)
 cargo run -p yt-engine --release --example bench_qps
+
+# 持久化服务样板
+YT_BIND=127.0.0.1:7879 cargo run -p yt-engine --example server_durable -- ./data/yitrace
 ```
 
 ## 怎么贡献
@@ -98,6 +102,7 @@ cargo run -p yt-engine --release --example bench_qps
 ### 提交前检查清单
 
 - [ ] `cargo test --offline`(引擎工作区)全绿
+- [ ] 改了 gateway / route table / replication / snapshot lease，跑 `distributed_process_eval`、`distributed_production_eval`、`distributed_read_target_eval`
 - [ ] `cargo clippy --offline -- -D warnings`(如果你改了引擎)
 - [ ] `cargo fmt --all -- --check`(格式)
 - [ ] 改了 SDK 的话,跑对应 SDK 测试
@@ -108,6 +113,7 @@ cargo run -p yt-engine --release --example bench_qps
 
 - **引擎保持零外部依赖**(`yitrace-engine/` 工作区)—— 不引 crate,需要新能力优先看 std 有没有
 - **重依赖隔离在工作区外**(像 Vortex 那样建独立 crate,引擎通过 trait 注入)
+- **shard 内单写,cluster 层扩展**—— 不要让多个 writer 抢同一 data dir;多写能力走 route table + gateway + shard replication
 - **诚实标注边界**——占位/验证级/未实现的地方用注释或 `todo!()` 标明,不假装已完成
 - **commit message 纯净、中文、无 AI 模型署名**
 

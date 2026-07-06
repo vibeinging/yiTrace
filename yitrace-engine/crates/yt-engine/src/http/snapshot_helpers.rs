@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::*;
 
 const MAX_CLUSTER_SNAPSHOT_LEASES: usize = 64;
+pub(super) const DEFAULT_SNAPSHOT_LEASE_TTL_NS: u128 = 300_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ClusterSnapshotShard {
@@ -107,6 +108,7 @@ struct SnapshotLeaseEntry {
     token: ClusterSnapshot,
     reads: Vec<ClusterSnapshotRead>,
     last_used_seq: u64,
+    expires_at_ns: u128,
 }
 
 impl Default for SnapshotLeaseBook {
@@ -133,12 +135,14 @@ impl SnapshotLeaseBook {
             reads: reads.clone(),
         };
         let mut leases = self.leases.lock().unwrap();
+        let expires_at_ns = snapshot_lease_deadline_ns(DEFAULT_SNAPSHOT_LEASE_TTL_NS);
         leases.insert(
             lease_id.clone(),
             SnapshotLeaseEntry {
                 token,
                 reads,
                 last_used_seq: seq,
+                expires_at_ns,
             },
         );
         while leases.len() > self.max_entries.max(1) {
@@ -158,6 +162,7 @@ impl SnapshotLeaseBook {
     fn lookup(&self, lease_id: &str) -> Option<ClusterSnapshotReadSet> {
         let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
         let mut leases = self.leases.lock().unwrap();
+        purge_expired_snapshot_leases(&mut leases);
         let entry = leases.get_mut(lease_id)?;
         entry.last_used_seq = seq;
         Some(ClusterSnapshotReadSet {
@@ -166,13 +171,32 @@ impl SnapshotLeaseBook {
         })
     }
 
+    fn renew(&self, lease_id: &str, ttl_ns: u128) -> Option<(ClusterSnapshotReadSet, u128)> {
+        let seq = self.next_seq.fetch_add(1, Ordering::AcqRel);
+        let mut leases = self.leases.lock().unwrap();
+        purge_expired_snapshot_leases(&mut leases);
+        let entry = leases.get_mut(lease_id)?;
+        entry.last_used_seq = seq;
+        entry.expires_at_ns = snapshot_lease_deadline_ns(ttl_ns);
+        Some((
+            ClusterSnapshotReadSet {
+                token: entry.token.clone(),
+                reads: entry.reads.clone(),
+            },
+            entry.expires_at_ns,
+        ))
+    }
+
     fn release(&self, lease_id: &str) -> bool {
-        self.leases.lock().unwrap().remove(lease_id).is_some()
+        let mut leases = self.leases.lock().unwrap();
+        purge_expired_snapshot_leases(&mut leases);
+        leases.remove(lease_id).is_some()
     }
 }
 
 impl EngineJsonApi {
     pub(super) fn snapshot_lease_json(&self, body: &str) -> (u16, String) {
+        let ttl_ns = snapshot_lease_ttl_ns_from_body(body).unwrap_or(DEFAULT_SNAPSHOT_LEASE_TTL_NS);
         let eventual = crate::wire::parse(body)
             .ok()
             .and_then(|value| {
@@ -190,12 +214,20 @@ impl EngineJsonApi {
         } else {
             self.pin_cluster_snapshot_read_set()
         };
+        let expires_at_ns = read_set
+            .token
+            .lease_id
+            .as_deref()
+            .and_then(|lease_id| self.snapshot_leases.renew(lease_id, ttl_ns))
+            .map(|(_, expires_at_ns)| expires_at_ns)
+            .unwrap_or_else(|| snapshot_lease_deadline_ns(ttl_ns));
         (
             200,
             format!(
-                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active"}}"#,
+                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","expiresAtNs":"{}"}}"#,
                 read_set.token.to_json(),
-                json_opt_str(read_set.token.lease_id.as_deref())
+                json_opt_str(read_set.token.lease_id.as_deref()),
+                expires_at_ns
             ),
         )
     }
@@ -210,7 +242,8 @@ impl EngineJsonApi {
                 )
             }
         };
-        let Some(read_set) = self.snapshot_leases.lookup(&lease_id) else {
+        let ttl_ns = snapshot_lease_ttl_ns_from_body(body).unwrap_or(DEFAULT_SNAPSHOT_LEASE_TTL_NS);
+        let Some((read_set, expires_at_ns)) = self.snapshot_leases.renew(&lease_id, ttl_ns) else {
             return snapshot_expired_error(
                 &ClusterSnapshot {
                     lease_id: Some(lease_id),
@@ -222,9 +255,10 @@ impl EngineJsonApi {
         (
             200,
             format!(
-                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active"}}"#,
+                r#"{{"snapshot":{},"leaseId":{},"leaseState":"active","expiresAtNs":"{}"}}"#,
                 read_set.token.to_json(),
-                json_opt_str(read_set.token.lease_id.as_deref())
+                json_opt_str(read_set.token.lease_id.as_deref()),
+                expires_at_ns
             ),
         )
     }
@@ -439,6 +473,36 @@ fn lease_id_from_body(body: &str) -> Option<String> {
             .and_then(crate::wire::Json::as_str)
             .map(ToString::to_string)
     })
+}
+
+pub(super) fn snapshot_lease_ttl_ns_from_body(body: &str) -> Option<u128> {
+    let value = crate::wire::parse(body).ok()?;
+    json_field_alias(&value, &["ttlNs", "ttl_ns", "leaseTtlNs", "lease_ttl_ns"])
+        .and_then(crate::wire::Json::as_u64)
+        .map(|value| value.max(1) as u128)
+        .or_else(|| {
+            json_field_alias(&value, &["ttlMs", "ttl_ms", "leaseTtlMs", "lease_ttl_ms"])
+                .and_then(crate::wire::Json::as_u64)
+                .map(|value| (value.max(1) as u128).saturating_mul(1_000_000))
+        })
+}
+
+pub(super) fn snapshot_lease_deadline_ns(ttl_ns: u128) -> u128 {
+    snapshot_now_ns().saturating_add(ttl_ns.max(1))
+}
+
+pub(super) fn snapshot_now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+fn purge_expired_snapshot_leases(
+    leases: &mut std::collections::BTreeMap<String, SnapshotLeaseEntry>,
+) {
+    let now = snapshot_now_ns();
+    leases.retain(|_, entry| entry.expires_at_ns > now);
 }
 
 fn parse_cluster_snapshot_str(value: &str) -> Result<ClusterSnapshot, String> {

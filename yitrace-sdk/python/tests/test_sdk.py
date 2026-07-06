@@ -1,4 +1,4 @@
-"""SDK 测试。可直接 `python3 tests/test_sdk.py` 跑，也兼容 pytest。"""
+"""SDK 测试。可直接 `python tests/test_sdk.py` 跑，也兼容 pytest。"""
 import os
 import sys
 
@@ -6,18 +6,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from yitrace import CollectingExporter, EventType, HttpExporter, Tracer, event_id  # noqa: E402
 
-# 引擎基准值：cargo run -p yt-core --example print_event_id
-ENGINE_BASELINE = {
-    ("demo-span", 7, EventType.SPAN_END): 16098495313036060864,
-    ("1002-1", 1, EventType.SPAN_START): 3941713543033365492,
-    ("反洗钱-1", 3, EventType.ATTR): 13462389519714918643,
+EVENT_ID_FIXTURE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "tests", "fixtures", "event_id_cases.tsv")
+)
+EVENT_TYPE_BY_NAME = {
+    "SPAN_START": EventType.SPAN_START,
+    "SPAN_END": EventType.SPAN_END,
+    "ATTR": EventType.ATTR,
+    "LOG": EventType.LOG,
+    "ERROR": EventType.ERROR,
 }
+
+
+def iter_event_id_cases():
+    with open(EVENT_ID_FIXTURE, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            ext_span_id, seq, event_type, expected = line.split("\t")
+            yield line_no, ext_span_id, int(seq), EVENT_TYPE_BY_NAME[event_type], int(expected)
 
 
 def test_event_id_matches_engine_byte_for_byte():
     # 与 Rust 引擎逐字节一致（含中文）——SDK↔引擎去重对得上的根。
-    for (ext, seq, et), expect in ENGINE_BASELINE.items():
-        assert event_id(ext, seq, et) == expect, f"{ext}|{seq}|{et.name}"
+    for line_no, ext, seq, et, expect in iter_event_id_cases():
+        assert event_id(ext, seq, et) == expect, f"fixture line {line_no}: {ext}|{seq}|{et.name}"
 
 
 def test_event_id_is_deterministic_and_sensitive():

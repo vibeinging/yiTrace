@@ -350,6 +350,466 @@ fn trace_aggregate_read_plan_marks_unindexed_attrs_as_folded_scan() {
     assert_json_contains(&aggregate, r#""custom_dimension":"tail-a""#);
 }
 
+#[test]
+fn ingest_wire_contract_eval_cases() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord);
+    let cases = vec![
+        evalkit::ApiEvalCase {
+            name: "accepts_null_attrs",
+            category: "ingest_contract",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_real_trace",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(1),
+                    body: r#"[{"trace_id":1001,"span_id":1,"session_id":1001,"ts":1,"seq":1,"event_type":2,"ext_span_id":"1001-1","status":0,"duration_ns":10,"output_text":"null attrs accepted","attrs":null}]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":1"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_trace_visible",
+                    method: "POST",
+                    path: "/v1/trace-search",
+                    tenant: Some(1),
+                    body: r#"{"filter":{"traceId":1001}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""total":1"#, r#""traceId":"1001""#],
+                    reject_contains: &[r#""total":0"#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "rejects_non_object_attrs",
+            category: "ingest_contract",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "reject_bad_attrs",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(1),
+                    body: r#"[{"trace_id":1002,"span_id":1,"ts":1,"seq":1,"event_type":2,"ext_span_id":"1002-1","attrs":"bad"}]"#,
+                    expect_status: 400,
+                    expect_contains: &["attrs 必须是对象"],
+                    reject_contains: &[r#""ingested""#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_bad_attrs_not_written",
+                    method: "POST",
+                    path: "/v1/trace-search",
+                    tenant: Some(1),
+                    body: r#"{"filter":{"traceId":1002}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""total":0"#],
+                    reject_contains: &[r#""traceId":"1002""#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "rejects_event_type_out_of_range",
+            category: "ingest_contract",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "reject_event_type",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(1),
+                    body: r#"[{"trace_id":1003,"span_id":1,"ts":1,"seq":1,"event_type":300,"ext_span_id":"1003-1"}]"#,
+                    expect_status: 400,
+                    expect_contains: &["event_type 超出 u8 范围"],
+                    reject_contains: &[r#""ingested""#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_bad_event_type_not_written",
+                    method: "POST",
+                    path: "/v1/trace-search",
+                    tenant: Some(1),
+                    body: r#"{"filter":{"traceId":1003}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""total":0"#],
+                    reject_contains: &[r#""traceId":"1003""#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "rejects_status_out_of_range",
+            category: "ingest_contract",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "reject_status",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(1),
+                    body: r#"[{"trace_id":1004,"span_id":1,"ts":1,"seq":1,"event_type":2,"ext_span_id":"1004-1","status":300}]"#,
+                    expect_status: 400,
+                    expect_contains: &["status 超出 u8 范围"],
+                    reject_contains: &[r#""ingested""#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_bad_status_not_written",
+                    method: "POST",
+                    path: "/v1/trace-search",
+                    tenant: Some(1),
+                    body: r#"{"filter":{"traceId":1004}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""total":0"#],
+                    reject_contains: &[r#""traceId":"1004""#],
+                },
+            ],
+        },
+    ];
+    let report = evalkit::run_api_eval_suite("ingest_wire_contract", &api, &cases);
+    assert!(report.passed(), "{}", report.failure_report());
+}
+
+#[test]
+fn api_entrypoints_use_real_eval_steps() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(coord);
+    let cases = vec![
+        evalkit::ApiEvalCase {
+            name: "sdk_ingest_usage_cost_round_trip",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_sdk_wire_batch",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: None,
+                    body: r#"[
+                      {"trace_id":7107,"span_id":1,"ts":100,"seq":1,"event_type":1,"ext_span_id":"7107-1","status":0,"input_tokens":900,"cached_input_tokens":100,"reasoning_tokens":20,"total_tokens":1170,"cost_usd":0.0025,"cost_currency":"USD","provider":"openai","logs":["开始"]},
+                      {"trace_id":7107,"span_id":1,"ts":150,"seq":2,"event_type":2,"ext_span_id":"7107-1","duration_ns":50,"output_tokens":150,"logs":["结束"]}
+                    ]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":2"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_trace_summary",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: None,
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[
+                        r#""trace_id":7107"#,
+                        r#""total_input_tokens":900"#,
+                        r#""total_cached_input_tokens":100"#,
+                        r#""total_reasoning_tokens":20"#,
+                        r#""total_tokens":1170"#,
+                        r#""total_cost_usd_nanos":2500000"#,
+                    ],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_trace_detail_usage",
+                    method: "GET",
+                    path: "/v1/traces/7107",
+                    tenant: None,
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[
+                        r#""provider":"openai""#,
+                        r#""cachedInputTokens":100"#,
+                        r#""reasoningTokens":20"#,
+                        r#""costUsd":0.002500"#,
+                    ],
+                    reject_contains: &[],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "external_ids_attrs_and_search_round_trip",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_external_ids",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: None,
+                    body: r#"[{
+                      "trace_id":"eval-run-uuid",
+                      "span_id":"eval-span-uuid",
+                      "session_id":"eval-session-uuid",
+                      "ts":100,
+                      "seq":1,
+                      "event_type":2,
+                      "ext_span_id":"eval-span-uuid",
+                      "status":0,
+                      "duration_ns":50,
+                      "agent_name":"risk",
+                      "input_text":"疑似盗刷",
+                      "attrs":{"external_run_id":"eval-run-uuid","project_id":"agentic-data","skill":"review","mode":"auto","call_site":"worker.ts:10"}
+                    }]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":1"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_external_trace_detail",
+                    method: "GET",
+                    path: "/v1/traces/eval-run-uuid",
+                    tenant: None,
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[
+                        r#""externalTraceId":"eval-run-uuid""#,
+                        r#""externalSpanId":"eval-span-uuid""#,
+                        r#""project_id":"agentic-data""#,
+                    ],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_external_span_detail",
+                    method: "GET",
+                    path: "/v1/traces/eval-run-uuid/spans/eval-span-uuid",
+                    tenant: None,
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[
+                        r#""externalSpanId":"eval-span-uuid""#,
+                        r#""call_site":"worker.ts:10""#,
+                    ],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_search_by_external_trace_id",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: r#"{"text":"盗刷","filter":{"trace_id":"eval-run-uuid"}}"#,
+                    expect_status: 200,
+                    expect_contains: &[
+                        r#""external_trace_id":"eval-run-uuid""#,
+                        r#""skill":"review""#,
+                    ],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_search_by_attrs",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: r#"{"text":"盗刷","filter":{"attrs":{"project_id":"agentic-data","skill":"review"}}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""external_trace_id":"eval-run-uuid""#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_attr_miss",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: r#"{"text":"盗刷","filter":{"project_id":"agentic-data","skill":"other"}}"#,
+                    expect_status: 200,
+                    expect_contains: &["[]"],
+                    reject_contains: &[r#""external_trace_id":"eval-run-uuid""#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "tenant_header_isolates_ingest_list_and_search",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_tenant_21",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(21),
+                    body: r#"[{"trace_id":7201,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"7201-1","tenant_id":999,"duration_ns":10,"logs":["盗刷"]}]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":1"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "seed_tenant_22",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: Some(22),
+                    body: r#"[{"trace_id":7202,"span_id":1,"ts":100,"seq":1,"event_type":2,"ext_span_id":"7202-1","tenant_id":999,"duration_ns":20,"logs":["盗刷"]}]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":1"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_tenant_21_list",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: Some(21),
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":7201"#],
+                    reject_contains: &[r#""trace_id":7202"#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_tenant_21_search",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: Some(21),
+                    body: r#"{"text":"盗刷","k":10}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":7201"#],
+                    reject_contains: &[r#""trace_id":7202"#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_body_tenant_cannot_spoof",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: Some(999),
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[],
+                    reject_contains: &[r#""trace_id":7201"#, r#""trace_id":7202"#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "text_search_and_agent_filter_round_trip",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_search_spans",
+                    method: "POST",
+                    path: "/v1/ingest",
+                    tenant: None,
+                    body: r#"[
+                      {"trace_id":7301,"span_id":10,"ts":1,"seq":1,"event_type":2,"ext_span_id":"7301-10","status":1,"duration_ns":100,"agent_name":"风控","logs":["疑似盗刷 已拦截"]},
+                      {"trace_id":7302,"span_id":20,"ts":1,"seq":1,"event_type":2,"ext_span_id":"7302-20","status":0,"duration_ns":50,"agent_name":"人工","logs":["盗刷误报 复核通过"]}
+                    ]"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""ingested":2"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_text_search_can_target_trace",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: r#"{"text":"盗刷","k":10,"filter":{"trace_id":7301}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":7301"#],
+                    reject_contains: &[r#""trace_id":7302"#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_agent_filter_keeps_risk_agent",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: r#"{"text":"盗刷","k":10,"filter":{"agent_name":"风控"}}"#,
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":7301"#, "风控"],
+                    reject_contains: &[r#""trace_id":7302"#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_bad_search_body_rejected",
+                    method: "POST",
+                    path: "/v1/search",
+                    tenant: None,
+                    body: "not json",
+                    expect_status: 400,
+                    expect_contains: &["error"],
+                    reject_contains: &[r#""trace_id":7301"#, r#""trace_id":7302"#],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "otlp_standard_endpoint_ingests_and_queries",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_otlp_trace",
+                    method: "POST",
+                    path: "/v1/traces",
+                    tenant: None,
+                    body: r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+                      "traceId":"000000000000000000000000000002bf",
+                      "spanId":"0000000000000001",
+                      "name":"chat",
+                      "startTimeUnixNano":"100",
+                      "endTimeUnixNano":"150",
+                      "status":{"code":1},
+                      "attributes":[{"key":"gen_ai.usage.input_tokens","value":{"intValue":"900"}}]
+                    }]}]}]}"#,
+                    expect_status: 200,
+                    expect_contains: &["partialSuccess"],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_otlp_trace_visible",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: None,
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":703"#, r#""total_input_tokens":900"#],
+                    reject_contains: &[],
+                },
+            ],
+        },
+        evalkit::ApiEvalCase {
+            name: "otlp_tenant_header_overrides_body_tenant_attr",
+            category: "api_entrypoint",
+            steps: vec![
+                evalkit::ApiEvalStep {
+                    name: "seed_otlp_tenant_trace",
+                    method: "POST",
+                    path: "/v1/traces",
+                    tenant: Some(1),
+                    body: r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{
+                      "traceId":"00000000000000000000000000000064",
+                      "spanId":"0000000000000002",
+                      "name":"chat",
+                      "startTimeUnixNano":"100",
+                      "endTimeUnixNano":"150",
+                      "attributes":[
+                        {"key":"yitrace.tenant_id","value":{"stringValue":"999"}},
+                        {"key":"yitrace.session_id","value":{"stringValue":"777"}},
+                        {"key":"input.value","value":{"stringValue":"租户隔离测试"}}
+                      ]
+                    }]}]}]}"#,
+                    expect_status: 200,
+                    expect_contains: &["partialSuccess"],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_header_tenant_can_read",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: Some(1),
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[r#""trace_id":100"#],
+                    reject_contains: &[],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_body_tenant_attr_cannot_read",
+                    method: "GET",
+                    path: "/v1/traces",
+                    tenant: Some(999),
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[],
+                    reject_contains: &[r#""trace_id":100"#],
+                },
+                evalkit::ApiEvalStep {
+                    name: "verify_otlp_session_visible",
+                    method: "GET",
+                    path: "/v1/sessions?cursor=0&limit=50",
+                    tenant: Some(1),
+                    body: "",
+                    expect_status: 200,
+                    expect_contains: &[r#""sessionId":"777""#],
+                    reject_contains: &[],
+                },
+            ],
+        },
+    ];
+    let report = evalkit::run_api_eval_suite("api_entrypoints", &api, &cases);
+    assert!(report.passed(), "{}", report.failure_report());
+}
+
 fn extract_json_object_field(body: &str, field: &str) -> String {
     let needle = format!("\"{field}\":");
     let value_start = body

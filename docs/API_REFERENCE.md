@@ -381,7 +381,7 @@ remote/process gateway 读 fanout 第一版支持两种查询策略：
 
 ### Snapshot lease  —— 显式快照租约（分布式/分页 API）
 
-显式 snapshot lease 用于长分页、跨多次请求的一致读。单机 / in-process cluster 会 pin 当前 manifest snapshot；remote gateway 会向每个 shard 建 shard-local lease，并在 gateway 内保存 composite lease。release 后同一个 lease 再 renew 或 replay 会返回 `409` + `code:"snapshot_expired"`。
+显式 snapshot lease 用于长分页、跨多次请求的一致读。单机 / in-process cluster 会 pin 当前 manifest snapshot；remote gateway 会向每个 shard 建 shard-local lease，并在 gateway 内保存 composite lease。lease 默认 TTL 是 5 分钟；创建和续租都可传 `ttlNs` / `ttlMs`，响应会返回 `expiresAtNs`。release 或 TTL 过期后，同一个 lease 再 renew 或 replay 会返回 `409` + `code:"snapshot_expired"`。
 
 | 方法 | 端点 | 用途 |
 |---|---|---|
@@ -393,7 +393,8 @@ remote/process gateway 读 fanout 第一版支持两种查询策略：
 
 ```json
 {
-  "consistency": "bounded_stale"
+  "consistency": "bounded_stale",
+  "ttlMs": 300000
 }
 ```
 
@@ -421,14 +422,15 @@ remote/process gateway 读 fanout 第一版支持两种查询策略：
     ]
   },
   "leaseId": "remote-lease-1",
-  "leaseState": "active"
+  "leaseState": "active",
+  "expiresAtNs": "1783350300000000000"
 }
 ```
 
 续租：
 
 ```json
-{ "leaseId": "remote-lease-1" }
+{ "leaseId": "remote-lease-1", "ttlMs": 300000 }
 ```
 
 带 lease 查询时可以把完整 `snapshot` 原样放回请求体；remote gateway 也接受只带 lease id 的 compact token：
@@ -448,7 +450,7 @@ route table reload 会清空 gateway 内的 remote composite lease；旧 token �
 
 ### POST /v1/vector-index / POST /v1/vector-search  —— 命名空间向量索引（原始 API）
 
-这组 API 给 Agent Memory / 相似任务 / 相似路径召回提供底座。yiTrace 不负责生成 embedding，只接收上层写入的向量。当前第一片实现是 append-only `named_vectors.dat` + 内存 flat index，保证 namespace、tenant、attrs filter 和重启恢复语义正确；后续再把 task/trajectory namespace 接到 HNSW/GraphIndex 性能路径。
+这组 API 给 Agent Memory / 相似任务 / 相似路径召回提供底座。yiTrace 不负责生成 embedding，只接收上层写入的向量。当前第一片实现是 append-only `named_vectors.dat` + 内存 flat index，保证 namespace、tenant、attrs filter 和重启恢复语义正确；带 `traceId` 的 `span` / `task` 向量搜索会按当前 snapshot 做 live-filter，retention soft-delete 后不会再返回已删 trace；`trajectory` 向量被视为路径资产，即使 source trace 被清理也仍可用于召回。后续再把 task/trajectory namespace 接到 HNSW/GraphIndex 性能路径。
 
 写入向量：
 
@@ -512,6 +514,29 @@ route table reload 会清空 gateway 内的 remote composite lease；旧 token �
 
 仅 process gateway / remote gateway 模式使用。请求体是 route table JSON，包含 `version` / `routeTableVersion` 和 `shards`。reload 会在同一 gateway 进程内替换 writer 视图、清空 tenant/session/trace 路由缓存，并拒绝低于当前版本的 route table。兼容别名：`POST /v1/route-table/reload`。
 
+也可以让 gateway 从文件读取 route table 后执行同一套 reload 逻辑：
+
+| 方法 | 端点 | 用途 |
+|---|---|---|
+| POST | `/v1/cluster/route-table/reload-file` | 从请求体里的 `path` / `file` / `routeTablePath` 读取 JSON 文件并热更新 |
+| POST | `/v1/cluster/route-table/watch` | `reload-file` 的兼容入口；当前是一次性重载 hook，不是后台 watcher |
+| POST | `/v1/route-table/reload-file` | `reload-file` 兼容别名 |
+
+```json
+{ "path": "/etc/yitrace/route-table.json" }
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "routeTableVersion": 52,
+  "source": "file",
+  "path": "/etc/yitrace/route-table.json"
+}
+```
+
 v1 扁平格式：每个 `shards[]` item 就是一条 route，至少需要 `id`/`shardId` 和 `addr`，可选 `role`、`readable`、`writable`、`weight`。
 
 ```json
@@ -547,7 +572,7 @@ v2 logical shard + replicas 格式：`shards[].shardId` 是稳定分片身份，
 { "ok": true, "routeTableVersion": 11 }
 ```
 
-`GET /v1/cluster/shards` 会返回当前 writable replica，并在 route table v2 下附带 `replicas` 诊断列表。这个接口是显式 reload 接缝，不等同于完整控制面：周期 watcher、心跳驱动 failover、old leader fencing 仍在分布式路线后续阶段；读 follower 已支持显式 health refresh 驱动的 bounded-stale 选择。
+`GET /v1/cluster/shards` 会返回当前 writable replica，并在 route table v2 下附带 `replicas` 诊断列表。这些接口是显式 reload / 文件 reload 接缝，不等同于完整控制面：后台 watcher、心跳驱动 failover、old leader fencing 仍在分布式路线后续阶段；读 follower 已支持显式 health refresh 驱动的 bounded-stale 选择。
 
 ### Cluster health / heartbeat  —— 显式副本健康采样
 
@@ -602,13 +627,14 @@ route table v2 下 gateway 可以显式刷新每个 replica 的健康状态。yi
 
 ### Shard replication  —— leader/follower WAL 复制底座（分布式运维 API）
 
-这些端点给同一 shard 内 leader/follower 复制使用，不是普通业务查询 API。第一版是显式拉取/应用：外部复制 worker 或测试进程从 leader 拉 WAL batch，再 POST 到 follower；yiTrace 目前不会在 embedded 进程里自动启动后台复制线程。
+这些端点给同一 shard 内 leader/follower 复制使用，不是普通业务查询 API。第一版是显式拉取/应用：外部复制 worker 或测试进程可以从 leader 拉 WAL batch，再 POST 到 follower；也可以在 follower 上调用一次性 `pull` 端点，让 follower 自己从 leader 拉取并本地 apply。yiTrace 目前不会在 embedded 进程里自动启动后台复制线程。
 
 | 方法 | 端点 | 用途 |
 |---|---|---|
 | GET | `/v1/replication/status` | 返回本实例复制水位 |
 | GET | `/v1/replication/wal?afterLsn=...` | 从 leader 导出 `afterLsn` 之后的已提交 WAL records |
 | POST | `/v1/replication/wal` | follower 幂等应用一批 WAL records |
+| POST | `/v1/replication/pull` | follower 一次性从 `leaderAddr` 拉 WAL 并 apply；别名：`/v1/replication/pull-once`、`/v1/replication/worker/run-once` |
 
 `after_lsn` / `afterLsn` / `from_lsn` / `fromLsn` 都可用。WAL batch 中的 `records` 使用 `/v1/ingest` 同款 wire event JSON，因此会保留原始 `tenant_id`、external ids、usage/cost、logs 和 attrs round-trip。
 
@@ -671,12 +697,43 @@ route table v2 下 gateway 可以显式刷新每个 replica 的健康状态。yi
 }
 ```
 
+一次性 pull 请求：
+
+```json
+{
+  "leaderAddr": "http://127.0.0.1:7901",
+  "afterLsn": 1,
+  "timeoutMs": 3000
+}
+```
+
+如果不传 `afterLsn`，follower 会用自己的 `committedTail` 作为起点。
+
+一次性 pull 响应：
+
+```json
+{
+  "pulled": true,
+  "fromLsn": 1,
+  "toLsn": 2,
+  "recordCount": 1,
+  "leaderAddr": "http://127.0.0.1:7901",
+  "status": {
+    "committedTail": 2,
+    "manifestVersion": 0,
+    "memtableWatermark": 0,
+    "memtableRows": 2,
+    "segmentCount": 0
+  }
+}
+```
+
 语义：
 
 - 完整重复 batch 是幂等 no-op。
 - 部分重叠 batch 会跳过已应用前缀，只追加缺失后缀。
 - follower tail 小于 `fromLsn` 时返回 `409 {"code":"replication_apply_failed"}`，说明缺了一段 WAL，需要 snapshot/bootstrap。
-- 这只覆盖 WAL tail 复制。sealed segment、manifest、attrs sidecar、vecindex、metadata、GC log 的远程同步仍在后续分布式路线里。
+- 这只覆盖 WAL tail 复制和一次性 pull worker。后台复制循环、snapshot bootstrap、sealed segment、manifest、attrs sidecar、vecindex、metadata、GC log 的远程同步仍在后续分布式路线里。
 
 ### POST /v1/trace-search  —— 跨 session 结构化 span 搜索（控制台/产品 API，camelCase 响应）
 

@@ -587,6 +587,11 @@ impl EngineJsonApi {
             ("POST", "/v1/replication/wal")
             | ("POST", "/v1/replication/apply")
             | ("POST", "/v1/replication/apply-wal") => self.apply_replication_wal_json(body),
+            ("POST", "/v1/replication/pull")
+            | ("POST", "/v1/replication/pull-once")
+            | ("POST", "/v1/replication/worker/run-once") => {
+                self.replication_pull_once_json(body, tenant)
+            }
             // Trace trajectory diff：比较两次尝试的路线、工具、状态、耗时和成本差异。
             ("POST", "/v1/traces/diff") | ("POST", "/v1/trace-diff") => {
                 self.trace_diff_json(body, tenant)

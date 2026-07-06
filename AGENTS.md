@@ -8,19 +8,21 @@
 
 ## 1. 项目是什么
 
-**yiTrace** 是一台单机、零外部依赖的 **AI Agent 可观测性数据库引擎**（Rust 自研）。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
+**yiTrace** 是一个本地优先、可分片演进的 **AI Agent TraceDB**（Rust 自研）。它可以作为单个私有服务运行，也可以嵌入 Node/Electron，还可以通过 gateway + shard route table 走分布式数据路径。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
 
 - trace 还原（事件折叠成完整 span）
 - 中文 BM25 检索 + 带过滤的向量 ANN 召回 + 混合检索（RRF）
 - 成本归因（token / 费用，per-agent）
 - 评测闭环（eval：打分、回归数据集、per-agent 看板）
 - 多租户隔离（tenant_id 全流程贯穿）
+- 分片读写底座（route table、gateway fanout、snapshot lease、follower read、WAL replication 原语）
 
 **关键约束（改代码时必须守住）：**
 
 - **引擎主体零外部依赖、只用 Rust 标准库**。`cargo test --offline` 必须离线可过。重依赖（Vortex 等）隔离在独立 crate（`yitrace-segstore-vortex` 等），**不要把外部 crate 拉进 `yt-engine`**。
 - **确定性 `event_id`** = `hash(ext_span_id, seq, event_type)`，跨 Python / TypeScript / 引擎逐字节一致。改 event 编码 = 破坏跨语言去重，必须有跨语言对账测试。
-- **接缝优先于实现**：分词 / 向量索引 / 段存储都是 trait 接缝（`Tokenizer` / `GraphIndex` / `SegmentStore` / `Bm25Index`）。换实现不动上层。
+- **shard 内单写，cluster 层多写**：不要让多个进程直接写同一个 data dir；分布式扩展通过 route table、gateway、replication 和 snapshot lease 做，单 shard 的 WAL/manifest 正确性不能被绕开。
+- **接缝优先于实现**：分词 / 向量索引 / 段存储 / shard client / route table 都是接缝。换实现不动上层。
 
 ---
 
@@ -33,8 +35,8 @@ yitrace-engine/              # 引擎（Rust workspace，std-only 零依赖）�
 │       ├── yt-manifest/        # 单写者-多读者：快照 pin 协议、回收水位（正确性脊梁）
 │       ├── yt-wal/             # 写前日志：fsync、崩溃安全帧、二进制编码
 │       ├── yt-memtable/        # 活内存表：双水位 + 受 gate 的 evict
-│       └── yt-engine/          # 协调器、四源折叠读、检索、eval、HTTP/OTLP、控制台
-│           └── examples/       # demo / server / bench_qps / eval_harness
+│       └── yt-engine/          # 协调器、四源折叠读、检索、eval、HTTP/OTLP、gateway、控制台
+│           └── examples/       # demo / server / server_durable / bench_qps / eval_harness
 yitrace-segstore-vortex/     # Vortex 列式段（工作区外，隔离重依赖）
 yitrace-tokenizer-jieba/     # cppjieba FFI（可选；引擎默认用纯 Rust ChineseTokenizer）
 yitrace-vecindex-graph/      # graph_index FFI（可选；引擎默认用自研磁盘 HNSW）
@@ -57,15 +59,17 @@ docs/                        # 设计文档 / 现状索引 / 分析
 
 ```bash
 cd yitrace-engine
-cargo test --offline                    # 全测试（含并发压测 + HTTP 往返 + ANN 召回 + 重启不丢）
+cargo test --offline                    # 全测试（含并发压测 + HTTP 往返 + ANN 召回 + 重启不丢 + 分布式 eval）
 cargo run -p yt-engine --example demo   # 可运行 demo：灌数据 → 折叠 → 中文搜 → 向量 → 混合召回
 cargo run -p yt-engine --example server # 起 HTTP 服务（:7878，自带 eval 种子数据）
+cargo run -p yt-engine --example server_durable -- ./data/yitrace  # 持久化服务样板
 cargo run -p yt-engine --example bench_qps --release  # 真实 QPS 压测（务必 --release）
 ```
 
 - **测试必须 `--offline` 能过**（守零依赖原则）。release 才跑 bench（debug 慢几十倍，数字无意义）。
 - 改了 HTTP/控制台后，要重新构建前端并内嵌：`cd yitrace-console && VITE_API=http npm run build && rm -rf ../yitrace-engine/crates/yt-engine/console_dist && cp -r dist ../yitrace-engine/crates/yt-engine/console_dist`。
 - 可选：`YT_TOKEN=secret cargo run ... --example server` 开 Bearer 鉴权；`cargo test -p yt-engine --features gzip` 含 gzip 解压。
+- 改了 gateway / route table / replication / snapshot lease，至少跑相关真实 eval：`cargo test --offline -p yt-engine --test distributed_process_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_production_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_read_target_eval -- --nocapture`。
 
 **外部 crate（隔离的重依赖，按需构建）：**
 

@@ -43,8 +43,8 @@
 - `loops` / `taskTraces` 真索引。
 - annotation / dataset / golden path / retention policy 的 metadata index。
 - 全文分域索引已完成第一片；仍缺 attrs.* 白名单域、retention soft-delete 后的域索引剔除和 100k+ 性能 bench。
-- task/span/trajectory 向量 namespace 已完成第一片（append-only `named_vectors.dat` + 内存 flat index）；仍缺 namespace HNSW/GraphIndex、高性能 filtered ANN、retention soft-delete 和 recall/perf 回归。
-- 生产 gateway route table watcher/外部控制面、更多读模型 snapshot 覆盖、sealed segment/manifest/sidecar/vecindex/metadata/GC log 同步、复制 worker/调度、自动 failover、retry budget 诊断和一致性策略配置。
+- task/span/trajectory 向量 namespace 已完成第一片（append-only `named_vectors.dat` + 内存 flat index）；span/task 带 traceId 的向量已按当前 snapshot 做 retention live-filter；仍缺 namespace HNSW/GraphIndex、高性能 filtered ANN 和 recall/perf 回归。
+- 生产 gateway 已有 route table 文件 reload hook、snapshot lease TTL 和一次性 replication pull worker；仍缺后台 route table watcher/外部控制面订阅、更多读模型 snapshot 覆盖、sealed segment/manifest/sidecar/vecindex/metadata/GC log 同步、后台复制调度、snapshot bootstrap、自动 failover、retry budget 诊断和一致性策略配置。
 
 ## Track A：读模型索引化
 
@@ -244,7 +244,7 @@ eval：
 
 ### A5：向量增强
 
-状态：已完成第一片。新增 span/task/trajectory 命名空间向量底座：`POST /v1/vector-index` 写入 `(tenant, namespace, key)`，`POST /v1/vector-search` 按 namespace + tenant + attrs filter 召回；durable 目录写 append-only `named_vectors.dat`，recover 时重建内存 flat index；Node 暴露 `db.indexVector()` / `db.searchVector()`；remote gateway 的 vector-index 按 key hash 路由，vector-search fanout 合并 top-k。它先保证语义、恢复和 API 合同正确，不代表最终高性能 ANN。
+状态：已完成第一片并补 live-filter。新增 span/task/trajectory 命名空间向量底座：`POST /v1/vector-index` 写入 `(tenant, namespace, key)`，`POST /v1/vector-search` 按 namespace + tenant + attrs filter 召回；durable 目录写 append-only `named_vectors.dat`，recover 时重建内存 flat index；Node 暴露 `db.indexVector()` / `db.searchVector()`；remote gateway 的 vector-index 按 key hash 路由，vector-search fanout 合并 top-k。span/task 这类带 `traceId` 的向量搜索会基于当前 snapshot 隐藏 retention soft-delete trace；trajectory 向量作为路径资产保留召回。它先保证语义、恢复和 API 合同正确，不代表最终高性能 ANN。
 
 目标：
 
@@ -270,7 +270,8 @@ eval：
 eval：
 
 - 已覆盖：task/trajectory namespace 不串；attrs/tenant filter；重启后召回稳定；remote gateway fanout 合并 top-k。
-- 待覆盖：span namespace 端到端；metadata filter 进图过滤；删除/retention 后 soft delete 生效；HNSW recall vs brute force 回归；100k vectors 性能 bench。
+- 已覆盖：删除/retention 后 span/task 向量 live-filter 生效，durable reopen 后仍不返回已删 trace。
+- 待覆盖：span namespace 端到端；metadata filter 进图过滤；HNSW recall vs brute force 回归；100k vectors 性能 bench。
 
 验收：
 
@@ -281,7 +282,7 @@ eval：
 
 ### B0：动态路由表
 
-状态：已完成第二片。2026-07-06 已完成静态 JSON route table 模型、版本/fingerprint、writer gateway 构造和 cluster diagnostics 暴露；`POST /v1/cluster/route-table/reload` 可显式热更新 writer 视图、清空路由缓存并拒绝旧版本；remote snapshot token 绑定 `routeTableVersion`，版本变化会返回 `route_table_expired`；route table v2 已支持 logical shard + replicas schema，gateway 按 logical shard 选择唯一 writable replica，cluster diagnostics 返回 writable `replicaId` 和 `replicas` 列表。后续仍缺周期 watcher / 外部控制面订阅。
+状态：已完成第二片并补文件 reload hook。2026-07-06 已完成静态 JSON route table 模型、版本/fingerprint、writer gateway 构造和 cluster diagnostics 暴露；`POST /v1/cluster/route-table/reload` 可显式热更新 writer 视图、清空路由缓存并拒绝旧版本；`POST /v1/cluster/route-table/reload-file` 和 `/watch` 兼容入口可从 route table 文件重载同一 gateway；remote snapshot token 绑定 `routeTableVersion`，版本变化会返回 `route_table_expired`；route table v2 已支持 logical shard + replicas schema，gateway 按 logical shard 选择唯一 writable replica，cluster diagnostics 返回 writable `replicaId` 和 `replicas` 列表。后续仍缺后台 watcher / 外部控制面订阅。
 
 目标：
 
@@ -324,13 +325,14 @@ eval：
 }
 ```
 
-- gateway 显式 reload API 已落地；后续补周期 watcher 或外部控制面订阅。
+- gateway 显式 reload API 和一次性文件 reload hook 已落地；后续补后台 watcher 或外部控制面订阅。
 - 路由表版本进入 fanout response。
 - 第一版不做自动 rebalance，只支持配置化新增/下线 shard。
 
 eval：
 
 - reload 后新写入走新路由（已覆盖真实 TCP fake shard eval）。
+- route table 文件 reload 后新写入走新 writable replica（已覆盖真实 TCP fake shard eval）。
 - v2 手动 promote 后，新写入走 promoted replica，旧 leader 不再接新写（已覆盖真实 TCP fake shard eval）。
 - old route table 下的 snapshot token 仍能完成分页，或返回明确 `route_table_expired`。
 - tenant/session/trace hash 路由稳定。
@@ -343,7 +345,7 @@ eval：
 
 ### B1：远程 snapshot lease
 
-状态：已完成第二片。`trace-search` / `trace-aggregate` 已经通过查询响应里的 shard-local snapshot 实现 remote gateway composite snapshot；gateway replay 时会把 composite token 拆给对应 shard，route table version/shard id 不匹配时返回 `route_table_expired`。`POST /v1/snapshots/lease` / `POST /v1/snapshots/renew` / `DELETE /v1/snapshots/:leaseId` 已支持 in-process cluster 和 remote gateway：remote gateway 会向各 shard 建 shard-local lease，自己保存 composite lease，renew 时续租所有 shard-local lease，release 后 replay/renew 返回 `snapshot_expired`。
+状态：已完成第二片并补 TTL。`trace-search` / `trace-aggregate` 已经通过查询响应里的 shard-local snapshot 实现 remote gateway composite snapshot；gateway replay 时会把 composite token 拆给对应 shard，route table version/shard id 不匹配时返回 `route_table_expired`。`POST /v1/snapshots/lease` / `POST /v1/snapshots/renew` / `DELETE /v1/snapshots/:leaseId` 已支持 in-process cluster 和 remote gateway：remote gateway 会向各 shard 建 shard-local lease，自己保存 composite lease，renew 时续租所有 shard-local lease；lease 默认 TTL 5 分钟，支持 `ttlNs` / `ttlMs`，响应返回 `expiresAtNs`；release 或 TTL 过期后 replay/renew 返回 `snapshot_expired`。
 
 目标：
 
@@ -361,24 +363,25 @@ eval：
   - `POST /v1/snapshots/lease`
   - `POST /v1/snapshots/renew`
   - `DELETE /v1/snapshots/:leaseId`
-- lease max entries 已有 LRU eviction；remote route table reload 会清空 composite lease。TTL 仍待做。
+- lease max entries 已有 LRU eviction；remote route table reload 会清空 composite lease；TTL 已落地。
 - cache key 必须绑定 read target + manifest version + read_model_revision。
 
 eval：
 
 - traceSearch / traceAggregate remote snapshot round-trip 按 shard-local lease 回放（已覆盖真实 TCP fake shard eval）。
 - 显式 remote snapshot lease / renew / release / release 后 replay 409 `snapshot_expired`（已覆盖真实 TCP fake shard eval）。
+- 单机和 remote gateway lease TTL 过期后 renew/replay 返回 `snapshot_expired`（已覆盖 eval）。
 - follower 追平后，旧 snapshot token 仍看旧结果。
 - lease 过期、篡改、route table 变更都返回明确错误；route table 变更返回 `route_table_expired` 已覆盖。
 - shard 宕机时 partial/strict 策略符合预期。
 
 验收：
 
-- `trace-search` / `trace-aggregate` 远程 snapshot replay 与 in-process snapshot lease 语义已对齐；后续扩展到 trajectory/storage/loop/task/session 等读模型，并补 TTL。
+- `trace-search` / `trace-aggregate` 远程 snapshot replay 与 in-process snapshot lease 语义已对齐；后续扩展到 trajectory/storage/loop/task/session 等读模型。
 
 ### B2：网络复制
 
-状态：已完成第一片。2026-07-06 已新增 `GET /v1/replication/status`、`GET /v1/replication/wal?afterLsn=...`、`POST /v1/replication/wal`，把已有 in-process WAL shipping 暴露为真实 HTTP 复制协议；多进程 eval 启动 leader/follower 两个 shard server，覆盖空 batch、catch-up、重复 batch 幂等和缺口 batch 409。它仍是显式 pull/apply 底座，不包含后台复制 worker、leaderTail/lag 聚合、snapshot bootstrap 或 sealed segment/metadata/sidecar 同步。
+状态：已完成第一片并补 one-shot pull worker。2026-07-06 已新增 `GET /v1/replication/status`、`GET /v1/replication/wal?afterLsn=...`、`POST /v1/replication/wal`，把已有 in-process WAL shipping 暴露为真实 HTTP 复制协议；`POST /v1/replication/pull` / `pull-once` / `worker/run-once` 可让 follower 从 leader 一次性拉 WAL 并本地 apply；多进程 eval 启动 leader/follower 两个 shard server，覆盖空 batch、catch-up、重复 batch 幂等、缺口 batch 409 和 one-shot pull。它仍不包含后台复制调度、leaderTail/lag 聚合、snapshot bootstrap 或 sealed segment/metadata/sidecar 同步。
 
 目标：
 
@@ -390,7 +393,7 @@ eval：
   - `GET /v1/replication/wal?after_lsn=...`
   - `GET /v1/replication/status`
   - `POST /v1/replication/wal`
-- 后续补 follower loop：
+- one-shot follower pull 已落地；后续补后台 follower loop：
   - 拉取 WAL batch
   - 幂等 apply
   - 定期 checkpoint
@@ -402,7 +405,7 @@ eval：
 eval：
 
 - follower 从空目录 bootstrap（空 batch 已覆盖，完整 snapshot bootstrap 待补）。
-- follower 从落后 LSN catch up（已覆盖真实双进程）。
+- follower 从落后 LSN catch up（手动 pull/apply 与 one-shot pull 都已覆盖真实双进程）。
 - 重复 WAL batch 幂等（已覆盖真实双进程）。
 - gap batch 返回 409，需要 snapshot/bootstrap（已覆盖真实双进程）。
 - torn response / network error 后 retry 不重复写。
@@ -410,7 +413,7 @@ eval：
 
 验收：
 
-- 当前 follower status 可报告 `committedTail`、`manifestVersion`、`memtableWatermark`、`memtableRows`、`segmentCount`。
+- 当前 follower status 可报告 `committedTail`、`manifestVersion`、`memtableWatermark`、`memtableRows`、`segmentCount`；one-shot pull 可返回本次 `fromLsn` / `toLsn` / `recordCount` 和 apply 后 follower status。
 - 后续复制 worker/cluster status 再聚合 `leaderTail`、`lagLsn`、`readable`、`reason`。
 
 ### B3：heartbeat / health / failover

@@ -1,15 +1,16 @@
 # yiTrace Engine
 
-> ⚠️ **状态:验证级骨架,不是生产就绪。** 技术前提用代码 + 会失败的测试钉死(156 测试),但分词/向量索引/安全合规未到生产级。**不要未经评估直接上生产。** 详见文末["距离开源还剩什么"](#距离开源还剩什么)。
+> ⚠️ **状态:alpha,不是生产托管集群。** 技术前提用代码 + 会失败的测试钉死,单机、嵌入式、读模型索引和分布式 gateway 原语都有 eval 覆盖。自动 failover、fencing、后台复制调度、TLS/RBAC 仍未完成。**不要未经评估直接上生产。** 详见根目录 [`docs/CURRENT_STATE.md`](../docs/CURRENT_STATE.md)。
 >
 > 许可证:**MIT**(见根目录 [LICENSE](../LICENSE))。内嵌 jieba 词典为 MIT(见 `data/JIEBA_DICT_NOTICE.md`),Vortex 为 Apache-2.0。
 
-单机、私有部署的 AI Agent 可观测性数据库。自研 Rust 引擎,刻意只用标准库、**零外部依赖**(`cargo test --offline` 离线可过)。面向中国金融/政企气隙机房,对标 Langfuse / LangSmith,但**数据不出内网、中文检索/语义向量是一等公民、自有索引 IP**。
+本地优先、可分片演进的 AI Agent TraceDB。自研 Rust 引擎,刻意只用标准库、**零外部依赖**(`cargo test --offline` 离线可过)。它既可以作为单个私有服务运行,也可以嵌入 Node/Electron,还可以通过 gateway + route table 路由到多个 shard。shard 内保持单写者正确性,cluster 层通过 fanout、snapshot lease、follower read 和 WAL replication 原语扩展。
 
 ```bash
-cargo test --offline                              # 156 测试(yt-core 9 + yt-engine 130 + eval_harness 6 + manifest 4 + memtable 2 + wal 5)
+cargo test --offline                              # 全量引擎测试,含分布式 eval
 cargo run -p yt-engine --example demo --offline  # 灌几条银行风控假 trace,跑写入→折叠→中文搜→找相似→混合召回
 cargo run -p yt-engine --example server          # 起 HTTP 摄入服务(8 线程池),curl 即可灌/查
+YT_BIND=127.0.0.1:7879 cargo run -p yt-engine --example server_durable -- ./data/yitrace  # 持久化服务样板
 YT_TOKEN=secret cargo run ... --example server   # 开 Bearer token 鉴权
 cargo test -p yt-engine --features gzip          # 含 gzip 请求体解压(可选 feature,默认离线 std-only)
 cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入/检索/建图)
@@ -100,6 +101,19 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | HTTP 鉴权头隔离 | ✅ | tenant 从 `X-Tenant-Id` 鉴权头取(**非请求体,客户端不能越权**) |
 | SDK 透传 | ✅ | Python `trace(name, tenant_id=)` / TS 同款 |
 
+### 分布式数据路径
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| route table | ✅ | v1 扁平 shard route + v2 logical shard/replicas;每个 logical shard 必须恰好一个 writable replica |
+| gateway 写路由 | ✅ | 按 tenant/session/trace 路由到 writable shard;返回 partialSuccess / failedShards / retrySafe |
+| 读 fanout merge | ✅ | search、traceSearch、aggregate、trajectory、storage、metadata、retention、vector 已有 remote fanout |
+| 一致性策略 | ✅ | 默认 partial;显式 strict/strong 或 `partial:false` 时任一 shard 失败会拒绝 |
+| follower read target | ✅ | 根据 health refresh 和 `replicationLagLsn <= maxLagLsn` 选择 readable follower,不合格回 leader |
+| remote snapshot lease | ✅ | gateway composite lease + shard-local lease,支持 TTL / renew / release / route table version 校验 |
+| WAL 复制原语 | ✅ | `replication/status`、`replication/wal` export/apply、`replication/pull` one-shot follower pull |
+| 生产控制面 | 🟡 | 后台 watcher、自动 failover、fencing、后台复制调度、snapshot bootstrap、sidecar/metadata/GC log 同步仍待做 |
+
 ### 可调旋钮(部署参数)
 
 | 参数 | 说明 |
@@ -146,49 +160,27 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 
 ---
 
-## 距离开源还剩什么
+## 当前边界
 
-### 🔴 必须补(开源前)
-
-| 项 | 说明 |
-|---|---|
-| **LICENSE** | 没有许可证文件 = 法律上不能复用。选 Apache-2.0 / MIT / AGPL 之一(见下"许可证决策") |
-| **环境门槛文档** | Rust MSRV、Python ≥3.10(`int\|None` 语法)、Node ≥18 + 平台匹配的 esbuild;现在环境一变 SDK 测试就挂 |
-| **外部 crate 的 vendoring / 镜像** | Vortex crate 联网拉依赖;开源用户/气隙环境要能离线构建(vendoring + build 说明) |
-| **README 的诚实定位** | "验证级骨架"必须醒目(否则误导使用者当生产级上);现状已写,但需顶部 badge/状态块更显眼 |
-| **统一构建脚本** | 多 crate 工作区 + 工作区外 crate + SDK,需要一篇"怎么从零构建 + 跑全部测试"的 CONTRIBUTING |
-
-### 🟡 强烈建议(开源后第一周会被问)
+### 🔴 进入生产前必须补
 
 | 项 | 说明 |
 |---|---|
-| **CHANGELOG + 版本号** | 现在是 git main 一条线,没有 release tag / CHANGELOG |
-| **CI(GitHub Actions)** | 多 Rust 版本矩阵 + clippy + fmt + SDK 多版本 + Vortex crate;现在零 CI |
-| **示例完整化** | `demo`/`server` 有,但缺"端到端:SDK 打点 → server → 查询 → eval"一条龙示例 |
-| **架构图** | 五 crate + 外部 crate + 数据流图,文字 README 说不清;需要一张图 |
-| **测试矩阵明示** | "156 测试验什么"现在堆在一段里,需要表格化(功能清单已部分解决) |
-| **竞品对比页** | 会反复被问"跟 Langfuse/ClickHouse 比怎样";产品说明里有但 README 没指 |
+| **安全边界** | TLS、RBAC、落盘加密、限流、PII 脱敏、持久审计仍未落地 |
+| **生产控制面** | route table 后台 watcher、自动 failover、old leader fencing、后台复制调度仍未落地 |
+| **复制恢复** | WAL tail 复制已有;leader compaction/retention 后的 snapshot bootstrap、sealed segment/sidecar/metadata/GC log 远程同步仍待做 |
+| **发布矩阵** | `@yitrace/db` root 包 + per-platform optional native packages 还需要正式 CI matrix 和 npm 发布 |
+| **外部真库对标** | jieba / graph_index FFI 接缝已就位,真库链接和生产召回对标仍要在构建机完成 |
 
-### 🟢 功能性缺口(不影响开源,但 README 要标"未实现")
+### 🟡 上量后优先补
 
 | 项 | 说明 |
 |---|---|
-| DataFusion 查询执行 | 现手写查询路径;换 DataFusion 是架构整洁度,不是功能/性能缺口 |
-| 全局跨段定位索引 | 亿级数据对段数真正次线性(阶段 2,见跨段扩展性分析) |
-| BM25 倒排段内化 | 真 TB(阶段 3,Quickwit/Lucene 模型) |
-| 向量量化(PQ/SQ) | 几十亿向量省内存;SQ 先行(4× 几乎无损) |
-| 安全合规 | TLS / RBAC 物理隔离 / 落盘加密 / 持久防篡改审计 / 限流 / PII 脱敏 |
-| LLM-judge eval | 现在 KeywordScorer;接 LLM-judge 需出站 HTTP(气隙走本地小模型) |
-
-### 许可证决策(必须先定)
-
-| 许可证 | 适合 |
-|---|---|
-| **Apache-2.0** | 最宽松、专利授权全、生态最广(Langfuse/Vortex/DuckDB 都是) |
-| MIT | 更短更简,但无专利授权条款 |
-| AGPL-3.0 | 防竞品白嫖(网络服务也得开源),但会劝退部分企业用户 |
-
-> 注意:内嵌的 jieba 词典是 **MIT**(声明在 `data/JIEBA_DICT_NOTICE.md`);选 Apache-2.0 兼容它。Vortex 是 Apache-2.0。
+| 高性能向量 namespace | `named_vectors.dat` + flat index 已可用;task/trajectory namespace 后续要接 HNSW/GraphIndex 和 recall/perf 回归 |
+| 100k/1M 性能 bench | 现有 bench 覆盖单机核心路径;读模型索引、gateway fanout 和 vector namespace 还需要大规模门禁 |
+| 预聚合 counter | `traceAggregate` 已有 segment rollup row;更激进的 `(group_schema, group_key) -> counters` 还没做 |
+| DataFusion 查询执行 | 现手写查询路径;DataFusion 仍是后续工程化方向 |
+| LLM-judge eval | 现在是规则 scorer;接 LLM judge 需要本地模型或受控出站 HTTP |
 
 ---
 

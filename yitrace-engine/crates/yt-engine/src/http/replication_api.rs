@@ -39,6 +39,116 @@ impl EngineJsonApi {
             ),
         }
     }
+
+    pub(super) fn replication_pull_once_json(
+        &self,
+        body: &str,
+        tenant: Option<u64>,
+    ) -> (u16, String) {
+        let request = match parse_replication_pull_request(body) {
+            Ok(request) => request,
+            Err(error) => return (400, format!(r#"{{"error":"{}"}}"#, json_escape(&error))),
+        };
+        let after_lsn = request
+            .after_lsn
+            .unwrap_or_else(|| self.coord().replication_status().committed_tail);
+        let path = format!("/v1/replication/wal?afterLsn={after_lsn}");
+        let leader = RemoteShardClient::new(request.leader_addr.clone()).with_timeout(
+            std::time::Duration::from_millis(request.timeout_ms.unwrap_or(3_000)),
+        );
+        let (status, batch_json) = match leader.route_json_with_tenant("GET", &path, "", tenant) {
+            Ok(result) => result,
+            Err(error) => {
+                return (
+                    503,
+                    format!(
+                        r#"{{"error":"replication pull failed","stage":"fetch","leaderAddr":"{}","detail":"{}"}}"#,
+                        json_escape(&request.leader_addr),
+                        json_escape(&error)
+                    ),
+                )
+            }
+        };
+        if status != 200 {
+            return (
+                status,
+                format!(
+                    r#"{{"error":"replication pull failed","stage":"fetch","leaderAddr":"{}","leaderStatus":{},"leaderBody":{}}}"#,
+                    json_escape(&request.leader_addr),
+                    status,
+                    json_string_value(&batch_json)
+                ),
+            );
+        }
+        let batch = match parse_replication_batch(&batch_json) {
+            Ok(batch) => batch,
+            Err(error) => {
+                return (
+                    502,
+                    format!(
+                        r#"{{"error":"replication pull failed","stage":"parse","detail":"{}"}}"#,
+                        json_escape(&error)
+                    ),
+                )
+            }
+        };
+        match self.coord().apply_wal_replication_batch(&batch) {
+            Ok(follower_status) => {
+                self.invalidate_read_model_cache();
+                (
+                    200,
+                    format!(
+                        r#"{{"pulled":true,"fromLsn":{},"toLsn":{},"recordCount":{},"leaderAddr":"{}","status":{}}}"#,
+                        batch.from_lsn,
+                        batch.to_lsn,
+                        batch.records.len(),
+                        json_escape(&request.leader_addr),
+                        replication_status_json(&follower_status)
+                    ),
+                )
+            }
+            Err(error) => (
+                409,
+                format!(
+                    r#"{{"error":"{}","code":"replication_pull_apply_failed","fromLsn":{},"toLsn":{}}}"#,
+                    json_escape(&error),
+                    batch.from_lsn,
+                    batch.to_lsn
+                ),
+            ),
+        }
+    }
+}
+
+struct ReplicationPullRequest {
+    leader_addr: String,
+    after_lsn: Option<u64>,
+    timeout_ms: Option<u64>,
+}
+
+fn parse_replication_pull_request(body: &str) -> Result<ReplicationPullRequest, String> {
+    let value = crate::wire::parse(body)?;
+    let leader_addr = json_field_alias(
+        &value,
+        &[
+            "leaderAddr",
+            "leader_addr",
+            "leader",
+            "sourceAddr",
+            "source_addr",
+            "addr",
+        ],
+    )
+    .and_then(crate::wire::Json::as_str)
+    .map(ToString::to_string)
+    .ok_or_else(|| "replication pull requires leaderAddr".to_string())?;
+    Ok(ReplicationPullRequest {
+        leader_addr,
+        after_lsn: json_field_alias(&value, &["afterLsn", "after_lsn", "after"])
+            .and_then(crate::wire::Json::as_u64),
+        timeout_ms: json_field_alias(&value, &["timeoutMs", "timeout_ms"])
+            .and_then(crate::wire::Json::as_u64),
+    })
 }
 
 fn replication_after_lsn(query: &str) -> Option<u64> {
