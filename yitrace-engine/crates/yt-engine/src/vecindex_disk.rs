@@ -411,7 +411,7 @@ mod simd {
                 let acc = std::hint::black_box(acc);
                 (t.elapsed().as_secs_f64(), acc)
             }
-            let mut s = 0xDEAD_BEEF_CAFE_F00Du64;
+            let s = 0xDEAD_BEEF_CAFE_F00Du64;
             let mk = |n: usize| -> Vec<Vec<f32>> {
                 (0..n).map(|_| rand_vec(s.rotate_left(7), 768)).collect()
             };

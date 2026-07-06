@@ -12,7 +12,7 @@ use crate::olog;
 const MAGIC: u32 = 0x5954_4D44; // "YTMD"
 const FORMAT_VER: u32 = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnnotationTarget {
     Trace,
     Span,
@@ -35,7 +35,7 @@ impl AnnotationTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnnotationStatus {
     Active,
     Resolved,

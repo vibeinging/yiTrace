@@ -249,6 +249,7 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
 | 给了 | 走哪路 |
 |---|---|
 | 只 `text` | 中文 BM25 检索 |
+| `text` + `textDomains` | 分域 BM25，只在 input/output/log/tool/model/agent 等指定域内检索 |
 | 只 `vector` | 向量找相似（带过滤进图） |
 | 两个都给 | 混合（RRF 融合） |
 
@@ -257,8 +258,10 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
 ```json
 {
   "text": "盗刷",
+  "textDomains": ["input_text", "logs"],
   "vector": [0.1, 0.2, 0.3],
   "k": 10,
+  "includeFanout": false,
   "filter": {
     "trace_id": 7,
     "agent_name": "风控",
@@ -278,8 +281,11 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
 | 字段 | 类型 | 必需 | 说明 |
 |---|---|---|---|
 | `text` | string | 二选一 | 中文检索词（CJK 分词） |
+| `textDomains` / `text_domains` / `domains` / `fields` | string[] | 否 | 分域全文检索，可选 `input_text`、`output_text`、`logs`、`tool_name`、`model`、`agent_name` |
+| `inputTextContains` / `outputContains` / `logContains` / `toolNameContains` / `modelContains` / `agentNameContains` | string | 否 | 便捷分域查询别名；等价于设置对应 domain 并使用该文本 |
 | `vector` | f32[] | 二选一 | 查询向量（维度需与索引一致） |
 | `k` | usize | 否 | 返回数，默认 10 |
+| `includeFanout` / `include_fanout` | bool | 否 | 仅 cluster mode 有意义；默认 `false` 保持旧数组响应，传 `true` 时返回 envelope 并带 fanout 诊断 |
 | `filter.trace_id` | u64? | 否 | 限定 trace |
 | `filter.agent_name` | string? | 否 | 限定 agent |
 | `filter.status` | u8? | 否 | 限定状态（0=ok，非 0=error） |
@@ -313,6 +319,8 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
   "span_id": 1,
   "external_span_id": "span-uuid",
   "score": 3.2720,
+  "searchIndex": "text_domain_bm25",
+  "textDomains": ["input_text", "logs"],
   "status": 0,
   "duration_ns": 4200000,
   "agent_name": "风控研判",
@@ -325,6 +333,350 @@ metadata 过滤语义：trace 级 annotation/link 命中整条 trace；span 级 
   }
 }
 ```
+
+`searchIndex` 解释本次命中的索引路径：`bm25_all_text` 是原始 all-text BM25，`text_domain_bm25` 是分域全文索引，`vector_graph` 是 span 向量图，`hybrid_bm25_vector` / `hybrid_text_domain_vector` 是 RRF 融合。分域全文索引会在摄入时分别索引 `input_text`、`output_text`、`logs`、`tool_name`、`model`、`agent_name`，并继续复用租户和 attrs filter；没有指定 domain 时保持旧的 all-text 行为。
+
+cluster mode 下默认仍返回同样的数组，保证旧客户端兼容。若请求传 `includeFanout:true`，响应会改为 envelope：
+
+```json
+{
+  "items": [
+    {
+      "trace_id": 7,
+      "span_id": 1,
+      "score": 3.272
+    }
+  ],
+  "total": 1,
+  "queryMode": "fanout_merge",
+  "shardCount": 3,
+  "okShards": 3,
+  "degraded": false,
+  "failedShards": [],
+  "consistencyUsed": "partial",
+  "partial": true,
+  "readTargets": [
+    {
+      "shard": 0,
+      "shardId": "logical-a",
+      "replicaId": "a-follower",
+      "addr": "http://127.0.0.1:7902",
+      "role": "follower",
+      "health": "healthy",
+      "replicationLagLsn": 0,
+      "reason": "bounded_stale_follower"
+    }
+  ]
+}
+```
+
+`degraded:true` 表示本次结果只来自成功 shard，`total` 也只统计成功 shard；业务侧不能把它当作全量结果。写入类 fanout 仍应 fail-fast，避免部分写成功被误判为完整成功。
+
+remote/process gateway 读 fanout 第一版支持两种查询策略：
+
+- 默认 `partial`：部分 shard 失败时仍返回成功 shard 的结果，响应带 `degraded:true`、`failedShards`、`consistencyUsed:"partial"`、`partial:true`。
+- 显式 `strict`：请求体传 `{"consistency":"strict"}` / `{"consistency":"strong"}`，或传 `{"partial":false}`；GET list 类接口也可用 `?consistency=strict` / `?partial=false`。任一 shard 失败时整体返回 `502`（部分成功）或 `503`（全失败），响应带 `consistencyUsed:"strict"`、`partial:false`。
+
+第一版已接入 `/v1/search`、`/v1/trace-search`、`/v1/trace-aggregate`、`/v1/trajectory-groups`、`/v1/trace-trajectories`、`/v1/storage-stats`、metadata list 和 `golden-path-export` 等读 fanout。默认 `partial` 模式会使用最近一次 health refresh 结果做 bounded-stale read target 选择：同一 logical shard 内优先读取 `healthy` 且 `replicationLagLsn <= maxLagLsn` 的 readable follower；没有合格 follower 时回 leader。显式 `strict` / `strong` 会强制读 leader。响应的 `readTargets` 解释每个 logical shard 实际读到哪个 replica，以及原因。remote gateway snapshot 会记录 `replicaId`，后续分页会回到同一个 replica，避免跨 replica replay 破坏一致性。
+
+### Snapshot lease  —— 显式快照租约（分布式/分页 API）
+
+显式 snapshot lease 用于长分页、跨多次请求的一致读。单机 / in-process cluster 会 pin 当前 manifest snapshot；remote gateway 会向每个 shard 建 shard-local lease，并在 gateway 内保存 composite lease。release 后同一个 lease 再 renew 或 replay 会返回 `409` + `code:"snapshot_expired"`。
+
+| 方法 | 端点 | 用途 |
+|---|---|---|
+| POST | `/v1/snapshots/lease` | 创建显式 snapshot lease |
+| POST | `/v1/snapshots/renew` | 续租并刷新最近使用时间 |
+| DELETE | `/v1/snapshots/:leaseId` | 释放 lease |
+
+创建：
+
+```json
+{
+  "consistency": "bounded_stale"
+}
+```
+
+响应：
+
+```json
+{
+  "snapshot": {
+    "mode": "remote_gateway",
+    "leaseId": "remote-lease-1",
+    "routeTableVersion": 80,
+    "shards": [
+      {
+        "shard": 0,
+        "shardId": "logical-a",
+        "replicaId": "a-follower",
+        "snapshot": {
+          "mode": "single_node",
+          "leaseId": "lease-1",
+          "shards": [
+            { "shardId": "local", "manifestVersion": 3 }
+          ]
+        }
+      }
+    ]
+  },
+  "leaseId": "remote-lease-1",
+  "leaseState": "active"
+}
+```
+
+续租：
+
+```json
+{ "leaseId": "remote-lease-1" }
+```
+
+带 lease 查询时可以把完整 `snapshot` 原样放回请求体；remote gateway 也接受只带 lease id 的 compact token：
+
+```json
+{
+  "snapshot": {
+    "mode": "remote_gateway",
+    "leaseId": "remote-lease-1",
+    "shards": []
+  },
+  "limit": 50
+}
+```
+
+route table reload 会清空 gateway 内的 remote composite lease；旧 token 会返回 `route_table_expired` 或 `snapshot_expired`，调用方应重新创建 lease。
+
+### POST /v1/vector-index / POST /v1/vector-search  —— 命名空间向量索引（原始 API）
+
+这组 API 给 Agent Memory / 相似任务 / 相似路径召回提供底座。yiTrace 不负责生成 embedding，只接收上层写入的向量。当前第一片实现是 append-only `named_vectors.dat` + 内存 flat index，保证 namespace、tenant、attrs filter 和重启恢复语义正确；后续再把 task/trajectory namespace 接到 HNSW/GraphIndex 性能路径。
+
+写入向量：
+
+```json
+{
+  "namespace": "task",
+  "key": "npm-native-packaging",
+  "vector": [0.12, 0.34, 0.56],
+  "traceId": "run-uuid",
+  "spanId": "span-uuid",
+  "attrs": {
+    "project_id": "agentic-data",
+    "schema_fingerprint": "schema-v1",
+    "embedding_model": "text-embedding-3-large"
+  }
+}
+```
+
+查询相似向量：
+
+```json
+{
+  "namespace": "task",
+  "vector": [0.10, 0.30, 0.58],
+  "k": 10,
+  "filter": {
+    "attrs": {
+      "project_id": "agentic-data",
+      "schema_fingerprint": "schema-v1"
+    }
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "items": [
+    {
+      "namespace": "task",
+      "key": "npm-native-packaging",
+      "score": 0.997,
+      "distance": 0.003,
+      "traceId": "run-uuid",
+      "spanId": "span-uuid",
+      "attrs": {
+        "project_id": "agentic-data",
+        "schema_fingerprint": "schema-v1"
+      }
+    }
+  ],
+  "total": 1,
+  "vectorIndex": "vector_namespace_flat"
+}
+```
+
+`namespace` 支持 `span`、`task`、`trajectory`。`key` 是命名空间内的稳定业务键；重复写同一个 `(tenant, namespace, key)` 会更新内存索引，并追加一条可恢复记录。remote gateway 下 `POST /v1/vector-index` 按 key hash 路由到一个 writable shard，`POST /v1/vector-search` fanout 到 readable shards 后按 score 合并 top-k，响应 `vectorIndex:"fanout_vector_namespace_flat"`。
+
+### POST /v1/cluster/route-table/reload  —— Remote gateway route table reload（分布式运维 API）
+
+仅 process gateway / remote gateway 模式使用。请求体是 route table JSON，包含 `version` / `routeTableVersion` 和 `shards`。reload 会在同一 gateway 进程内替换 writer 视图、清空 tenant/session/trace 路由缓存，并拒绝低于当前版本的 route table。兼容别名：`POST /v1/route-table/reload`。
+
+v1 扁平格式：每个 `shards[]` item 就是一条 route，至少需要 `id`/`shardId` 和 `addr`，可选 `role`、`readable`、`writable`、`weight`。
+
+```json
+{
+  "version": 11,
+  "shards": [
+    { "id": "shard-a", "addr": "127.0.0.1:7901", "role": "leader", "readable": true, "writable": true, "weight": 1 },
+    { "id": "shard-b", "addr": "127.0.0.1:7902", "role": "leader", "readable": true, "writable": true, "weight": 1 }
+  ]
+}
+```
+
+v2 logical shard + replicas 格式：`shards[].shardId` 是稳定分片身份，`replicas[]` 表达同一分片下的 leader/follower/candidate。当前 gateway 写路径要求每个 logical shard **恰好一个** `writable:true` replica，手动 promote 时通过 reload 切换 writable replica；旧 leader fencing 仍由部署/控制面保证。
+
+```json
+{
+  "routeTableVersion": 51,
+  "shards": [
+    {
+      "shardId": "logical-a",
+      "replicas": [
+        { "replicaId": "a-primary", "addr": "127.0.0.1:7901", "role": "follower", "readable": true, "writable": false },
+        { "replicaId": "a-follower", "addr": "127.0.0.1:7902", "role": "leader", "readable": true, "writable": true, "priority": 20, "maxLagLsn": 0 }
+      ]
+    }
+  ]
+}
+```
+
+成功响应：
+
+```json
+{ "ok": true, "routeTableVersion": 11 }
+```
+
+`GET /v1/cluster/shards` 会返回当前 writable replica，并在 route table v2 下附带 `replicas` 诊断列表。这个接口是显式 reload 接缝，不等同于完整控制面：周期 watcher、心跳驱动 failover、old leader fencing 仍在分布式路线后续阶段；读 follower 已支持显式 health refresh 驱动的 bounded-stale 选择。
+
+### Cluster health / heartbeat  —— 显式副本健康采样
+
+route table v2 下 gateway 可以显式刷新每个 replica 的健康状态。yiTrace 第一版不在 embedded 进程里自动启动后台 heartbeat；运维进程、控制面或测试可以主动调用刷新接口，然后用 `GET /v1/cluster/health` 或 `GET /v1/cluster/shards` 查看最近一次采样结果。
+
+| 方法 | 端点 | 用途 |
+|---|---|---|
+| GET | `/v1/cluster/health` | 返回最近一次 replica health snapshot |
+| POST | `/v1/cluster/health/refresh` | 立即探测 route table 中的所有 replica |
+| GET/POST | `/v1/cluster/heartbeat` | health snapshot / refresh 的兼容别名 |
+
+刷新会优先请求每个 replica 的 `GET /v1/replication/status`，老节点返回 404 时回退到 `GET /v1/cluster/shards`。gateway 会按同一 logical shard 的 writable leader tail 计算 follower `replicationLagLsn`；如果 follower lag 超过 route table 中的 `maxLagLsn`，健康状态会从 `healthy` 降为 `stale`，并标记 `readable:false`。连接失败会标记为 `unreachable`。这只是诊断和后续读 follower/failover 的底座，不会自动切 leader。
+
+响应示例：
+
+```json
+{
+  "routeTableVersion": 60,
+  "replicaCount": 3,
+  "replicas": [
+    {
+      "shardId": "logical-a",
+      "replicaId": "a-leader",
+      "addr": "http://127.0.0.1:7901",
+      "health": "healthy",
+      "httpStatus": 200,
+      "latencyMs": 2,
+      "checkedAtNs": "1783350000000000000",
+      "committedTail": 5,
+      "leaderTail": 5,
+      "replicationLagLsn": 0,
+      "readable": true,
+      "reason": "ok"
+    },
+    {
+      "shardId": "logical-a",
+      "replicaId": "a-follower",
+      "addr": "http://127.0.0.1:7902",
+      "health": "stale",
+      "httpStatus": 200,
+      "latencyMs": 3,
+      "checkedAtNs": "1783350000000000000",
+      "committedTail": 3,
+      "leaderTail": 5,
+      "replicationLagLsn": 2,
+      "readable": false,
+      "reason": "lag_exceeds_budget"
+    }
+  ]
+}
+```
+
+### Shard replication  —— leader/follower WAL 复制底座（分布式运维 API）
+
+这些端点给同一 shard 内 leader/follower 复制使用，不是普通业务查询 API。第一版是显式拉取/应用：外部复制 worker 或测试进程从 leader 拉 WAL batch，再 POST 到 follower；yiTrace 目前不会在 embedded 进程里自动启动后台复制线程。
+
+| 方法 | 端点 | 用途 |
+|---|---|---|
+| GET | `/v1/replication/status` | 返回本实例复制水位 |
+| GET | `/v1/replication/wal?afterLsn=...` | 从 leader 导出 `afterLsn` 之后的已提交 WAL records |
+| POST | `/v1/replication/wal` | follower 幂等应用一批 WAL records |
+
+`after_lsn` / `afterLsn` / `from_lsn` / `fromLsn` 都可用。WAL batch 中的 `records` 使用 `/v1/ingest` 同款 wire event JSON，因此会保留原始 `tenant_id`、external ids、usage/cost、logs 和 attrs round-trip。
+
+状态响应：
+
+```json
+{
+  "committedTail": 2,
+  "manifestVersion": 1,
+  "memtableWatermark": 0,
+  "memtableRows": 2,
+  "segmentCount": 0
+}
+```
+
+拉取响应：
+
+```json
+{
+  "fromLsn": 0,
+  "toLsn": 1,
+  "recordCount": 1,
+  "records": [
+    {
+      "trace_id": 77001,
+      "span_id": 1,
+      "ts": 77001,
+      "seq": 1,
+      "event_type": 2,
+      "ext_span_id": "77001-1",
+      "tenant_id": 770,
+      "attrs": { "project_id": "process-distributed-eval" }
+    }
+  ],
+  "status": {
+    "committedTail": 1,
+    "manifestVersion": 0,
+    "memtableWatermark": 0,
+    "memtableRows": 1,
+    "segmentCount": 0
+  }
+}
+```
+
+应用响应：
+
+```json
+{
+  "applied": true,
+  "fromLsn": 0,
+  "toLsn": 1,
+  "recordCount": 1,
+  "status": {
+    "committedTail": 1,
+    "manifestVersion": 0,
+    "memtableWatermark": 0,
+    "memtableRows": 1,
+    "segmentCount": 0
+  }
+}
+```
+
+语义：
+
+- 完整重复 batch 是幂等 no-op。
+- 部分重叠 batch 会跳过已应用前缀，只追加缺失后缀。
+- follower tail 小于 `fromLsn` 时返回 `409 {"code":"replication_apply_failed"}`，说明缺了一段 WAL，需要 snapshot/bootstrap。
+- 这只覆盖 WAL tail 复制。sealed segment、manifest、attrs sidecar、vecindex、metadata、GC log 的远程同步仍在后续分布式路线里。
 
 ### POST /v1/trace-search  —— 跨 session 结构化 span 搜索（控制台/产品 API，camelCase 响应）
 
@@ -425,9 +777,11 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
 
 `index` 用于观测本次查询的候选收窄路径：`attrs_postings+folded_verify` 表示先用 attrs postings / segment sidecar 收窄，再用 folded span 校验；`metadata_filter+folded_scan` 表示使用 annotation/dataset 元数据过滤；`folded_scan` 表示当前仍是折叠快照扫描。
 
+cluster mode 下，`/v1/trace-search` 还会返回 `queryMode:"fanout_merge"`、`shardCount`、`okShards`、`degraded`、`failedShards` 和 `snapshot`。`degraded:false` 表示本次 fanout 覆盖了全部 shard；远程 gateway 遇到部分 shard 失败时会用同一字段表达不完整结果。remote gateway 的 snapshot 形如 `{"mode":"remote_gateway","routeTableVersion":33,"shards":[{"shard":0,"shardId":"route-a","snapshot":{...}}]}`；下一页或后续同条件查询可把这个 snapshot 原样放回请求体，gateway 会拆成 shard-local snapshot 转发。route table version 或 shard id 不匹配时返回 `409` + `code:"route_table_expired"`。
+
 ### POST /v1/trace-aggregate  —— 跨 session group-by 聚合（控制台/产品 API，camelCase 响应）
 
-用于 trace inbox 统计和 path mining：先复用 `/v1/trace-search` 的过滤语义筛出 folded spans，再按字段分组，返回 span 数、trace 去重数、错误率、duration、usage、cost 和少量示例。
+用于 trace inbox 统计和 path mining：复用 `/v1/trace-search` 的过滤语义，再按字段分组，返回 span 数、trace 去重数、错误率、duration、usage、cost 和少量示例。常见高频维度会优先走 segment 级 traceAggregate rollup + WAL tail overlay；安全条件不满足时自动回退 folded scan。
 
 **请求体**：
 
@@ -519,9 +873,38 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
   "total": 1,
   "spanTotal": 12,
   "index": "attrs_postings+folded_verify",
-  "aggregationIndex": "folded_snapshot"
+  "aggregationIndex": "segment_rollup_tail_overlay",
+  "aggregationPlanner": "segment_rollup_tail_overlay",
+  "rollupEligible": true,
+  "rollupBlockedBy": [],
+  "readPlan": {
+    "spanReadIndex": "segment_rollup",
+    "usedSegmentRollup": true,
+    "segmentRollupSegments": 3,
+    "segmentRollupRows": 12000,
+    "tailFoldedSpanCount": 0,
+    "usedAttrPostings": false,
+    "candidateSpanKeys": null,
+    "scannedSegments": 0,
+    "foldedSpanCount": 12,
+    "unsupportedAttrKeys": [],
+    "verification": "rollup_scope_safety",
+    "rollupFallbackReason": null
+  },
+  "readModelCache": "miss"
 }
 ```
+
+高频重复调用会复用进程内 read-model cache，响应返回 `readModelCache:"miss"` 或 `readModelCache:"hit"`。`readPlan` 用来判断本次冷查询是否真正走了索引：
+
+- `spanReadIndex:"segment_rollup"` + `usedSegmentRollup:true` 表示读取 segment 级 traceAggregate rollup，没有扫描 folded segment。
+- `spanReadIndex:"tail_folded_scan"` 表示当前只有 WAL/MemTable tail，没有 sealed segment rollup 可用。
+- `spanReadIndex:"attrs_postings"` 表示回退 folded scan 时，先用高频 attrs sidecar 缩小候选 span，再 folded verify。
+- `spanReadIndex:"folded_scan"` 表示没有可用 postings 或 rollup，只能扫描折叠。
+
+`segmentRollupSegments` / `segmentRollupRows` 表示本次读取了多少个 rollup sidecar 和 rollup 行；`tailFoldedSpanCount` 表示 overlay 的 WAL/MemTable tail span 数；`candidateSpanKeys` 是 attrs postings 给出的候选 span key 数；`scannedSegments` 是 folded scan 触及的 segment 数。`aggregationPlanner:"rollup_safety_fallback_folded_scan"` 且 `readPlan.rollupFallbackReason` 非空时，说明 group-by 本来可用 rollup，但因为安全条件回退，例如同一 span 横跨多个 segment、segment 有 deletion vector / upgrade patch、使用了时间窗口等。`rollupBlockedBy` 会列出 metadata 反向过滤、全文 contains、identity filter、cost/token range 或 unsupported groupBy 等规划级阻塞原因。
+
+cluster / process gateway 模式下，`/v1/trace-aggregate` 还会返回 `queryMode`、`shardCount`、`okShards`、`degraded`、`failedShards` 和可选 `snapshot`；in-process cluster 在所有 shard 都满足安全条件时返回 `aggregationIndex:"fanout_segment_rollup_tail_overlay"`，否则整次查询退回 fanout folded reduce。process gateway 的 remote reduce 仍通过 shard API fanout 返回。聚合结果只覆盖成功 shard；当 `degraded:true` 时，`spanTotal` 和每个 bucket 的计数都不是全局完整值。remote gateway 的 snapshot 契约与 `/v1/trace-search` 相同，可用于让聚合页和列表页读取同一组 shard-local manifest。
 
 ### POST /v1/trajectory-groups  —— Trajectory group / best-path candidates（控制台/产品 API，camelCase 响应）
 
@@ -589,6 +972,8 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
 }
 ```
 
+高频重复调用会复用进程内 read-model cache，响应会额外返回 `readModelCache:"miss"` 或 `readModelCache:"hit"`。在 process gateway 模式下，该接口会跨 shard fanout + reduce，`trajectoryIndex` 会变为 `remote_fanout_materialized_reduce` 并带 `okShards` / `degraded` / `failedShards` 诊断。
+
 ### POST /v1/trace-trajectories  —— Materialized trace trajectory read model（控制台/产品 API，camelCase 响应）
 
 按 `/v1/trace-search` 的过滤语义筛出 trace，再返回每条 trace 的轻量 trajectory 摘要。它面向 Trace Inbox、Golden Path review 和 Agent Memory 导出前的列表页：不读取 input/output/log 大字段，只返回路径、耗时、usage/cost 和 scope 字段。兼容别名：`POST /v1/trajectories`。
@@ -644,6 +1029,8 @@ annotation / dataset association 的反向过滤规则：trace 级记录命中�
   "index": "materialized"
 }
 ```
+
+高频重复调用会复用进程内 read-model cache，响应会额外返回 `readModelCache:"miss"` 或 `readModelCache:"hit"`。在 process gateway 模式下，该接口会跨 shard merge/page，`index` 会变为 `remote_fanout_materialized` 并带 shard 诊断字段。
 
 ### POST /v1/storage-stats  —— Storage governance stats（控制台/产品 API，camelCase 响应）
 

@@ -445,7 +445,7 @@ try {
     filter: { taskFingerprint: "npm-native-packaging", projectId: "agentic-data" },
     limit: 10,
   });
-  assert.equal(traceTrajectories.index, "materialized");
+  assert.equal(traceTrajectories.index, "materialized_trace_trajectory_cache");
   assert.equal(traceTrajectories.total, 2);
   assert.ok(traceTrajectories.items[0].trajectory.signature.startsWith("fnv1a64:"));
   assert.ok(traceTrajectories.items.some((item) => item.trajectory.steps.includes("tool:builder-tool|phase:verify|validator:npm_test")));

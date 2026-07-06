@@ -5,6 +5,8 @@ export declare class NativeYiTraceDB {
   ingestJson(eventsJson: string, tenantId?: string | undefined | null): string
   ingestOtlpJson(otlpJson: string, tenantId?: string | undefined | null): string
   searchJson(queryJson: string, tenantId?: string | undefined | null): string
+  vectorIndexJson(vectorJson: string, tenantId?: string | undefined | null): string
+  vectorSearchJson(queryJson: string, tenantId?: string | undefined | null): string
   traceSearchJson(queryJson: string, tenantId?: string | undefined | null): string
   traceAggregateJson(queryJson: string, tenantId?: string | undefined | null): string
   trajectoryGroupsJson(queryJson: string, tenantId?: string | undefined | null): string

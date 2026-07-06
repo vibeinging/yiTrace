@@ -11,8 +11,8 @@ P0 接入底座已基本完成：嵌入式 Node DB、外部字符串 id、attrs 
 
 - 第一批和第二批关键字段已从 attrs 提升为稳定 schema，下一步是更强聚合索引和 rollup。
 - 大规模查询/聚合从扫描走向列式下推或物化统计。
-- review/eval/path mining 的派生资产具备生命周期治理。
-- Agent loop、trace diff、trajectory group、Golden Path store、path adherence、evidence/export/health 都已有基础读写模型；下一步重点是高性能物化、Best/Challenger 治理、重复 trace 压缩和发版/DX。
+- review/eval/path mining 的派生资产具备清晰存储、索引、导出和 retention 边界。
+- Agent loop、trace diff、trajectory group、Golden Path store、path adherence、evidence/export/health 都已有基础读写模型；下一步重点是高性能物化、重复 trace 压缩的独立方案和发版/DX。Best/Challenger 治理属于上层产品，不进入 yiTrace 底座待开发队列。
 
 ## 2026-07-04 复核后的开发优先级
 
@@ -25,16 +25,18 @@ P0 接入底座已基本完成：嵌入式 Node DB、外部字符串 id、attrs 
 
 ### P1：高频查询高性能化（部分落地）
 
-- `traceAggregate()` 从 folded snapshot 扫描升级为列式聚合下推、物化 rollup 或 group-by 索引。
-- `loops()` / `taskTraces()` 补物化 loop/task index，避免高频页面反复扫 folded spans。
-- `trajectoryGroups()` / `goldenPathHealth()` 补 trajectory-level 物化索引，支撑 Golden Path mining 高频使用。
+- 2026-07-06 已补第一版高频 read-model cache：`traceAggregate()`、`trajectoryGroups()`、`traceTrajectories()`、`loops()`、`taskTraces()` 会返回 `readModelCache:"miss|hit"`，重复查询可复用同一 tenant + request body 的结果；ingest、annotation、dataset association、Golden Path、retention 等写路径会显式失效。
+- `traceAggregate()` 已有 segment 级 rollup sidecar 第一片，安全查询返回 `segment_rollup_tail_overlay`；后续仍需 group counter rollup 和 100k+ 性能 bench。
+- `loops()` / `taskTraces()` 已复用 segment rollup sidecar 第一片，安全查询返回 `loop_task_sidecar+tail_overlay`；后续仍可补专门的 loop/task 倒排或 counter index。
+- `trajectoryGroups()` / `traceTrajectories()` 已有物化缓存层；`goldenPathHealth()` 若变成高频入口，仍需 trajectory-level 物化索引。
 - metadata index：annotation/dataset/golden path/retention policy 按 tenant + status + project/task + createdAt 建索引，替代全量 metadata scan。
 - 2026-07-04 已补查询可观测契约：`traceSearch` / `traceAggregate` / `trajectoryGroups` 顶层返回 `index` / `aggregationIndex` / `trajectoryIndex`，明确 attrs postings、metadata filter、folded scan 和 trajectory materialized cache 的使用情况。真正的列式聚合下推/rollup 仍是后续性能专项。
 
-### P1：Golden Path 治理增强（基础版已落地）
+### 非底座：Golden Path 治理增强（暂不排入底座开发）
 
-- Best/Challenger 底座已落地：Golden Path metadata 记录 `challengerOf`、`evalProfile`、`minSampleCount`、`marginScore`、`comparisonWindowNs`、`promotedFrom`、`deprecationReason`、`staleReasons`；DB 不自动判优，但给产品层稳定证据。
-- Golden Path stale/deprecation signals 基础版已落地：`goldenPathHealth()` 输出 `governance.stale` / `staleReasons`，覆盖样本不足、health 低于阈值、source signature 变化、deprecated 等信号。
+- Golden Path metadata 目前保留 `challengerOf`、`evalProfile`、`minSampleCount`、`marginScore`、`comparisonWindowNs`、`promotedFrom`、`deprecationReason`、`staleReasons` 等字段，是为了记录和导出上层产品传入的证据/状态，不代表 DB 内置 BestPath election。
+- `goldenPathHealth()` 输出 `governance.stale` / `staleReasons`，只作为证据 read model；是否 promote、deprecate、替换推荐路径，由 Agent Memory / 控制台 / 业务产品层决定。
+- yiTrace 底座继续承担 candidate store、path adherence、evidence/export/health、retention 保护和索引优化，不实现自动 Best/Challenger 治理策略。
 - 重复 trace / canonical source 压缩方案单独设计：先做 `storageStats()` 证据和 retention policy，再决定是否做引用计数。
 
 ### P1：成本能力补齐（基础版已落地）
@@ -104,7 +106,7 @@ P0 接入底座已基本完成：嵌入式 Node DB、外部字符串 id、attrs 
 - `db.loop(loopId)` / `GET /v1/loops/:loopId`
 - `db.taskTraces(taskFingerprint)` / `GET /v1/tasks/:fingerprint/traces`
 
-已基于 P0.5 字段完成基础版：支持 attrs 精确过滤、metadata 反向过滤、分页、usage/cost/error/duration 聚合和 trace/span 明细。当前仍是 folded snapshot 扫描聚合，后续如果 loop 页变成高频入口，再补物化 loop/task 索引。
+已基于 P0.5 字段完成基础版：支持 attrs 精确过滤、metadata 反向过滤、分页、usage/cost/error/duration 聚合和 trace/span 明细。2026-07-06 已补第一片 loop/task sidecar：安全查询复用 segment rollup row，返回 `loop_task_sidecar+tail_overlay`；后续如果 loop 页变成极高频入口，再补专门的 loop/task postings 或 counter index。
 
 ## P2：Trace Diff / Trajectory Comparison
 

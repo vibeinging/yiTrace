@@ -4,7 +4,7 @@
 //! 进程被 kill -9 后重启数据仍在。用于真·崩溃测试集成脚本。
 //!
 //! 也可作为最小持久化部署样板：
-//!   cargo run -p yt-engine --example server_durable -- /data/yitrace
+//!   YT_BIND=127.0.0.1:7879 cargo run -p yt-engine --example server_durable -- /data/yitrace
 //!   # 然后 curl 灌/查；kill -9 后重启同样命令，数据还在。
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -24,8 +24,8 @@ fn main() {
         server = server.with_auth_token(tok);
     }
     let server = Arc::new(server);
-    let addr = "127.0.0.1:7879";
-    let listener = TcpListener::bind(addr).expect("bind");
+    let addr = std::env::var("YT_BIND").unwrap_or_else(|_| "127.0.0.1:7879".to_string());
+    let listener = TcpListener::bind(&addr).expect("bind");
     println!("持久化服务 → http://{addr}/  (POST /v1/ingest, GET /v1/traces)");
     server.serve_pool(listener, 4);
 }

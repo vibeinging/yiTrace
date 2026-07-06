@@ -439,6 +439,18 @@ class YiTraceDB {
     return parseJson(response);
   }
 
+  async indexVector(vector, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.vectorIndexJson(JSON.stringify(normalizeSearchQuery(vector)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async searchVector(query, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.vectorSearchJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
   async traceSearch(query = {}, options = {}) {
     this.#ensureOpen();
     const response = this.#native.traceSearchJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);

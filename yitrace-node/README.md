@@ -133,6 +133,11 @@ const hits = await db.search({
     },
   },
 });
+const inputOnlyHits = await db.search({
+  text: "疑似盗刷订单",
+  textDomains: ["input_text"],
+  filter: { attrs: { project_id: "agentic-data" } },
+});
 const trace = await db.trace("run-uuid");
 const span = await db.span("run-uuid", "span-uuid");
 const logMessages = span?.logEvents?.flatMap((event) => event.messages) ?? [];
@@ -325,7 +330,9 @@ console.log(page.index);
 
 Use `traceAggregate()` when a product page needs grouped stats before drilling
 into individual spans. It uses the same filter shape as `traceSearch()` and
-groups the filtered folded spans:
+groups the filtered spans. Sealed segments can use the engine's
+traceAggregate rollup sidecar; WAL/MemTable tail is overlaid in-process and
+unsafe cases fall back to folded scan:
 
 ```ts
 const stats = await db.traceAggregate({
@@ -339,6 +346,7 @@ const stats = await db.traceAggregate({
 
 console.log(stats.items[0]?.key, stats.items[0]?.errorRate);
 console.log(stats.index, stats.aggregationIndex);
+console.log(stats.readPlan?.usedSegmentRollup, stats.readPlan?.rollupFallbackReason);
 ```
 
 Use `trajectoryGroups()` when a product page needs to find repeated successful
@@ -375,6 +383,42 @@ const trajectories = await db.traceTrajectories({
 
 console.log(trajectories.items[0]?.trace.fields);
 console.log(trajectories.items[0]?.trajectory.signature);
+```
+
+Use `indexVector()` / `searchVector()` when an Agent Memory or eval pipeline
+already has embeddings for a task, span, or trajectory. yiTrace stores the
+vector in a namespace and applies tenant/attrs filters during search; it does
+not call an embedding model itself. The current embedded implementation is a
+durable flat namespace index (`named_vectors.dat`) that prioritizes recovery
+and API semantics; the high-performance HNSW namespace path is a follow-up
+engine optimization.
+
+```ts
+await db.indexVector({
+  namespace: "task",
+  key: "npm-native-packaging",
+  vector: [0.12, 0.34, 0.56],
+  traceId: "builder-run",
+  attrs: {
+    project_id: "agentic-data",
+    schema_fingerprint: "schema-v1",
+    embedding_model: "text-embedding-3-large",
+  },
+});
+
+const similarTasks = await db.searchVector({
+  namespace: "task",
+  vector: [0.10, 0.30, 0.58],
+  k: 10,
+  filter: {
+    attrs: {
+      project_id: "agentic-data",
+      schema_fingerprint: "schema-v1",
+    },
+  },
+});
+
+console.log(similarTasks.vectorIndex, similarTasks.items[0]?.key);
 ```
 
 Use `storageStats()` to inspect what a filtered slice of trace data costs before

@@ -87,6 +87,11 @@ export interface SearchFilter {
 
 export interface SearchQuery {
   text?: string;
+  textDomains?: Array<"input_text" | "output_text" | "logs" | "tool_name" | "model" | "agent_name" | string>;
+  text_domains?: Array<"input_text" | "output_text" | "logs" | "tool_name" | "model" | "agent_name" | string>;
+  inputTextContains?: string;
+  outputContains?: string;
+  logContains?: string;
   vector?: number[];
   k?: number;
   filter?: SearchFilter;
@@ -101,8 +106,65 @@ export interface SearchHit {
   fields?: Record<string, unknown>;
   attrs?: Record<string, unknown>;
   score?: number;
+  searchIndex?: string;
+  textDomains?: string[];
   text?: string;
   [key: string]: unknown;
+}
+
+export type VectorNamespace = "span" | "task" | "trajectory";
+
+export interface VectorIndexInput extends MetadataAttrs {
+  namespace: VectorNamespace | string;
+  key?: string;
+  id?: string;
+  taskFingerprint?: string;
+  task_fingerprint?: string;
+  trajectorySignature?: string;
+  trajectory_signature?: string;
+  traceId?: TenantId;
+  trace_id?: TenantId;
+  spanId?: TenantId;
+  span_id?: TenantId;
+  vector?: number[];
+  embedding?: number[];
+  attrs?: Record<string, unknown>;
+}
+
+export interface VectorSearchQuery extends MetadataAttrs {
+  namespace?: VectorNamespace | string;
+  vector?: number[];
+  embedding?: number[];
+  queryVector?: number[];
+  query_vector?: number[];
+  k?: number;
+  limit?: number;
+  filter?: MetadataAttrs & {
+    namespace?: VectorNamespace | string;
+    key?: string;
+    id?: string;
+    traceId?: TenantId;
+    trace_id?: TenantId;
+    spanId?: TenantId;
+    span_id?: TenantId;
+  };
+}
+
+export interface VectorSearchHit {
+  namespace: VectorNamespace | string;
+  key: string;
+  tenantId: string | null;
+  traceId: string | null;
+  spanId: string | null;
+  distance: number;
+  score: number;
+  attrs: Record<string, unknown>;
+}
+
+export interface VectorSearchPage<T = VectorSearchHit> {
+  items: T[];
+  total: number;
+  vectorIndex: string;
 }
 
 export interface MetadataAttrs {
@@ -1917,6 +1979,8 @@ export declare class YiTraceDB {
   ingest(events: SpanEvent[], options?: TenantOptions): Promise<IngestResult>;
   ingestOtlp(body: unknown, options?: TenantOptions): Promise<IngestResult>;
   search<T = SearchHit>(query?: SearchQuery, options?: TenantOptions): Promise<T[]>;
+  indexVector<T = { ok: true; vectorIndex: string }>(vector: VectorIndexInput, options?: TenantOptions): Promise<T>;
+  searchVector<T = VectorSearchPage>(query: VectorSearchQuery, options?: TenantOptions): Promise<T>;
   traceSearch<T = TraceSearchPage>(query?: TraceSearchQuery, options?: TenantOptions): Promise<T>;
   traceAggregate<T = TraceAggregatePage>(query?: TraceAggregateQuery, options?: TenantOptions): Promise<T>;
   trajectoryGroups<T = TrajectoryGroupPage>(query?: TrajectoryGroupsQuery, options?: TenantOptions): Promise<T>;

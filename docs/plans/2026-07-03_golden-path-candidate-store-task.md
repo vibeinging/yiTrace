@@ -120,6 +120,6 @@ Node/Electron：
 
 ## 后续
 
-- 产品层 BestPath election / adjudicator：在同一 scope 下维护推荐路径和 challengers。
+- 产品层 BestPath election / adjudicator：在同一 scope 下维护推荐路径和 challengers。2026-07-06 口径确认：这不属于 yiTrace 底座待开发能力，yiTrace 只提供证据 API 和可持久化候选资产。
 - Hit/reference count 与重复 trace 压缩策略。
-- Retention policy：把 raw trace 保留策略和 Golden Path 治理状态打通。
+- Retention policy：把 raw trace 保留策略和 Golden Path 引用/active 状态打通。

@@ -87,6 +87,24 @@ impl NativeYiTraceDb {
         self.route("POST", "/v1/search", &query_json, tenant_id)
     }
 
+    #[napi(js_name = "vectorIndexJson")]
+    pub fn vector_index_json(
+        &self,
+        vector_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/vector-index", &vector_json, tenant_id)
+    }
+
+    #[napi(js_name = "vectorSearchJson")]
+    pub fn vector_search_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/vector-search", &query_json, tenant_id)
+    }
+
     #[napi(js_name = "traceSearchJson")]
     pub fn trace_search_json(
         &self,
