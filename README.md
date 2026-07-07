@@ -1,12 +1,12 @@
 # yiTrace
 
-**A local-first TraceDB for AI agents.**
+**The embedded TraceDB for AI agents.**
 
-yiTrace turns raw agent events into searchable evidence. Replay multi-turn runs,
-inspect tool calls, search Chinese and English trace text, track token/cost/eval
-signals, and export path evidence for Agent Memory. Use it in-process with
-`@yitrace/db`, `yitrace-db`, or Rust `yitrace-db`, as a private server, or
-behind a shard gateway.
+yiTrace is the trace database that lives inside your agent process — like SQLite
+for application data, but for agent traces. Drop it into a coding agent, a
+self-improving loop, or any LLM workflow, and every prompt, tool call, retry,
+and multi-agent handoff becomes searchable, replayable evidence you can come
+back to tomorrow.
 
 [中文](README.zh-CN.md) · English
 
@@ -18,26 +18,36 @@ behind a shard gateway.
 
 ![yiTrace console](docs/images/console-overview.png)
 
-yiTrace is built for agent teams that need trace data to be private, queryable,
-and useful after the run is over:
+### Why an embedded TraceDB
 
-- keep agent traces local instead of sending prompts and tool output to a hosted service
-- replay conversations, tool calls, retries, errors, and multi-agent handoffs
-- search traces with BM25, attrs filters, vector recall, and trajectory similarity
-- track token usage, cost, eval results, annotations, and dataset links
-- mine repeated task paths and export Golden Path evidence for Agent Memory
+Most LLM observability tools send your prompts and tool output to a hosted
+service. That works for cloud-first teams, but not for agents that run on a
+developer's laptop, inside an Electron app, or behind a company firewall — the
+exact places where trace data is most sensitive and most useful.
 
-> Status: alpha, runnable today. The storage engine, WAL recovery, SDK ingest,
-> OTLP ingest, Node/Electron package, read-model indexes, retention, and
-> distributed gateway primitives are covered by offline tests. This is not yet a
-> managed production cluster: automatic failover, fencing, background replication
-> scheduling, TLS/RBAC, and enterprise hardening are still roadmap items.
+yiTrace flips the default: **traces stay local by default**, queryable across
+sessions, durable across crashes, and never leave your process unless you choose
+to. The same Rust engine runs embedded in Node, Python, and Rust, or as a
+private local server with a bundled console.
+
+- **Local by default** — prompts, tool I/O, and logs stay in your data directory, not a SaaS
+- **Searchable tomorrow** — Chinese & English BM25, attr filters, vector recall, hybrid RRF
+- **Replayable** — fold raw events into spans, replay multi-turn runs and multi-agent handoffs
+- **Crash-safe** — WAL + manifest + GC log; deterministic `event_id` survives kill -9 and replay
+- **Cost & eval aware** — per-agent token/cost attribution, eval scores, annotations, dataset links
+
+> Status: alpha, runnable today. The embedded engine, WAL recovery, SDK/OTLP
+> ingest, Node/Electron package, read-model indexes, and retention are covered
+> by offline tests. TLS/RBAC, persistent audit, team aggregation, and managed
+> clustering are explicitly **not** in scope yet — see
+> [Project Status](#project-status) and the
+> [hardening plan](docs/plans/2026-07-07_next-phase-hardening-plan.md).
 
 ---
 
 ## Start Here
 
-Embed yiTrace in Node.js or Electron:
+Embed yiTrace in Node.js or Electron (most common for coding agents):
 
 ```bash
 npm install @yitrace/db
@@ -92,18 +102,17 @@ output, logs, token usage, cost, and eval evidence.
 
 | Mode | Use it when | What exists today |
 |---|---|---|
-| SDK + local server | You want private trace capture and console replay | `cargo run -p yt-engine --example server`, HTTP JSON API, embedded console |
-| Durable single server | You want one private data directory with restart recovery | `server_durable`, WAL, manifest, immutable segments, disk vector index |
-| Node / Electron embedded DB | You want `import { YiTraceDB } from "@yitrace/db"` and no extra process | Node-API package, ESM/CJS, optional native packages, same Rust engine in-process |
-| Python embedded DB | You want `from yitrace_db import YiTraceDB` inside a Python agent | PyO3/maturin package, same `EngineJsonApi` in-process boundary |
-| Rust embedded DB | You want `use yitrace_db::YiTraceDb` in a Rust agent/backend | Thin Rust crate over `EngineJsonApi`, no N-API/PyO3 layer |
-| Sharded gateway | You have multiple shard servers or want the distributed path | route table, write routing, read fanout, partial/strict consistency, follower read targets |
-| Replicated shard | You want leader/follower primitives | replication status, WAL export/apply, one-shot follower pull, lag/health diagnostics |
+| **Node / Electron embedded DB** | You want `import { YiTraceDB } from "@yitrace/db"` inside a coding agent or Electron app, no extra process | Node-API package, ESM/CJS, optional native packages, same Rust engine in-process |
+| **Python embedded DB** | You want `from yitrace_db import YiTraceDB` inside a Python agent | PyO3/maturin package, same `EngineJsonApi` in-process boundary |
+| **Rust embedded DB** | You want `use yitrace_db::YiTraceDb` in a Rust agent/backend | Thin Rust crate over `EngineJsonApi`, no N-API/PyO3 layer |
+| **Local server + console** | You want private trace capture with a browser UI for replay | `cargo run -p yt-engine --example server`, HTTP JSON API, embedded console |
+| **Durable single server** | You want one private data directory with restart recovery | `server_durable`, WAL, manifest, immutable segments, disk vector index |
+| Distributed path *(upgrade route)* | You outgrow a single shard and need horizontal scale | route table, write routing, read fanout, partial/strict consistency, follower read targets, WAL replication primitives — **a verified data path, not a managed cluster** |
 
-The important distinction: yiTrace is no longer just a one-process tool. The storage
-core is still single-writer per shard because that is the correct failure model.
-Cluster-level scale comes from routing, fanout, snapshots, and replication around
-those shards.
+The default shape is **one process, one data directory, one writer** — the same
+model SQLite made ubiquitous. Cluster-level scale (sharding, replication,
+follower reads) is an upgrade route for when a single shard is no longer enough,
+not the starting point.
 
 ---
 
@@ -584,6 +593,10 @@ What exists now:
 - remote snapshot tokens and explicit snapshot leases with TTL
 - network WAL tail export/apply and one-shot follower pull
 - health, heartbeat, retry, timeout, and circuit breaker primitives
+- a reusable `RemoteGatewayServer` and runnable gateway entry:
+  `cargo run -p yt-engine --example gateway_server -- /etc/yitrace/route-table.json`
+- a real multi-process chaos eval for kill/promote/reload, follower catch-up,
+  stale snapshot rejection, and "old leader must not receive new writes"
 
 Example route table:
 
@@ -602,12 +615,27 @@ Example route table:
 }
 ```
 
+Run a gateway from a route table:
+
+```bash
+cd yitrace-engine
+YT_BIND=127.0.0.1:7880 YT_GATEWAY_WORKERS=8 \
+  cargo run -p yt-engine --example gateway_server -- /etc/yitrace/route-table.json
+```
+
+For a quick local smoke test without replicas, use:
+
+```bash
+YT_SHARDS=127.0.0.1:7901,127.0.0.1:7902 \
+  cargo run -p yt-engine --example gateway_server
+```
+
 Important boundary: this is a verified distributed data path, not a full
-production control plane. Still missing: background route-table watcher,
-automatic failover, fencing, scheduled replication worker, snapshot bootstrap,
-and remote syncing for sealed segments, sidecars, metadata, and GC logs. The
-tests already start real shard and gateway processes, but deployment automation
-is still yours.
+production control plane. The gateway now has a real std-only server entry and
+a fixed worker pool, so it is no longer just eval/test code. Still missing:
+background route-table watcher, automatic failover, fencing, scheduled
+replication worker, snapshot bootstrap, and remote syncing for sealed segments,
+sidecars, metadata, and GC logs. Deployment automation is still yours.
 
 ---
 
@@ -694,6 +722,25 @@ Run the engine suite:
 cd yitrace-engine
 cargo test --offline
 ```
+
+Run the risk eval suite:
+
+```bash
+./scripts/eval_all.sh
+```
+
+Use `./scripts/eval_all.sh --packages --pack --crash` before a release to add
+SDK/UI/package checks, `@yitrace/db` clean-consumer pack verification, and
+kill-9 recovery.
+
+Run the scale smoke bench:
+
+```bash
+./scripts/bench_scale.sh --smoke
+```
+
+It writes a Markdown report under `docs/reports/scale/`. Use `--medium` or
+explicit `--spans / --queries` when you want a real baseline.
 
 Optional crates:
 

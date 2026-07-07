@@ -229,6 +229,67 @@ fn trace_aggregate_buckets_from_rollup_rows(
     by_key.into_values().collect()
 }
 
+fn trace_aggregate_buckets_from_preaggregate_buckets(
+    buckets: &[crate::TraceAggregatePreaggregateBucket],
+    fields: &[TraceAggregateGroupField],
+) -> Vec<TraceAggregateBucket> {
+    let mut by_key: std::collections::BTreeMap<Vec<String>, TraceAggregateBucket> =
+        std::collections::BTreeMap::new();
+    for source in buckets {
+        let values: Vec<String> = fields
+            .iter()
+            .map(|field| {
+                trace_aggregate_preaggregate_field_name(&field.kind)
+                    .and_then(|name| source.key.get(&name).cloned())
+                    .unwrap_or_else(|| "null".to_string())
+            })
+            .collect();
+        let bucket = by_key
+            .entry(values.clone())
+            .or_insert_with(|| TraceAggregateBucket {
+                values,
+                span_count: 0,
+                trace_ids: std::collections::HashSet::new(),
+                error_count: 0,
+                duration_sum_ns: 0,
+                duration_max_ns: 0,
+                durations_ns: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 0,
+                cost_usd_nanos: 0,
+                examples: Vec::new(),
+            });
+        bucket.trace_ids.extend(source.trace_ids.iter().copied());
+        bucket.span_count += source.span_count;
+        bucket.error_count += source.error_count;
+        bucket.duration_sum_ns += source.duration_sum_ns;
+        bucket.duration_max_ns = bucket.duration_max_ns.max(source.duration_max_ns);
+        bucket.durations_ns.extend(source.durations_ns.iter().copied());
+        bucket.input_tokens += source.input_tokens;
+        bucket.output_tokens += source.output_tokens;
+        bucket.cached_input_tokens += source.cached_input_tokens;
+        bucket.reasoning_tokens += source.reasoning_tokens;
+        bucket.total_tokens += source.total_tokens;
+        bucket.cost_usd_nanos += source.cost_usd_nanos;
+        for example in &source.examples {
+            if bucket.examples.len() >= 3 {
+                break;
+            }
+            bucket.examples.push(TraceAggregateExample {
+                trace_id: example.trace_id,
+                span_id: example.span_id,
+                external_trace_id: example.external_trace_id.clone(),
+                external_span_id: example.external_span_id.clone(),
+                name: example.name.clone(),
+            });
+        }
+    }
+    by_key.into_values().collect()
+}
+
 fn trace_aggregate_value_json(s: &FoldedSpan, kind: &TraceAggregateGroupKind) -> String {
     match kind {
         TraceAggregateGroupKind::Attr(key) => crate::folded_span_attr_value(s, key)
@@ -336,10 +397,13 @@ fn trace_aggregate_planner_fields_json(
     folded_span_count: usize,
     rollup_stats: Option<&crate::TraceAggregateRollupStats>,
     rollup_fallback_reason: Option<&str>,
+    preaggregate_profile: Option<&[String]>,
 ) -> String {
     let blockers = trace_aggregate_rollup_blockers(fields, request);
     let eligible = blockers.is_empty();
-    let planner = if let Some(stats) = rollup_stats {
+    let planner = if preaggregate_profile.is_some() {
+        "aggregate_preaggregate_tail_overlay"
+    } else if let Some(stats) = rollup_stats {
         if stats.used_segment_rollup {
             "segment_rollup_tail_overlay"
         } else {
@@ -367,6 +431,7 @@ fn trace_aggregate_planner_fields_json(
             folded_span_count,
             rollup_stats,
             rollup_fallback_reason,
+            preaggregate_profile,
         )
     )
 }
@@ -376,20 +441,34 @@ fn trace_aggregate_read_plan_json(
     folded_span_count: usize,
     rollup_stats: Option<&crate::TraceAggregateRollupStats>,
     rollup_fallback_reason: Option<&str>,
+    preaggregate_profile: Option<&[String]>,
 ) -> String {
     if let Some(rollup) = rollup_stats {
+        let span_read_index = if preaggregate_profile.is_some() {
+            "aggregate_preaggregate"
+        } else if rollup.used_segment_rollup {
+            "segment_rollup"
+        } else {
+            "tail_folded_scan"
+        };
+        let preaggregate_profile = preaggregate_profile
+            .map(json_string_array)
+            .unwrap_or_else(|| "null".to_string());
+        let verification = if span_read_index == "aggregate_preaggregate" {
+            "preaggregate_scope_safety"
+        } else {
+            "rollup_scope_safety"
+        };
         return format!(
-            r#"{{"spanReadIndex":"{}","usedSegmentRollup":{},"segmentRollupSegments":{},"segmentRollupRows":{},"tailFoldedSpanCount":{},"usedAttrPostings":false,"candidateSpanKeys":null,"scannedSegments":0,"foldedSpanCount":{},"unsupportedAttrKeys":[],"verification":"rollup_scope_safety","rollupFallbackReason":null}}"#,
-            if rollup.used_segment_rollup {
-                "segment_rollup"
-            } else {
-                "tail_folded_scan"
-            },
+            r#"{{"spanReadIndex":"{}","usedSegmentRollup":{},"segmentRollupSegments":{},"segmentRollupRows":{},"tailFoldedSpanCount":{},"aggregatePreaggregateProfile":{},"usedAttrPostings":false,"candidateSpanKeys":null,"scannedSegments":0,"foldedSpanCount":{},"unsupportedAttrKeys":[],"verification":"{}","rollupFallbackReason":null}}"#,
+            span_read_index,
             rollup.used_segment_rollup,
             rollup.segment_rollup_segments,
             rollup.segment_rollup_rows,
             rollup.tail_folded_span_count,
+            preaggregate_profile,
             folded_span_count,
+            verification,
         );
     }
     let span_read_index = if stats.used_attr_postings {
@@ -425,6 +504,75 @@ fn trace_aggregate_read_plan_json(
         unsupported_attr_keys,
         verification,
         fallback
+    )
+}
+
+fn trace_aggregate_preaggregate_fields(
+    fields: &[TraceAggregateGroupField],
+    request: &TraceSearchRequest,
+) -> Option<Vec<String>> {
+    let mut profile = std::collections::BTreeSet::new();
+    for field in fields {
+        let name = trace_aggregate_preaggregate_field_name(&field.kind)?;
+        if !trace_aggregate_preaggregate_field_supported(&name) {
+            return None;
+        }
+        profile.insert(name);
+    }
+    let spec = &request.spec;
+    if spec.status.is_some() {
+        profile.insert("status".to_string());
+    }
+    if spec.kind.is_some() {
+        profile.insert("kind".to_string());
+    }
+    if spec.agent_name.is_some() {
+        profile.insert("agent_name".to_string());
+    }
+    if spec.tool_name.is_some() {
+        profile.insert("tool_name".to_string());
+    }
+    if spec.model.is_some() {
+        profile.insert("model".to_string());
+    }
+    for key in spec.attrs.keys() {
+        if !trace_aggregate_preaggregate_field_supported(key) {
+            return None;
+        }
+        profile.insert(key.clone());
+    }
+    let profile: Vec<String> = profile.into_iter().collect();
+    if crate::trace_aggregate_preaggregate_profile_supported(&profile) {
+        Some(profile)
+    } else {
+        None
+    }
+}
+
+fn trace_aggregate_preaggregate_field_name(kind: &TraceAggregateGroupKind) -> Option<String> {
+    match kind {
+        TraceAggregateGroupKind::Attr(key) => Some(key.clone()),
+        TraceAggregateGroupKind::AgentName => Some("agent_name".to_string()),
+        TraceAggregateGroupKind::ToolName => Some("tool_name".to_string()),
+        TraceAggregateGroupKind::Model => Some("model".to_string()),
+        TraceAggregateGroupKind::Provider => Some("provider".to_string()),
+        TraceAggregateGroupKind::Kind => Some("kind".to_string()),
+        TraceAggregateGroupKind::Status => Some("status".to_string()),
+    }
+}
+
+fn trace_aggregate_preaggregate_field_supported(field: &str) -> bool {
+    matches!(
+        field,
+        "project_id"
+            | "task_fingerprint"
+            | "validation_status"
+            | "tool_name"
+            | "agent_name"
+            | "skill"
+            | "mode"
+            | "status"
+            | "kind"
     )
 }
 

@@ -27,6 +27,8 @@
 - `evalkit::ApiEvalStep`
 - `evalkit::run_api_eval_suite`
 - `evalkit::EvalSuiteReport`
+- `risk_eval_matrix.rs`：把分布式写安全、API 合同、读计划、retention、发布包合同、gateway 安全放进同一个 suite。
+- `scripts/eval_all.sh`：风险 eval 总入口，默认跑 `risk_eval_matrix`、真实分布式 chaos eval、主 eval harness、gateway example 编译和 Rust DB crate。
 
 已迁入真实 API eval 的旧 HTTP 合同：
 
@@ -43,7 +45,7 @@
 | API 合同 eval | 是 | 是 | 走 `EngineJsonApi`，每个 case 可包含 seed / execute / verify 多个真实步骤 |
 | 业务场景 eval | 是 | 是 | 走 `eval_harness.rs`，用业务 trace 串起 traceSearch、aggregate、Golden Path、retention、cluster read model |
 | 持久化 eval | 是 | 迁移中 | 应由 eval case 创建 data dir、写入、重启、验证 |
-| 真实进程 / socket eval | 是 | 待接入 | `distributed_process_eval.rs` 会起真实 shard/gateway 子进程并走 TCP，后续要包装成 eval suite |
+| 真实进程 / socket eval | 是 | 部分接入 | `distributed_process_eval.rs`、`distributed_chaos_eval.rs` 起真实 shard/gateway 子进程并走 TCP；`risk_eval_matrix` 也覆盖真实 gateway/socket 安全入口 |
 | kill -9 eval | 是 | 待接入 | `crash_recovery_kill9.sh` 会真 kill -9，后续要输出 eval 报告 |
 
 仍有少量旧测试还没迁移，不能算最终状态：
@@ -62,6 +64,8 @@
 | HTTP 摄入入口 | `eval_harness::ingest_wire_contract_eval_cases` | `/v1/ingest` 成功后必须通过 `/v1/trace-search` 查回自己写的数据 |
 | API 入口合同 | `eval_harness::api_entrypoints_use_real_eval_steps` | ingest、外部 ID、租户、OTLP、中文搜索都走 seed / verify 真实步骤 |
 | 分布式 gateway 恢复 | `distributed_process_eval::gateway_process_recovers_after_backend_shard_restart` | 真实启动 3 shard + 1 gateway，杀掉一个 shard 后确认降级，再重启同 data dir 同端口并查回全量；检查结果进入 eval report |
+| 风险矩阵 eval | `risk_eval_matrix::risk_eval_matrix_framework_covers_project_risks` | 一次跑通分布式写安全、tenant 合同、坏输入不落库、readPlan、retention、包发布合同、gateway auth/body limit、socket tenant 隔离 |
+| eval 总入口 | `scripts/eval_all.sh` | 默认跑风险矩阵、分布式 chaos、主 eval harness、gateway example 编译、Rust DB crate；`--packages --pack --crash` 打开更重的包级、打包和崩溃验证 |
 
 同时修正解析行为：
 
@@ -76,23 +80,23 @@
 | SDK 线格式摄入 `/v1/ingest` | 偏少，已开始补 | SDK 到 WireRecord、外部字符串 id、attrs、token/cost、坏 JSON、本轮新增坏 attrs 和越界值 | 每个必填字段缺失都要有 400；重复提交同一批 HTTP 事件后 trace/token 不翻倍 |
 | OTLP 摄入 `/v1/traces` | 中等 | OTLP 正常摄入、坏 body、租户头覆盖 body tenant | 更多 OpenInference 字段别名、resource/scope 多层属性覆盖顺序、异常 span 状态映射 |
 | 单写 WAL / 重启 / 崩溃 | 较强 | WAL 重启、flush 后重启、crash replay 幂等、kill -9 脚本、随机 op fuzz | HTTP 维度的重复 ingest 幂等小用例；更多半写 WAL frame 损坏用例 |
-| 多写控制 | 偏少 | route table 拒绝双 writable、手动 promote 切换写主、并发读写回收 | 同一 data dir 双进程打开锁；双写主配置 reload 拒绝后旧 route table 不变 |
+| 多写控制 | 中等 | route table 拒绝双 writable、手动 promote 切换写主、并发读写回收、risk eval 统一检查写主约束 | 同一 data dir 双进程打开锁；双写主配置 reload 拒绝后旧 route table 不变；自动 failover/fencing |
 | 单机查询列表 | 中等 | trace 列表、summary 聚合、token/cost 汇总、时间过滤、tenant 隔离 | 分页边界、空结果、坏 query 参数、外部 trace id 与数字 id 混用 |
 | Trace 详情 / Span 详情 | 中等 | 瀑布、树结构、父子关系、大字段晚物化、span batch、snapshot、tenant 隔离 | span batch 中部分 span 不存在；cursor/limit 越界；snapshot hash 稳定性专项 |
 | Session / Turn | 中等 | session timeline、turn 顺序、cache 命中和失效、多轮分类 | 空 session、跨租户同 session id、分页边界、异常轮状态 |
 | 中文 BM25 搜索 | 中等 | 中文检索、字段过滤、tenant 隔离、text domains、重启重建索引 | 空 text、超大 text、特殊符号、只搜 agent/tool/model 域的独立小用例 |
 | 向量搜索 / 混合搜索 | 中等 | vector、hybrid、过滤进图、disk vector 重启、namespace vector | 向量维度不一致、空向量、k 越界、filtered ANN recall/perf 固定样本 |
 | attrs 过滤 / 一等字段 | 较强 | attrs sidecar、flush/recover、未索引 attrs 回退、数组 attrs、schema 字段过滤 | 复杂 JSON object attr 过滤语义；同 key 多事件覆盖后索引一致 |
-| 读模型 cache / rollup | 中等 | cache hit/miss、写入失效、traceAggregate rollup、fallback 原因、loop/task sidecar | 多租户 cache key 隔离小用例；retention 后 cache 必须失效的小用例 |
+| 读模型 cache / rollup | 中等 | cache hit/miss、写入失效、traceAggregate rollup、fallback 原因、loop/task sidecar、risk eval 检查 `readPlan`/rollup/cache hit 可观测 | 多租户 cache key 隔离小用例；retention 后 cache 必须失效的小用例 |
 | Annotation / Dataset | 较强 | 创建、查询、分页、更新、软删、反向过滤、持久化、租户隔离 | 坏状态值、坏 target、span 级和 trace 级同时存在时的精确过滤 |
 | Golden Path | 较强 | 创建、确认、adherence、evidence、export、health、retention 后 source retained、租户隔离 | 拒绝 / deprecated 状态查询；candidateTraceId 不存在；重复创建同 source 的行为 |
-| Retention / Storage | 中等 | dry-run、保护 annotation/dataset/golden/snapshot/eval/path memory、apply、compact、audit、policy run-due | deleteBeforeTs 缺失或非法；MemTable/WAL tail 热 trace 跳过的 HTTP 小用例；重复 apply 幂等 |
-| 分布式读写 | 较强但还不是生产集群 | 进程内 cluster、真实多进程 shard、3 shard + 1 gateway fanout、gateway 后端 shard 重启恢复、partial/strict、follower read、snapshot lease、WAL replication | 后台 route watcher、failover fencing、复制断点恢复长循环、sealed segment/metadata/vecindex 同步 |
-| Node 嵌入式 DB | 中等偏强 | ESM/CJS、open/close、lock、ingest/search/traces/sessions/metadata/retention/golden path/reopen | 每个 JS API 的坏参数测试；Electron asar/native path 模拟 |
+| Retention / Storage | 中等 | dry-run、保护 annotation/dataset/golden/snapshot/eval/path memory、apply、compact、audit、policy run-due、risk eval 覆盖 annotation 保护和冷 trace 删除 | deleteBeforeTs 缺失或非法；MemTable/WAL tail 热 trace 跳过的 HTTP 小用例；重复 apply 幂等 |
+| 分布式读写 | 较强但还不是生产集群 | 进程内 cluster、真实多进程 shard、3 shard + 1 gateway fanout、gateway 后端 shard 重启恢复、partial/strict、follower read、snapshot lease、WAL replication、真实 chaos eval | 后台 route watcher、failover fencing、复制断点恢复长循环、sealed segment/metadata/vecindex 同步 |
+| Node 嵌入式 DB | 中等偏强 | ESM/CJS、open/close、lock、ingest/search/traces/sessions/metadata/retention/golden path/reopen、risk eval 检查 root package + optional platform package + pack verify 脚本合同 | 每个 JS API 的坏参数测试；Electron asar/native path 模拟 |
 | Python SDK | 中等 | event_id fixture、span 生命周期、父子 span、tokens、异常、HTTP exporter headers/retry/buffer cap | exporter HTTP 非 2xx 细分、timeout、close 多次调用、并发 span |
 | TypeScript SDK | 偏少 | event_id fixture、span 生命周期、父子 span、tokens、异常 | HTTP exporter retry/buffer cap、BigInt wire 全字段、async close 失败场景 |
 | 控制台前端 | 偏少 | HTTP client header/query/path encode、搜索字段映射、mock 分页和 trace 树、build | 组件渲染测试、错误态、空态、真实 API 合同截图/浏览器回归 |
-| 性能 | 有工具，缺门禁 | `bench_qps`、并发请求、并发读写回收、kill -9 加压 | 固定阈值脚本：最低 QPS、P95、索引构建时间、内存上限 |
+| 性能 | 有工具，缺硬阈值 | `bench_qps`、并发请求、并发读写回收、kill -9 加压、risk eval 检查 readPlan 是否走 rollup/cache | 固定阈值脚本：最低 QPS、P95、索引构建时间、内存上限 |
 
 ## 下一批优先级
 
@@ -103,6 +107,7 @@ P0：
 3. 同一 data dir 双打开必须失败，保护单写者。
 4. `/v1/search` 向量维度不一致、空向量、非法 `k` 返回 400。
 5. retention apply 缺 `deleteBeforeTs` 返回 400，重复 apply 保持幂等。
+6. `eval_all.sh --heavy` 接到 CI/release 手册，避免只跑轻量默认集。
 
 P1：
 

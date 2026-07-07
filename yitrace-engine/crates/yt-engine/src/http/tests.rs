@@ -24,6 +24,25 @@ fn durable_temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+fn test_json_u64(body: &str, path: &[&str]) -> u64 {
+    fn lookup<'a>(value: &'a crate::wire::Json, path: &[&str]) -> &'a crate::wire::Json {
+        if let Some((head, tail)) = path.split_first() {
+            lookup(
+                value
+                    .get(head)
+                    .unwrap_or_else(|| panic!("missing json key {head} in {value:?}")),
+                tail,
+            )
+        } else {
+            value
+        }
+    }
+    let parsed = crate::wire::parse(body).unwrap_or_else(|err| panic!("bad json: {err}: {body}"));
+    lookup(&parsed, path)
+        .as_u64()
+        .unwrap_or_else(|| panic!("json path {path:?} is not u64 in {body}"))
+}
+
 include!("tests/part_00.rs");
 include!("tests/part_01.rs");
 include!("tests/part_02.rs");

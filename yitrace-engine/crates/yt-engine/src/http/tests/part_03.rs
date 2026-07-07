@@ -312,6 +312,72 @@
             h.join().unwrap();
         }
     }
+
+    #[test]
+    fn remote_gateway_server_routes_real_socket_requests() {
+        let shard = Arc::new(server());
+        let shard_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shard_addr = shard_listener.local_addr().unwrap();
+        let shard_server = Arc::clone(&shard);
+        std::thread::spawn(move || shard_server.serve_pool(shard_listener, 4));
+
+        let gateway = RemoteShardGateway::new(vec![format!("http://{shard_addr}")]).unwrap();
+        let gateway = RemoteGatewayServer::new(gateway);
+        let gateway_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway_addr = gateway_listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || gateway.serve_n(&gateway_listener, 3));
+
+        let (status, cluster) =
+            gateway_socket_request(gateway_addr, "GET", "/v1/cluster/shards", "", None, None);
+        assert_eq!(status, 200, "{cluster}");
+        assert!(cluster.contains(r#""mode":"process_gateway""#), "{cluster}");
+        assert!(cluster.contains(r#""shardCount":1"#), "{cluster}");
+
+        let batch = r#"[
+          {"trace_id":8701,"span_id":1,"session_id":8701,"ts":1,"seq":1,"event_type":1,"ext_span_id":"8701-1","input_text":"gateway production server smoke","attrs":{"project_id":"gateway-entry","skill":"deploy"}},
+          {"trace_id":8701,"span_id":1,"session_id":8701,"ts":2,"seq":2,"event_type":2,"ext_span_id":"8701-1","status":0,"duration_ns":10,"output_text":"gateway server ok"}
+        ]"#;
+        let (status, body) =
+            gateway_socket_request(gateway_addr, "POST", "/v1/ingest", batch, Some(3), None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""ingested":2"#), "{body}");
+
+        let query = r#"{"text":"production server","k":5,"filter":{"attrs":{"project_id":"gateway-entry"}}}"#;
+        let (status, body) =
+            gateway_socket_request(gateway_addr, "POST", "/v1/search", query, Some(3), None);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains(r#""trace_id":8701"#), "{body}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn remote_gateway_server_enforces_auth_and_body_limit() {
+        let gateway = RemoteShardGateway::new(vec!["127.0.0.1:1".to_string()]).unwrap();
+        let gateway = RemoteGatewayServer::new(gateway)
+            .with_auth_token("secret")
+            .with_max_body(4);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || gateway.serve_n(&listener, 2));
+
+        let (status, body) =
+            gateway_socket_request(addr, "GET", "/v1/cluster/shards", "", None, None);
+        assert_eq!(status, 401, "{body}");
+        assert!(body.contains("unauthorized"), "{body}");
+
+        let (status, body) = gateway_socket_request(
+            addr,
+            "POST",
+            "/v1/ingest",
+            r#"{"too":"large"}"#,
+            None,
+            Some("secret"),
+        );
+        assert_eq!(status, 413, "{body}");
+        assert!(body.contains("body too large"), "{body}");
+        handle.join().unwrap();
+    }
+
     #[test]
     fn real_socket_roundtrip() {
         // 真 socket：起服务线程,客户端 POST 再 GET,验证字节真从一个连接搬到另一个。
@@ -344,4 +410,39 @@
         assert!(resp2.contains("\"trace_id\":7"), "{resp2}");
 
         handle.join().unwrap();
+    }
+
+    fn gateway_socket_request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+        tenant: Option<u64>,
+        token: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let tenant_header = tenant
+            .map(|id| format!("X-Tenant-Id: {id}\r\n"))
+            .unwrap_or_default();
+        let auth_header = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{tenant_header}{auth_header}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        let status = resp
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        (status, body)
     }

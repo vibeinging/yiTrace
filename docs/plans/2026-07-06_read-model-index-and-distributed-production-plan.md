@@ -8,7 +8,7 @@
 这份计划覆盖两条主线：
 
 1. **高频读模型索引化**：把 `traceAggregate`、`loops`、`taskTraces`、metadata 查询、全文/向量召回从 folded snapshot 扫描或轻量 cache，推进到可重建、可观测、可恢复的物化索引/rollup。
-2. **生产分布式完整路径**：在现有 process gateway / shard server / WAL shipping eval 基础上，补动态路由表、远程 snapshot lease、网络复制、heartbeat/failover、retry/熔断和一致性策略。
+2. **生产分布式完整路径**：在现有 `RemoteGatewayServer` / shard server / WAL shipping eval 基础上，补动态路由表、远程 snapshot lease、网络复制、heartbeat/failover、retry/熔断和一致性策略。
 
 非目标：
 
@@ -35,7 +35,7 @@
 - `traceAggregate` 第一版 read-plan + segment rollup 已落地：sealed segment 会生成可重建 `trace_aggregate_rollups/seg-*.agg` sidecar，查询安全时走 `segment_rollup_tail_overlay`，否则回退 folded scan；响应返回 `readPlan.spanReadIndex`、`usedSegmentRollup`、`segmentRollupRows`、`tailFoldedSpanCount`、`usedAttrPostings`、`candidateSpanKeys`、`scannedSegments`、`unsupportedAttrKeys`、`aggregationPlanner`、`rollupEligible`、`rollupBlockedBy` 和 `rollupFallbackReason`，eval 覆盖 segment 命中、tail-only、跨 segment span fallback、自定义 attrs 降级、cluster fanout 和 durable reopen。
 - process gateway 第一版：路由写入、search/traceSearch fanout、aggregate/trajectory/storage/metadata/retention fanout 与诊断。
 - follower read 原语：WAL tail shipping、replica status、bounded-stale follower read、snapshot token 绑定 read target。
-- 远端生产化接缝第一版：`RemoteShardRouteTable` 支持 JSON 路由表解析、版本、role/readable/writable/weight 和 fingerprint；`RemoteShardGateway::from_route_table_json()` 可从路由表构造 writer gateway，并在 cluster diagnostics 返回 `routeTableVersion`；`POST /v1/cluster/route-table/reload` 可显式热更新同一 gateway 的 writer 视图，拒绝旧版本回退并清空路由缓存；`trace-search` / `trace-aggregate` 可返回 `mode:"remote_gateway"` 的 composite snapshot，下一次请求由 gateway 拆成 shard-local snapshot 回放，route table 变更会返回 `route_table_expired`；`POST /v1/snapshots/lease` / `POST /v1/snapshots/renew` / `DELETE /v1/snapshots/:id` 已支持 in-process cluster 和 remote gateway 显式 lease lifecycle；`RemoteShardClient` 支持最小 retry、timeout 和 circuit breaker，eval 用真实 TCP fake shard 覆盖 retry、非幂等写不重试、half-open 恢复、reload 后新写入走新 shard、remote snapshot 按 shard 回放和 remote lease release 后 `snapshot_expired`。
+- 远端生产化接缝第一版：`RemoteGatewayServer` 提供 std-only gateway server 入口和固定线程池，`gateway_server` example 可从 route table 或 `YT_SHARDS` 启动；`RemoteShardRouteTable` 支持 JSON 路由表解析、版本、role/readable/writable/weight 和 fingerprint；`RemoteShardGateway::from_route_table_json()` 可从路由表构造 writer gateway，并在 cluster diagnostics 返回 `routeTableVersion`；`POST /v1/cluster/route-table/reload` 可显式热更新同一 gateway 的 writer 视图，拒绝旧版本回退并清空路由缓存；`trace-search` / `trace-aggregate` 可返回 `mode:"remote_gateway"` 的 composite snapshot，下一次请求由 gateway 拆成 shard-local snapshot 回放，route table 变更会返回 `route_table_expired`；`POST /v1/snapshots/lease` / `POST /v1/snapshots/renew` / `DELETE /v1/snapshots/:id` 已支持 in-process cluster 和 remote gateway 显式 lease lifecycle；`RemoteShardClient` 支持最小 retry、timeout 和 circuit breaker，eval 用真实 TCP fake shard 覆盖 retry、非幂等写不重试、half-open 恢复、reload 后新写入走新 shard、remote snapshot 按 shard 回放和 remote lease release 后 `snapshot_expired`。
 
 仍缺：
 
@@ -44,7 +44,7 @@
 - annotation / dataset / golden path / retention policy 的 metadata index。
 - 全文分域索引已完成第一片；仍缺 attrs.* 白名单域、retention soft-delete 后的域索引剔除和 100k+ 性能 bench。
 - task/span/trajectory 向量 namespace 已完成第一片（append-only `named_vectors.dat` + 内存 flat index）；span/task 带 traceId 的向量已按当前 snapshot 做 retention live-filter；仍缺 namespace HNSW/GraphIndex、高性能 filtered ANN 和 recall/perf 回归。
-- 生产 gateway 已有 route table 文件 reload hook、snapshot lease TTL 和一次性 replication pull worker；仍缺后台 route table watcher/外部控制面订阅、更多读模型 snapshot 覆盖、sealed segment/manifest/sidecar/vecindex/metadata/GC log 同步、后台复制调度、snapshot bootstrap、自动 failover、retry budget 诊断和一致性策略配置。
+- 生产 gateway 已有可复用 `RemoteGatewayServer`、`gateway_server` example、route table 文件 reload hook、snapshot lease TTL 和一次性 replication pull worker；gateway server 入口已脱离 eval/test 形态。仍缺后台 route table watcher/外部控制面订阅、更多读模型 snapshot 覆盖、sealed segment/manifest/sidecar/vecindex/metadata/GC log 同步、后台复制调度、snapshot bootstrap、自动 failover、retry budget 诊断和一致性策略配置。
 
 ## Track A：读模型索引化
 
@@ -418,7 +418,7 @@ eval：
 
 ### B3：heartbeat / health / failover
 
-状态：已完成第三片。2026-07-06 复核后已把 `RemoteShardRouteTable` 升级为兼容 v1 扁平 route 和 v2 logical shard + replicas；v2 强制每个 logical shard 恰好一个 writable replica，手动 promote 可通过 reload route table 切换写 leader，并有真实 TCP fake shard eval 覆盖。显式 heartbeat/health refresh 已落地：`POST /v1/cluster/health/refresh` 会探测 route table 中所有 replica 的 `/v1/replication/status`，聚合 `committedTail`、`leaderTail`、`replicationLagLsn`、`healthy/stale/unreachable/diverged` 和原因；`GET /v1/cluster/health` 返回最近一次采样，`GET /v1/cluster/shards` 会带上 health diagnostics。读 fanout 已接入 bounded-stale read target：默认 partial 查询优先读 healthy 且 lag 不超过 `maxLagLsn` 的 follower，stale/unreachable 时回 leader；`readTargets` 返回实际 replica、lag 和原因；remote gateway snapshot 写入 `replicaId`，后续分页会回到同一个 replica。真实 TCP eval 覆盖 follower lag 超阈值变 stale、不可达 replica 变 unreachable、fresh follower 被读、stale follower 回 leader。周期 watcher、自动 failover 和 fencing 仍未实现。
+状态：已完成第三片，并补了真实多进程 chaos eval 和风险矩阵 eval。2026-07-06 复核后已把 `RemoteShardRouteTable` 升级为兼容 v1 扁平 route 和 v2 logical shard + replicas；v2 强制每个 logical shard 恰好一个 writable replica，手动 promote 可通过 reload route table 切换写 leader，并有真实 TCP fake shard eval 覆盖。2026-07-07 新增 `distributed_chaos_eval`：起 2 个 logical shard、每个 shard 一个 leader + follower、一个 gateway 进程；覆盖 follower catch-up 后默认读 follower、kill leader 后 strict 查询失败、promote follower + reload route table 后继续写、旧 snapshot 返回 `route_table_expired`、旧 leader 重启后不能收到新写。2026-07-07 追加 `risk_eval_matrix` 和 `scripts/eval_all.sh`：把 route table 写主约束、API 租户合同、坏输入不落库、traceAggregate readPlan、retention 保护、嵌入包发布合同、gateway auth/body limit、HTTP socket tenant 隔离挂到统一 `EvalSuiteReport`。显式 heartbeat/health refresh 已落地：`POST /v1/cluster/health/refresh` 会探测 route table 中所有 replica 的 `/v1/replication/status`，聚合 `committedTail`、`leaderTail`、`replicationLagLsn`、`healthy/stale/unreachable/diverged` 和原因；`GET /v1/cluster/health` 返回最近一次采样，`GET /v1/cluster/shards` 会带上 health diagnostics。读 fanout 已接入 bounded-stale read target：默认 partial 查询优先读 healthy 且 lag 不超过 `maxLagLsn` 的 follower，stale/unreachable 时回 leader；`readTargets` 返回实际 replica、lag 和原因；remote gateway snapshot 写入 `replicaId`，后续分页会回到同一个 replica。真实 TCP eval 覆盖 follower lag 超阈值变 stale、不可达 replica 变 unreachable、fresh follower 被读、stale follower 回 leader。周期 watcher、自动 failover 和 fencing 仍未实现。
 
 目标：
 
@@ -463,6 +463,7 @@ eval：
 - node timeout 后进入 suspect/unreachable（unreachable 已覆盖真实 TCP eval）。
 - draining shard 不接新写，但旧 snapshot 可读。
 - 手动 promote 后新写入走新 leader（已覆盖）。
+- 旧 leader 重启后仍不能收到新写，旧 snapshot 在 route table 变更后返回 `route_table_expired`（已由真实多进程 chaos eval 覆盖）。
 
 验收：
 

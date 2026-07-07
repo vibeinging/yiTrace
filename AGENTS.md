@@ -8,14 +8,16 @@
 
 ## 1. 项目是什么
 
-**yiTrace** 是一个本地优先、可分片演进的 **AI Agent TraceDB**（Rust 自研）。它可以作为单个私有服务运行，也可以嵌入 Node/Electron，还可以通过 gateway + shard route table 走分布式数据路径。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
+**yiTrace** 是一个 **Agent 的嵌入式 TraceDB**（Rust 自研）——之于 agent trace，就像 SQLite 之于应用数据。**主定位是单进程嵌入式**（Node / Python / Rust 三件套，嵌入 agent 进程内），本地服务次选，**分布式数据路径是升级路径，不是托管集群**（不是主推卖点）。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
 
 - trace 还原（事件折叠成完整 span）
 - 中文 BM25 检索 + 带过滤的向量 ANN 召回 + 混合检索（RRF）
 - 成本归因（token / 费用，per-agent）
 - 评测闭环（eval：打分、回归数据集、per-agent 看板）
 - 多租户隔离（tenant_id 全流程贯穿）
-- 分片读写底座（route table、gateway fanout、snapshot lease、follower read、WAL replication 原语）
+- 分布式升级路径（route table、gateway fanout、snapshot lease、follower read、WAL replication 原语）——单分片扛不住时的水平扩展手段，不是团队聚合方案
+
+> 定位依据：[`docs/research/2026-07-07_trace-landscape-research.md`](docs/research/2026-07-07_trace-landscape-research.md) §6/§7、[`docs/research/2026-07-07_team-aggregation-research.md`](docs/research/2026-07-07_team-aggregation-research.md)。**注意：分片集群原语 ≠ 团队聚合**——前者是"一个库的水平扩展"，后者是"多个独立本地库的向上汇集"，是两件事，不要混用。
 
 **关键约束（改代码时必须守住）：**
 
@@ -65,13 +67,18 @@ cargo test --offline                    # 全测试（含并发压测 + HTTP 往
 cargo run -p yt-engine --example demo   # 可运行 demo：灌数据 → 折叠 → 中文搜 → 向量 → 混合召回
 cargo run -p yt-engine --example server # 起 HTTP 服务（:7878，自带 eval 种子数据）
 cargo run -p yt-engine --example server_durable -- ./data/yitrace  # 持久化服务样板
+cargo run -p yt-engine --example gateway_server -- /etc/yitrace/route-table.json  # 分片 gateway 入口
 cargo run -p yt-engine --example bench_qps --release  # 真实 QPS 压测（务必 --release）
+../scripts/bench_scale.sh --smoke        # 规模压测 smoke，生成 docs/reports/scale/*.md
+../scripts/eval_all.sh                  # 风险 eval 总入口：risk matrix + chaos + eval harness + gateway example + Rust DB crate
 ```
 
 - **测试必须 `--offline` 能过**（守零依赖原则）。release 才跑 bench（debug 慢几十倍，数字无意义）。
 - 改了 HTTP/控制台后，要重新构建前端并内嵌：`cd yitrace-console && VITE_API=http npm run build && rm -rf ../yitrace-engine/crates/yt-engine/console_dist && cp -r dist ../yitrace-engine/crates/yt-engine/console_dist`。
 - 可选：`YT_TOKEN=secret cargo run ... --example server` 开 Bearer 鉴权；`cargo test -p yt-engine --features gzip` 含 gzip 解压。
-- 改了 gateway / route table / replication / snapshot lease，至少跑相关真实 eval：`cargo test --offline -p yt-engine --test distributed_process_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_production_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_read_target_eval -- --nocapture`。
+- 改了 gateway / route table / replication / snapshot lease，至少跑相关真实 eval：`cargo test --offline -p yt-engine --test distributed_chaos_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_process_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_production_eval -- --nocapture`、`cargo test --offline -p yt-engine --test distributed_read_target_eval -- --nocapture`。
+- 大改后或发布前跑 `./scripts/eval_all.sh`；需要 SDK/UI/Node/Python DB 包级回归加 `--packages`，需要 `@yitrace/db` clean consumer 打包验证加 `--pack`，需要 kill -9 崩溃恢复加 `--crash`。
+- 下一阶段暂停补产品功能，优先跑生产成熟度硬化：规模压测用 `./scripts/bench_scale.sh --smoke` / `--medium` / `--large`，安全边界看 `docs/design/2026-07-07_security-privacy-hardening.md`，发版矩阵看 `docs/plans/2026-07-07_release-matrix-hardening-plan.md`。
 
 **外部 crate（隔离的重依赖，按需构建）：**
 

@@ -1,11 +1,11 @@
 # yiTrace
 
-**给 AI Agent 用的本地优先 TraceDB。**
+**Agent 的嵌入式 TraceDB。**
 
-yiTrace 把 Agent 的原始事件变成可查询证据。你可以回放多轮运行、查看工具调用、
-搜索中文/英文 trace、分析 token/成本/eval，并把路径证据导出给 Agent Memory。
-它可以通过 `@yitrace/db` 嵌进 Node / Electron，也可以通过 `yitrace-db` 嵌进 Python
-或 Rust，还可以跑成私有服务，后续再放到分片 gateway 后面。
+yiTrace 是一个跑在 agent 进程里的 trace 数据库——之于 agent trace，就像
+SQLite 之于应用数据。把它接进 coding agent、自改进循环、或任何 LLM 工作流，
+每一次 prompt、工具调用、重试、多 agent 协作，都会变成明天还能搜得到、回放得
+出、查得清的证据。
 
 中文 · [English](README.md)
 
@@ -17,23 +17,32 @@ yiTrace 把 Agent 的原始事件变成可查询证据。你可以回放多轮�
 
 ![yiTrace 控制台](docs/images/console-overview.png)
 
-yiTrace 适合正在做 Agent 的团队，尤其是那些希望 trace 数据私有、可查、后续还能复用的团队：
+### 为什么需要“嵌入式”TraceDB
 
-- 把 prompt、工具输出和内部错误留在本地或内网，不交给托管服务
-- 回放对话、工具调用、重试、错误和多 Agent 移交
-- 用 BM25、attrs 过滤、向量召回和 trajectory 相似召回搜索 trace
-- 跟踪 token、成本、eval、annotation 和 dataset 关联
-- 发现重复任务里的稳定路径，导出 Golden Path 证据给 Agent Memory
+大多数 LLM 可观测工具会把 prompt 和工具输出送到云端服务。这对云原生团队够用，
+但对那些跑在开发者本机、Electron 应用里、或公司防火墙后面的 agent 来说不行
+——而这些恰恰是 trace 数据最敏感、也最有价值的地方。
 
-> 状态：alpha，可运行。存储引擎、WAL 恢复、SDK 摄入、OTLP 摄入、Node/Electron 包、
-> 读模型索引、retention 和分布式 gateway 原语都有离线测试覆盖。它还不是完整托管式生产集群：
-> 自动 failover、fencing、后台复制调度、TLS/RBAC 和企业安全加固仍在路线图中。
+yiTrace 反转了这个默认：**trace 默认留在本地**，可跨 session 检索、崩溃不丢、
+你不主动送出去就不会离开进程。同一套 Rust 引擎可以嵌进 Node / Python / Rust，
+也可以作为带控制台的私有本地服务运行。
+
+- **默认本地** —— prompt、工具 I/O、日志留在你的 data 目录，不去 SaaS
+- **明天能搜** —— 中英文 BM25、attrs 过滤、向量召回、RRF 混合检索
+- **能回放** —— 把原始事件折叠成 span，回放多轮 run 和多 agent 协作
+- **崩溃不丢** —— WAL + manifest + GC log；确定性 `event_id` 扛得住 kill -9 和重放
+- **成本和评测感知** —— per-agent token/成本归因、eval 分数、annotation、数据集关联
+
+> 状态：alpha，今天就能跑。嵌入式引擎、WAL 恢复、SDK/OTLP 灌入、Node/Electron
+> 包、读模型索引、retention 由离线测试覆盖。TLS/RBAC、持久审计、团队聚合、托管
+> 集群**明确暂不在范围内** —— 见[项目状态](#项目状态)与
+> [硬化计划](docs/plans/2026-07-07_next-phase-hardening-plan.md)。
 
 ---
 
 ## 先跑起来
 
-嵌进 Node.js 或 Electron：
+嵌入 Node.js / Electron（coding agent 最常用）：
 
 ```bash
 npm install @yitrace/db
@@ -46,7 +55,7 @@ const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
 const hits = await db.search({ text: "盗刷", k: 10 });
 ```
 
-嵌进 Python：
+嵌入 Python：
 
 ```bash
 pip install yitrace-db
@@ -59,7 +68,7 @@ db = YiTraceDB.open("./data", tenant_id=1)
 hits = db.search(text="盗刷", k=10)
 ```
 
-嵌进 Rust：
+嵌入 Rust：
 
 ```toml
 [dependencies]
@@ -79,8 +88,8 @@ let hits = db.search(&SearchQuery::text("盗刷").k(10))?;
 ./scripts/demo_all.sh
 ```
 
-打开 `http://127.0.0.1:7878`，搜索 `盗刷`，点开 span，看 input、output、log、
-token、成本和 eval 证据。
+浏览器打开 `http://127.0.0.1:7878`，搜 `盗刷`，看 span 的 input、output、
+日志、token 用量、成本和 eval 证据。
 
 ---
 
@@ -88,16 +97,16 @@ token、成本和 eval 证据。
 
 | 模式 | 适合什么时候用 | 当前已有 |
 |---|---|---|
-| SDK + 本地服务 | 先把 Agent trace 私有化收起来，并打开控制台回放 | `cargo run -p yt-engine --example server`、HTTP JSON API、内嵌控制台 |
-| 持久化单服务 | 一个私有 data dir，重启后数据还在 | `server_durable`、WAL、manifest、不可变段、磁盘向量索引 |
-| Node / Electron 嵌入式 DB | 想写 `import { YiTraceDB } from "@yitrace/db"`，不想单独起进程 | Node-API、ESM/CJS、optional native packages、同一套 Rust 引擎 |
-| Python 嵌入式 DB | 想在 Python Agent 里写 `from yitrace_db import YiTraceDB` | PyO3/maturin 包，同样走进程内 `EngineJsonApi` |
-| Rust 嵌入式 DB | 想在 Rust Agent/后端里写 `use yitrace_db::YiTraceDb` | `EngineJsonApi` 的轻封装，没有 N-API/PyO3 这一层 |
-| 分片 gateway | 有多个 shard，或者要走分布式演进路径 | route table、写路由、读 fanout、partial/strict、一致性读目标 |
-| shard 主从复制 | 同一个 shard 内要 leader/follower 原语 | replication status、WAL 导出/应用、one-shot follower pull、lag/health 诊断 |
+| **Node / Electron 嵌入式 DB** | 想在 coding agent 或 Electron 应用里 `import { YiTraceDB } from "@yitrace/db"`，不起额外进程 | Node-API、ESM/CJS、optional native packages、同一套 Rust 引擎进程内调用 |
+| **Python 嵌入式 DB** | 想在 Python agent 里 `from yitrace_db import YiTraceDB` | PyO3/maturin 包，同一 `EngineJsonApi` 进程内边界 |
+| **Rust 嵌入式 DB** | 想在 Rust agent/后端里 `use yitrace_db::YiTraceDb` | `EngineJsonApi` 的轻封装，没有 N-API/PyO3 这一层 |
+| **本地服务 + 控制台** | 想私有采集 trace，用浏览器 UI 回放 | `cargo run -p yt-engine --example server`、HTTP JSON API、内嵌控制台 |
+| **持久化单服务** | 一个私有 data dir，重启后数据还在 | `server_durable`、WAL、manifest、不可变段、磁盘向量索引 |
+| 分布式路径 *（升级路径）* | 单分片扛不住，需要水平扩展 | route table、写路由、读 fanout、partial/strict 一致性、follower read、WAL replication 原语 —— **是可验证的数据路径，不是托管集群** |
 
-关键点：yiTrace 不再只是“单机”。但每个 shard 内仍坚持单写者，这是正确性边界。
-集群能力来自 shard 外层的路由、fanout、snapshot lease 和复制。
+默认形态是**一个进程、一个 data 目录、一个写者** —— SQLite 让这种模型普及到
+应用数据库，yiTrace 把它带到 agent trace。集群级扩展（分片、复制、follower
+读）是单分片不够用时的升级路径，不是起点。
 
 ---
 
@@ -551,6 +560,10 @@ SDK / OTLP / @yitrace/db / yitrace-db clients
 - remote snapshot token 和带 TTL 的 snapshot lease
 - 网络 WAL tail 导出/应用，以及 follower one-shot pull
 - health、heartbeat、retry、timeout、circuit breaker 原语
+- 可复用 `RemoteGatewayServer` 和可运行 gateway 入口：
+  `cargo run -p yt-engine --example gateway_server -- /etc/yitrace/route-table.json`
+- 真实多进程 chaos eval，覆盖 kill/promote/reload、follower 追平、旧 snapshot 拒绝、
+  以及“旧 leader 不能收到新写入”
 
 route table 示例：
 
@@ -569,9 +582,25 @@ route table 示例：
 }
 ```
 
+用 route table 启动 gateway：
+
+```bash
+cd yitrace-engine
+YT_BIND=127.0.0.1:7880 YT_GATEWAY_WORKERS=8 \
+  cargo run -p yt-engine --example gateway_server -- /etc/yitrace/route-table.json
+```
+
+本地快速试跑、不配副本时，也可以先用：
+
+```bash
+YT_SHARDS=127.0.0.1:7901,127.0.0.1:7902 \
+  cargo run -p yt-engine --example gateway_server
+```
+
 边界也要说清：这是已经有真实多进程 eval 覆盖的分布式数据路径，不是完整生产控制面。
-还缺后台 route-table watcher、自动 failover、fencing、后台复制 worker、snapshot bootstrap，
-以及 sealed segments、sidecar、metadata、GC log 的远程同步。部署和运维自动化目前仍需要业务侧自己做。
+gateway 现在有了 std-only 的正式 server 入口和固定线程池，不再只是 eval/test 里的临时代码。
+但后台 route-table watcher、自动 failover、fencing、后台复制 worker、snapshot bootstrap，
+以及 sealed segments、sidecar、metadata、GC log 的远程同步还没做。部署和运维自动化目前仍需要业务侧自己做。
 
 ---
 
@@ -648,6 +677,24 @@ read-time fold
 cd yitrace-engine
 cargo test --offline
 ```
+
+运行风险 eval：
+
+```bash
+./scripts/eval_all.sh
+```
+
+发版前可以跑 `./scripts/eval_all.sh --packages --pack --crash`，额外覆盖 SDK/UI/包级测试、
+`@yitrace/db` clean consumer 打包验证和 kill-9 恢复。
+
+运行规模压测 smoke：
+
+```bash
+./scripts/bench_scale.sh --smoke
+```
+
+它会在 `docs/reports/scale/` 下生成 Markdown 报告。需要真实基线时，用 `--medium`
+或显式传 `--spans / --queries`。
 
 可选 crate：
 

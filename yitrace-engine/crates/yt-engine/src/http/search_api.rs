@@ -138,20 +138,122 @@ impl EngineJsonApi {
             Ok(read_set) => read_set,
             Err(resp) => return resp,
         };
+        let cache_input = format!("{}|{}", body, read_set.cache_fingerprint());
+        if let Some(cached) = self.read_model_cache_get("trace_search", tenant, &cache_input) {
+            return (200, cached);
+        }
         let metadata_matches =
             self.trace_search_metadata_matches(&request.annotation, &request.dataset, tenant);
 
-        let mut spans = if request.spec.attrs.is_empty() {
-            read_set
-                .coord_at(0)
-                .read_spans_query(read_set.snapshot_at(0), &request.query)
-                .0
-        } else {
-            read_set.coord_at(0).read_spans_query_for_attrs(
+        let rollup_blockers = trace_search_rollup_blockers(&request);
+        let mut rollup_fallback_reason: Option<&'static str> = None;
+        if rollup_blockers.is_empty() {
+            let filters = trace_aggregate_rollup_filters(&request);
+            match read_set.coord_at(0).trace_search_rollup_page_read(
                 read_set.snapshot_at(0),
                 &request.query,
-                &request.spec.attrs,
+                &filters,
+                &sort_by,
+                desc,
+                cursor,
+                limit,
+            ) {
+                Ok(page_read) => {
+                    let keys: std::collections::HashSet<(u64, u64)> =
+                        page_read.keys.iter().copied().collect();
+                    let full_spans = if page_read.keys.is_empty() {
+                        Vec::new()
+                    } else {
+                        read_set
+                            .coord_at(0)
+                            .read_spans_query_for_keys_projected(
+                                read_set.snapshot_at(0),
+                                &request.query,
+                                &keys,
+                                crate::Projection::ALL,
+                            )
+                            .0
+                    };
+                    let mut by_key: std::collections::HashMap<(u64, u64), FoldedSpan> = full_spans
+                        .into_iter()
+                        .map(|span| ((span.trace_id, span.span_id), span))
+                        .collect();
+                    let full_page = page_read
+                        .keys
+                        .iter()
+                        .filter_map(|key| by_key.remove(key))
+                        .collect::<Vec<_>>();
+                    if full_page.len() == page_read.keys.len() {
+                        let items: Vec<String> = full_page
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| json_trace_search_span(s, cursor + i))
+                            .collect();
+                        let end = cursor.saturating_add(limit).min(page_read.total);
+                        let next = if end < page_read.total {
+                            end.to_string()
+                        } else {
+                            "null".to_string()
+                        };
+                        let read_plan = trace_search_read_plan_json(
+                            "trace_search_rollup",
+                            &AttrIndexedReadStats::default(),
+                            Some(&page_read.stats),
+                            page_read.total,
+                            page_read.keys.len(),
+                            &rollup_blockers,
+                            None,
+                        );
+                        let response = format!(
+                            r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}","readPlan":{}{} }}"#,
+                            items.join(","),
+                            next,
+                            page_read.total,
+                            trace_search_index_label(&request),
+                            read_plan,
+                            read_set.snapshot_field(),
+                        );
+                        return (
+                            200,
+                            self.read_model_cache_put(
+                                "trace_search",
+                                tenant,
+                                &cache_input,
+                                response,
+                            ),
+                        );
+                    }
+                    rollup_fallback_reason = Some("page_hydrate_miss");
+                }
+                Err(reason) => {
+                    rollup_fallback_reason = Some(reason);
+                }
+            }
+        }
+
+        let scan_projection = trace_search_scan_projection(&request, &sort_by);
+        let (mut spans, attr_stats) = if request.spec.attrs.is_empty() {
+            let (spans, scanned_segments) = read_set.coord_at(0).read_spans_query_projected(
+                read_set.snapshot_at(0),
+                &request.query,
+                scan_projection,
+            );
+            (
+                spans,
+                AttrIndexedReadStats {
+                    scanned_segments,
+                    ..Default::default()
+                },
             )
+        } else {
+            read_set
+                .coord_at(0)
+                .read_spans_query_for_attrs_projected_with_stats(
+                    read_set.snapshot_at(0),
+                    &request.query,
+                    &request.spec.attrs,
+                    scan_projection,
+                )
         };
         spans.retain(|s| trace_search_match(s, &request.spec, &metadata_matches));
         sort_trace_search_spans(&mut spans, &sort_by, desc);
@@ -163,6 +265,31 @@ impl EngineJsonApi {
         } else {
             &[][..]
         };
+        let full_page;
+        let page = if scan_projection == crate::Projection::ALL || page.is_empty() {
+            page
+        } else {
+            let keys: std::collections::HashSet<(u64, u64)> =
+                page.iter().map(|s| (s.trace_id, s.span_id)).collect();
+            let full_spans = read_set
+                .coord_at(0)
+                .read_spans_query_for_keys_projected(
+                    read_set.snapshot_at(0),
+                    &request.query,
+                    &keys,
+                    crate::Projection::ALL,
+                )
+                .0;
+            let mut by_key: std::collections::HashMap<(u64, u64), FoldedSpan> = full_spans
+                .into_iter()
+                .map(|span| ((span.trace_id, span.span_id), span))
+                .collect();
+            full_page = page
+                .iter()
+                .filter_map(|span| by_key.remove(&(span.trace_id, span.span_id)))
+                .collect::<Vec<_>>();
+            &full_page
+        };
         let items: Vec<String> = page
             .iter()
             .enumerate()
@@ -173,16 +300,27 @@ impl EngineJsonApi {
         } else {
             "null".to_string()
         };
+        let read_plan = trace_search_read_plan_json(
+            "folded_scan",
+            &attr_stats,
+            None,
+            total,
+            page.len(),
+            &rollup_blockers,
+            rollup_fallback_reason,
+        );
+        let response = format!(
+            r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}","readPlan":{}{} }}"#,
+            items.join(","),
+            next,
+            total,
+            trace_search_index_label(&request),
+            read_plan,
+            read_set.snapshot_field(),
+        );
         (
             200,
-            format!(
-                r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}"{}}}"#,
-                items.join(","),
-                next,
-                total,
-                trace_search_index_label(&request),
-                read_set.snapshot_field(),
-            ),
+            self.read_model_cache_put("trace_search", tenant, &cache_input, response),
         )
     }
 
@@ -200,6 +338,12 @@ impl EngineJsonApi {
             Ok(read_set) => read_set,
             Err(resp) => return resp,
         };
+        let cache_input = format!("{}|{}", body, read_set.cache_fingerprint());
+        if let Some(cached) =
+            self.read_model_cache_get("cluster_trace_search", tenant, &cache_input)
+        {
+            return (200, cached);
+        }
 
         let cursor = json_field_alias(&v, &["cursor", "offset"])
             .and_then(Json::as_u64)
@@ -247,17 +391,18 @@ impl EngineJsonApi {
             "null".to_string()
         };
         let report = FanoutReport::all_ok(self.shards().len());
+        let response = format!(
+            r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}","queryMode":"fanout_merge"{}{}}}"#,
+            items.join(","),
+            next,
+            total,
+            trace_search_index_label(&request),
+            report.json_fields(),
+            read_set.snapshot_field(),
+        );
         (
             200,
-            format!(
-                r#"{{"items":[{}],"nextCursor":{},"total":{},"index":"{}","queryMode":"fanout_merge"{}{}}}"#,
-                items.join(","),
-                next,
-                total,
-                trace_search_index_label(&request),
-                report.json_fields(),
-                read_set.snapshot_field(),
-            ),
+            self.read_model_cache_put("cluster_trace_search", tenant, &cache_input, response),
         )
     }
 
@@ -301,32 +446,88 @@ impl EngineJsonApi {
         let mut read_stats = AttrIndexedReadStats::default();
         let mut rollup_stats = None;
         let mut rollup_fallback_reason = None;
+        let mut preaggregate_profile = None;
         let mut used_segment_rollup = false;
         let (mut buckets, span_total) = if blockers.is_empty() {
-            match read_set.coord_at(0).trace_aggregate_rollup_read(
-                read_set.snapshot_at(0),
-                &request.query,
-                &trace_aggregate_rollup_filters(&request),
-            ) {
-                Ok(read) => {
-                    let span_total = read.rows.len();
-                    used_segment_rollup = read.stats.used_segment_rollup;
-                    let buckets =
-                        trace_aggregate_buckets_from_rollup_rows(&read.rows, &group_fields);
-                    rollup_stats = Some(read.stats);
-                    (buckets, span_total)
+            if let Some(profile_fields) =
+                trace_aggregate_preaggregate_fields(&group_fields, &request)
+            {
+                match read_set.coord_at(0).trace_aggregate_preaggregate_read(
+                    read_set.snapshot_at(0),
+                    &request.query,
+                    &trace_aggregate_rollup_filters(&request),
+                    &profile_fields,
+                ) {
+                    Ok(read) => {
+                        let span_total = read.buckets.iter().map(|bucket| bucket.span_count).sum();
+                        used_segment_rollup = read.stats.used_segment_rollup;
+                        let buckets = trace_aggregate_buckets_from_preaggregate_buckets(
+                            &read.buckets,
+                            &group_fields,
+                        );
+                        preaggregate_profile = Some(profile_fields);
+                        rollup_stats = Some(read.stats);
+                        (buckets, span_total)
+                    }
+                    Err(reason) => {
+                        rollup_fallback_reason = Some(reason);
+                        match read_set.coord_at(0).trace_aggregate_rollup_read(
+                            read_set.snapshot_at(0),
+                            &request.query,
+                            &trace_aggregate_rollup_filters(&request),
+                        ) {
+                            Ok(read) => {
+                                let span_total = read.rows.len();
+                                used_segment_rollup = read.stats.used_segment_rollup;
+                                let buckets = trace_aggregate_buckets_from_rollup_rows(
+                                    &read.rows,
+                                    &group_fields,
+                                );
+                                rollup_stats = Some(read.stats);
+                                (buckets, span_total)
+                            }
+                            Err(row_reason) => {
+                                rollup_fallback_reason = Some(row_reason);
+                                let (spans, stats) = self
+                                    .trace_search_spans_for_coord_snapshot_with_stats(
+                                        read_set.coord_at(0),
+                                        read_set.snapshot_at(0),
+                                        &request,
+                                        tenant,
+                                    );
+                                let span_total = spans.len();
+                                read_stats = stats;
+                                (trace_aggregate_buckets(&spans, &group_fields), span_total)
+                            }
+                        }
+                    }
                 }
-                Err(reason) => {
-                    rollup_fallback_reason = Some(reason);
-                    let (spans, stats) = self.trace_search_spans_for_coord_snapshot_with_stats(
-                        read_set.coord_at(0),
-                        read_set.snapshot_at(0),
-                        &request,
-                        tenant,
-                    );
-                    let span_total = spans.len();
-                    read_stats = stats;
-                    (trace_aggregate_buckets(&spans, &group_fields), span_total)
+            } else {
+                match read_set.coord_at(0).trace_aggregate_rollup_read(
+                    read_set.snapshot_at(0),
+                    &request.query,
+                    &trace_aggregate_rollup_filters(&request),
+                ) {
+                    Ok(read) => {
+                        let span_total = read.rows.len();
+                        used_segment_rollup = read.stats.used_segment_rollup;
+                        let buckets =
+                            trace_aggregate_buckets_from_rollup_rows(&read.rows, &group_fields);
+                        rollup_stats = Some(read.stats);
+                        (buckets, span_total)
+                    }
+                    Err(reason) => {
+                        rollup_fallback_reason = Some(reason);
+                        let (spans, stats) = self.trace_search_spans_for_coord_snapshot_with_stats(
+                            read_set.coord_at(0),
+                            read_set.snapshot_at(0),
+                            &request,
+                            tenant,
+                        );
+                        let span_total = spans.len();
+                        read_stats = stats;
+                        (trace_aggregate_buckets(&spans, &group_fields), span_total)
+                    }
                 }
             }
         } else {
@@ -347,7 +548,9 @@ impl EngineJsonApi {
             .take(limit)
             .map(|bucket| trace_aggregate_bucket_json(bucket, &group_fields))
             .collect();
-        let aggregation_index = if used_segment_rollup {
+        let aggregation_index = if preaggregate_profile.is_some() {
+            "aggregate_preaggregate_tail_overlay"
+        } else if used_segment_rollup {
             "segment_rollup_tail_overlay"
         } else if rollup_stats.is_some() {
             "tail_folded_scan"
@@ -369,6 +572,7 @@ impl EngineJsonApi {
                 span_total,
                 rollup_stats.as_ref(),
                 rollup_fallback_reason,
+                preaggregate_profile.as_deref(),
             ),
         )
         .replace(" }", "}");
@@ -422,34 +626,75 @@ impl EngineJsonApi {
         let mut rollup_fallback_reason = None;
         let mut span_total = 0usize;
         let mut used_segment_rollup = false;
+        let mut preaggregate_profile = None;
         let mut buckets = Vec::new();
         if blockers.is_empty() {
-            let mut rollup_rows = Vec::new();
-            let mut stats = crate::TraceAggregateRollupStats::default();
-            let mut failed_reason = None;
-            for idx in 0..self.shards().len() {
-                match read_set.coord_at(idx).trace_aggregate_rollup_read(
-                    read_set.snapshot_at(idx),
-                    &request.query,
-                    &trace_aggregate_rollup_filters(&request),
-                ) {
-                    Ok(read) => {
-                        stats.add_shard(&read.stats);
-                        rollup_rows.extend(read.rows);
-                    }
-                    Err(reason) => {
-                        failed_reason = Some(reason);
-                        break;
+            if let Some(profile_fields) =
+                trace_aggregate_preaggregate_fields(&group_fields, &request)
+            {
+                let mut preaggregate_buckets = Vec::new();
+                let mut stats = crate::TraceAggregateRollupStats::default();
+                let mut failed_reason = None;
+                for idx in 0..self.shards().len() {
+                    match read_set.coord_at(idx).trace_aggregate_preaggregate_read(
+                        read_set.snapshot_at(idx),
+                        &request.query,
+                        &trace_aggregate_rollup_filters(&request),
+                        &profile_fields,
+                    ) {
+                        Ok(read) => {
+                            stats.add_shard(&read.stats);
+                            preaggregate_buckets.extend(read.buckets);
+                        }
+                        Err(reason) => {
+                            failed_reason = Some(reason);
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(reason) = failed_reason {
-                rollup_fallback_reason = Some(reason);
+                if let Some(reason) = failed_reason {
+                    rollup_fallback_reason = Some(reason);
+                } else {
+                    span_total = preaggregate_buckets
+                        .iter()
+                        .map(|bucket| bucket.span_count)
+                        .sum();
+                    used_segment_rollup = stats.used_segment_rollup;
+                    buckets = trace_aggregate_buckets_from_preaggregate_buckets(
+                        &preaggregate_buckets,
+                        &group_fields,
+                    );
+                    preaggregate_profile = Some(profile_fields);
+                    rollup_stats = Some(stats);
+                }
             } else {
-                span_total = rollup_rows.len();
-                used_segment_rollup = stats.used_segment_rollup;
-                buckets = trace_aggregate_buckets_from_rollup_rows(&rollup_rows, &group_fields);
-                rollup_stats = Some(stats);
+                let mut rollup_rows = Vec::new();
+                let mut stats = crate::TraceAggregateRollupStats::default();
+                let mut failed_reason = None;
+                for idx in 0..self.shards().len() {
+                    match read_set.coord_at(idx).trace_aggregate_rollup_read(
+                        read_set.snapshot_at(idx),
+                        &request.query,
+                        &trace_aggregate_rollup_filters(&request),
+                    ) {
+                        Ok(read) => {
+                            stats.add_shard(&read.stats);
+                            rollup_rows.extend(read.rows);
+                        }
+                        Err(reason) => {
+                            failed_reason = Some(reason);
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = failed_reason {
+                    rollup_fallback_reason = Some(reason);
+                } else {
+                    span_total = rollup_rows.len();
+                    used_segment_rollup = stats.used_segment_rollup;
+                    buckets = trace_aggregate_buckets_from_rollup_rows(&rollup_rows, &group_fields);
+                    rollup_stats = Some(stats);
+                }
             }
         }
         if rollup_stats.is_none() {
@@ -476,7 +721,9 @@ impl EngineJsonApi {
             .map(|bucket| trace_aggregate_bucket_json(bucket, &group_fields))
             .collect();
         let report = FanoutReport::all_ok(self.shards().len());
-        let aggregation_index = if used_segment_rollup {
+        let aggregation_index = if preaggregate_profile.is_some() {
+            "fanout_aggregate_preaggregate_tail_overlay"
+        } else if used_segment_rollup {
             "fanout_segment_rollup_tail_overlay"
         } else if rollup_stats.is_some() {
             "fanout_tail_folded_scan"
@@ -500,6 +747,7 @@ impl EngineJsonApi {
             span_total,
             rollup_stats.as_ref(),
             rollup_fallback_reason,
+            preaggregate_profile.as_deref(),
         ));
         response.push('}');
         (

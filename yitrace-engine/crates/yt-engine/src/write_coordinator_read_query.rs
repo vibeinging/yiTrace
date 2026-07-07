@@ -165,7 +165,26 @@ impl WriteCoordinator {
     /// 返回 (折叠出的 span, 实际扫描的段数)。所有判定只用快照里钉死的版本。
     pub fn read_spans_query(&self, snap: &Snapshot, q: &TraceQuery) -> (Vec<FoldedSpan>, usize) {
         // 普通读 / trace 详情要原文,读全列。
-        self.fold_query(snap, q, None, Projection::ALL)
+        self.read_spans_query_projected(snap, q, Projection::ALL)
+    }
+
+    pub fn read_spans_query_projected(
+        &self,
+        snap: &Snapshot,
+        q: &TraceQuery,
+        proj: Projection,
+    ) -> (Vec<FoldedSpan>, usize) {
+        self.fold_query(snap, q, None, proj)
+    }
+
+    pub fn read_spans_query_for_keys_projected(
+        &self,
+        snap: &Snapshot,
+        q: &TraceQuery,
+        keys: &HashSet<(u64, u64)>,
+        proj: Projection,
+    ) -> (Vec<FoldedSpan>, usize) {
+        self.fold_query(snap, q, Some(keys), proj)
     }
 
     fn attr_matching_span_keys(
@@ -286,9 +305,19 @@ impl WriteCoordinator {
         q: &TraceQuery,
         attrs: &BTreeMap<String, String>,
     ) -> (Vec<FoldedSpan>, AttrIndexedReadStats) {
+        self.read_spans_query_for_attrs_projected_with_stats(snap, q, attrs, Projection::ALL)
+    }
+
+    pub fn read_spans_query_for_attrs_projected_with_stats(
+        &self,
+        snap: &Snapshot,
+        q: &TraceQuery,
+        attrs: &BTreeMap<String, String>,
+        proj: Projection,
+    ) -> (Vec<FoldedSpan>, AttrIndexedReadStats) {
         let mut stats = AttrIndexedReadStats::default();
         if attrs.is_empty() {
-            let (spans, scanned) = self.read_spans_query(snap, q);
+            let (spans, scanned) = self.read_spans_query_projected(snap, q, proj);
             stats.scanned_segments = scanned;
             return (spans, stats);
         }
@@ -305,8 +334,8 @@ impl WriteCoordinator {
             return (Vec::new(), stats);
         }
         let (mut spans, scanned) = match candidate_keys {
-            Some(keys) => self.fold_query(snap, q, Some(&keys), Projection::ALL),
-            None => self.read_spans_query(snap, q),
+            Some(keys) => self.fold_query(snap, q, Some(&keys), proj),
+            None => self.read_spans_query_projected(snap, q, proj),
         };
         stats.scanned_segments = scanned;
         spans.retain(|s| folded_span_attrs_match(s, attrs));
@@ -452,7 +481,11 @@ impl WriteCoordinator {
                 if !in_keys(r.trace_id, r.span_id) {
                     continue;
                 }
-                inputs.push(r.to_fold_input());
+                let mut input = r.to_fold_input();
+                if !proj.is_all() {
+                    input.fields = project_span_fields(&input.fields, proj);
+                }
+                inputs.push(input);
             }
         }
 

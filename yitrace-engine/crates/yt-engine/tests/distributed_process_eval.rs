@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use yt_engine::{
     evalkit::{EvalCaseReport, EvalCheckReport, EvalSuiteReport},
-    HttpIngestServer, RemoteShardGateway, WriteCoordinator,
+    HttpIngestServer, RemoteGatewayServer, RemoteShardGateway, WriteCoordinator,
 };
 
 const CHILD_ENV: &str = "YT_DISTRIBUTED_EVAL_CHILD";
@@ -299,65 +299,6 @@ fn session_for_gateway_shard_after(
         .unwrap_or_else(|| panic!("could not find session for shard {shard}"))
 }
 
-struct GatewayRequest {
-    method: String,
-    path: String,
-    body: String,
-    tenant: Option<u64>,
-}
-
-fn read_gateway_request(stream: &TcpStream) -> Option<GatewayRequest> {
-    let clone = stream.try_clone().ok()?;
-    let mut reader = BufReader::new(clone);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
-    let mut content_length = 0usize;
-    let mut tenant = None;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).ok()? == 0 {
-            break;
-        }
-        if header == "\r\n" || header == "\n" {
-            break;
-        }
-        let lower = header.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = lower.strip_prefix("x-tenant-id:") {
-            tenant = v.trim().parse().ok();
-        }
-    }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).ok()?;
-    }
-    Some(GatewayRequest {
-        method,
-        path,
-        body: String::from_utf8_lossy(&body).into_owned(),
-        tenant,
-    })
-}
-
-fn respond_json(stream: &mut TcpStream, status: u16, body: &str) {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        502 => "Bad Gateway",
-        _ => "Error",
-    };
-    let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
-}
-
 fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -372,14 +313,6 @@ fn json_escape(value: &str) -> String {
         }
     }
     out
-}
-
-fn handle_gateway_stream(mut stream: TcpStream, gateway: &RemoteShardGateway) {
-    let Some(req) = read_gateway_request(&stream) else {
-        return;
-    };
-    let (status, body) = gateway.route_with_tenant(&req.method, &req.path, &req.body, req.tenant);
-    respond_json(&mut stream, status, &body);
 }
 
 /// 这个 ignored test 是真实 shard server 子进程入口。
@@ -418,9 +351,7 @@ fn gateway_server_child_process() {
         .collect();
     let gateway = RemoteShardGateway::new(shards).expect("remote shard gateway");
     let listener = TcpListener::bind(&bind).expect("bind gateway server");
-    for stream in listener.incoming().flatten() {
-        handle_gateway_stream(stream, &gateway);
-    }
+    Arc::new(RemoteGatewayServer::new(gateway)).serve_pool(listener, 4);
 }
 
 /// 真多实例 eval：启动多个独立 shard server 进程，经 TCP 写入和查询，再 kill/restart 单 shard。

@@ -11,7 +11,7 @@
 //!   归并，去重键 = 确定性 event_id。真实实现是 DataFusion 的 `ExecutionPlan`。
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -64,9 +64,9 @@ pub use vecindex_disk::{DiskGraphConfig, DiskGraphIndex, DiskGraphStore, Durable
 
 mod http;
 pub use http::{
-    EngineJsonApi, HttpIngestServer, InProcessReplicaSpec, InProcessShardSpec, RemoteShardClient,
-    RemoteShardGateway, RemoteShardRoute, RemoteShardRouteRole, RemoteShardRouteTable, ShardId,
-    StorageMode,
+    EngineJsonApi, HttpIngestServer, InProcessReplicaSpec, InProcessShardSpec, RemoteGatewayServer,
+    RemoteShardClient, RemoteShardGateway, RemoteShardRoute, RemoteShardRouteRole,
+    RemoteShardRouteTable, ShardId, StorageMode,
 };
 
 /// 编译期嵌入的控制台静态资源（build.rs 生成；console_dist/ 不存在则为空表）。
@@ -145,6 +145,94 @@ impl Projection {
     pub const fn bits(self) -> u32 {
         self.0
     }
+}
+
+pub(crate) fn project_span_fields(fields: &SpanFields, proj: Projection) -> SpanFields {
+    if proj.is_all() {
+        return fields.clone();
+    }
+    let mut out = SpanFields::default();
+    if proj.has(Projection::STATUS) {
+        out.status = fields.status;
+    }
+    if proj.has(Projection::DURATION_NS) {
+        out.duration_ns = fields.duration_ns;
+    }
+    if proj.has(Projection::PARENT_SPAN_ID) {
+        out.parent_span_id = fields.parent_span_id;
+    }
+    if proj.has(Projection::INPUT_TOKENS) {
+        out.input_tokens = fields.input_tokens;
+    }
+    if proj.has(Projection::OUTPUT_TOKENS) {
+        out.output_tokens = fields.output_tokens;
+    }
+    if proj.has(Projection::USAGE_COST) {
+        out.cached_input_tokens = fields.cached_input_tokens;
+        out.reasoning_tokens = fields.reasoning_tokens;
+        out.total_tokens = fields.total_tokens;
+        out.cost_usd_nanos = fields.cost_usd_nanos;
+        out.cost_currency = fields.cost_currency.clone();
+        out.provider = fields.provider.clone();
+    }
+    if proj.has(Projection::SESSION_ID) {
+        out.session_id = fields.session_id;
+    }
+    if proj.has(Projection::TENANT_ID) {
+        out.tenant_id = fields.tenant_id;
+    }
+    if proj.has(Projection::EXTERNAL_IDS) {
+        out.external_trace_id = fields.external_trace_id.clone();
+        out.external_span_id = fields.external_span_id.clone();
+        out.external_parent_span_id = fields.external_parent_span_id.clone();
+        out.external_session_id = fields.external_session_id.clone();
+    }
+    if proj.has(Projection::AGENTIC_FIELDS) {
+        out.project_id = fields.project_id.clone();
+        out.skill = fields.skill.clone();
+        out.mode = fields.mode.clone();
+        out.call_site = fields.call_site.clone();
+        out.task_fingerprint = fields.task_fingerprint.clone();
+        out.loop_id = fields.loop_id.clone();
+        out.harness_version = fields.harness_version.clone();
+        out.schema_fingerprint = fields.schema_fingerprint.clone();
+        out.intent_signature = fields.intent_signature.clone();
+        out.validation_status = fields.validation_status.clone();
+        out.review_status = fields.review_status.clone();
+        out.eval_status = fields.eval_status.clone();
+        out.path_memory_id = fields.path_memory_id.clone();
+        out.stop_reason = fields.stop_reason.clone();
+        out.phase = fields.phase.clone();
+        out.validator = fields.validator.clone();
+    }
+    if proj.has(Projection::AGENT_NAME) {
+        out.agent_name = fields.agent_name.clone();
+    }
+    if proj.has(Projection::TOOL_NAME) {
+        out.tool_name = fields.tool_name.clone();
+    }
+    if proj.has(Projection::MODEL) {
+        out.model = fields.model.clone();
+    }
+    if proj.has(Projection::INPUT_TEXT) {
+        out.input_text = fields.input_text.clone();
+    }
+    if proj.has(Projection::OUTPUT_TEXT) {
+        out.output_text = fields.output_text.clone();
+    }
+    if proj.has(Projection::EVAL_SCORE) {
+        out.eval_score = fields.eval_score;
+    }
+    if proj.has(Projection::EVAL_LABEL) {
+        out.eval_label = fields.eval_label.clone();
+    }
+    if proj.has(Projection::LOGS) {
+        out.logs = fields.logs.clone();
+    }
+    if proj.has(Projection::ATTRS) {
+        out.attrs = fields.attrs.clone();
+    }
+    out
 }
 
 /// 列式不可变段存储。真实实现接 **Vortex**（layouts + zone-map + 统计）；
@@ -352,6 +440,61 @@ impl SegmentStore for InMemorySegmentStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    fn scan_fold_inputs_projected(
+        &self,
+        seg: SegmentId,
+        proj: Projection,
+    ) -> Option<Vec<(u32, FoldInput)>> {
+        Some(
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&seg.get())
+                .map(|rs| {
+                    rs.iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            (
+                                i as u32,
+                                FoldInput {
+                                    trace_id: r.trace_id,
+                                    span_id: r.span_id,
+                                    identity: r.identity.clone(),
+                                    fields: project_span_fields(&r.fields, proj),
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+    fn scan_fold_inputs_in_time(
+        &self,
+        seg: SegmentId,
+        from: i64,
+        to: i64,
+        proj: Projection,
+    ) -> Option<Vec<FoldInput>> {
+        Some(
+            self.rows
+                .lock()
+                .unwrap()
+                .get(&seg.get())
+                .map(|rs| {
+                    rs.iter()
+                        .filter(|r| r.ts >= from && r.ts <= to)
+                        .map(|r| FoldInput {
+                            trace_id: r.trace_id,
+                            span_id: r.span_id,
+                            identity: r.identity.clone(),
+                            fields: project_span_fields(&r.fields, proj),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
     }
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
         self.rows
@@ -2976,6 +3119,62 @@ impl WireRecord {
 
 // ───────────────────────── 单写者协调器 ─────────────────────────
 
+/// trace rollup 预聚合 profile 的物化预算。
+///
+/// 默认 `full()` 保持现有行为：storageStats 和 traceAggregate 的内置高频 profile 全部物化，
+/// 所以 `WriteCoordinator::new/open/open_durable` 的单机默认路径不变。只有通过
+/// [`CoordinatorBuilder`] 显式设置 limit 时，才会减少预聚合 profile；缺失的 profile 会回退到
+/// segment rollup 或 folded scan，不会返回截断结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceRollupProfileConfig {
+    storage_profile_limit: Option<usize>,
+    aggregate_profile_limit: Option<usize>,
+    max_buckets_per_profile: Option<usize>,
+}
+
+impl Default for TraceRollupProfileConfig {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+impl TraceRollupProfileConfig {
+    pub fn full() -> Self {
+        Self {
+            storage_profile_limit: None,
+            aggregate_profile_limit: None,
+            max_buckets_per_profile: None,
+        }
+    }
+
+    pub fn with_storage_profile_limit(mut self, limit: usize) -> Self {
+        self.storage_profile_limit = Some(limit);
+        self
+    }
+
+    pub fn with_aggregate_profile_limit(mut self, limit: usize) -> Self {
+        self.aggregate_profile_limit = Some(limit);
+        self
+    }
+
+    pub fn with_max_buckets_per_profile(mut self, limit: usize) -> Self {
+        self.max_buckets_per_profile = Some(limit);
+        self
+    }
+
+    pub(crate) fn storage_profile_limit(&self) -> Option<usize> {
+        self.storage_profile_limit
+    }
+
+    pub(crate) fn aggregate_profile_limit(&self) -> Option<usize> {
+        self.aggregate_profile_limit
+    }
+
+    pub(crate) fn max_buckets_per_profile(&self) -> Option<usize> {
+        self.max_buckets_per_profile
+    }
+}
+
 /// 所有 manifest 提交的串行入口。持有 WAL + current 指针 + 段存储。
 pub struct WriteCoordinator {
     /// 单写者锁：flush/compaction/delete/upgrade 全过这把锁。
@@ -3049,6 +3248,8 @@ pub struct WriteCoordinator {
     trace_aggregate_rollups: Mutex<HashMap<u64, Arc<TraceAggregateSegmentRollup>>>,
     /// 持久模式下的 traceAggregate rollup 目录。它是派生读模型，不进入 WAL/manifest 主格式。
     trace_aggregate_rollup_dir: Option<std::path::PathBuf>,
+    /// rollup 预聚合物化预算。默认 full，不改变单机版现有行为。
+    trace_rollup_profile_config: TraceRollupProfileConfig,
     /// trace → span keys。attrs 命中一个 span 后，用它扩展回整条 trace 的完整聚合。
     trace_span_keys: Mutex<HashMap<u64, HashSet<(u64, u64)>>>,
     /// trace trajectory 物化读模型缓存。写入同 trace 后失效，读路径按需重建。
@@ -3409,6 +3610,7 @@ pub struct CoordinatorBuilder {
     graph: Option<Arc<dyn GraphIndex>>,
     /// 持久模式磁盘向量索引的参数（缓冲预算 / m / ef）。None = 默认。仅在没注入自定义 graph 时生效。
     vec_cfg: Option<DiskGraphConfig>,
+    trace_rollup_profile_config: TraceRollupProfileConfig,
 }
 
 impl CoordinatorBuilder {
@@ -3458,6 +3660,33 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// 控制 trace rollup 预聚合 profile 的物化预算。默认 full；显式收紧时，缺失 profile 会回退慢路径。
+    pub fn with_trace_rollup_profile_config(mut self, cfg: TraceRollupProfileConfig) -> Self {
+        self.trace_rollup_profile_config = cfg;
+        self
+    }
+
+    /// 便捷设置 storageStats / traceAggregate 各自最多物化多少个 profile family。
+    pub fn with_trace_rollup_profile_limits(
+        mut self,
+        storage_limit: usize,
+        aggregate_limit: usize,
+    ) -> Self {
+        self.trace_rollup_profile_config = self
+            .trace_rollup_profile_config
+            .with_storage_profile_limit(storage_limit)
+            .with_aggregate_profile_limit(aggregate_limit);
+        self
+    }
+
+    /// 限制单个 profile 的最大 bucket 数。超限时整个 profile 不物化，避免返回截断聚合。
+    pub fn with_trace_rollup_profile_bucket_limit(mut self, limit: usize) -> Self {
+        self.trace_rollup_profile_config = self
+            .trace_rollup_profile_config
+            .with_max_buckets_per_profile(limit);
+        self
+    }
+
     /// 内存 WAL（测试/开发）。
     pub fn build(self, segments: Arc<dyn SegmentStore>) -> Arc<WriteCoordinator> {
         WriteCoordinator::build_full(
@@ -3470,6 +3699,7 @@ impl CoordinatorBuilder {
             None,
             self.bm25,
             self.graph,
+            self.trace_rollup_profile_config,
             None,
         )
     }
@@ -3490,6 +3720,7 @@ impl CoordinatorBuilder {
             None,
             self.bm25,
             self.graph,
+            self.trace_rollup_profile_config,
             None,
         ))
     }
@@ -3499,7 +3730,13 @@ impl CoordinatorBuilder {
         self,
         dir: impl AsRef<std::path::Path>,
     ) -> std::io::Result<Arc<WriteCoordinator>> {
-        WriteCoordinator::open_durable_inner(dir, self.bm25, self.graph, self.vec_cfg)
+        WriteCoordinator::open_durable_inner(
+            dir,
+            self.bm25,
+            self.graph,
+            self.vec_cfg,
+            self.trace_rollup_profile_config,
+        )
     }
 }
 

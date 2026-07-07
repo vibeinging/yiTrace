@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use yt_engine::evalkit;
 use yt_engine::{
-    DatasetAssociationFilter, EngineJsonApi, GoldenPathFilter, InMemorySegmentStore, KeywordScorer,
-    ReplicationStatus, ShardId, TraceAnnotationFilter, TraceQuery, WalReplicationBatch, WireRecord,
-    WriteCoordinator,
+    CoordinatorBuilder, DatasetAssociationFilter, EngineJsonApi, GoldenPathFilter,
+    InMemorySegmentStore, KeywordScorer, ReplicationStatus, ShardId, TraceAnnotationFilter,
+    TraceQuery, WalReplicationBatch, WireRecord, WriteCoordinator,
 };
 
 fn fresh() -> Arc<WriteCoordinator> {
@@ -51,14 +51,21 @@ fn high_frequency_read_models_use_materialized_cache_and_invalidate_on_write() {
     let (status, aggregate_first) =
         api.route_with_tenant("POST", "/v1/trace-aggregate", aggregate_query, Some(91));
     assert_eq!(status, 200, "{aggregate_first}");
-    assert_json_contains(&aggregate_first, r#""aggregationIndex":"tail_folded_scan""#);
     assert_json_contains(
         &aggregate_first,
-        r#""aggregationPlanner":"tail_only_query_time_reduce""#,
+        r#""aggregationIndex":"aggregate_preaggregate_tail_overlay""#,
+    );
+    assert_json_contains(
+        &aggregate_first,
+        r#""aggregationPlanner":"aggregate_preaggregate_tail_overlay""#,
     );
     assert_json_contains(&aggregate_first, r#""rollupEligible":true"#);
-    assert_json_contains(&aggregate_first, r#""spanReadIndex":"tail_folded_scan""#);
+    assert_json_contains(
+        &aggregate_first,
+        r#""spanReadIndex":"aggregate_preaggregate""#,
+    );
     assert_json_contains(&aggregate_first, r#""usedSegmentRollup":false"#);
+    assert_json_contains(&aggregate_first, r#""tailFoldedSpanCount":2"#);
     assert_json_contains(&aggregate_first, r#""usedAttrPostings":false"#);
     assert_json_contains(&aggregate_first, r#""candidateSpanKeys":null"#);
     assert_json_contains(&aggregate_first, r#""readModelCache":"miss""#);
@@ -154,19 +161,51 @@ fn trace_aggregate_uses_segment_rollup_after_flush() {
     assert_eq!(status, 200, "{ingest}");
     coord.flush_memtable();
 
+    let metrics = coord.metrics();
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_cached_segments"),
+        1,
+        "single-node flush should keep one cached rollup segment\n{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_cached_rows"),
+        4,
+        "rollup row count should match flushed folded spans\n{metrics}"
+    );
+    assert!(
+        metric_value(&metrics, "yt_trace_rollup_storage_profile_families") > 0,
+        "storage profile families should be observable without changing query behavior\n{metrics}"
+    );
+    assert!(
+        metric_value(&metrics, "yt_trace_rollup_storage_profile_buckets") > 0,
+        "storage profile buckets should be observable without changing query behavior\n{metrics}"
+    );
+    assert!(
+        metric_value(&metrics, "yt_trace_rollup_aggregate_profile_families") > 0,
+        "aggregate profile families should be observable without changing query behavior\n{metrics}"
+    );
+    assert!(
+        metric_value(&metrics, "yt_trace_rollup_aggregate_profile_buckets") > 0,
+        "aggregate profile buckets should be observable without changing query behavior\n{metrics}"
+    );
+
     let query = r#"{"filter":{"projectId":"rollup-hit"},"groupBy":["validationStatus","toolName"],"sort":"count","limit":10}"#;
     let (status, aggregate) = api.route_with_tenant("POST", "/v1/trace-aggregate", query, Some(93));
     assert_eq!(status, 200, "{aggregate}");
     assert_json_contains(
         &aggregate,
-        r#""aggregationIndex":"segment_rollup_tail_overlay""#,
+        r#""aggregationIndex":"aggregate_preaggregate_tail_overlay""#,
     );
     assert_json_contains(
         &aggregate,
-        r#""aggregationPlanner":"segment_rollup_tail_overlay""#,
+        r#""aggregationPlanner":"aggregate_preaggregate_tail_overlay""#,
     );
     assert_json_contains(&aggregate, r#""usedSegmentRollup":true"#);
-    assert_json_contains(&aggregate, r#""spanReadIndex":"segment_rollup""#);
+    assert_json_contains(&aggregate, r#""spanReadIndex":"aggregate_preaggregate""#);
+    assert_json_contains(
+        &aggregate,
+        r#""aggregatePreaggregateProfile":["project_id","tool_name","validation_status"]"#,
+    );
     assert_json_contains(&aggregate, r#""segmentRollupSegments":1"#);
     assert_json_contains(&aggregate, r#""segmentRollupRows":4"#);
     assert_json_contains(&aggregate, r#""tailFoldedSpanCount":0"#);
@@ -180,6 +219,125 @@ fn trace_aggregate_uses_segment_rollup_after_flush() {
         &aggregate,
         r#""key":{"validation_status":"fail","toolName":"executor"},"spanCount":1"#,
     );
+}
+
+#[test]
+fn trace_rollup_profile_budget_falls_back_without_changing_results() {
+    let coord = CoordinatorBuilder::new()
+        .with_trace_rollup_profile_limits(0, 0)
+        .build(Arc::new(InMemorySegmentStore::default()));
+    let api = EngineJsonApi::new(Arc::clone(&coord));
+    let body = r#"[
+      {"trace_id":93601,"span_id":1,"session_id":9361,"ts":10,"seq":1,"event_type":2,"ext_span_id":"93601-1","status":0,"duration_ns":100,"tool_name":"planner","input_tokens":10,"output_tokens":1,"attrs":{"project_id":"rollup-budget","validation_status":"pass","skill":"review","mode":"auto"}},
+      {"trace_id":93602,"span_id":1,"session_id":9362,"ts":20,"seq":1,"event_type":2,"ext_span_id":"93602-1","status":0,"duration_ns":200,"tool_name":"planner","input_tokens":20,"output_tokens":2,"attrs":{"project_id":"rollup-budget","validation_status":"pass","skill":"review","mode":"auto"}},
+      {"trace_id":93603,"span_id":1,"session_id":9363,"ts":30,"seq":1,"event_type":2,"ext_span_id":"93603-1","status":1,"duration_ns":300,"tool_name":"executor","input_tokens":30,"output_tokens":3,"attrs":{"project_id":"rollup-budget","validation_status":"fail","skill":"review","mode":"auto"}},
+      {"trace_id":93604,"span_id":1,"session_id":9364,"ts":40,"seq":1,"event_type":2,"ext_span_id":"93604-1","status":0,"duration_ns":400,"tool_name":"planner","input_tokens":40,"output_tokens":4,"attrs":{"project_id":"other","validation_status":"pass","skill":"review","mode":"auto"}}
+    ]"#;
+    let (status, ingest) = api.route_with_tenant("POST", "/v1/ingest", body, Some(93));
+    assert_eq!(status, 200, "{ingest}");
+    coord.flush_memtable();
+
+    let metrics = coord.metrics();
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_cached_segments"),
+        1,
+        "{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_cached_rows"),
+        4,
+        "{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_storage_profile_families"),
+        0,
+        "storage preaggregate profiles should be disabled by explicit budget\n{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_storage_profile_buckets"),
+        0,
+        "{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_aggregate_profile_families"),
+        0,
+        "aggregate preaggregate profiles should be disabled by explicit budget\n{metrics}"
+    );
+    assert_eq!(
+        metric_value(&metrics, "yt_trace_rollup_aggregate_profile_buckets"),
+        0,
+        "{metrics}"
+    );
+
+    let aggregate_query = r#"{"filter":{"projectId":"rollup-budget"},"groupBy":["validationStatus","toolName"],"sort":"count","limit":10}"#;
+    let (status, aggregate) =
+        api.route_with_tenant("POST", "/v1/trace-aggregate", aggregate_query, Some(93));
+    assert_eq!(status, 200, "{aggregate}");
+    assert_json_contains(
+        &aggregate,
+        r#""aggregationIndex":"segment_rollup_tail_overlay""#,
+    );
+    assert_json_contains(&aggregate, r#""spanReadIndex":"segment_rollup""#);
+    assert_json_contains(&aggregate, r#""segmentRollupRows":4"#);
+    assert_json_contains(&aggregate, r#""spanTotal":3"#);
+    assert_json_contains(
+        &aggregate,
+        r#""key":{"validation_status":"pass","toolName":"planner"},"spanCount":2"#,
+    );
+    assert_json_contains(
+        &aggregate,
+        r#""key":{"validation_status":"fail","toolName":"executor"},"spanCount":1"#,
+    );
+
+    let storage_query =
+        r#"{"filter":{"projectId":"rollup-budget"},"groupBy":["validationStatus"]}"#;
+    let (status, storage) =
+        api.route_with_tenant("POST", "/v1/storage-stats", storage_query, Some(93));
+    assert_eq!(status, 200, "{storage}");
+    assert_json_contains(&storage, r#""spanReadIndex":"storage_segment_rollup""#);
+    assert_json_contains(&storage, r#""spanCount":3"#);
+    assert_json_contains(&storage, r#""traceCount":3"#);
+}
+
+#[test]
+fn trace_search_uses_segment_rollup_for_simple_list_page_and_falls_back_for_text() {
+    let coord = fresh();
+    let api = EngineJsonApi::new(Arc::clone(&coord));
+    let body = r#"[
+      {"trace_id":93501,"span_id":1,"session_id":9351,"ts":10,"seq":1,"event_type":2,"ext_span_id":"93501-1","status":0,"duration_ns":100,"tool_name":"planner","input_text":"rollup slow item","attrs":{"project_id":"trace-search-rollup","validation_status":"pass","skill":"review","mode":"auto"}},
+      {"trace_id":93502,"span_id":1,"session_id":9352,"ts":20,"seq":1,"event_type":2,"ext_span_id":"93502-1","status":0,"duration_ns":300,"tool_name":"planner","input_text":"rollup top item","attrs":{"project_id":"trace-search-rollup","validation_status":"pass","skill":"review","mode":"auto"}},
+      {"trace_id":93503,"span_id":1,"session_id":9353,"ts":30,"seq":1,"event_type":2,"ext_span_id":"93503-1","status":1,"duration_ns":200,"tool_name":"executor","input_text":"must-read-text fallback item","attrs":{"project_id":"trace-search-rollup","validation_status":"fail","skill":"review","mode":"auto"}},
+      {"trace_id":93504,"span_id":1,"session_id":9354,"ts":40,"seq":1,"event_type":2,"ext_span_id":"93504-1","status":0,"duration_ns":400,"tool_name":"planner","input_text":"outside project","attrs":{"project_id":"other","validation_status":"pass","skill":"review","mode":"auto"}}
+    ]"#;
+    let (status, ingest) = api.route_with_tenant("POST", "/v1/ingest", body, Some(93));
+    assert_eq!(status, 200, "{ingest}");
+    coord.flush_memtable();
+
+    let list_query =
+        r#"{"filter":{"projectId":"trace-search-rollup"},"sort":"duration","limit":2}"#;
+    let (status, list) = api.route_with_tenant("POST", "/v1/trace-search", list_query, Some(93));
+    assert_eq!(status, 200, "{list}");
+    assert_json_contains(&list, r#""total":3"#);
+    assert_json_contains(&list, r#""nextCursor":2"#);
+    assert_json_contains(&list, r#""index":"attrs_postings+folded_verify""#);
+    assert_json_contains(&list, r#""spanReadIndex":"trace_search_rollup""#);
+    assert_json_contains(&list, r#""usedSegmentRollup":true"#);
+    assert_json_contains(&list, r#""segmentRollupRows":4"#);
+    assert_json_contains(&list, r#""tailFoldedSpanCount":0"#);
+    assert_json_contains(&list, r#""pageHydrateKeys":2"#);
+    assert_json_contains(&list, r#""rollupBlockedBy":[]"#);
+    assert_json_contains(&list, r#""traceId":"93502""#);
+    assert_json_contains(&list, r#""inputText":{"preview":"rollup top item""#);
+
+    let text_query =
+        r#"{"text":"must-read-text","filter":{"projectId":"trace-search-rollup"},"limit":10}"#;
+    let (status, text) = api.route_with_tenant("POST", "/v1/trace-search", text_query, Some(93));
+    assert_eq!(status, 200, "{text}");
+    assert_json_contains(&text, r#""total":1"#);
+    assert_json_contains(&text, r#""traceId":"93503""#);
+    assert_json_contains(&text, r#""spanReadIndex":"folded_scan""#);
+    assert_json_contains(&text, r#""usedAttrPostings":true"#);
+    assert_json_contains(&text, r#""rollupBlockedBy":["text_contains_filter"]"#);
 }
 
 #[test]
@@ -247,8 +405,9 @@ fn durable_trace_aggregate_rollup_survives_reopen() {
         assert_eq!(status, 200, "{aggregate}");
         assert_json_contains(
             &aggregate,
-            r#""aggregationIndex":"segment_rollup_tail_overlay""#,
+            r#""aggregationIndex":"aggregate_preaggregate_tail_overlay""#,
         );
+        assert_json_contains(&aggregate, r#""spanReadIndex":"aggregate_preaggregate""#);
         assert_json_contains(&aggregate, r#""usedSegmentRollup":true"#);
         assert_json_contains(&aggregate, r#""segmentRollupSegments":1"#);
         assert_json_contains(&aggregate, r#""segmentRollupRows":2"#);
@@ -1464,8 +1623,7 @@ fn attrs_sidecar_index_cache_is_lazy_and_trace_summaries_stay_complete() {
             "no sidecar posting list should be loaded before the first query"
         );
 
-        let indexed_query =
-            r#"{"filter":{"projectId":"index-perf","connectionIds":"conn-a"},"limit":10}"#;
+        let indexed_query = r#"{"filter":{"projectId":"index-perf","connectionIds":"conn-a","spanId":1},"limit":10}"#;
         let (status, indexed) =
             api.route_with_tenant("POST", "/v1/trace-search", indexed_query, Some(16));
         assert_eq!(status, 200, "{indexed}");
@@ -1489,8 +1647,13 @@ fn attrs_sidecar_index_cache_is_lazy_and_trace_summaries_stay_complete() {
         );
 
         let first_hits = metric_value(&after_first, "yt_attr_sidecar_cache_hits");
-        let (status, indexed_again) =
-            api.route_with_tenant("POST", "/v1/trace-search", indexed_query, Some(16));
+        let indexed_query_same_terms = r#"{"filter":{"projectId":"index-perf","connectionIds":"conn-a","spanId":1},"limit":20}"#;
+        let (status, indexed_again) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            indexed_query_same_terms,
+            Some(16),
+        );
         assert_eq!(status, 200, "{indexed_again}");
         assert_json_contains(&indexed_again, r#""total":2"#);
         let after_second = coord.metrics();
@@ -1599,7 +1762,8 @@ fn single_shard_facade_reports_cluster_shape_and_keeps_indexed_search_path() {
             "recover should not prewarm segment posting lists"
         );
 
-        let query = r#"{"filter":{"projectId":"cluster-facade","skill":"routing"},"limit":10}"#;
+        let query =
+            r#"{"filter":{"projectId":"cluster-facade","skill":"routing","spanId":1},"limit":10}"#;
         let (status, indexed) = api.route_with_tenant("POST", "/v1/trace-search", query, Some(77));
         assert_eq!(status, 200, "{indexed}");
         assert_json_contains(&indexed, r#""total":2"#);
@@ -1758,10 +1922,10 @@ fn in_process_cluster_routes_ingest_and_merges_indexed_queries() {
     assert_json_contains(&agg, r#""spanTotal":3"#);
     assert_json_contains(
         &agg,
-        r#""aggregationIndex":"fanout_segment_rollup_tail_overlay""#,
+        r#""aggregationIndex":"fanout_aggregate_preaggregate_tail_overlay""#,
     );
     assert_json_contains(&agg, r#""usedSegmentRollup":true"#);
-    assert_json_contains(&agg, r#""spanReadIndex":"segment_rollup""#);
+    assert_json_contains(&agg, r#""spanReadIndex":"aggregate_preaggregate""#);
     assert_json_contains(&agg, r#""queryMode":"fanout_merge""#);
     assert_json_contains(&agg, r#""okShards":3"#);
     assert_json_contains(&agg, r#""degraded":false"#);

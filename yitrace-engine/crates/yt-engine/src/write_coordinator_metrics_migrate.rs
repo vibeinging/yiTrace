@@ -67,6 +67,7 @@ impl WriteCoordinator {
         ) = self.seg_attr_cache.lock().unwrap().stats();
         let fold_cache_entries = self.seg_fold_cache.lock().unwrap().map.len();
         let bloom_count = self.seg_key_bloom.lock().unwrap().len();
+        let trace_rollup_profile_stats = self.trace_aggregate_rollup_profile_stats();
         let datasets = self.datasets.lock().unwrap().len();
         let annotations = self.annotations.lock().unwrap().len();
         let dataset_associations = self.dataset_associations.lock().unwrap().len();
@@ -265,6 +266,56 @@ impl WriteCoordinator {
         out.push_str("# HELP yt_seg_bloom_count 段级 key Bloom 条目数。\n");
         out.push_str("# TYPE yt_seg_bloom_count gauge\n");
         out.push_str(&format!("yt_seg_bloom_count {bloom_count}\n\n"));
+
+        out.push_str("# HELP yt_trace_rollup_cached_segments 已载入内存的 trace rollup segment 数。\n");
+        out.push_str("# TYPE yt_trace_rollup_cached_segments gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_cached_segments {}\n\n",
+            trace_rollup_profile_stats.cached_segments
+        ));
+
+        out.push_str("# HELP yt_trace_rollup_cached_rows 已载入内存的 trace rollup span row 数。\n");
+        out.push_str("# TYPE yt_trace_rollup_cached_rows gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_cached_rows {}\n\n",
+            trace_rollup_profile_stats.cached_rows
+        ));
+
+        out.push_str(
+            "# HELP yt_trace_rollup_storage_profile_families 已载入 storageStats 预聚合 profile 族数量。\n",
+        );
+        out.push_str("# TYPE yt_trace_rollup_storage_profile_families gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_storage_profile_families {}\n\n",
+            trace_rollup_profile_stats.storage_profile_families
+        ));
+
+        out.push_str(
+            "# HELP yt_trace_rollup_storage_profile_buckets 已载入 storageStats 预聚合 bucket 数量。\n",
+        );
+        out.push_str("# TYPE yt_trace_rollup_storage_profile_buckets gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_storage_profile_buckets {}\n\n",
+            trace_rollup_profile_stats.storage_profile_buckets
+        ));
+
+        out.push_str(
+            "# HELP yt_trace_rollup_aggregate_profile_families 已载入 traceAggregate 预聚合 profile 族数量。\n",
+        );
+        out.push_str("# TYPE yt_trace_rollup_aggregate_profile_families gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_aggregate_profile_families {}\n\n",
+            trace_rollup_profile_stats.aggregate_profile_families
+        ));
+
+        out.push_str(
+            "# HELP yt_trace_rollup_aggregate_profile_buckets 已载入 traceAggregate 预聚合 bucket 数量。\n",
+        );
+        out.push_str("# TYPE yt_trace_rollup_aggregate_profile_buckets gauge\n");
+        out.push_str(&format!(
+            "yt_trace_rollup_aggregate_profile_buckets {}\n\n",
+            trace_rollup_profile_stats.aggregate_profile_buckets
+        ));
 
         out.push_str("# HELP yt_datasets 评测数据集数。\n");
         out.push_str("# TYPE yt_datasets gauge\n");

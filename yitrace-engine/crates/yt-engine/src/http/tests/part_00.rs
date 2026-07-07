@@ -626,6 +626,190 @@
         }
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn storage_stats_read_model_cache_hits_and_invalidates_on_ingest() {
+        let dir = durable_temp_dir("storage-stats-cache");
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord);
+
+        let first_batch = r#"[
+          {"trace_id":701,"span_id":1,"ts":10,"seq":1,"event_type":1,"ext_span_id":"701-1","input_text":"cache first","attrs":{"project_id":"cache-demo"}},
+          {"trace_id":701,"span_id":1,"ts":20,"seq":2,"event_type":2,"ext_span_id":"701-1","duration_ns":10,"output_text":"done"}
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", first_batch, Some(7));
+        assert_eq!(status, 200, "{body}");
+        api.coord().flush_memtable();
+
+        let query = r#"{"filter":{"projectId":"cache-demo"},"groupBy":["projectId"]}"#;
+        let (status, first) =
+            api.route_with_tenant("POST", "/v1/storage-stats", query, Some(7));
+        assert_eq!(status, 200, "{first}");
+        assert!(first.contains(r#""traceCount":1"#), "{first}");
+        assert!(
+            first.contains(r#""spanReadIndex":"storage_preaggregate""#),
+            "{first}"
+        );
+        assert!(
+            first.contains(r#""storagePreaggregateProfile":["project_id"]"#),
+            "{first}"
+        );
+        assert!(first.contains(r#""readModelCache":"miss""#), "{first}");
+
+        let (status, second) =
+            api.route_with_tenant("POST", "/v1/storage-stats", query, Some(7));
+        assert_eq!(status, 200, "{second}");
+        assert!(second.contains(r#""traceCount":1"#), "{second}");
+        assert!(second.contains(r#""readModelCache":"hit""#), "{second}");
+
+        let identity_query =
+            r#"{"filter":{"projectId":"cache-demo","traceId":701},"groupBy":["projectId"]}"#;
+        let (status, identity) =
+            api.route_with_tenant("POST", "/v1/storage-stats", identity_query, Some(7));
+        assert_eq!(status, 200, "{identity}");
+        assert!(
+            identity.contains(r#""spanReadIndex":"folded_scan""#),
+            "{identity}"
+        );
+        assert!(
+            identity.contains(r#""rollupFallbackReason":"rollup_blocked""#),
+            "{identity}"
+        );
+
+        let row_rollup_query = r#"{"filter":{"projectId":"cache-demo"},"groupBy":["callSite"]}"#;
+        let (status, row_rollup) =
+            api.route_with_tenant("POST", "/v1/storage-stats", row_rollup_query, Some(7));
+        assert_eq!(status, 200, "{row_rollup}");
+        assert!(
+            row_rollup.contains(r#""spanReadIndex":"storage_segment_rollup""#),
+            "{row_rollup}"
+        );
+
+        let second_batch = r#"[
+          {"trace_id":702,"span_id":1,"ts":30,"seq":1,"event_type":1,"ext_span_id":"702-1","input_text":"cache second","attrs":{"project_id":"cache-demo"}},
+          {"trace_id":702,"span_id":1,"ts":40,"seq":2,"event_type":2,"ext_span_id":"702-1","duration_ns":10,"output_text":"done"}
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", second_batch, Some(7));
+        assert_eq!(status, 200, "{body}");
+
+        let (status, after_ingest) =
+            api.route_with_tenant("POST", "/v1/storage-stats", query, Some(7));
+        assert_eq!(status, 200, "{after_ingest}");
+        assert!(after_ingest.contains(r#""traceCount":2"#), "{after_ingest}");
+        assert!(
+            after_ingest.contains(r#""readModelCache":"miss""#),
+            "{after_ingest}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn storage_stats_preaggregate_matches_folded_scan_for_basic_totals() {
+        let dir = durable_temp_dir("storage-stats-rollup-parity");
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord);
+
+        let batch = r#"[
+          {"trace_id":901,"span_id":1,"session_id":91,"ts":10,"seq":1,"event_type":1,"ext_span_id":"901-1","input_text":"risk input","attrs":{"project_id":"rollup-parity","skill":"review"}},
+          {"trace_id":901,"span_id":1,"session_id":91,"ts":20,"seq":2,"event_type":2,"ext_span_id":"901-1","duration_ns":10,"status":0,"output_text":"risk output","logs":["first done"]},
+          {"trace_id":901,"span_id":2,"session_id":91,"ts":30,"seq":1,"event_type":1,"ext_span_id":"901-2","tool_name":"validator","input_text":"tool input","attrs":{"project_id":"rollup-parity","skill":"review"}},
+          {"trace_id":901,"span_id":2,"session_id":91,"ts":40,"seq":2,"event_type":2,"ext_span_id":"901-2","duration_ns":20,"status":2,"output_text":"tool output","logs":["tool failed"]}
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", batch, Some(9));
+        assert_eq!(status, 200, "{body}");
+        api.coord().flush_memtable();
+
+        let fast_query = r#"{"filter":{"projectId":"rollup-parity"},"groupBy":["projectId"]}"#;
+        let (status, fast) =
+            api.route_with_tenant("POST", "/v1/storage-stats", fast_query, Some(9));
+        assert_eq!(status, 200, "{fast}");
+        assert!(
+            fast.contains(r#""spanReadIndex":"storage_preaggregate""#),
+            "{fast}"
+        );
+
+        let fallback_query =
+            r#"{"filter":{"projectId":"rollup-parity","traceId":901},"groupBy":["projectId"]}"#;
+        let (status, fallback) =
+            api.route_with_tenant("POST", "/v1/storage-stats", fallback_query, Some(9));
+        assert_eq!(status, 200, "{fallback}");
+        assert!(
+            fallback.contains(r#""spanReadIndex":"folded_scan""#),
+            "{fallback}"
+        );
+
+        for path in [
+            &["total", "traceCount"][..],
+            &["total", "spanCount"],
+            &["total", "sessionCount"],
+            &["total", "eventCount"],
+            &["total", "errorSpanCount"],
+            &["total", "bytes", "inputText"],
+            &["total", "bytes", "outputText"],
+            &["total", "bytes", "logs"],
+            &["total", "bytes", "attrs"],
+            &["total", "bytes", "fields"],
+            &["total", "bytes", "estimated"],
+        ] {
+            assert_eq!(
+                test_json_u64(&fast, path),
+                test_json_u64(&fallback, path),
+                "path {path:?}"
+            );
+        }
+        assert_eq!(test_json_u64(&fast, &["total", "traceCount"]), 1);
+        assert_eq!(test_json_u64(&fast, &["total", "spanCount"]), 2);
+        assert_eq!(test_json_u64(&fast, &["total", "eventCount"]), 4);
+        assert_eq!(test_json_u64(&fast, &["total", "errorSpanCount"]), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trace_search_read_model_cache_hits_and_invalidates_on_ingest() {
+        let dir = durable_temp_dir("trace-search-cache");
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let api = EngineJsonApi::new(coord);
+
+        let first_batch = r#"[
+          {"trace_id":801,"span_id":1,"ts":10,"seq":1,"event_type":1,"ext_span_id":"801-1","input_text":"trace cache first","attrs":{"project_id":"trace-cache"}},
+          {"trace_id":801,"span_id":1,"ts":20,"seq":2,"event_type":2,"ext_span_id":"801-1","duration_ns":10,"output_text":"done"}
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", first_batch, Some(8));
+        assert_eq!(status, 200, "{body}");
+        api.coord().flush_memtable();
+
+        let query = r#"{"filter":{"projectId":"trace-cache"},"limit":10}"#;
+        let (status, first) = api.route_with_tenant("POST", "/v1/trace-search", query, Some(8));
+        assert_eq!(status, 200, "{first}");
+        assert!(first.contains(r#""total":1"#), "{first}");
+        assert!(first.contains(r#""readModelCache":"miss""#), "{first}");
+
+        let (status, second) = api.route_with_tenant("POST", "/v1/trace-search", query, Some(8));
+        assert_eq!(status, 200, "{second}");
+        assert!(second.contains(r#""total":1"#), "{second}");
+        assert!(second.contains(r#""readModelCache":"hit""#), "{second}");
+
+        let second_batch = r#"[
+          {"trace_id":802,"span_id":1,"ts":30,"seq":1,"event_type":1,"ext_span_id":"802-1","input_text":"trace cache second","attrs":{"project_id":"trace-cache"}},
+          {"trace_id":802,"span_id":1,"ts":40,"seq":2,"event_type":2,"ext_span_id":"802-1","duration_ns":10,"output_text":"done"}
+        ]"#;
+        let (status, body) = api.route_with_tenant("POST", "/v1/ingest", second_batch, Some(8));
+        assert_eq!(status, 200, "{body}");
+
+        let (status, after_ingest) =
+            api.route_with_tenant("POST", "/v1/trace-search", query, Some(8));
+        assert_eq!(status, 200, "{after_ingest}");
+        assert!(after_ingest.contains(r#""total":2"#), "{after_ingest}");
+        assert!(
+            after_ingest.contains(r#""readModelCache":"miss""#),
+            "{after_ingest}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn retention_plan_protects_snapshot_eval_and_path_memory_refs() {
         let dir = durable_temp_dir("retention-derived-protect");

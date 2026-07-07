@@ -135,6 +135,52 @@ fn trace_search_request_from_json(
     }
 }
 
+fn trace_search_scan_projection(
+    request: &TraceSearchRequest,
+    sort_by: &str,
+) -> crate::Projection {
+    let mut cols = crate::Projection::STATUS
+        | crate::Projection::DURATION_NS
+        | crate::Projection::INPUT_TOKENS
+        | crate::Projection::OUTPUT_TOKENS
+        | crate::Projection::USAGE_COST
+        | crate::Projection::SESSION_ID
+        | crate::Projection::TENANT_ID
+        | crate::Projection::AGENT_NAME
+        | crate::Projection::TOOL_NAME
+        | crate::Projection::MODEL
+        | crate::Projection::EXTERNAL_IDS
+        | crate::Projection::ATTRS
+        | crate::Projection::AGENTIC_FIELDS;
+
+    if request.spec.text.is_some() {
+        cols |= crate::Projection::INPUT_TEXT | crate::Projection::OUTPUT_TEXT | crate::Projection::LOGS;
+    }
+    if request.spec.input_contains.is_some() {
+        cols |= crate::Projection::INPUT_TEXT;
+    }
+    if request.spec.output_contains.is_some() {
+        cols |= crate::Projection::OUTPUT_TEXT;
+    }
+    if request.spec.log_contains.is_some() {
+        cols |= crate::Projection::LOGS;
+    }
+
+    match sort_by.to_ascii_lowercase().as_str() {
+        "duration" | "duration_ns" | "durationns" => cols |= crate::Projection::DURATION_NS,
+        "cost" | "cost_usd" | "costusd" => cols |= crate::Projection::USAGE_COST,
+        "tokens" | "token_count" | "tokencount" => {
+            cols |= crate::Projection::INPUT_TOKENS
+                | crate::Projection::OUTPUT_TOKENS
+                | crate::Projection::USAGE_COST;
+        }
+        "status" => cols |= crate::Projection::STATUS,
+        _ => {}
+    }
+
+    crate::Projection::of(cols)
+}
+
 fn trace_search_match(
     s: &FoldedSpan,
     spec: &TraceSearchSpec,
@@ -633,6 +679,68 @@ fn sort_trace_search_spans(spans: &mut [FoldedSpan], sort_by: &str, desc: bool) 
         ord.then_with(|| a.trace_id.cmp(&b.trace_id))
             .then_with(|| a.span_id.cmp(&b.span_id))
     });
+}
+
+fn trace_search_rollup_blockers(request: &TraceSearchRequest) -> Vec<String> {
+    let mut blockers = trace_aggregate_rollup_blockers(&[], request);
+    if request.query.trace_id.is_some() {
+        blockers.push("trace_id_filter".to_string());
+    }
+    if request.query.time_from != i64::MIN || request.query.time_to != i64::MAX {
+        blockers.push("time_window_filter".to_string());
+    }
+    blockers
+}
+
+fn trace_search_read_plan_json(
+    span_read_index: &str,
+    attr_stats: &AttrIndexedReadStats,
+    rollup_stats: Option<&crate::TraceAggregateRollupStats>,
+    folded_span_count: usize,
+    page_hydrate_keys: usize,
+    rollup_blockers: &[String],
+    fallback_reason: Option<&str>,
+) -> String {
+    let candidate_span_keys = attr_stats
+        .candidate_span_keys
+        .map_or("null".to_string(), |n| n.to_string());
+    let unsupported = attr_stats
+        .unsupported_attr_keys
+        .iter()
+        .map(|key| format!(r#""{}""#, json_escape(key)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rollup_blockers = rollup_blockers
+        .iter()
+        .map(|key| format!(r#""{}""#, json_escape(key)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fallback_reason = fallback_reason.map_or("null".to_string(), json_string_value);
+    let (used_segment_rollup, segment_rollup_segments, segment_rollup_rows, tail_folded_span_count) =
+        rollup_stats.map_or((false, 0, 0, 0), |stats| {
+            (
+                stats.used_segment_rollup,
+                stats.segment_rollup_segments,
+                stats.segment_rollup_rows,
+                stats.tail_folded_span_count,
+            )
+        });
+    format!(
+        r#"{{"spanReadIndex":"{}","usedSegmentRollup":{},"segmentRollupSegments":{},"segmentRollupRows":{},"tailFoldedSpanCount":{},"usedAttrPostings":{},"candidateSpanKeys":{},"scannedSegments":{},"foldedSpanCount":{},"pageHydrateKeys":{},"unsupportedAttrKeys":[{}],"rollupBlockedBy":[{}],"rollupFallbackReason":{}}}"#,
+        span_read_index,
+        used_segment_rollup,
+        segment_rollup_segments,
+        segment_rollup_rows,
+        tail_folded_span_count,
+        attr_stats.used_attr_postings,
+        candidate_span_keys,
+        attr_stats.scanned_segments,
+        folded_span_count,
+        page_hydrate_keys,
+        unsupported,
+        rollup_blockers,
+        fallback_reason,
+    )
 }
 
 fn cost_sort_key(s: &FoldedSpan) -> u128 {

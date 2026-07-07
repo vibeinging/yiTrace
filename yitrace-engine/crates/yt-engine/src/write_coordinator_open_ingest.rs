@@ -20,6 +20,7 @@ impl WriteCoordinator {
             None,
             None,
             None,
+            TraceRollupProfileConfig::full(),
             None,
         ))
     }
@@ -28,7 +29,7 @@ impl WriteCoordinator {
     /// 重启用同一目录 `open_durable` + `recover()`：先从 manifest 重建段集合(指向盘上段文件)、再 WAL 重放
     /// 水位之后的尾巴 —— **flush 过的数据(水位之前、WAL 不再重放)从持久段读回,真正重启不丢**。
     pub fn open_durable(dir: impl AsRef<std::path::Path>) -> std::io::Result<Arc<Self>> {
-        Self::open_durable_inner(dir, None, None, None)
+        Self::open_durable_inner(dir, None, None, None, TraceRollupProfileConfig::full())
     }
 
     /// open_durable 的内部实现，多收可选索引覆盖 + 磁盘向量索引参数（[`CoordinatorBuilder`] 用它注入）。
@@ -37,6 +38,7 @@ impl WriteCoordinator {
         bm25: Option<Arc<dyn Bm25Index>>,
         graph: Option<Arc<dyn GraphIndex>>,
         vec_cfg: Option<DiskGraphConfig>,
+        trace_rollup_profile_config: TraceRollupProfileConfig,
     ) -> std::io::Result<Arc<Self>> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
@@ -70,6 +72,7 @@ impl WriteCoordinator {
             vector_path,
             bm25,
             graph,
+            trace_rollup_profile_config,
             Some(dir.to_path_buf()),
         );
         // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
@@ -100,6 +103,7 @@ impl WriteCoordinator {
             None,
             None,
             None,
+            TraceRollupProfileConfig::full(),
             None,
         )
     }
@@ -115,6 +119,7 @@ impl WriteCoordinator {
         vector_path: Option<std::path::PathBuf>,
         bm25: Option<Arc<dyn Bm25Index>>,
         graph: Option<Arc<dyn GraphIndex>>,
+        trace_rollup_profile_config: TraceRollupProfileConfig,
         dir: Option<std::path::PathBuf>,
     ) -> Arc<Self> {
         let attr_sidecar_dir = dir.as_ref().map(|d| d.join("attr_postings"));
@@ -187,6 +192,7 @@ impl WriteCoordinator {
             attr_sidecar_dir,
             trace_aggregate_rollups: Mutex::new(HashMap::new()),
             trace_aggregate_rollup_dir,
+            trace_rollup_profile_config,
             trace_span_keys: Mutex::new(HashMap::new()),
             trace_trajectory_idx: Mutex::new(HashMap::new()),
             session_idx: Mutex::new(SessionIndex::default()),

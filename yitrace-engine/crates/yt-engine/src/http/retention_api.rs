@@ -590,14 +590,40 @@ impl EngineJsonApi {
         self.filtered_spans_for_storage_for_coord(self.coord(), v, tenant)
     }
 
+    pub(super) fn filtered_spans_for_storage_projected(
+        &self,
+        v: &crate::wire::Json,
+        tenant: Option<u64>,
+        proj: crate::Projection,
+    ) -> Result<(yt_manifest::Snapshot, Vec<FoldedSpan>), String> {
+        self.filtered_spans_for_storage_for_coord_projected(self.coord(), v, tenant, proj)
+    }
+
     pub(super) fn filtered_spans_for_storage_for_coord(
         &self,
         coord: &WriteCoordinator,
         v: &crate::wire::Json,
         tenant: Option<u64>,
     ) -> Result<(yt_manifest::Snapshot, Vec<FoldedSpan>), String> {
+        self.filtered_spans_for_storage_for_coord_projected(
+            coord,
+            v,
+            tenant,
+            crate::Projection::ALL,
+        )
+    }
+
+    pub(super) fn filtered_spans_for_storage_for_coord_projected(
+        &self,
+        coord: &WriteCoordinator,
+        v: &crate::wire::Json,
+        tenant: Option<u64>,
+        proj: crate::Projection,
+    ) -> Result<(yt_manifest::Snapshot, Vec<FoldedSpan>), String> {
         let snap = coord.pin_snapshot();
-        let spans = self.filtered_spans_for_storage_for_coord_snapshot(coord, &snap, v, tenant)?;
+        let spans = self.filtered_spans_for_storage_for_coord_snapshot_projected(
+            coord, &snap, v, tenant, proj,
+        )?;
         Ok((snap, spans))
     }
 
@@ -608,6 +634,23 @@ impl EngineJsonApi {
         v: &crate::wire::Json,
         tenant: Option<u64>,
     ) -> Result<Vec<FoldedSpan>, String> {
+        self.filtered_spans_for_storage_for_coord_snapshot_projected(
+            coord,
+            snap,
+            v,
+            tenant,
+            crate::Projection::ALL,
+        )
+    }
+
+    pub(super) fn filtered_spans_for_storage_for_coord_snapshot_projected(
+        &self,
+        coord: &WriteCoordinator,
+        snap: &yt_manifest::Snapshot,
+        v: &crate::wire::Json,
+        tenant: Option<u64>,
+        proj: crate::Projection,
+    ) -> Result<Vec<FoldedSpan>, String> {
         let request = trace_search_request_from_json(v, tenant);
         let metadata_matches = self.trace_search_metadata_matches_for_coord(
             coord,
@@ -616,9 +659,18 @@ impl EngineJsonApi {
             tenant,
         );
         let mut spans = if request.spec.attrs.is_empty() {
-            coord.read_spans_query(snap, &request.query).0
+            coord
+                .read_spans_query_projected(snap, &request.query, proj)
+                .0
         } else {
-            coord.read_spans_query_for_attrs(snap, &request.query, &request.spec.attrs)
+            coord
+                .read_spans_query_for_attrs_projected_with_stats(
+                    snap,
+                    &request.query,
+                    &request.spec.attrs,
+                    proj,
+                )
+                .0
         };
         spans.retain(|s| trace_search_match(s, &request.spec, &metadata_matches));
         Ok(spans)

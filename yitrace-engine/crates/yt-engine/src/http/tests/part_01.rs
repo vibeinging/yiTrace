@@ -572,9 +572,14 @@
             "{body}"
         );
         assert!(
-            body.contains(r#""aggregationIndex":"tail_folded_scan""#),
+            body.contains(r#""aggregationIndex":"aggregate_preaggregate_tail_overlay""#),
             "{body}"
         );
+        assert!(
+            body.contains(r#""spanReadIndex":"aggregate_preaggregate""#),
+            "{body}"
+        );
+        assert!(body.contains(r#""usedSegmentRollup":false"#), "{body}");
         assert!(body.contains(r#""readModelCache":"miss""#), "{body}");
 
         let (status, body) = s.route_with_tenant(

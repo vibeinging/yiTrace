@@ -21,7 +21,7 @@ use yt_core::fold::FoldInput;
 use yt_core::ids::SegmentId;
 use yt_wal::WalRecord;
 
-use crate::SegmentStore;
+use crate::{project_span_fields, Projection, SegmentStore};
 
 /// 段落盘到一个目录，每段一个文件。
 pub struct FileSegmentStore {
@@ -75,6 +75,51 @@ impl SegmentStore for FileSegmentStore {
             .enumerate()
             .map(|(i, r)| (i as u32, r.to_fold_input()))
             .collect()
+    }
+
+    fn scan_fold_inputs_projected(
+        &self,
+        seg: SegmentId,
+        proj: Projection,
+    ) -> Option<Vec<(u32, FoldInput)>> {
+        Some(
+            self.scan_records(seg)
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    (
+                        i as u32,
+                        FoldInput {
+                            trace_id: r.trace_id,
+                            span_id: r.span_id,
+                            identity: r.identity.clone(),
+                            fields: project_span_fields(&r.fields, proj),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn scan_fold_inputs_in_time(
+        &self,
+        seg: SegmentId,
+        from: i64,
+        to: i64,
+        proj: Projection,
+    ) -> Option<Vec<FoldInput>> {
+        Some(
+            self.scan_records(seg)
+                .iter()
+                .filter(|r| r.ts >= from && r.ts <= to)
+                .map(|r| FoldInput {
+                    trace_id: r.trace_id,
+                    span_id: r.span_id,
+                    identity: r.identity.clone(),
+                    fields: project_span_fields(&r.fields, proj),
+                })
+                .collect(),
+        )
     }
 
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
@@ -194,6 +239,62 @@ mod tests {
         store.unlink_segment(seg);
         assert!(!store.seg_path(seg).exists(), "unlink 真删段文件");
         assert!(store.scan_records(seg).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projected_scan_keeps_only_requested_fields() {
+        let dir = temp_dir();
+        let seg = SegmentId::new(9);
+        let store = FileSegmentStore::open(&dir).unwrap();
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("project_id".to_string(), "\"scale-a\"".to_string());
+        store.flush_to_segment(
+            seg,
+            &[WalRecord {
+                trace_id: 7,
+                span_id: 8,
+                ts: 100,
+                identity: EventIdentity {
+                    ext_span_id: "projected".into(),
+                    seq: 1,
+                    event_type: EventType::SpanEnd,
+                },
+                fields: SpanFields {
+                    status: Some(1),
+                    tenant_id: Some(42),
+                    input_text: Some("keep input".into()),
+                    output_text: Some("drop output".into()),
+                    logs: vec!["drop log".into()],
+                    attrs,
+                    ..Default::default()
+                },
+            }],
+        );
+
+        let proj = Projection::of(
+            Projection::STATUS | Projection::TENANT_ID | Projection::INPUT_TEXT | Projection::ATTRS,
+        );
+        let rows = store.scan_fold_inputs_projected(seg, proj).unwrap();
+        assert_eq!(rows.len(), 1);
+        let fields = &rows[0].1.fields;
+        assert_eq!(fields.status, Some(1));
+        assert_eq!(fields.tenant_id, Some(42));
+        assert_eq!(fields.input_text.as_deref(), Some("keep input"));
+        assert_eq!(
+            fields.attrs.get("project_id").map(String::as_str),
+            Some("\"scale-a\"")
+        );
+        assert!(
+            fields.output_text.is_none(),
+            "output_text was not projected"
+        );
+        assert!(fields.logs.is_empty(), "logs were not projected");
+
+        let time_rows = store
+            .scan_fold_inputs_in_time(seg, 101, 200, Projection::ALL)
+            .unwrap();
+        assert!(time_rows.is_empty(), "time projection filters outside rows");
         let _ = fs::remove_dir_all(&dir);
     }
 

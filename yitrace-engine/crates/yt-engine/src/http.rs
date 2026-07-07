@@ -778,6 +778,7 @@ include!("http/remote_gateway_snapshot_lease.rs");
 include!("http/remote_gateway_consistency.rs");
 include!("http/remote_gateway.rs");
 include!("http/remote_gateway_vector.rs");
+include!("http/remote_gateway_server.rs");
 include!("http/remote_gateway_helpers.rs");
 include!("http/remote_gateway_merge.rs");
 include!("http/remote_gateway_storage.rs");
