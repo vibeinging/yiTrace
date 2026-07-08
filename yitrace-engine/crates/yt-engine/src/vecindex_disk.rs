@@ -25,7 +25,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt; // 定位读写（read_at/write_at），无文件游标 → 并发只读安全
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

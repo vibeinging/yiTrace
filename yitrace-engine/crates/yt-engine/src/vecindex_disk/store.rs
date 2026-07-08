@@ -162,8 +162,7 @@ impl DiskGraphStore {
             return Ok(a);
         }
         let mut buf = vec![0u8; self.node_rec_size];
-        self.nodes
-            .read_exact_at(&mut buf, id as u64 * self.node_rec_size as u64)?;
+        read_exact_at(&self.nodes, &mut buf, id as u64 * self.node_rec_size as u64)?;
         let a = Arc::new(decode_node(&buf));
         self.node_cache.lock().unwrap().put(id, a.clone());
         Ok(a)
@@ -175,8 +174,7 @@ impl DiskGraphStore {
             return Ok(v);
         }
         let mut buf = vec![0u8; self.dim * 4];
-        self.vectors
-            .read_exact_at(&mut buf, id as u64 * self.dim as u64 * 4)?;
+        read_exact_at(&self.vectors, &mut buf, id as u64 * self.dim as u64 * 4)?;
         let v: Arc<[f32]> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -214,7 +212,7 @@ impl DiskGraphStore {
         for &x in vector {
             buf.extend_from_slice(&x.to_le_bytes());
         }
-        self.vectors.write_all_at(&buf, id * self.dim as u64 * 4)
+        write_all_at(&self.vectors, &buf, id * self.dim as u64 * 4)
     }
 
     fn write_node(
@@ -236,8 +234,7 @@ impl DiskGraphStore {
             level,
             &nb,
         );
-        self.nodes
-            .write_all_at(&buf, id * self.node_rec_size as u64)?;
+        write_all_at(&self.nodes, &buf, id * self.node_rec_size as u64)?;
         // 写穿：节点缓存同步更新，读路径直接命中、不回盘。
         self.node_cache.lock().unwrap().put(
             id as u32,
@@ -251,6 +248,69 @@ impl DiskGraphStore {
         );
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::FileExt;
+
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer"));
+        }
+        offset += n as u64;
+        let tmp = buf;
+        buf = &mut tmp[n..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::FileExt;
+
+    while !buf.is_empty() {
+        let n = file.seek_write(buf, offset)?;
+        if n == 0 {
+            return Err(Error::new(ErrorKind::WriteZero, "failed to write whole buffer"));
+        }
+        offset += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read_exact(buf)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.write_all(buf)
 }
 
 const NODE_HEADER: usize = 8 + 8 + 1 + 1 + 2; // trace + span + deleted + level + neighbor_count
