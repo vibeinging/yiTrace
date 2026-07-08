@@ -103,7 +103,6 @@ pub fn pending_deletions(entries: &[GcEntry]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn pending_returns_mark_without_done() {

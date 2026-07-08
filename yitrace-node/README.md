@@ -128,8 +128,31 @@ const span = await db.span("run-uuid", "span-uuid");
 const logMessages = span?.logEvents?.flatMap((event) => event.messages) ?? [];
 const traces = await db.traces();
 
+const page = await db.traceSearch({
+  filter: { projectId: "agentic-data", skill: "review", toolName: "card-risk" },
+  limit: 10,
+});
+console.log(page.readPlan?.source, page.readPlan?.candidateSpanKeys);
+
 await db.close();
 ```
+
+`traceSearch` / `traceAggregate` / `storageStats` / `traceTrajectories` / `trajectoryGroups` /
+`loops` / `loop` / `taskTraces` return `readPlan`. `source: "filter_index"` means the query
+first used the attrs sidecar postings to narrow span keys. Postings are memory-budgeted:
+very wide values or total-entry pressure disable only the affected postings, then queries
+fall back to the sidecar rows and still return correct results. Persistent data dirs write a
+disposable `filter_attrs.dat` segment cache and reopen recovery loads it before replaying the
+WAL tail. `source: "scan"` means it fell back to a full folded scan, for example when the
+filter only contains `text` or unknown attrs.
+`traceAggregate` can also return `source: "aggregate_rollup"` for no-text aggregate queries;
+persistent data dirs write a `trace_rollup.dat` segment cache, and reopen recovery loads it before
+replaying the WAL tail. The cache is disposable: deletes, retention apply, segment upgrades, stale
+versions, or corrupt cache contents rebuild it from the current snapshot.
+Trajectory, loop, and task helpers can return `source: "trajectory_rollup"` for no-text path
+summaries and reuse the same `trace_rollup.dat` cache after reopen. When those helpers expand
+complete traces after finding candidates, `readPlan.traceFetchSource` shows whether that second
+step also used the rollup by trace id. Text filters still use the normal folded read path.
 
 Direct event ingest is still supported when you already have wire events:
 
@@ -217,9 +240,12 @@ The equivalent nested form is `filter.attrs.{project_id,skill,mode,call_site}`.
 Values are exact matches after JSON normalization. Strings remain strings,
 numbers remain JSON numbers, booleans remain booleans, `null` remains null, and
 arrays/objects round-trip as JSON arrays/objects in `attrs` on search, trace,
-and span detail responses. Filtering is currently guaranteed only for
-`project_id`, `skill`, `mode`, and `call_site`; other attrs are stored and
-returned but not indexed as filter sidecars.
+and span detail responses. Filtering is guaranteed for the high-frequency read
+model fields: `project_id`, `skill`, `mode`, `call_site`, `task_fingerprint`,
+`loop_id`, `harness_version`, `schema_fingerprint`, `intent_signature`,
+`validation_status`, `review_status`, `eval_status`, `path_memory_id`,
+`stop_reason`, `phase`, and `validator`. Other attrs are stored and returned,
+but do not have a dedicated index contract yet.
 
 Session listing also accepts the same attrs filter shape:
 
@@ -231,6 +257,78 @@ await db.sessions({
 
 The session filter returns a session when at least one span in that session
 matches all supplied attrs, then returns the complete session aggregate.
+
+Single-node read models are exposed as thin wrappers over the same in-process
+engine API:
+
+```ts
+const trajectories = await db.traceTrajectories({
+  filter: { projectId: "agentic-data", taskFingerprint: "refund-v1" },
+});
+const groups = await db.trajectoryGroups({
+  filter: { projectId: "agentic-data", taskFingerprint: "refund-v1" },
+});
+const diff = await db.traceDiff("run-a", "run-b");
+const loops = await db.loops({ projectId: "agentic-data", taskFingerprint: "refund-v1" });
+const loop = await db.loop("loop-refund");
+const taskRuns = await db.taskTraces("refund-v1", { validationStatus: "pass" });
+```
+
+These APIs use the in-memory filter index for the common filtering step. No-text
+path summaries reuse the span rollup cache; materialized disk indexes dedicated
+to trajectory, loop, and task views are a later performance upgrade.
+
+Annotation and dataset association are stored in the embedded metadata ledger.
+They do not copy trace payloads and do not change the trace/WAL/segment format:
+
+```ts
+const annotation = await db.annotate({
+  traceId: "run-a",
+  spanId: "span-a",
+  label: "best_path",
+  score: 950,
+  source: "human",
+  attrs: { project_id: "agentic-data", skill: "review" },
+});
+
+await db.updateAnnotation(annotation.annotationId, {
+  status: "resolved",
+  reviewer: "qa",
+});
+
+await db.linkDatasetItem({
+  datasetId: "agentic-regression",
+  itemId: "case-1",
+  traceId: "run-a",
+  spanId: "span-a",
+  split: "eval",
+  label: "pass",
+});
+
+const annotations = await db.annotations({ projectId: "agentic-data", includeDeleted: true });
+const datasetLinks = await db.datasetAssociations({ datasetId: "agentic-regression" });
+```
+
+Retention uses the same metadata ledger for audit and policy records. It is
+explicit: call `retentionPlan()` first, then `applyRetention()` when the plan is
+acceptable. Hot traces still in the WAL tail are skipped. Audit and policy
+queries use the same in-memory metadata postings as annotations.
+
+```ts
+const plan = await db.retentionPlan({
+  filter: { projectId: "agentic-data" },
+  deleteBeforeTs: 100000,
+  protect: { annotations: true, datasetAssociations: true },
+});
+
+const result = await db.applyRetention({
+  filter: { projectId: "agentic-data" },
+  deleteBeforeTs: 100000,
+  requestedBy: "nightly-retention",
+});
+
+const audits = await db.retentionAudits({ source: "nightly-retention" });
+```
 
 `OpenOptions.readOnly` is intentionally not exposed yet. Passing `readOnly`
 throws at runtime so applications do not accidentally assume a true read-only

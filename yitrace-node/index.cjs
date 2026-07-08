@@ -28,6 +28,40 @@ function plainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
+const ATTR_ALIASES = {
+  projectId: "project_id",
+  callSite: "call_site",
+  taskFingerprint: "task_fingerprint",
+  loopId: "loop_id",
+  harnessVersion: "harness_version",
+  schemaFingerprint: "schema_fingerprint",
+  intentSignature: "intent_signature",
+  validationStatus: "validation_status",
+  reviewStatus: "review_status",
+  evalStatus: "eval_status",
+  pathMemoryId: "path_memory_id",
+  stopReason: "stop_reason",
+};
+
+const ATTR_KEYS = [
+  "project_id",
+  "skill",
+  "mode",
+  "call_site",
+  "task_fingerprint",
+  "loop_id",
+  "harness_version",
+  "schema_fingerprint",
+  "intent_signature",
+  "validation_status",
+  "review_status",
+  "eval_status",
+  "path_memory_id",
+  "stop_reason",
+  "phase",
+  "validator",
+];
+
 function normalizeSearchQuery(query = {}) {
   const out = { ...query };
   if (query.filter) {
@@ -44,16 +78,81 @@ function normalizeSearchQuery(query = {}) {
   return out;
 }
 
-function normalizeSessionAttrs(options = {}) {
+function normalizeAttrs(options = {}) {
   const attrs = {};
   const source = plainObject(options.attrs) ? options.attrs : {};
-  for (const key of ["project_id", "skill", "mode", "call_site"]) {
+  for (const key of ATTR_KEYS) {
     if (source[key] !== undefined) attrs[key] = source[key];
     if (options[key] !== undefined) attrs[key] = options[key];
   }
-  if (options.projectId !== undefined) attrs.project_id = options.projectId;
-  if (options.callSite !== undefined) attrs.call_site = options.callSite;
+  for (const [camel, snake] of Object.entries(ATTR_ALIASES)) {
+    if (source[camel] !== undefined) attrs[snake] = source[camel];
+    if (options[camel] !== undefined) attrs[snake] = options[camel];
+  }
   return Object.keys(attrs).length > 0 ? attrs : undefined;
+}
+
+function normalizeMetadataBody(input = {}) {
+  const out = { ...input };
+  const attrs = { ...(plainObject(input.attrs) ? input.attrs : {}) };
+  for (const key of ATTR_KEYS) {
+    if (input[key] !== undefined) attrs[key] = input[key];
+  }
+  for (const [camel, snake] of Object.entries(ATTR_ALIASES)) {
+    if (input[camel] !== undefined) attrs[snake] = input[camel];
+  }
+  if (Object.keys(attrs).length > 0) out.attrs = attrs;
+  return out;
+}
+
+function metadataQueryString(options = {}) {
+  const params = new URLSearchParams();
+  for (const key of [
+    "cursor",
+    "offset",
+    "limit",
+    "target",
+    "label",
+    "name",
+    "source",
+    "status",
+    "split",
+    "enabled",
+  ]) {
+    if (options[key] !== undefined && options[key] !== null) params.set(key, String(options[key]));
+  }
+  const aliases = {
+    traceId: "traceId",
+    trace_id: "trace_id",
+    spanId: "spanId",
+    span_id: "span_id",
+    includeDeleted: "includeDeleted",
+    include_deleted: "include_deleted",
+    datasetId: "datasetId",
+    dataset_id: "dataset_id",
+    itemId: "itemId",
+    item_id: "item_id",
+    datasetItemId: "datasetItemId",
+    dataset_item_id: "dataset_item_id",
+    evalRunId: "evalRunId",
+    eval_run_id: "eval_run_id",
+    auditId: "auditId",
+    audit_id: "audit_id",
+    policyId: "policyId",
+    policy_id: "policy_id",
+    createdAfterNs: "createdAfterNs",
+    created_after_ns: "created_after_ns",
+    createdBeforeNs: "createdBeforeNs",
+    created_before_ns: "created_before_ns",
+    minCreatedAtNs: "minCreatedAtNs",
+    maxCreatedAtNs: "maxCreatedAtNs",
+  };
+  for (const [from, to] of Object.entries(aliases)) {
+    if (options[from] !== undefined && options[from] !== null) params.set(to, String(options[from]));
+  }
+  const attrs = normalizeMetadataBody(options).attrs;
+  if (attrs && Object.keys(attrs).length > 0) params.set("attrs", JSON.stringify(attrs));
+  return params.toString();
 }
 
 class SpanEventBuilder {
@@ -209,6 +308,117 @@ class YiTraceDB {
     return parseJson(response);
   }
 
+  async traceSearch(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.traceSearchJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async traceAggregate(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.traceAggregateJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async storageStats(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.storageStatsJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async retentionPlan(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.retentionPlanJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async applyRetention(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.applyRetentionJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async retentionAudits(options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.retentionAuditsJson(metadataQueryString(options), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async createRetentionPolicy(policy, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.createRetentionPolicyJson(JSON.stringify(policy), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async retentionPolicies(options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.retentionPoliciesJson(metadataQueryString(options), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async runRetentionPolicies(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.runRetentionPoliciesJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async traceTrajectories(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.traceTrajectoriesJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async trajectoryGroups(query = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.trajectoryGroupsJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async traceDiff(leftOrQuery, rightTraceId, options = {}) {
+    this.#ensureOpen();
+    const query = plainObject(leftOrQuery)
+      ? leftOrQuery
+      : { baseTraceId: leftOrQuery, candidateTraceId: rightTraceId };
+    const response = this.#native.traceDiffJson(JSON.stringify(query), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async annotate(annotation, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.annotateJson(JSON.stringify(normalizeMetadataBody(annotation)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async annotations(options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.annotationsJson(metadataQueryString(options), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async updateAnnotation(annotationId, update = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.updateAnnotationJson(String(annotationId), JSON.stringify(normalizeMetadataBody(update)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async deleteAnnotation(annotationId, deleteInfo = {}, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.deleteAnnotationJson(String(annotationId), JSON.stringify(deleteInfo ?? {}), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async linkDatasetItem(association, options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.linkDatasetItemJson(JSON.stringify(normalizeMetadataBody(association)), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
+  async datasetAssociations(options = {}) {
+    this.#ensureOpen();
+    const response = this.#native.datasetAssociationsJson(metadataQueryString(options), tenantId(options) ?? this.#tenantId);
+    return parseJson(response);
+  }
+
   async traces(options = {}) {
     this.#ensureOpen();
     return parseJson(this.#native.tracesJson(tenantId(options) ?? this.#tenantId));
@@ -216,12 +426,49 @@ class YiTraceDB {
 
   async sessions(options = {}) {
     this.#ensureOpen();
-    const attrs = normalizeSessionAttrs(options);
+    const attrs = normalizeAttrs(options);
     return parseJson(
       this.#native.sessionsJson(
         options.cursor ?? 0,
         options.limit ?? 50,
         options.filter,
+        attrs ? JSON.stringify(attrs) : undefined,
+        tenantId(options) ?? this.#tenantId,
+      ),
+    );
+  }
+
+  async loops(options = {}) {
+    this.#ensureOpen();
+    const attrs = normalizeAttrs(options);
+    return parseJson(
+      this.#native.loopsJson(
+        options.cursor ?? 0,
+        options.limit ?? 50,
+        attrs ? JSON.stringify(attrs) : undefined,
+        tenantId(options) ?? this.#tenantId,
+      ),
+    );
+  }
+
+  async loop(loopId, options = {}) {
+    this.#ensureOpen();
+    try {
+      return parseJson(this.#native.loopJson(String(loopId), tenantId(options) ?? this.#tenantId));
+    } catch (error) {
+      if (String(error?.message ?? error).includes("status=404")) return null;
+      throw error;
+    }
+  }
+
+  async taskTraces(fingerprint, options = {}) {
+    this.#ensureOpen();
+    const attrs = normalizeAttrs(options);
+    return parseJson(
+      this.#native.taskTracesJson(
+        String(fingerprint),
+        options.cursor ?? 0,
+        options.limit ?? 50,
         attrs ? JSON.stringify(attrs) : undefined,
         tenantId(options) ?? this.#tenantId,
       ),

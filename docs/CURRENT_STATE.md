@@ -1,6 +1,6 @@
 # yiTrace 当前态（唯一权威现状索引）
 
-> 更新：2026-06-22
+> 更新：2026-07-07
 > 这篇是**现状的唯一权威入口**。docs/ 下文档很多（41+ 篇，含多轮红队过程产物），新读者从这里看，不要被历史过程文档带偏。
 > 一句话：**项目走过一次大转向（openGauss 扩展 → 自研 Rust 引擎），当前承重的是 Rust 引擎；仓库里两套代码并存，本文讲清哪套是当前态。**
 
@@ -12,11 +12,12 @@
 
 | 目录 | 是什么 | 状态 |
 |---|---|---|
-| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，yt-core 9 + yt-engine 130 + eval_harness 6 + manifest 4 + memtable 2 + wal 5 测试绿 |
+| `yitrace-engine/` | **自研 Rust 引擎**（5 crate：core/wal/manifest/engine + 示例）。摄入/折叠/检索/eval/持久化全在这。**默认用纯 Rust 中文词级分词 `ChineseTokenizer`**（词典 DAG + 最大概率 DP，jieba 全量词典 34.9 万词内嵌，std-only）。 | **当前承重**，yt-core 9 + yt-engine 130 passed / 1 ignored + eval_harness 6 + manifest 4 + memtable 2 + wal 5 测试绿 |
 | `yitrace-segstore-vortex/` | **列式段存储（Vortex）**，实现引擎的 `SegmentStore`。独立 crate、工作区外，**不污染零依赖骨架**。 | 已落地：写读 + 谓词下推 + 投影下推 + 默认压缩，7 测试绿 |
 | `yitrace-tokenizer-jieba/` | **团队 jieba 词级分词接入**（FFI），实现引擎的 `Tokenizer`。Vortex 同款隔离、工作区外。 | 接缝 + ABI 契约 + 离线 mock 测试绿（3 测）；真库在构建机 `--features link` 接 |
 | `yitrace-vecindex-graph/` | **团队 graph_index 向量 ANN 接入**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 接缝 + ABI 契约（带过滤回调）+ 离线 mock 测试绿（4 测）；真库在构建机 `--features link` 接 |
 | `yitrace-sdk/python`、`yitrace-sdk/typescript` | 打点 SDK，确定性 event_id 与引擎逐字节一致。 | 可用，各带测试 |
+| `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试 |
 
 **权威产品/技术入口**：`docs/2026-06-22_yitrace-产品说明.md`（决策层）、`docs/design/2026-06-22_yitrace-技术文档.md`（工程）、`docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`（列式段）。
 
@@ -47,6 +48,10 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 
 **已是真的（有测试）**：确定性 event_id（跨语言逐字节一致）、四源读时折叠、快照隔离、崩溃重放幂等（含 upgrade 重叠窗口）、时间分层 compaction、重启不丢；中文 BM25 多概念召回完胜子串；**纯 Rust 中文词级分词**（词典 DAG + 最大概率 DP，jieba 全量词典内嵌默认装、引擎默认用，歧义"研究生命→研究/生命"判对、自有词典叠加、接真 BM25 端到端，8 测）；带过滤 ANN 召回表驱动实测（1% 选择性 post-filter 0.17 / in-graph 1.00，到 20% 收敛）；列式段谓词+投影下推；端到端 SDK/OTLP→HTTP→折叠→检索/eval/成本。
 
+**当前单机读模型（有测试）**：`/v1/trace-search`、`/v1/trace-aggregate`、`/v1/storage-stats`、`/v1/trace-trajectories`、`/v1/trajectory-groups`、`/v1/traces/diff`、`/v1/loops`、`/v1/loops/:loopId`、`/v1/tasks/:fingerprint/traces` 已有正确优先的单机版，并已接入 Node/Python/Rust 嵌入式包。`trace-search`、`trace-aggregate`、`storage-stats`、`trace-trajectories`、`trajectory-groups`、`loops`、`loop detail`、`task traces` 会对 `project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤走 attrs sidecar，并在响应里返回 `readPlan`，说明是否命中索引、候选 span 数和扫描段数。attrs sidecar 内存态是 postings，不再每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时禁用对应 postings，退回扫描 sidecar 行，结果不丢。持久模式会写 `filter_attrs.dat` 作为 segment-only sidecar cache，重启时加载 cache 后再叠加 WAL tail。无文本的 `trace-aggregate` 会走 `aggregate_rollup`；无文本的 trajectory/loop/task 读模型会走 `trajectory_rollup`，只读路径所需小字段，不读 input/output/logs；拿到候选 trace 后，会按 trace_id 从 rollup 取完整 span，不再为少量候选 trace 重新组装全租户 span，`readPlan.traceFetchSource` 会暴露这一步是否命中 rollup。持久模式还会写 `trace_rollup.dat` 作为 segment-only rollup cache。两份 cache 都不是数据源，损坏或版本不匹配会自动扫描 segment 重建。删除、retention apply、upgrade 和 recover 后会按当前快照同步重建 rollup/sidecar。带 text 的聚合和路径查询仍会回到正确扫描。postings 按需分页的磁盘 buffer manager、loop-task 独立磁盘索引仍是后续优化，不是当前实现。
+
+**当前元数据和 retention 账本（有测试）**：`/v1/annotations` 和 `/v1/dataset-associations` 已有单机持久版，支持 tenant 隔离、attrs 过滤、annotation 更新/软删除、dataset item 关联，并接入 Node/Python/Rust 嵌入式包；annotation/dataset 查询会先走内存 metadata postings，再做最终校验。`/v1/retention-plan`、`/v1/retention/apply`、`/v1/retention-audits`、`/v1/retention-policies`、`/v1/retention-policies/run-due` 已迁入主线：先 dry-run，再显式 apply；默认保护 annotation、dataset、snapshot、eval link、path memory 引用；只软删除已 flush 的 segment row，跳过 MemTable/WAL tail 热 trace；audit/policy 随 `metadata.dat` 持久化，查询按 id/tenant/source/name/enabled 走内存 postings。它不复制 trace 大字段，也不改 WAL/segment 格式。后台自动执行仍是后续优化。
+
 **仍是占位/待接**：团队 jieba / graph_index 真库链接（两条接缝/FFI crate/契约都已就位，差构建机上的库 + 真召回对标）、BM25 段内倒排 + block-max-WAND（内存倒排够用，上量再换）、LLM-judge eval、DataFusion 查询执行、索引驱动的 Vortex 随机取行。
 
 **已暂缓但有止损点**：等保三级 / TLS / RBAC / 落盘加密 / PII 脱敏 / 持久防篡改审计。**止损条件**：任一真实金融/政企 PoC 立项 → TLS + RBAC + 持久审计日志必须先于该 PoC 落地（PoC 安全评审最低门槛）。
@@ -59,7 +64,7 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 - **CRC32 已换查表**（零依赖，已做）；BM25 logs 编码已换可逆转义（含 NUL/二进制/CJK 安全，已做）。
 - **真 kill -9 崩溃测试**（§1.3）：`tests/crash_recovery_kill9.sh` + `server_durable` example，连续 20 次"灌→kill-9→重启→验证数据+检索"，零失败。顺手修了 agent_name 未被 BM25 索引的真 bug（用户按 agent 名搜会搜空）。
 - **模糊测试**（§1.4）：`fuzz_fold_semantics_across_random_op_sequences` —— 8 个种子 × 80-119 步随机「ingest/flush/compaction/崩溃重放」，oracle 逐字段断言折叠结果一致、span 数无多无少。钉死随机组合下 last-non-null 折叠、compaction 不丢、崩溃幂等不塌。
-- **`/v1/metrics` 端点**（§3.1）：Prometheus 文本格式，暴露 manifest 版本/活跃段数/dead 段数/内存表行数/活跃读者/WAL 尾/刷盘阈值/过滤属性/折叠缓存/Bloom/数据集 11 个指标。curl + 单测实测。Prometheus 可直接抓、Grafana 出看板。
+- **`/v1/metrics` 端点**（§3.1）：Prometheus 文本格式，暴露 manifest 版本/活跃段数/dead 段数/内存表行数/活跃读者/WAL 尾/刷盘阈值/过滤属性/过滤 postings/被预算禁用的过滤 postings/折叠缓存/Bloom/数据集等指标。curl + 单测实测。Prometheus 可直接抓、Grafana 出看板。
 - **在线快照备份**（§3.3）：`backup_snapshot(dest)` 走 pin 协议拿一致快照（GC 不会删被引用的段），拷 segments/ + wal.log + manifest.dat + vecindex/ + gc.log 到目标目录,得到可独立 `open_durable` 恢复的一致快照。备份期间读写不阻塞（snapshot 隔离）。测试 `backup_snapshot_restores_consistent_data` 钉死。
 - **升级迁移**（§3.4）：`manifest.dat` 已带 `MAGIC + FORMAT_VER`（=1），decode 区分坏 magic/未来版本/老版本（各走明确日志而非静默 None）。`check_format(dir)` 返回 (磁盘版本, 引擎版本)；`migrate(dir)` 骨架（版本相等=Ok，老版本/未来版本=明确 Err）。`/metrics` 暴露 `yt_format_version`。当前无历史老版本数据，真实逐版本迁移在引入格式变更时扩展。
 

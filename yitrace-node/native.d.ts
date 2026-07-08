@@ -5,8 +5,29 @@ export declare class NativeYiTraceDB {
   ingestJson(eventsJson: string, tenantId?: string | undefined | null): string
   ingestOtlpJson(otlpJson: string, tenantId?: string | undefined | null): string
   searchJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceSearchJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceAggregateJson(queryJson: string, tenantId?: string | undefined | null): string
+  storageStatsJson(queryJson: string, tenantId?: string | undefined | null): string
+  retentionPlanJson(queryJson: string, tenantId?: string | undefined | null): string
+  applyRetentionJson(queryJson: string, tenantId?: string | undefined | null): string
+  retentionAuditsJson(queryString?: string | undefined | null, tenantId?: string | undefined | null): string
+  createRetentionPolicyJson(policyJson: string, tenantId?: string | undefined | null): string
+  retentionPoliciesJson(queryString?: string | undefined | null, tenantId?: string | undefined | null): string
+  runRetentionPoliciesJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceTrajectoriesJson(queryJson: string, tenantId?: string | undefined | null): string
+  trajectoryGroupsJson(queryJson: string, tenantId?: string | undefined | null): string
+  traceDiffJson(queryJson: string, tenantId?: string | undefined | null): string
+  annotateJson(annotationJson: string, tenantId?: string | undefined | null): string
+  annotationsJson(queryString?: string | undefined | null, tenantId?: string | undefined | null): string
+  updateAnnotationJson(annotationId: string, updateJson: string, tenantId?: string | undefined | null): string
+  deleteAnnotationJson(annotationId: string, deleteJson?: string | undefined | null, tenantId?: string | undefined | null): string
+  linkDatasetItemJson(associationJson: string, tenantId?: string | undefined | null): string
+  datasetAssociationsJson(queryString?: string | undefined | null, tenantId?: string | undefined | null): string
   tracesJson(tenantId?: string | undefined | null): string
   sessionsJson(cursor?: number | undefined | null, limit?: number | undefined | null, filter?: string | undefined | null, attrsJson?: string | undefined | null, tenantId?: string | undefined | null): string
+  loopsJson(cursor?: number | undefined | null, limit?: number | undefined | null, attrsJson?: string | undefined | null, tenantId?: string | undefined | null): string
+  loopJson(loopId: string, tenantId?: string | undefined | null): string
+  taskTracesJson(fingerprint: string, cursor?: number | undefined | null, limit?: number | undefined | null, attrsJson?: string | undefined | null, tenantId?: string | undefined | null): string
   traceJson(traceId: string, tenantId?: string | undefined | null): string
   spanJson(traceId: string, spanId: string, tenantId?: string | undefined | null): string
   flush(): void

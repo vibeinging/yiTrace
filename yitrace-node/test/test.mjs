@@ -148,18 +148,277 @@ try {
   assert.equal(filteredSessions.items.length, 1);
   assert.equal(filteredSessions.items[0].externalSessionId, "builder-session");
 
+  const traceSearch = await db.traceSearch({
+    text: "builder",
+    filter: { attrs: { project_id: "agentic-data", skill: "builder" } },
+    limit: 10,
+  });
+  assert.equal(traceSearch.total, 1);
+  assert.equal(traceSearch.items[0].externalTraceId, "builder-run");
+  assert.equal(traceSearch.items[0].externalSpanId, "builder-span");
+  assert.equal(traceSearch.readPlan.source, "filter_index");
+  assert.equal(traceSearch.readPlan.usedFilterIndex, true);
+  assert.equal(traceSearch.readPlan.candidateSpanKeys, 1);
+
+  const aggregate = await db.traceAggregate({
+    filter: { projectId: "agentic-data" },
+    groupBy: ["skill"],
+  });
+  assert.ok(aggregate.items.some((item) => item.key.skill === "builder" && item.spanCount === 1));
+  assert.equal(aggregate.readPlan.usedFilterIndex, true);
+
+  const storage = await db.storageStats({
+    filter: { projectId: "agentic-data" },
+    groupBy: ["skill"],
+  });
+  assert.ok(storage.total.traceCount >= 2);
+  assert.ok(storage.total.spanCount >= 2);
+  assert.ok(storage.total.estimatedBytes > 0);
+  assert.equal(storage.readPlan.usedFilterIndex, true);
+
+  await db.ingest([
+    {
+      trace_id: "node-task-a",
+      span_id: "plan",
+      ts: 300,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-task-a-plan",
+      agent_name: "planner",
+      status: 0,
+      duration_ns: 100,
+      attrs: { project_id: "agentic-data", skill: "builder", task_fingerprint: "node-task", loop_id: "node-loop", validation_status: "pass" },
+    },
+    {
+      trace_id: "node-task-a",
+      span_id: "tool",
+      parent_span_id: "plan",
+      ts: 310,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-task-a-tool",
+      tool_name: "sql.check",
+      status: 0,
+      duration_ns: 50,
+      attrs: { project_id: "agentic-data", skill: "builder", task_fingerprint: "node-task", loop_id: "node-loop", validation_status: "pass" },
+    },
+    {
+      trace_id: "node-task-b",
+      span_id: "plan",
+      ts: 320,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-task-b-plan",
+      agent_name: "planner",
+      status: 0,
+      duration_ns: 80,
+      attrs: { project_id: "agentic-data", skill: "builder", task_fingerprint: "node-task", loop_id: "node-loop", validation_status: "fail" },
+    },
+    {
+      trace_id: "node-task-b",
+      span_id: "manual",
+      parent_span_id: "plan",
+      ts: 330,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-task-b-manual",
+      tool_name: "manual.review",
+      status: 1,
+      duration_ns: 300,
+      attrs: { project_id: "agentic-data", skill: "builder", task_fingerprint: "node-task", loop_id: "node-loop", validation_status: "fail" },
+    },
+  ]);
+
+  const trajectories = await db.traceTrajectories({ filter: { projectId: "agentic-data", taskFingerprint: "node-task" }, limit: 10 });
+  assert.equal(trajectories.total, 2);
+  assert.ok(trajectories.items.some((item) => item.summary.externalTraceId === "node-task-a"));
+
+  const groups = await db.trajectoryGroups({ filter: { projectId: "agentic-data", taskFingerprint: "node-task" }, limit: 10 });
+  assert.equal(groups.total, 2);
+  assert.ok(groups.items.some((item) => item.successCount === 1));
+
+  const diff = await db.traceDiff("node-task-a", "node-task-b");
+  assert.equal(diff.sameSignature, false);
+  assert.equal(diff.commonPrefix, 1);
+
+  const loops = await db.loops({ projectId: "agentic-data", taskFingerprint: "node-task" });
+  assert.equal(loops.total, 1);
+  assert.equal(loops.items[0].loopId, "node-loop");
+
+  const loop = await db.loop("node-loop");
+  assert.equal(loop.summary.traceCount, 2);
+
+  const taskPass = await db.taskTraces("node-task", { validationStatus: "pass" });
+  assert.equal(taskPass.total, 1);
+  assert.equal(taskPass.items[0].summary.externalTraceId, "node-task-a");
+
+  const annotation = await db.annotate({
+    traceId: "builder-run",
+    spanId: "builder-span",
+    label: "best_path",
+    score: 950,
+    reason: "human confirmed",
+    source: "test",
+    projectId: "agentic-data",
+    attrs: { skill: "builder" },
+  });
+  assert.equal(annotation.annotationId, "1");
+  assert.equal(annotation.externalTraceId, "builder-run");
+  assert.equal(annotation.attrs.project_id, "agentic-data");
+
+  const annotations = await db.annotations({ projectId: "agentic-data", skill: "builder", label: "best_path" });
+  assert.equal(annotations.total, 1);
+  assert.equal(annotations.items[0].label, "best_path");
+
+  const updatedAnnotation = await db.updateAnnotation(annotation.annotationId, {
+    status: "resolved",
+    reviewer: "qa",
+    attrs: { mode: "eval" },
+  });
+  assert.equal(updatedAnnotation.status, "resolved");
+  assert.equal(updatedAnnotation.attrs.project_id, "agentic-data");
+  assert.equal(updatedAnnotation.attrs.mode, "eval");
+
+  const deletedAnnotation = await db.deleteAnnotation(annotation.annotationId, { reviewer: "qa", reason: "stale" });
+  assert.equal(deletedAnnotation.status, "deleted");
+
+  const activeOnly = await db.annotations({ projectId: "agentic-data", label: "best_path" });
+  assert.equal(activeOnly.total, 0);
+  const includeDeleted = await db.annotations({ projectId: "agentic-data", label: "best_path", includeDeleted: true });
+  assert.equal(includeDeleted.total, 1);
+  assert.equal(includeDeleted.items[0].reason, "stale");
+
+  const datasetLink = await db.linkDatasetItem({
+    datasetId: "node-regression",
+    itemId: "case-1",
+    traceId: "builder-run",
+    spanId: "builder-span",
+    split: "eval",
+    label: "pass",
+    score: 900,
+    projectId: "agentic-data",
+    attrs: { skill: "builder" },
+  });
+  assert.equal(datasetLink.associationId, "1");
+  assert.equal(datasetLink.externalSpanId, "builder-span");
+
+  const datasetLinks = await db.datasetAssociations({ datasetId: "node-regression", projectId: "agentic-data" });
+  assert.equal(datasetLinks.total, 1);
+  assert.equal(datasetLinks.items[0].itemId, "case-1");
+
   const missedSessions = await db.sessions({ projectId: "agentic-data", skill: "missing" });
   assert.equal(missedSessions.items.length, 0);
 
   const hiddenFromSpoofedTenant = await db.traces({ tenantId: 999 });
   assert.equal(hiddenFromSpoofedTenant.length, 0);
+  const hiddenAnnotations = await db.annotations({ projectId: "agentic-data", includeDeleted: true, tenantId: 999 });
+  assert.equal(hiddenAnnotations.total, 0);
+
+  await db.ingest([
+    {
+      trace_id: "node-retention-keep",
+      span_id: "span",
+      ts: 400,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-retention-keep-span",
+      status: 0,
+      duration_ns: 10,
+      output_text: "retention keep",
+      attrs: { project_id: "node-retention", skill: "cleanup" },
+    },
+    {
+      trace_id: "node-retention-delete",
+      span_id: "span",
+      ts: 410,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-retention-delete-span",
+      status: 0,
+      duration_ns: 10,
+      output_text: "retention delete",
+      attrs: { project_id: "node-retention", skill: "cleanup" },
+    },
+  ]);
+  await db.flush();
+  await db.ingest([
+    {
+      trace_id: "node-retention-hot",
+      span_id: "span",
+      ts: 420,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "node-retention-hot-span",
+      status: 0,
+      duration_ns: 10,
+      output_text: "retention hot",
+      attrs: { project_id: "node-retention", skill: "cleanup" },
+    },
+  ]);
+  await db.annotate({ traceId: "node-retention-keep", label: "keep", source: "retention-test", projectId: "node-retention" });
+
+  const retentionQuery = {
+    filter: { projectId: "node-retention" },
+    deleteBeforeTs: 1_000,
+    protect: { annotations: true, datasetAssociations: true, snapshots: true, evalLinks: true, pathMemory: true },
+    requestedBy: "node-test",
+    reason: "ttl",
+  };
+  const retentionPlan = await db.retentionPlan(retentionQuery);
+  assert.equal(retentionPlan.dryRun, true);
+  assert.equal(retentionPlan.candidates.traceCount, 3);
+  assert.ok(Object.values(retentionPlan.protectedReasons).some((reasons) => reasons.includes("annotation")));
+  assert.equal(retentionPlan.deletableTraceIds.length, 2);
+
+  const retentionApply = await db.applyRetention(retentionQuery);
+  assert.equal(retentionApply.applied, true);
+  assert.equal(retentionApply.applyResult.deletedTraceIds.length, 1);
+  assert.equal(retentionApply.applyResult.skippedLiveTraceIds.length, 1);
+  const retentionTraces = await db.traceSearch({ filter: { projectId: "node-retention" }, limit: 10 });
+  assert.equal(retentionTraces.total, 2);
+  assert.ok(retentionTraces.items.some((item) => item.externalTraceId === "node-retention-keep"));
+  assert.ok(retentionTraces.items.some((item) => item.externalTraceId === "node-retention-hot"));
+  assert.ok(!retentionTraces.items.some((item) => item.externalTraceId === "node-retention-delete"));
+
+  const retentionAudits = await db.retentionAudits({ source: "node-test" });
+  assert.equal(retentionAudits.total, 1);
+  assert.equal(retentionAudits.items[0].counts.deletedTraceCount, 1);
+
+  const retentionPolicy = await db.createRetentionPolicy({
+    name: "node-retention-policy",
+    intervalNs: 1000,
+    nextRunAtNs: 1,
+    query: {
+      filter: { projectId: "node-retention" },
+      deleteBeforeTs: 1_000,
+      protect: { annotations: true },
+      requestedBy: "node-policy",
+    },
+    source: "node-policy",
+    reason: "ttl",
+  });
+  assert.equal(retentionPolicy.policyId, "1");
+  const runDue = await db.runRetentionPolicies({ nowNs: 2, limit: 1 });
+  assert.equal(runDue.ran, 1);
+  assert.equal(runDue.items[0].ok, true);
 
   await db.close();
 
   const reopened = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
   const recovered = await reopened.traces();
-  assert.equal(recovered.length, 3);
+  assert.equal(recovered.length, 7);
   assert.equal(recovered.find((t) => t.external_trace_id === "run-uuid")?.external_trace_id, "run-uuid");
+  const recoveredAnnotations = await reopened.annotations({ projectId: "agentic-data", includeDeleted: true });
+  assert.equal(recoveredAnnotations.total, 1);
+  assert.equal(recoveredAnnotations.items[0].status, "deleted");
+  const recoveredLinks = await reopened.datasetAssociations({ datasetId: "node-regression" });
+  assert.equal(recoveredLinks.total, 1);
+  assert.equal(recoveredLinks.items[0].itemId, "case-1");
+  const recoveredAudits = await reopened.retentionAudits();
+  assert.equal(recoveredAudits.total, 2);
+  const recoveredPolicies = await reopened.retentionPolicies({ name: "node-retention-policy" });
+  assert.equal(recoveredPolicies.total, 1);
+  assert.equal(recoveredPolicies.items[0].lastRunAtNs, "2");
   await reopened.close();
 } finally {
   await rm(dir, { recursive: true, force: true });

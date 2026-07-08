@@ -87,6 +87,217 @@ impl NativeYiTraceDb {
         self.route("POST", "/v1/search", &query_json, tenant_id)
     }
 
+    #[napi(js_name = "traceSearchJson")]
+    pub fn trace_search_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/trace-search", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "traceAggregateJson")]
+    pub fn trace_aggregate_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/trace-aggregate", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "storageStatsJson")]
+    pub fn storage_stats_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/storage-stats", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "retentionPlanJson")]
+    pub fn retention_plan_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/retention-plan", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "applyRetentionJson")]
+    pub fn apply_retention_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/retention/apply", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "retentionAuditsJson")]
+    pub fn retention_audits_json(
+        &self,
+        query_string: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = "/v1/retention-audits".to_string();
+        if let Some(query) = query_string {
+            if !query.trim().is_empty() {
+                path.push('?');
+                path.push_str(query.trim_start_matches('?'));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "createRetentionPolicyJson")]
+    pub fn create_retention_policy_json(
+        &self,
+        policy_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/retention-policies", &policy_json, tenant_id)
+    }
+
+    #[napi(js_name = "retentionPoliciesJson")]
+    pub fn retention_policies_json(
+        &self,
+        query_string: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = "/v1/retention-policies".to_string();
+        if let Some(query) = query_string {
+            if !query.trim().is_empty() {
+                path.push('?');
+                path.push_str(query.trim_start_matches('?'));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "runRetentionPoliciesJson")]
+    pub fn run_retention_policies_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route(
+            "POST",
+            "/v1/retention-policies/run-due",
+            &query_json,
+            tenant_id,
+        )
+    }
+
+    #[napi(js_name = "traceTrajectoriesJson")]
+    pub fn trace_trajectories_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/trace-trajectories", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "trajectoryGroupsJson")]
+    pub fn trajectory_groups_json(
+        &self,
+        query_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/trajectory-groups", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "traceDiffJson")]
+    pub fn trace_diff_json(&self, query_json: String, tenant_id: Option<String>) -> Result<String> {
+        self.route("POST", "/v1/traces/diff", &query_json, tenant_id)
+    }
+
+    #[napi(js_name = "annotateJson")]
+    pub fn annotate_json(
+        &self,
+        annotation_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route("POST", "/v1/annotations", &annotation_json, tenant_id)
+    }
+
+    #[napi(js_name = "annotationsJson")]
+    pub fn annotations_json(
+        &self,
+        query_string: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = "/v1/annotations".to_string();
+        if let Some(query) = query_string {
+            if !query.trim().is_empty() {
+                path.push('?');
+                path.push_str(query.trim_start_matches('?'));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "updateAnnotationJson")]
+    pub fn update_annotation_json(
+        &self,
+        annotation_id: String,
+        update_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let path = format!(
+            "/v1/annotations/{}",
+            url_encode_component(annotation_id.trim())
+        );
+        self.route("PATCH", &path, &update_json, tenant_id)
+    }
+
+    #[napi(js_name = "deleteAnnotationJson")]
+    pub fn delete_annotation_json(
+        &self,
+        annotation_id: String,
+        delete_json: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let path = format!(
+            "/v1/annotations/{}",
+            url_encode_component(annotation_id.trim())
+        );
+        self.route(
+            "DELETE",
+            &path,
+            delete_json.as_deref().unwrap_or(""),
+            tenant_id,
+        )
+    }
+
+    #[napi(js_name = "linkDatasetItemJson")]
+    pub fn link_dataset_item_json(
+        &self,
+        association_json: String,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        self.route(
+            "POST",
+            "/v1/dataset-associations",
+            &association_json,
+            tenant_id,
+        )
+    }
+
+    #[napi(js_name = "datasetAssociationsJson")]
+    pub fn dataset_associations_json(
+        &self,
+        query_string: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = "/v1/dataset-associations".to_string();
+        if let Some(query) = query_string {
+            if !query.trim().is_empty() {
+                path.push('?');
+                path.push_str(query.trim_start_matches('?'));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
     #[napi(js_name = "tracesJson")]
     pub fn traces_json(&self, tenant_id: Option<String>) -> Result<String> {
         self.route("GET", "/v1/traces", "", tenant_id)
@@ -112,6 +323,58 @@ impl NativeYiTraceDb {
                 path.push_str(&url_encode_component(&f));
             }
         }
+        if let Some(attrs) = attrs_json {
+            if !attrs.is_empty() {
+                path.push_str("&attrs=");
+                path.push_str(&url_encode_component(&attrs));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "loopsJson")]
+    pub fn loops_json(
+        &self,
+        cursor: Option<u32>,
+        limit: Option<u32>,
+        attrs_json: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = format!(
+            "/v1/loops?cursor={}&limit={}",
+            cursor.unwrap_or(0),
+            limit.unwrap_or(50)
+        );
+        if let Some(attrs) = attrs_json {
+            if !attrs.is_empty() {
+                path.push_str("&attrs=");
+                path.push_str(&url_encode_component(&attrs));
+            }
+        }
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "loopJson")]
+    pub fn loop_json(&self, loop_id: String, tenant_id: Option<String>) -> Result<String> {
+        let path = format!("/v1/loops/{}", url_encode_component(loop_id.trim()));
+        self.route("GET", &path, "", tenant_id)
+    }
+
+    #[napi(js_name = "taskTracesJson")]
+    pub fn task_traces_json(
+        &self,
+        fingerprint: String,
+        cursor: Option<u32>,
+        limit: Option<u32>,
+        attrs_json: Option<String>,
+        tenant_id: Option<String>,
+    ) -> Result<String> {
+        let mut path = format!(
+            "/v1/tasks/{}/traces?cursor={}&limit={}",
+            url_encode_component(fingerprint.trim()),
+            cursor.unwrap_or(0),
+            limit.unwrap_or(50)
+        );
         if let Some(attrs) = attrs_json {
             if !attrs.is_empty() {
                 path.push_str("&attrs=");

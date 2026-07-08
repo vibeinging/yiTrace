@@ -133,7 +133,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 - value 可为 string / number / bool / null / array / object。
 - yiTrace 会校验并保存 value 的 JSON 字面量；search、trace、span detail 返回时恢复成相同 JSON 形态。
 - 同一 span 多个事件写同一个 attr key 时，后到事件覆盖先到事件。
-- 当前只承诺 `project_id`、`skill`、`mode`、`call_site` 四个 attrs 进入过滤 sidecar；其他 attrs 会持久化并返回，但不保证可过滤。
+- 当前高频 attrs 已进入读模型过滤：`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`harness_version`、`schema_fingerprint`、`intent_signature`、`validation_status`、`review_status`、`eval_status`、`path_memory_id`、`stop_reason`、`phase`、`validator`。其他 attrs 会持久化并返回，但不保证有专门索引。
 
 ### POST /v1/traces  —— OTLP/HTTP 标准端点（生态入口 / 原始 API）
 
@@ -179,7 +179,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ### GET /v1/metrics  —— Prometheus 指标
 
-返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
+返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_filter_attr_postings`、`yt_filter_attr_disabled_postings`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
 
 ### GET /v1/healthz / GET /v1/readyz  —— 进程探针
 
@@ -259,6 +259,541 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "mode": "auto",
     "call_site": "worker.ts:10"
   }
+}
+```
+
+---
+
+## 单机读模型 API（原始 API，camelCase 响应）
+
+这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时会禁用对应 postings，并回退扫描 sidecar 行，保证结果不丢。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`；重启时先加载缓存，再叠加 WAL tail。缓存不是数据源，删掉、损坏或版本不匹配都会自动扫描 segment 重建。带 `text` 的聚合和路径查询仍会回到正确扫描。把 postings 做成按需分页的磁盘 buffer manager、以及 loop/task 独立磁盘索引仍是后续优化。
+
+### POST /v1/trace-search  —— 结构化 span 搜索
+
+**请求体**：
+
+```json
+{
+  "text": "退款审核",
+  "filter": {
+    "projectId": "agentic-data",
+    "skill": "review",
+    "validationStatus": "pass",
+    "agentName": "planner",
+    "status": 0
+  },
+  "sortBy": "duration",
+  "cursor": 0,
+  "limit": 50
+}
+```
+
+支持的过滤：
+
+| 字段 | 说明 |
+|---|---|
+| `filter.traceId` / `trace_id` | 内部数字 id 或外部字符串 id |
+| `filter.spanId` / `span_id` | 内部数字 id 或外部字符串 id |
+| `filter.sessionId` / `session_id` | 内部数字 id 或外部字符串 id |
+| `filter.externalTraceId` / `external_trace_id` | 外部 trace id 精确匹配 |
+| `filter.externalSpanId` / `external_span_id` | 外部 span id 精确匹配 |
+| `filter.externalSessionId` / `external_session_id` | 外部 session id 精确匹配 |
+| `filter.status` | 0=ok，非 0=error |
+| `filter.agentName` / `agent_name` | agent 精确匹配 |
+| `filter.toolName` / `tool_name` | tool 精确匹配 |
+| `filter.model` | model 精确匹配 |
+| `filter.projectId` / `project_id`、`skill`、`mode`、`callSite` / `call_site`、`taskFingerprint` / `task_fingerprint`、`validationStatus` / `validation_status` 等 | attrs 精确匹配 |
+| `filter.attrs` | 任意 attrs 精确匹配 |
+| `text` / `q` | 在 input/output/logs 中做 contains 过滤 |
+| `sortBy` | `trace` / `duration` / `tokens` / `status` |
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "traceId": "123",
+      "spanId": "1",
+      "externalTraceId": "run-uuid",
+      "externalSpanId": "span-uuid",
+      "status": 0,
+      "durationNs": 12000000,
+      "inputTokens": 900,
+      "outputTokens": 120,
+      "agentName": "planner",
+      "toolName": null,
+      "model": "qwen",
+      "attrs": {
+        "project_id": "agentic-data",
+        "skill": "review"
+      }
+    }
+  ],
+  "total": 1,
+  "cursor": 0,
+  "limit": 50,
+  "scannedSpans": 4,
+  "readPlan": {
+    "source": "filter_index",
+    "usedFilterIndex": true,
+    "candidateSpanKeys": 12,
+    "scannedSegments": 4,
+    "matchedSpans": 1,
+    "fallbackReason": null,
+    "unsupportedAttrKeys": [],
+    "traceFetchSource": null,
+    "traceFetchSpanCount": null,
+    "traceFetchFallbackReason": null
+  }
+}
+```
+
+`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。如果 `source` 是 `scan`，说明本次没有可用索引，例如只有 `text` contains 过滤或只用了未知 attrs key；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；如果某个 postings 被预算禁用，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
+
+### POST /v1/trace-aggregate  —— 对搜索结果做 groupBy
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data"
+  },
+  "groupBy": ["skill", "validationStatus"],
+  "limit": 20
+}
+```
+
+`filter` 语义与 `/v1/trace-search` 相同。`groupBy` 支持常见字段：`projectId`、`skill`、`mode`、`callSite`、`taskFingerprint`、`validationStatus`、`status`、`agentName`、`toolName`、`model` 等；未知字段按 attrs key 处理。
+
+无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。持久模式会把已进入 segment 的 rollup 写到 `trace_rollup.dat`，文件里带 manifest version 和 memtable watermark；恢复时如果匹配，就直接加载这份 segment-only 缓存，再从 WAL 叠加还没 flush 的尾部事件。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除、segment upgrade 或重启恢复后，rollup 会按当前快照同步重建，删除行不会被算回来，补写字段也会反映到聚合结果里。`trace_rollup.dat` 可以安全删除；损坏或过期只会让下一次启动多扫一次 segment。
+
+**响应**：
+
+```json
+{
+  "items": [
+    {
+      "key": {
+        "skill": "review",
+        "validation_status": "pass"
+      },
+      "spanCount": 12,
+      "traceCount": 8,
+      "errorCount": 0,
+      "durationSumNs": "42000000",
+      "durationMaxNs": 12000000,
+      "inputTokens": 9000,
+      "outputTokens": 1200
+    }
+  ],
+  "total": 12,
+  "groupBy": ["skill", "validation_status"],
+  "scannedSpans": 4,
+  "readPlan": {
+    "source": "aggregate_rollup",
+    "usedFilterIndex": true,
+    "candidateSpanKeys": 12,
+    "scannedSegments": 0,
+    "matchedSpans": 12,
+    "fallbackReason": null,
+    "unsupportedAttrKeys": [],
+    "traceFetchSource": null,
+    "traceFetchSpanCount": null,
+    "traceFetchFallbackReason": null
+  }
+}
+```
+
+### POST /v1/storage-stats  —— 估算空间与数据量
+
+**请求体**：
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data"
+  },
+  "groupBy": ["skill"]
+}
+```
+
+**响应**：
+
+```json
+{
+  "total": {
+    "traceCount": 8,
+    "spanCount": 12,
+    "eventCount": 36,
+    "estimatedBytes": 18240
+  },
+  "groups": [
+    {
+      "key": {
+        "skill": "review"
+      },
+      "traceCount": 8,
+      "spanCount": 12,
+      "eventCount": 36,
+      "estimatedBytes": 18240
+    }
+  ],
+  "groupBy": ["skill"],
+  "scannedSpans": 4,
+  "readPlan": {
+    "source": "filter_index",
+    "usedFilterIndex": true,
+    "candidateSpanKeys": 12,
+    "scannedSegments": 4,
+    "matchedSpans": 12,
+    "fallbackReason": null,
+    "unsupportedAttrKeys": [],
+    "traceFetchSource": null,
+    "traceFetchSpanCount": null,
+    "traceFetchFallbackReason": null
+  }
+}
+```
+
+### POST /v1/trace-trajectories  —— trace 路径摘要
+
+按 `/v1/trace-search` 的过滤语义先找 trace，再返回每条 trace 的完整路径摘要。无 `text` 时会优先走 `trajectory_rollup`，只用小字段生成路径摘要；持久库重启后可以复用 `trace_rollup.dat` 里的 segment rollup，再叠加 WAL tail。带 `text` 时需要检查 input/output/logs，会回到普通折叠读。后续若继续优化，是做独立的 trajectory/loop/task 磁盘索引。
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data",
+    "taskFingerprint": "refund-v1"
+  },
+  "cursor": 0,
+  "limit": 50
+}
+```
+
+响应里每个 item 含 `summary` 和 `steps`：
+
+```json
+{
+  "items": [
+    {
+      "summary": {
+        "traceId": "123",
+        "externalTraceId": "run-uuid",
+        "taskFingerprint": "refund-v1",
+        "loopId": "loop-1",
+        "validationStatus": "pass",
+        "signature": "agent|planner|||0>tool|sql.check|sql.check||0"
+      },
+      "steps": [
+        {"index": 0, "kind": "agent", "name": "planner", "status": 0},
+        {"index": 1, "kind": "tool", "name": "sql.check", "status": 0}
+      ]
+    }
+  ],
+  "total": 1,
+  "cursor": 0,
+  "limit": 50,
+  "scannedSpans": 0,
+  "readPlan": {
+    "source": "trajectory_rollup",
+    "usedFilterIndex": true,
+    "candidateSpanKeys": 12,
+    "scannedSegments": 0,
+    "matchedSpans": 12,
+    "fallbackReason": null,
+    "unsupportedAttrKeys": [],
+    "traceFetchSource": "trajectory_rollup",
+    "traceFetchSpanCount": 12,
+    "traceFetchFallbackReason": null
+  }
+}
+```
+
+### POST /v1/trajectory-groups  —— 相同路径分桶
+
+用于找“同类问题里哪些路径反复出现”。它不判断 Best Path，只提供底座证据。
+
+```json
+{
+  "filter": {
+    "projectId": "agentic-data",
+    "taskFingerprint": "refund-v1"
+  },
+  "sort": "best",
+  "limit": 20
+}
+```
+
+响应字段：
+
+```json
+{
+  "items": [
+    {
+      "signature": "agent|planner|||0>tool|sql.check|sql.check||0",
+      "traceCount": 12,
+      "spanCount": 24,
+      "successCount": 11,
+      "errorCount": 1,
+      "steps": [],
+      "examples": []
+    }
+  ],
+  "total": 3,
+  "scannedSpans": 0,
+  "readPlan": {
+    "source": "trajectory_rollup",
+    "usedFilterIndex": true,
+    "candidateSpanKeys": 12,
+    "scannedSegments": 0,
+    "matchedSpans": 12,
+    "fallbackReason": null,
+    "unsupportedAttrKeys": [],
+    "traceFetchSource": "trajectory_rollup",
+    "traceFetchSpanCount": 12,
+    "traceFetchFallbackReason": null
+  }
+}
+```
+
+### POST /v1/traces/diff  —— 两条 trace 对比
+
+比较两条 trace 的路径、共同前缀、缺失步骤、额外步骤和粗粒度指标差异。
+
+```json
+{
+  "baseTraceId": "run-a",
+  "candidateTraceId": "run-b",
+  "includeSteps": true
+}
+```
+
+响应：
+
+```json
+{
+  "sameSignature": false,
+  "commonPrefix": 1,
+  "left": {},
+  "right": {},
+  "delta": {
+    "durationNs": "230000000",
+    "inputTokens": -10,
+    "outputTokens": 5,
+    "spanCount": 1
+  },
+  "missingSteps": ["tool|sql.check|sql.check||0"],
+  "extraSteps": ["tool|manual.review|manual.review||1"]
+}
+```
+
+### GET /v1/loops  —— loop 汇总
+
+按 `attrs.loop_id` 汇总。支持 `cursor` / `limit`，以及 `projectId`、`taskFingerprint`、`skill`、`validationStatus` 等 attrs 查询参数或 `attrs={...}`。
+
+```bash
+GET /v1/loops?projectId=agentic-data&taskFingerprint=refund-v1
+```
+
+响应含 `items`、`total`、`cursor`、`limit`、`scannedSpans` 和 `readPlan`。无 `text` 的 loop 查询会优先走 `trajectory_rollup`，用小字段汇总 loop；如果 rollup 不可用，会回退到普通折叠读。
+
+### GET /v1/loops/:loopId  —— loop 详情
+
+返回单个 loop 的 summary、trace trajectory 列表和 span 明细。404 表示当前租户下没有这个 loop。
+
+响应含 `summary`、`traces`、`spans`、`scannedSpans` 和 `readPlan`。`loopId` 本身会作为索引过滤条件；无 `text` 时优先走 `trajectory_rollup`。如果详情里的完整 trace 也从 rollup 按 trace_id 精确取到，`readPlan.traceFetchSource` 会是 `trajectory_rollup`。
+
+### GET /v1/tasks/:fingerprint/traces  —— 同类 task 的 trace 列表
+
+按 `attrs.task_fingerprint` 查 trace。过滤是 trace 级语义：同一条 trace 里只要能共同证明这些 attrs，就返回完整 trace。
+
+```bash
+GET /v1/tasks/refund-v1/traces?validationStatus=pass&limit=20
+```
+
+响应含 `items`、`total`、`cursor`、`limit`、`scannedSpans` 和 `readPlan`。实现会先用 `task_fingerprint` 缩小候选 trace，再展开完整 trace 做最终过滤；无 `text` 时优先走 `trajectory_rollup`。展开完整 trace 时会优先按 trace_id 从 rollup 取，命中情况看 `readPlan.traceFetchSource`。
+
+---
+
+## 元数据 API（标注 / 数据集关联）
+
+这组端点不改 trace/WAL/segment 格式，也不复制大字段。它是独立的轻量账本，用来记录“这条 trace/span 被人工怎么判定”“它属于哪个回归集样本”。持久模式下写入数据目录里的 `metadata.dat`。查询会先走内存 metadata postings，再对候选记录做最终校验；列表响应里的 `metadataIndex: "sidecar"` 表示这条路径已启用。
+
+### POST /v1/annotations  —— 给 trace/span 加标注
+
+请求体：
+
+```json
+{
+  "traceId": "run-uuid",
+  "spanId": "span-uuid",
+  "target": "span",
+  "label": "best_path",
+  "score": 950,
+  "reason": "human confirmed",
+  "source": "qa",
+  "attrs": {
+    "project_id": "agentic-data",
+    "skill": "review"
+  }
+}
+```
+
+必填：`traceId/trace_id`、`label`。`spanId/span_id` 可选；不传则默认标注整条 trace。`status` 可为 `active`、`resolved`、`rejected`、`deleted`，默认 `active`。
+
+响应：
+
+```json
+{
+  "annotationId": "1",
+  "target": "span",
+  "traceId": "123",
+  "spanId": "456",
+  "externalTraceId": "run-uuid",
+  "externalSpanId": "span-uuid",
+  "label": "best_path",
+  "status": "active",
+  "attrs": {
+    "project_id": "agentic-data"
+  }
+}
+```
+
+### GET /v1/annotations  —— 查询标注
+
+支持 `cursor`、`limit`、`traceId`、`spanId`、`target`、`label`、`source`、`status`、`includeDeleted=true`，以及 `projectId/skill/mode/callSite` 等 attrs 查询参数或 `attrs={...}`。
+
+```bash
+GET /v1/annotations?projectId=agentic-data&label=best_path&includeDeleted=true
+```
+
+默认不返回 `deleted` 标注；需要审计/回收站视图时显式传 `includeDeleted=true`。
+
+### PATCH /v1/annotations/:id  —— 更新标注
+
+请求体可包含 `label`、`score`、`reason`、`source`、`status`、`reviewer`、`attrs`。默认合并 attrs；传 `replaceAttrs=true` 时替换整份 attrs。
+
+```json
+{
+  "status": "resolved",
+  "reviewer": "qa",
+  "attrs": {
+    "mode": "eval"
+  }
+}
+```
+
+### DELETE /v1/annotations/:id  —— 软删除标注
+
+不会物理删除记录，只把 `status` 改成 `deleted`，可带 `reviewer` / `reason`。
+
+### POST /v1/dataset-associations  —— 关联外部数据集样本
+
+请求体：
+
+```json
+{
+  "datasetId": "agentic-regression",
+  "itemId": "case-1",
+  "traceId": "run-uuid",
+  "spanId": "span-uuid",
+  "split": "eval",
+  "label": "pass",
+  "score": 900,
+  "attrs": {
+    "project_id": "agentic-data",
+    "skill": "review"
+  }
+}
+```
+
+必填：`datasetId/dataset_id`、`itemId/item_id`、`traceId/trace_id`。这只是记录关联关系，不复制 trace 内容。
+
+### GET /v1/dataset-associations  —— 查询数据集关联
+
+支持 `cursor`、`limit`、`datasetId`、`itemId`、`traceId`、`spanId`、`evalRunId`、`split`、`label`，以及 attrs 查询参数。
+
+```bash
+GET /v1/dataset-associations?datasetId=agentic-regression&projectId=agentic-data
+```
+
+---
+
+## Retention API（清理计划 / 执行 / 审计 / 策略）
+
+Retention 是显式调用的存储治理能力：先 dry-run 看会删什么，再 apply 软删除已 flush 到 segment 的行。它不会在嵌入式进程里自动启动后台删除线程。仍在 MemTable/WAL tail 的热 trace 会整条跳过，响应里返回 `skippedLiveTraceIds`，避免半条 trace 被删。
+
+默认保护被 annotation、dataset association、snapshot、eval link、path memory 引用的 trace。audit/policy 查询会先走内存 metadata postings，再做最终校验；执行本身仍然必须显式触发。当前主线不把 Golden Path 治理作为底座能力。
+
+### POST /v1/retention-plan  —— dry-run 清理计划
+
+```json
+{
+  "filter": { "projectId": "agentic-data", "skill": "review" },
+  "deleteBeforeTs": 100000,
+  "protect": {
+    "annotations": true,
+    "datasetAssociations": true,
+    "snapshots": true,
+    "evalLinks": true,
+    "pathMemory": true
+  },
+  "limit": 20
+}
+```
+
+返回 `candidates`、`protected`、`deletable`、`protectedReasons` 和 `deletableTraceIds` 样本。
+
+### POST /v1/retention/apply  —— 执行清理
+
+请求体同 `retention-plan`，但必须提供 `deleteBeforeTs`。执行后写入一条 tenant-scoped audit。
+
+可选参数：
+
+| 参数 | 说明 |
+|---|---|
+| `compact` | `true` 时尝试把 deletion vector 物化进新段 |
+| `reclaim` | compaction 后是否尝试安全回收旧段 |
+| `requestedBy` / `source` | 审计来源 |
+| `reason` | 审计原因 |
+
+### GET/POST /v1/retention-audits  —— 查询清理审计
+
+GET 支持 `cursor`、`limit`、`auditId`、`source`、`createdAfterNs`、`createdBeforeNs`。`auditId`、`tenant`、`source` 会先走 metadata postings；时间范围做最终校验。
+
+```bash
+GET /v1/retention-audits?source=nightly-retention&limit=20
+```
+
+### POST/GET /v1/retention-policies  —— 保存和查询清理策略
+
+策略只保存和显式触发，不自动后台运行。GET 查询支持 `policyId`、`name`、`enabled`，并会先走 metadata postings。
+
+```json
+{
+  "name": "nightly-retention",
+  "intervalNs": 86400000000000,
+  "nextRunAtNs": 1,
+  "query": {
+    "filter": { "projectId": "agentic-data" },
+    "olderThanNs": 2592000000000000,
+    "protect": { "annotations": true }
+  },
+  "source": "cron",
+  "reason": "ttl"
+}
+```
+
+`query` 必须包含 `deleteBeforeTs`，或 `olderThanNs` / `ttlNs` / `retentionNs` 这类 TTL 字段。run-due 时会按当前 `nowNs` 转成 `deleteBeforeTs`。
+
+### POST /v1/retention-policies/run-due  —— 显式运行到期策略
+
+```json
+{
+  "nowNs": 2,
+  "limit": 10
 }
 ```
 

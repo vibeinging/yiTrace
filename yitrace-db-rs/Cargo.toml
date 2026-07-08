@@ -1,0 +1,15 @@
+[package]
+name = "yitrace-db"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+description = "Embedded yiTrace TraceDB for Rust agents"
+readme = "README.md"
+repository = "https://github.com/vibeinging/yiTrace"
+keywords = ["tracedb", "ai-agents", "observability", "agent-memory"]
+categories = ["database", "development-tools::debugging"]
+publish = false
+
+[dependencies]
+yt-engine = { path = "../yitrace-engine/crates/yt-engine" }
