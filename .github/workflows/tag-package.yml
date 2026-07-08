@@ -175,6 +175,10 @@ jobs:
           manylinux: "2014"
           args: --release --out ../dist/tag-package/python-db
 
+      - name: Fix Python DB manylinux artifact ownership
+        if: ${{ matrix.target == 'python-db' && startsWith(matrix.platform, 'linux-') }}
+        run: sudo chown -R "$USER":"$USER" dist/tag-package
+
       - name: Write Python DB manylinux checksums
         if: ${{ matrix.target == 'python-db' && startsWith(matrix.platform, 'linux-') }}
         shell: python
