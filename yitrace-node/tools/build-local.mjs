@@ -14,6 +14,9 @@ if (!target) {
   throw new Error(`Unsupported local build target: ${process.platform}/${process.arch}`);
 }
 
-execFileSync("napi", ["build", "--release", "--platform", "--target", target, ...process.argv.slice(2)], {
-  stdio: "inherit",
-});
+const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+execFileSync(
+  npm,
+  ["exec", "--", "napi", "build", "--release", "--platform", "--target", target, ...process.argv.slice(2)],
+  { stdio: "inherit" },
+);
