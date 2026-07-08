@@ -4,8 +4,9 @@ Embedded yiTrace DB for Python agents.
 
 `yitrace-db` is the Python equivalent of `@yitrace/db`: it embeds the Rust
 yiTrace engine in the Python process and calls `EngineJsonApi` in-process. It
-does not parse yiTrace files in Python, does not start an HTTP server, and does
-not send traffic through a TCP socket.
+does not parse yiTrace files in Python and does not send embedded calls through
+a TCP socket. It can optionally expose the same DB through FastAPI or the
+`yitrace-db serve` CLI when you want a local server.
 
 ## Install
 
@@ -28,7 +29,22 @@ Use `--interpreter` when the machine has multiple Python installs; otherwise
 maturin may discover an old system Python instead of the environment you are
 building for.
 
+## Test
+
+```bash
+python -m pytest
+```
+
+From the repository root, run the package-mode eval when changing package
+contracts, `connect(path=...)`, FastAPI router behavior, or server-mode docs:
+
+```bash
+./scripts/package_mode_eval.sh
+```
+
 ## Usage
+
+You can use it directly:
 
 ```python
 from yitrace_db import YiTraceDB, create_span_event_builder
@@ -107,9 +123,51 @@ with YiTraceDB.open("./data", tenant_id=1) as db:
     print(db.search(text="盗刷", k=10))
 ```
 
-The existing `yitrace` package remains the pure-Python instrumentation SDK. Use
-it when you only need to emit traces to a running yiTrace service. Use
-`yitrace-db` when a Python app needs an embedded local TraceDB.
+Or through the user-facing `yitrace` package:
+
+```python
+from yitrace import DbExporter, Tracer, connect
+
+db = connect(path="./data", tenant_id=1)
+tracer = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
+```
+
+The existing `yitrace` package remains the pure-Python instrumentation SDK and
+client facade. Use `yitrace` when you want one import for HTTP and local modes.
+Use `yitrace-db` directly when a Python app needs the embedded DB handle.
+
+## Server Mode
+
+Install optional server dependencies:
+
+```bash
+python -m pip install "yitrace-db[server]"
+```
+
+Expose an embedded DB through FastAPI:
+
+```python
+from fastapi import FastAPI
+from yitrace_db import YiTraceDB
+from yitrace_db.fastapi import create_yitrace_router
+
+db = YiTraceDB.open("./data", tenant_id=1)
+app = FastAPI()
+app.include_router(create_yitrace_router(db), prefix="/yitrace")
+```
+
+Or start the small CLI server:
+
+```bash
+yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
+```
+
+Embedded mode is single-process. `uvicorn --workers 1`, a local agent, or an
+Electron main process can hold one `YiTraceDB` handle. Do not run
+`uvicorn --workers N` or multiple containers that open the same data directory
+with embedded DB handles. For that case, run one yiTrace server process and send
+all workers to it over HTTP. `.yitrace.lock` keeps rejecting a second embedded
+writer instead of silently corrupting the data dir.
 
 The read-model helpers above are single-node implementations. Common filters
 such as `project_id`, `skill`, `task_fingerprint`, `loop_id`,

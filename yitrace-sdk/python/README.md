@@ -2,13 +2,23 @@
 
 > 许可证:MIT。要求 Python ≥ 3.8。
 
-给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②）。
+给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件。
 
 ```
 python3 tests/test_sdk.py     # 含与引擎逐字节一致的 event_id、失败缓冲、HTTP header 校验
 ```
 
-## 用法
+从仓库根目录改包形态时跑统一回归：
+
+```bash
+./scripts/package_mode_eval.sh
+```
+
+它会覆盖 `connect(url/path)`、`DbExporter`、Python embedded DB、Node/Rust embedded 包和 TypeScript SDK。
+
+## 三种用法
+
+### 1. 只在本地调试
 
 ```python
 from yitrace import Tracer, ConsoleExporter
@@ -28,6 +38,48 @@ with tracer.trace("反洗钱筛查") as t:
 `seq` 在 span 内单调递增、由客户端给定，原样进引擎、引擎绝不重补 —— 进引擎后按 `(trace, span)`
 折叠成一条完整 span。
 
+### 2. 发到运行中的 yiTrace server
+
+```python
+from yitrace import Tracer, HttpExporter
+
+tr = Tracer(exporter=HttpExporter("http://127.0.0.1:7878/v1/ingest"), node_id=1)
+with tr.trace("反洗钱筛查") as t:
+    with t.span("调用LLM研判") as s:
+        s.set_tokens(1200, 340)
+tr.close()  # flush → POST 到引擎摄入服务
+```
+
+也可以用统一 client 查数据：
+
+```python
+from yitrace import connect
+
+client = connect(url="http://127.0.0.1:7878", tenant_id=1)
+print(client.search(text="盗刷", k=10))
+```
+
+### 3. 直接写本地 embedded DB
+
+先安装 `yitrace-db`，再用 `connect(path=...)`：
+
+```python
+from yitrace import DbExporter, Tracer, connect
+
+db = connect(path="./data", tenant_id=1)  # requires yitrace-db
+tr = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
+
+with tr.trace("反洗钱筛查", tenant_id=1) as t:
+    with t.span("调用LLM研判") as s:
+        s.log("疑似盗刷")
+
+tr.close()
+print(db.search(text="盗刷", k=10))
+db.close()
+```
+
+`connect(url=...)` 返回 HTTP client；`connect(path=...)` 返回 `yitrace-db` 的 embedded DB handle。
+
 ## 关键保证：event_id 跨语言逐字节一致
 
 `event_id = FNV-1a(ext_span_id ++ seq(8字节小端) ++ [event_type_tag])`，与引擎 `yt-core::event`
@@ -42,21 +94,11 @@ with tracer.trace("反洗钱筛查") as t:
 
 | 文件 | 作用 |
 |---|---|
+| `client.py` | `YiTraceClient` / `connect()`，用同一入口连接远程 server 或本地 embedded DB |
 | `event.py` | `EventType` / `event_id`（与引擎一致的 FNV）/ `SpanEvent`（对应引擎 WalRecord） |
 | `tracer.py` | `Tracer` / `Trace` / `Span` 打点 API（上下文管理器） |
-| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `BatchExporter`（攒批）/ `HttpExporter`（批量 POST + 失败缓冲） |
+| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `DbExporter`（写 embedded DB）/ `BatchExporter`（攒批）/ `HttpExporter`（批量 POST + 失败缓冲） |
 | `_snowflake.py` | 单调雪花 ID（trace/span id） |
-
-## 发到引擎（跨进程已打通）
-
-```python
-from yitrace import Tracer, HttpExporter
-tr = Tracer(exporter=HttpExporter("http://127.0.0.1:7878/v1/ingest"), node_id=1)
-with tr.trace("反洗钱筛查") as t:
-    with t.span("调用LLM研判") as s:
-        s.set_tokens(1200, 340)
-tr.close()  # flush → POST 到引擎摄入服务
-```
 
 引擎侧 `cargo run -p yt-engine --example server` 起 HTTP 摄入服务即可接收；`curl localhost:7878/v1/traces` 查回。
 

@@ -7,7 +7,7 @@
 #   - Rust 引擎离线测试
 #
 # 可选参数：
-#   --packages       额外跑 Python/TypeScript SDK、控制台、Node/Python/Rust 嵌入式 DB 包
+#   --packages       额外跑 package-mode eval 和控制台测试
 #   --pack           额外跑 @yitrace/db 本地打包验证
 #   --crash          额外跑 kill -9 崩溃恢复测试（默认 3 轮，可用 --crash-rounds N）
 #   --heavy          等同于 --packages --pack --crash
@@ -110,47 +110,29 @@ if [[ "$RUN_ENGINE" -eq 1 ]]; then
   run cargo test --offline --manifest-path "$ROOT_DIR/yitrace-engine/Cargo.toml"
 fi
 
-if [[ "$RUN_PACKAGES" -eq 1 && "$RUN_SDK" -eq 1 ]]; then
-  if need_dir "$ROOT_DIR/yitrace-sdk/python"; then
-    run python "$ROOT_DIR/yitrace-sdk/python/tests/test_sdk.py"
+if [[ "$RUN_PACKAGES" -eq 1 ]]; then
+  PACKAGE_ARGS=()
+  if [[ "$RUN_SDK" -eq 0 ]]; then
+    PACKAGE_ARGS+=("--skip-sdk")
   fi
-
-  if need_dir "$ROOT_DIR/yitrace-sdk/typescript"; then
-    pushd "$ROOT_DIR/yitrace-sdk/typescript" >/dev/null
-    run npm test
-    popd >/dev/null
+  if [[ "$RUN_PYTHON_DB" -eq 0 ]]; then
+    PACKAGE_ARGS+=("--skip-python-db")
   fi
-fi
-
-if [[ "$RUN_PACKAGES" -eq 1 && "$RUN_UI" -eq 1 ]]; then
-  if need_dir "$ROOT_DIR/yitrace-console"; then
-    pushd "$ROOT_DIR/yitrace-console" >/dev/null
-    run npm test
-    run npm run build
-    popd >/dev/null
+  if [[ "$RUN_RUST_DB" -eq 0 ]]; then
+    PACKAGE_ARGS+=("--skip-rust-db")
   fi
-fi
-
-if [[ "$RUN_PACKAGES" -eq 1 && "$RUN_PYTHON_DB" -eq 1 ]]; then
-  if need_dir "$ROOT_DIR/yitrace-db-python"; then
-    pushd "$ROOT_DIR/yitrace-db-python" >/dev/null
-    run python -m pytest
-    popd >/dev/null
+  if [[ "$RUN_NODE" -eq 0 ]]; then
+    PACKAGE_ARGS+=("--skip-node")
   fi
-fi
+  run "$ROOT_DIR/scripts/package_mode_eval.sh" "${PACKAGE_ARGS[@]}"
 
-if [[ "$RUN_PACKAGES" -eq 1 && "$RUN_RUST_DB" -eq 1 ]]; then
-  if need_dir "$ROOT_DIR/yitrace-db-rs"; then
-    run cargo test --offline --manifest-path "$ROOT_DIR/yitrace-db-rs/Cargo.toml"
-  fi
-fi
-
-if [[ "$RUN_PACKAGES" -eq 1 && "$RUN_NODE" -eq 1 ]]; then
-  if need_dir "$ROOT_DIR/yitrace-node"; then
-    pushd "$ROOT_DIR/yitrace-node" >/dev/null
-    run npm run build
-    run npm test
-    popd >/dev/null
+  if [[ "$RUN_UI" -eq 1 ]]; then
+    if need_dir "$ROOT_DIR/yitrace-console"; then
+      pushd "$ROOT_DIR/yitrace-console" >/dev/null
+      run npm test
+      run npm run build
+      popd >/dev/null
+    fi
   fi
 fi
 

@@ -32,7 +32,7 @@
 
 已完成：
 
-- 第 1 步质量工具：新增 `eval_all.sh`、`test_all.sh`、`bench_scale.sh`、`scale_bench`、主线版 `risk_eval_matrix`。
+- 第 1 步质量工具：新增 `eval_all.sh`、`test_all.sh`、`package_mode_eval.sh`、`bench_scale.sh`、`scale_bench`、主线版 `risk_eval_matrix`。`eval_all.sh --packages` 和 `test_all.sh` 已统一通过 package-mode eval 覆盖 Python/TypeScript SDK、Node/Python/Rust 嵌入式包。
 - 第 2 步嵌入式 DB 包：迁入 `yitrace-db-python`、`yitrace-db-rs`，并补 Node/Python/Rust 对 `traceSearch`、`traceAggregate`、`storageStats` 的稳定包装。
 - 第 3/4 步的一部分：主线新增 `/v1/trace-search`、`/v1/trace-aggregate`、`/v1/storage-stats` 的单机基础版，常用过滤先走内存派生索引，再折叠候选 span；响应返回 `readPlan`，可判断是否命中索引。
 - 第 4 步继续完成：新增 `/v1/trace-trajectories`、`/v1/trajectory-groups`、`/v1/traces/diff`、`/v1/loops`、`/v1/loops/:loopId`、`/v1/tasks/:fingerprint/traces` 的单机基础版，并补 Node/Python/Rust 嵌入式包装和 eval。
@@ -63,6 +63,7 @@
 
 - `scripts/eval_all.sh`
 - `scripts/test_all.sh`
+- `scripts/package_mode_eval.sh`
 - `scripts/bench_scale.sh`
 - `scale_bench` example
 - `risk_eval_matrix`
@@ -80,6 +81,7 @@ cd yitrace-engine
 cargo test --offline -p yt-engine --test risk_eval_matrix
 cargo run -p yt-engine --example scale_bench --release -- --spans 10000
 ../scripts/eval_all.sh
+../scripts/package_mode_eval.sh
 ```
 
 ### 第 2 步：迁移嵌入式 DB 包
@@ -241,12 +243,15 @@ cargo test --offline -p yt-engine storage_stats
 
 - loop/task / trajectory 更细的独立持久化磁盘物化索引。
 - attrs postings 按需分页的磁盘 buffer manager。
+- 更正式的规模压测：冷启动、热缓存、10 万 / 100 万 span、低选择性 / 高选择性过滤都要有固定报告。
+- BM25 已有内存倒排上的 block-max-WAND；仍缺段内持久倒排、分块 postings 和上量型 WAND，避免百万级数据冷启动后重建/常驻内存压力过大。
 
 原则：
 
 - 每个索引都要能解释“有没有命中索引”。
 - 如果索引不可用，必须能 fallback 到正确结果。
 - 性能测试要覆盖冷启动和热缓存。
+- P1 上量优化不改变现有数据正确性：先保持现有 `filter_attrs.dat` / `trace_rollup.dat` cache 可删可重建，再把热点 postings 和路径索引拆成独立磁盘结构。
 
 验收：
 
@@ -254,8 +259,17 @@ cargo test --offline -p yt-engine storage_stats
 cd yitrace-engine
 cargo run -p yt-engine --example scale_bench --release -- --spans 100000 --cold
 cargo run -p yt-engine --example scale_bench --release -- --spans 100000 --warm
+cargo run -p yt-engine --example scale_bench --release -- --spans 1000000 --cold
+cargo run -p yt-engine --example scale_bench --release -- --spans 1000000 --warm
 cargo test --offline -p yt-engine index
 ```
+
+P1 上量处理顺序：
+
+1. **先补正式性能基线**：固定 10 万 / 100 万 span、冷启动 / 热缓存、低选择性 / 高选择性过滤。先知道痛点真实大小，避免盲目写复杂索引。
+2. **attrs postings 磁盘分页**：把现在内存 postings 的宽值/大 postings 放到磁盘分页结构里，内存只保留目录、热页和预算内缓存；查询仍用 `readPlan` 暴露命中、回退和扫描量。
+3. **loop/task/trajectory 独立物化索引**：从共享 `trace_rollup.dat` 拆出按 `loop_id`、`task_fingerprint`、路径签名组织的磁盘索引，减少路径类接口的二次整理成本。
+4. **BM25 段内持久倒排**：把当前全局内存倒排升级为每段自带 term 字典 + 分块 postings + 块上界；现有内存 WAND 逻辑保留为语义基准，段内实现必须和暴力打分逐位一致。
 
 ### 第 7 步：文档回流
 

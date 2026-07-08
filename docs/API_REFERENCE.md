@@ -1,6 +1,6 @@
-# yiTrace HTTP API Reference
+# yiTrace API Reference
 
-> yiTrace 的所有功能都通过 HTTP JSON API 暴露。**自带控制台前端没有特权**——它和任何第三方前端调的是同一套 `/v1/*` 端点。想写自己的前端 / Dashboard / 接入 Grafana，照着本文即可。
+> yiTrace 的主要功能都通过一套 JSON API 暴露。HTTP server 调的是 `/v1/*` 端点；Node / Python / Rust 嵌入式 DB 包也是进程内调用同一层 `EngineJsonApi`。**自带控制台前端没有特权**——它和任何第三方前端调的是同一套 API。想写自己的前端 / Dashboard / Agent 后端，照着本文即可。
 >
 > 字段契约直接取自 `yitrace-engine/crates/yt-engine/src/http.rs` 的实现，不是从前端反推。
 
@@ -14,6 +14,33 @@ cd yitrace-engine && cargo run -p yt-engine --example server
 ```
 
 控制台前端已内嵌进单二进制，`GET /`（非 `/v1/*`）返回前端页面。你要用自己的前端，**忽略 `GET /`，直接调下面的 `/v1/*`**。
+
+---
+
+## 这份 API 文档怎么用
+
+yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 Node / Python / Rust 三种包，但字段契约是一套：
+
+| 方式 | 入口 | 是否走 HTTP socket | 适合谁 |
+|---|---|---|---|
+| 独立服务 | `cargo run -p yt-engine --example server` 后调 `/v1/*` | 是 | 自己写前端、已有服务要集中上报、接 OTLP/OpenInference |
+| Node / Electron 嵌入式 | `@yitrace/db` | 否 | Node 后端、Electron main process，要像 SQLite/Chroma 一样本地打开 |
+| Python 嵌入式 | `yitrace-db` / `import yitrace_db` | 否 | Python agent 或本地工具要直接写入并搜索 |
+| Rust 嵌入式 | `yitrace-db` crate | 否 | Rust agent 或本地服务要直接嵌入 |
+
+嵌入式包不是直接读文件。它们都把 Rust engine 加载到当前进程，再调用同一套 `EngineJsonApi`。
+所以本文里的请求体、响应字段、`readPlan`、attrs 过滤、trace/span 详情等契约，也适用于嵌入式包的高级方法或 `route_json` 风格方法。
+嵌入式只适合单进程持有一个 writer。FastAPI `uvicorn --workers 1` 可以嵌入；`uvicorn --workers N`、
+多个容器、多个服务共享同一个 data dir 时，应改为一个 yiTrace server 进程，其他 worker 走 HTTP。
+
+对外推荐顺序：
+
+1. **只是打点上报**：优先用 `yitrace` Python SDK 或 `@yitrace/trace-sdk`。
+2. **已经有 OTel/OpenInference**：直接把 OTLP/HTTP JSON 发到 `POST /v1/traces`。
+3. **应用内需要本地搜索和 trace 详情**：用 `@yitrace/db`、`yitrace-db` Python 包或 Rust crate。
+4. **自己写 UI / 服务**：直接调 `/v1/*`。
+
+alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、annotation/dataset/retention 基座。仍在路线图里的上量项包括 attrs postings 磁盘分页、独立 loop/task/trajectory 索引、百万 span 冷/热性能基线、段内持久 BM25 倒排。
 
 ---
 

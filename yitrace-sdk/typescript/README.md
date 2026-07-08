@@ -2,18 +2,26 @@
 
 > 许可证:MIT。要求 Node ≥ 18。
 
-给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件（产物②的 TS 半边）。
+给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件。
 
 ```
 npm test     # 含与引擎逐字节一致的 event_id、失败缓冲、close flush 校验
 ```
+
+从仓库根目录改包形态时跑统一回归：
+
+```bash
+./scripts/package_mode_eval.sh
+```
+
+它会同时覆盖 TypeScript SDK、Python SDK、Node embedded DB、Python embedded DB 和 Rust embedded crate。
 
 ## 用法
 
 JS 没有 Python 的 `with`，用回调式作用域：
 
 ```ts
-import { Tracer, ConsoleExporter } from "./src/index.ts";
+import { Tracer, ConsoleExporter } from "@yitrace/trace-sdk";
 
 const tracer = new Tracer(new ConsoleExporter(), 1);
 
@@ -46,7 +54,7 @@ Python 与 TS 的测试都据此断言一致。
 ## 发到引擎（跨进程已打通）
 
 ```ts
-import { Tracer, HttpExporter } from "./src/index.ts";
+import { Tracer, HttpExporter } from "@yitrace/trace-sdk";
 const tr = new Tracer(new HttpExporter("http://127.0.0.1:7878/v1/ingest"), 2);
 tr.trace("盗刷拦截", (t) => {
   t.span("调用LLM研判", (s) => s.setTokens(800, 150));

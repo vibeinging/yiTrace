@@ -4,18 +4,22 @@
 去重、崩溃重放幂等全都对得上。
 """
 from ._snowflake import Snowflake
+from .client import YiTraceClient, connect
 from .event import EventType, SpanEvent, event_id
-from .exporter import BatchExporter, CollectingExporter, ConsoleExporter, Exporter, HttpExporter
+from .exporter import BatchExporter, CollectingExporter, ConsoleExporter, DbExporter, Exporter, HttpExporter
 from .tracer import Span, Trace, Tracer
 
 __all__ = [
     "Snowflake",
+    "YiTraceClient",
+    "connect",
     "EventType",
     "SpanEvent",
     "event_id",
     "Exporter",
     "ConsoleExporter",
     "CollectingExporter",
+    "DbExporter",
     "BatchExporter",
     "HttpExporter",
     "Tracer",

@@ -41,6 +41,27 @@ class CollectingExporter(Exporter):
         self.events.append(event)
 
 
+class DbExporter(Exporter):
+    """把 SDK 事件直接写进 embedded YiTraceDB。"""
+
+    def __init__(self, db, *, tenant_id: int | str | None = None) -> None:
+        self.db = db
+        self.tenant_id = tenant_id
+        self._sent = 0
+
+    def export(self, event: SpanEvent) -> None:
+        self.export_batch([event])
+
+    def export_batch(self, events: list[SpanEvent]) -> None:
+        if not events:
+            return
+        self.db.ingest([event.to_wire() for event in events], tenant_id=self.tenant_id)
+        self._sent += len(events)
+
+    def sent_count(self) -> int:
+        return self._sent
+
+
 class BatchExporter(Exporter):
     """攒批缓冲装饰器：攒够一批就**整批**交给下游 sink 的 `export_batch`（一次请求/一次落盘），
     不再逐条转。要批量 HTTP 直接用 `HttpExporter`（它本身就攒批）；要给任意 sink 加攒批语义才套这个。"""

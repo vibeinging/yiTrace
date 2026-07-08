@@ -1,6 +1,6 @@
-# 团队 graph_index C ABI 契约（提案 — 按真实符号调整）
+# 可选 graph_index C ABI 契约（提案，按真实符号调整）
 
-本 crate 按下面这套 C ABI 调用团队 graph_index 库。**这是提案契约**：真符号不同就改 `src/lib.rs` 的
+本 crate 按下面这套 C ABI 调用外部 graph_index 库。**这是提案契约**：真符号不同就改 `src/lib.rs` 的
 `extern "C"` 块与 `GraphAnnFfi`，trait 接缝（`yt_engine::GraphIndex`）不变。
 
 ```c

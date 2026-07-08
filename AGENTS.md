@@ -8,7 +8,7 @@
 
 ## 1. 项目是什么
 
-**yiTrace** 是一台单机、零外部依赖的 **AI Agent 可观测性数据库引擎**（Rust 自研）。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
+**yiTrace** 是给 AI Agent 用的本地 trace SDK、回放控制台和嵌入式 TraceDB。Rust 引擎主体是自研的，可以作为独立 HTTP 服务运行，也可以被 Node / Electron / Python / Rust 应用嵌入到进程内。把 Agent（多轮对话、调工具、多 agent 协作）跑出来的 trace 灌进来，提供：
 
 - trace 还原（事件折叠成完整 span）
 - 中文 BM25 检索 + 带过滤的向量 ANN 召回 + 混合检索（RRF）
@@ -18,7 +18,7 @@
 
 **关键约束（改代码时必须守住）：**
 
-- **引擎主体零外部依赖、只用 Rust 标准库**。`cargo test --offline` 必须离线可过。重依赖（Vortex 等）隔离在独立 crate（`yitrace-segstore-vortex` 等），**不要把外部 crate 拉进 `yt-engine`**。
+- **引擎主体零外部依赖、只用 Rust 标准库**。`cargo test --offline` 必须离线可过。重依赖（Vortex、N-API、PyO3 等）隔离在独立目录 / crate（`yitrace-segstore-vortex`、`yitrace-node`、`yitrace-db-python` 等），**不要把外部 crate 拉进 `yt-engine`**。
 - **确定性 `event_id`** = `hash(ext_span_id, seq, event_type)`，跨 Python / TypeScript / 引擎逐字节一致。改 event 编码 = 破坏跨语言去重，必须有跨语言对账测试。
 - **接缝优先于实现**：分词 / 向量索引 / 段存储都是 trait 接缝（`Tokenizer` / `GraphIndex` / `SegmentStore` / `Bm25Index`）。换实现不动上层。
 
@@ -43,6 +43,8 @@ yitrace-sdk/                 # 打点 SDK
 │   └── typescript/              # @yitrace/trace-sdk（tsconfig + build 已配）
 yitrace-node/                # @yitrace/db：Node/Electron 嵌入式 DB（N-API，独立于 engine workspace）
 │   └── npm/                     # NAPI-RS optional platform packages（darwin/linux/win）
+yitrace-db-python/           # yitrace-db：Python 嵌入式 DB（PyO3/maturin，可选 FastAPI server）
+yitrace-db-rs/               # yitrace-db：Rust 嵌入式 DB crate
 yitrace-console/             # 控制台前端（React + Vite + TS，构建产物内嵌进引擎单二进制）
 docs/                        # 设计文档 / 现状索引 / 分析
 ```
@@ -84,6 +86,14 @@ python -m pytest                              # 跑测试
 # TypeScript
 cd yitrace-sdk/typescript && npm install && npm run build   # tsc 出 dist/
 npm test                                      # tsx 跑测试
+```
+
+**嵌入式 DB 包：**
+
+```bash
+cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI 包装
+cd yitrace-db-rs && cargo test --offline      # Rust embedded DB crate
+./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归
 ```
 
 **Node / Electron 嵌入式 DB（`@yitrace/db`）：**
@@ -206,7 +216,25 @@ curl -XPOST localhost:7878/v1/search -d '{"text":"盗刷","vector":[0.1,0.2,...]
 
 **多租户**：tenant 从 `X-Tenant-Id` 请求头取（非 body，客户端不能越权），`/v1/search` 与 `GET /v1/traces` 都按 tenant 隔离。
 
-### 5.4 嵌入式 Node / Electron DB
+### 5.4 Python 嵌入式 DB
+
+Python 项目如果只想打点上报，用 `yitrace` SDK + `HttpExporter`。如果还要在本地搜索 trace，安装 `yitrace-db`，再通过 `yitrace.connect(path=...)` 打开本地目录：
+
+```python
+from yitrace import DbExporter, Tracer, connect
+
+with connect(path="./data", tenant_id=1) as db:
+    tracer = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
+    with tracer.trace("反洗钱筛查", tenant_id=1) as t:
+        with t.span("交易风控") as span:
+            span.log("疑似盗刷")
+    tracer.close()
+    print(db.search(text="盗刷", k=10))
+```
+
+`connect(url=...)` 返回 HTTP client，`connect(path=...)` 返回本地 embedded DB handle。`yitrace-db` 也提供可选 FastAPI router 和 `yitrace-db serve` CLI。embedded 模式只适合单进程持有一个 writer；`uvicorn --workers N`、多个容器或多个服务共享同一个 data dir 时，改用一个 yiTrace server，其他 worker 走 HTTP。
+
+### 5.5 嵌入式 Node / Electron DB
 
 Node 后端或 Electron 应用不一定要启动 HTTP server。发布到 npm 后，用户可以直接安装：
 
@@ -234,7 +262,7 @@ await db.close();
 
 这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` 支持 search 和 sessions 精确过滤，JSON value 会按 string/number/bool/null/array/object round-trip。Electron 应用应在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。一个 data dir 同时只允许一个写者，`.yitrace.lock` 会阻止多进程同时打开。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成带 commit/label 后缀的 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；不要长期覆盖复用 `0.0.1.tgz`。AgenticData server 侧必须选定单一 native 架构：当前默认 x64 时 DuckDB、yiTrace、sqlite 都保持 x64；若切 arm64，先把 DuckDB/sqlite 也切到 arm64 或 optional per-platform 策略，不能混用架构。交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
 
-### 5.5 控制台
+### 5.6 控制台
 
 服务起来后浏览器开 `http://127.0.0.1:7878/`——前端已内嵌进引擎单二进制。左栏会话列表、中栏多轮时间线 + 瀑布、右栏 Span 详情。
 
@@ -247,5 +275,6 @@ await db.close();
 3. **改 event 编码 / 折叠逻辑 / 检索算子**，必须更新或新增对应测试（这些是承重不变量）。
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
 5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
-6. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
-7. **提交信息不带 AI 工具名**，写清 what + why。
+6. **改了 `yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响包边界，再跑 `./scripts/package_mode_eval.sh`。
+7. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
+8. **提交信息不带 AI 工具名**，写清 what + why。

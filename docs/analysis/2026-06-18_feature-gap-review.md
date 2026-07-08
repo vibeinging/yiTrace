@@ -82,6 +82,8 @@
 - **进展(2026-06-22)—— graph_index 带过滤召回已验证**:`graph.rs` 写了真图式 ANN(NSW,非暴力 L2 占位),实测两种过滤策略:稀疏谓词(命中集 67/800)下 **post-filter 召回 0.50 vs in-graph(进图过滤,ACORN 思路)召回 1.00**。结论:**进图过滤确实把 post-filter 丢掉的召回救回来了**,红队 C 风险("拉不回")在这个窄场景被证伪。会失败的测试 `in_graph_filter_recovers_recall_that_post_filter_loses` 兜住、确定性可复算。**仍是验证级**(单层 NSW、无量化/SIMD、std-only),真上量换团队 graph_index 的 C ABI。
 - **进展(2026-06-22)—— BM25 中文倒排已验证**:`bm25.rs` = 真倒排 + BM25 打分,中文用**无词典 CJK bigram** 分词。实测查"盗刷风控"非连续多概念串,真 BM25 按 tf-idf 召回排序、**子串占位一条都召不回**(`bm25_ranks_by_relevance_where_substring_returns_nothing`)。**两块真索引(BM25+graph)已设为引擎默认**,既有端到端检索测试照常通过。验证级(bigram 非 jieba 词级);真上量换团队 FFI。**至此 #1(核心 IP 验证)两半都做完;剩 #2 段/manifest 落盘。**
 
+> 2026-07-08 校准：上面两条是当时判断。当前主线默认已升级为自研 `ChineseTokenizer`（内嵌 jieba 全量词典，词典 DAG + DP）和自研磁盘型 `DiskGraphIndex`。外部 jieba / graph_index FFI 不再是 P1 主线缺口，只保留为可选适配和对标。当前真正的 P1/P2 压力在段内倒排 + WAND、删除/更新 postings 处理、ANN 量化/SIMD、配置和安全闭环。
+
 ### 第 2 层 — 数据模型前置（eval/成本/session 的共同地基）
 
 **[P1] SpanFields 扩字段:input/output 文本、agent_name、tool_name、model、session_id、user_id**

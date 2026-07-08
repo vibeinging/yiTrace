@@ -193,6 +193,14 @@ For Electron, open the database from the main process and expose narrow IPC
 methods to renderers. Do not let multiple app processes open the same `dataDir`
 for writing; yiTrace creates a `.yitrace.lock` file to enforce a single writer.
 
+For Node servers, the same rule applies. A single process may hold one
+`YiTraceDB` handle and serve many concurrent requests through that handle. Do
+not run `cluster`, PM2, or multiple containers where every worker opens the same
+`dataDir`. If the app needs multiple workers, run one yiTrace server process or
+one owner process for `YiTraceDB`, then have workers send trace data over HTTP
+or IPC. The embedded package deliberately fails fast on the second writer
+instead of pretending to be a multi-process database.
+
 String IDs are supported for direct `db.ingest()`. yiTrace keeps an internal
 stable `u64` hash for indexing and stores the original values in
 `external_trace_id`, `external_span_id`, `external_parent_span_id`, and
@@ -379,6 +387,16 @@ npm test
 current Node platform. That file is intentionally ignored by git. Set
 `NAPI_TARGET=aarch64-apple-darwin` or another Rust target triple when you need
 to override local target detection.
+
+From the repository root, also run the package-mode eval when changing the Node
+package or cross-language package contracts:
+
+```bash
+./scripts/package_mode_eval.sh
+```
+
+That eval builds and tests `@yitrace/db` together with the Python, Rust, and
+TypeScript package surfaces, so package drift is caught in one place.
 
 ## Publishing
 

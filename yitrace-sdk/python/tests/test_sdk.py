@@ -1,10 +1,11 @@
 """SDK 测试。可直接 `python3 tests/test_sdk.py` 跑，也兼容 pytest。"""
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from yitrace import CollectingExporter, EventType, HttpExporter, Tracer, event_id  # noqa: E402
+from yitrace import CollectingExporter, DbExporter, EventType, HttpExporter, Tracer, YiTraceClient, connect, event_id  # noqa: E402
 
 # 引擎基准值：cargo run -p yt-core --example print_event_id
 ENGINE_BASELINE = {
@@ -234,6 +235,99 @@ def test_http_exporter_caps_buffer_and_reports_dropped():
         assert errors == [1], "超过上限应丢最老事件并上报 dropped"
     finally:
         urllib.request.urlopen = old_urlopen
+
+
+def test_db_exporter_writes_tracer_events_to_embedded_db_handle():
+    class FakeDb:
+        def __init__(self):
+            self.calls = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append((events, tenant_id))
+            return {"ingested": len(events)}
+
+    db = FakeDb()
+    exporter = DbExporter(db, tenant_id=7)
+    tracer = Tracer(exporter=exporter, node_id=1)
+    with tracer.trace("local", tenant_id=7) as trace:
+        with trace.span("span") as span:
+            span.log("hello")
+    tracer.close()
+
+    assert exporter.sent_count() == 3
+    assert len(db.calls) == 3
+    assert all(call[1] == 7 for call in db.calls)
+    assert [call[0][0]["event_type"] for call in db.calls] == [
+        EventType.SPAN_START.value,
+        EventType.LOG.value,
+        EventType.SPAN_END.value,
+    ]
+
+
+def test_yitrace_client_routes_json_with_auth_and_tenant_headers():
+    import urllib.request  # noqa: E402
+
+    captured = {}
+    old_urlopen = urllib.request.urlopen
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def read(self):
+            return b'[{"trace_id":1}]'
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = req.data
+        return Resp()
+
+    try:
+        urllib.request.urlopen = fake_urlopen
+        client = YiTraceClient("http://example.test", token="secret", tenant_id=3, timeout=1.25)
+        result = client.search(text="盗刷", k=1)
+    finally:
+        urllib.request.urlopen = old_urlopen
+
+    assert result == [{"trace_id": 1}]
+    assert captured["url"] == "http://example.test/v1/search"
+    assert captured["timeout"] == 1.25
+    headers = {k.lower(): v for k, v in captured["headers"].items()}
+    assert headers["authorization"] == "Bearer secret"
+    assert headers["x-tenant-id"] == "3"
+    assert b"\\u76d7\\u5237" not in captured["body"], "body keeps readable UTF-8 JSON"
+
+
+def test_connect_selects_http_or_optional_embedded_package():
+    remote = connect("http://localhost:7878", tenant_id=1)
+    assert isinstance(remote, YiTraceClient)
+
+    opened = {}
+
+    class FakeYiTraceDB:
+        @classmethod
+        def open(cls, path, **options):
+            opened["path"] = str(path)
+            opened["options"] = options
+            return "embedded-db"
+
+    old_module = sys.modules.get("yitrace_db")
+    sys.modules["yitrace_db"] = types.SimpleNamespace(YiTraceDB=FakeYiTraceDB)
+    try:
+        local = connect(path="./data", tenant_id=9)
+    finally:
+        if old_module is None:
+            sys.modules.pop("yitrace_db", None)
+        else:
+            sys.modules["yitrace_db"] = old_module
+
+    assert local == "embedded-db"
+    assert opened == {"path": "./data", "options": {"tenant_id": 9}}
 
 
 if __name__ == "__main__":

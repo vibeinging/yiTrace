@@ -38,7 +38,7 @@ fn search_text_and_vector_find_and_fold_spans() {
 #[test]
 fn builder_injects_custom_tokenizer_end_to_end() {
     // 注入口验证：用 CoordinatorBuilder 换分词器后起引擎，自定义分词一路贯穿到 search_text。
-    // 这条就是「团队 jieba 到位后只换分词层」在引擎层的契约。
+    // 这条就是「外部分词或自定义分词只换分词层」在引擎层的契约。
     struct WordTokenizer; // 按空白切，整段中文当一个词（不拆 bigram）
     impl Tokenizer for WordTokenizer {
         fn tokenize(&self, text: &str) -> Vec<String> {
@@ -192,7 +192,7 @@ fn tenant_filter_isolates_search_across_tenants() {
 #[test]
 fn builder_injects_custom_graph_index_end_to_end() {
     // 注入口验证：用 CoordinatorBuilder 换 GraphIndex 后，search_similar 走的是注入的实现，不是默认 ANN。
-    // 这条是「团队 graph_index 到位后只换向量索引层」在引擎层的契约（与 jieba 那条对称）。
+    // 这条是「外部或自定义 GraphIndex 只换向量索引层」在引擎层的契约（与分词那条对称）。
     struct StubGraph; // 无视查询向量，永远只返回 (7,99) —— 默认 L2 ANN 不会这么选
     impl GraphIndex for StubGraph {
         fn index_embedding(&self, _t: u64, _s: u64, _e: Vec<f32>) {}

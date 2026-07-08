@@ -33,6 +33,8 @@
 2. 产品说明第 50 行说"核心算法是团队自己的,不是调外部库",**这个表述对当前 Rust 引擎成立,对 openGauss 扩展路线不成立**(那是用内核的 DiskANN/jieba)。两条路线的"自有 IP"成色不同,文档必须交代清楚现在押的是哪条。
 3. 竞品分析里反复说对手"把存储外包给 ClickHouse",但**自研 Rust 引擎目前的 BM25 是 bigram、ANN 是单层 NSW 无量化,都是文档自承的"验证级"**——离"自有 IP 能压住 DiskANN/jieba"还有距离。这个 gap 在路线分叉不澄清的情况下会被掩盖。
 
+> 2026-07-08 校准：当前主线已经不再是 bigram + 单层 NSW。默认中文检索是自研 `ChineseTokenizer` + BM25，默认向量索引是自研磁盘型多层 `DiskGraphIndex`。`yitrace-tokenizer-jieba` 和 `yitrace-vecindex-graph` 只作为可选外部适配层，不能再把“真库没接”写成核心 P1 缺口。
+
 **建议**:在产品说明里加一段"路线选择",明确:(a) openGauss 扩展是第一版方案、为何转向;(b) Rust 引擎是当前承重路线;(c) tracevault SQL 是保留参考还是放弃;(d) "自有 IP"当前的真实成色(算法自研、但精度/性能未对线生产级)。
 
 ---

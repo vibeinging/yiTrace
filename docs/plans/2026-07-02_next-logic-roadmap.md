@@ -23,6 +23,19 @@
 - OTLP 解析新增 `yitrace.session_id` / `yitrace.tenant_id`，HTTP 路径继续由 `X-Tenant-Id` 覆盖租户字段，并用测试固定 header 优先级。
 - 新增 `yitrace-node/` MVP：`@yitrace/db` 通过 Node-API 嵌入 Rust engine，支持 `open/close/ingest/search/traces/sessions/trace/span` 和 data-dir 单写者锁。
 
+## 2026-07-08 P1 状态校准
+
+这份路线图是 2026-07-02 写的，中间主线已经补了不少能力。现在看 P1，要按下面口径读：
+
+| P1 项 | 当前判断 |
+|---|---|
+| SDK 上报体验 | 已落地：Python / TypeScript 都有失败缓冲、统计和 close flush 路径 |
+| OTLP tenant / session 映射 | 已落地：session 映射可用，HTTP 写入继续以 `X-Tenant-Id` 为安全边界 |
+| Node / Electron 嵌入式 DB | 已落地：`@yitrace/db` 通过 N-API 调 engine，不直接读文件 |
+| 配置系统 / 安全最小闭环 | 仍是 P1：需要更像生产 server 的启动配置、强制 tenant、审计文件、限流等 |
+| Eval 数据闭环 / Agent DAG | 已有 annotation、dataset association、loop/task/read-model 基座；完整产品闭环和 UI 仍是后续 |
+| 外部 jieba / graph_index FFI | 不是主线 P1 缺口：默认已是自研 `ChineseTokenizer` + `DiskGraphIndex`，外部 FFI 只作为可选适配和对标 |
+
 ## P0：一键可运行闭环
 
 ### 1. 增加 `demo_all` 一条龙

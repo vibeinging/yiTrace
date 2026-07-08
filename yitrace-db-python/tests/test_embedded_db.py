@@ -334,3 +334,55 @@ def test_python_embedded_db_general_route_json_and_closed_errors():
 
         with pytest.raises(RuntimeError, match="closed"):
             db.search(text="missing")
+
+
+def test_python_fastapi_router_reuses_embedded_db_route_boundary():
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+    from yitrace_db.fastapi import create_yitrace_router
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with YiTraceDB.open(tmp) as db:
+            app = fastapi.FastAPI()
+            app.include_router(create_yitrace_router(db), prefix="/yitrace")
+            client = testclient.TestClient(app)
+
+            builder = create_span_event_builder(
+                {
+                    "trace_id": "router-run",
+                    "session_id": "router-session",
+                    "attrs": {"project_id": "router-project", "skill": "fastapi"},
+                }
+            )
+            builder.start_span(span_id="router-span", name="fastapi route", input_text="疑似盗刷")
+            builder.log("疑似盗刷", span_id="router-span")
+            builder.end_span(span_id="router-span", status=0, duration_ns=1)
+
+            ingest = client.post("/yitrace/v1/ingest", json=builder.events(), headers={"X-Tenant-Id": "42"})
+            assert ingest.status_code == 200
+            assert ingest.json()["ingested"] == 3
+
+            search = client.post(
+                "/yitrace/v1/search",
+                json={"text": "盗刷", "filter": {"attrs": {"project_id": "router-project"}}},
+                headers={"X-Tenant-Id": "42"},
+            )
+            assert search.status_code == 200
+            assert search.json()[0]["external_trace_id"] == "router-run"
+
+            other_tenant = client.post(
+                "/yitrace/v1/search",
+                json={"text": "盗刷", "filter": {"attrs": {"project_id": "router-project"}}},
+                headers={"X-Tenant-Id": "43"},
+            )
+            assert other_tenant.status_code == 200
+            assert other_tenant.json() == []
+
+
+def test_python_cli_rejects_multi_worker_embedded_serve():
+    from yitrace_db.cli import _parse_bind, main
+
+    assert _parse_bind("0.0.0.0:7878") == ("0.0.0.0", 7878)
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(SystemExit):
+            main(["serve", "--data-dir", tmp, "--workers", "2"])

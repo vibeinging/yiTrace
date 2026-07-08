@@ -7,6 +7,13 @@ Python. It opens a yiTrace data directory in-process, calls the Rust engine
 through `EngineJsonApi`, and does not start an HTTP server or parse storage
 files in application code.
 
+It is an embedded crate, not a deployment server. One process may hold one
+writer handle for a data directory and serve many threads through that handle.
+Do not run multiple processes that all call `YiTraceDb::open("./data")` against
+the same directory. For multi-process or multi-service deployments, run one
+yiTrace server process and send requests to it over HTTP, or keep one explicit
+writer process and talk to it through your own IPC.
+
 ## Install
 
 Local development from this repository:
@@ -134,4 +141,11 @@ let json = db.route_json("GET", "/v1/traces", "")?;
 ```bash
 cd yitrace-db-rs
 cargo test --offline
+```
+
+From the repository root, run the package-mode eval when changing the Rust
+embedded API or any shared embedded contract:
+
+```bash
+./scripts/package_mode_eval.sh
 ```

@@ -1,10 +1,11 @@
 # yiTrace
 
-**A single-binary trace database for AI agents.**
+**Local-first trace SDK, replay UI, and embedded TraceDB for AI agents.**
 
-Run it locally, point OTLP/OpenInference or the SDK at it, and get trace replay,
-Chinese search, vector recall, cost attribution, and evals without sending agent
-data to a hosted observability service.
+Run it locally, use the SDK or OTLP/OpenInference endpoint, or embed it directly
+in Node, Electron, Python, or Rust. You get trace replay, Chinese search, vector
+recall, cost attribution, and evals without sending agent data to a hosted
+observability service.
 
 [中文](README.zh-CN.md) · English
 
@@ -28,9 +29,10 @@ yiTrace is for teams building agents that need private, inspectable traces:
 - collect failed spans into eval datasets and track regressions
 - run in one directory, with the engine core using only the Rust standard library
 
-> Status: alpha, runnable today. Storage, WAL recovery, OTLP ingest, SDKs,
-> Chinese search, vector recall, and evals are covered by offline tests.
-> RBAC/TLS/hosted deployment are roadmap items.
+> Status: alpha, ready for early adopters. Storage, WAL recovery, OTLP ingest,
+> SDKs, embedded DB packages, Chinese search, vector recall, attrs filtering,
+> rollups, and eval basics are covered by offline tests. RBAC/TLS/hosted
+> deployment and million-span scale work are roadmap items.
 
 ---
 
@@ -100,6 +102,24 @@ curl localhost:7878/v1/traces \
   -H 'X-Tenant-Id: 1'
 ```
 
+## Use From Your App
+
+Pick the thinnest integration that matches your app:
+
+| App shape | Use | Notes |
+|---|---|---|
+| Existing OpenTelemetry / OpenInference traces | `POST /v1/traces` | Standard OTLP/HTTP JSON endpoint |
+| Python app that only emits traces | `yitrace` SDK or `connect(url=...)` | Sends to a running yiTrace service |
+| TypeScript / Node app that only emits traces | `@yitrace/trace-sdk` | Sends to a running yiTrace service |
+| Node backend or Electron app that needs local search | `@yitrace/db` | Embeds the Rust engine through Node-API; no local HTTP server |
+| Python app that needs local search | `yitrace.connect(path=...)` backed by `yitrace-db` | Embeds the Rust engine through PyO3/maturin |
+| Rust app that needs local search | `yitrace-db` crate | Thin wrapper over the same in-process engine API |
+| Custom dashboard or service | `/v1/*` HTTP API | Same endpoints used by the bundled console |
+
+During alpha, published registry packages and local tarballs may coexist. For
+locked internal installs, use the package-specific `pack` or wheel build flow
+and depend on immutable artifacts instead of mutable local filenames.
+
 ## Console
 
 The engine can serve the React console as embedded static assets. From source,
@@ -119,7 +139,7 @@ cargo run -p yt-engine --example server
 Then open `http://127.0.0.1:7878/`.
 
 The console has no private API. It talks to the same `/v1/*` JSON endpoints as
-any other UI. See [HTTP API Reference](docs/API_REFERENCE.md).
+any other UI. See [API Reference](docs/API_REFERENCE.md).
 
 ---
 
@@ -189,6 +209,68 @@ machine. Maintainer packaging and publish steps are documented in
 Before the public npm release, teams can use `npm run pack:local` in
 `yitrace-node/` to produce versioned tarballs and lock those tarballs in a
 consumer repository or internal npm registry.
+
+---
+
+## Embedded Python / Rust
+
+Use these when the app wants a local searchable TraceDB instead of only sending
+events to a running service.
+
+Python:
+
+```bash
+cd yitrace-db-python
+python -m pip install -e .
+```
+
+```python
+from yitrace import DbExporter, Tracer, connect
+
+with connect(path="./data", tenant_id=1) as db:
+    tracer = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
+    with tracer.trace("risk review", tenant_id=1) as trace:
+        with trace.span("LLM check") as span:
+            span.log("疑似盗刷")
+    tracer.close()
+    print(db.search({"text": "盗刷", "k": 10}))
+```
+
+To expose the embedded DB to multiple app workers, run one server process
+instead of opening the same data directory from every worker:
+
+```bash
+python -m pip install "yitrace-db[server]"
+yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
+```
+
+Embedded DB is for one process holding one writer handle. `uvicorn --workers 1`
+can embed it; `uvicorn --workers N`, multiple containers, or multiple services
+sharing one data dir should talk to a single yiTrace server over HTTP.
+
+Rust:
+
+```toml
+[dependencies]
+yitrace-db = { path = "../yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, SpanEndOptions, SpanEventBuilder, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+let mut events = SpanEventBuilder::new("run-uuid");
+events
+    .session_id("session-uuid")
+    .attr("project_id", "agentic-data")
+    .start_span("span-uuid", "risk review")
+    .end_span_with("span-uuid", SpanEndOptions::ok().duration_ns(12_000_000));
+db.ingest_builder(&events)?;
+let hits = db.search(&SearchQuery::text("盗刷").k(10))?;
+```
+
+All embedded packages call the same `EngineJsonApi` boundary in-process. They do
+not parse WAL, manifest, or segment files in application code.
 
 ---
 
@@ -292,9 +374,9 @@ Three mechanisms carry the design:
 - **Four-source fold**: a snapshot merges memtable, immutable segments, delete
   bitmaps, and late-write blocks by `event_id`.
 
-The engine body is std-only Rust. Heavier integrations, such as Vortex columnar
-segments, jieba FFI, and external graph indexes, live in separate crates behind
-traits.
+The engine body is std-only Rust. Heavier integrations live in separate crates
+behind traits. The default tokenizer and vector index are self-contained; FFI
+crates are optional adapters for external tokenizers or graph indexes.
 
 ---
 
@@ -305,26 +387,28 @@ traits.
 | Storage, WAL, snapshots, restart recovery | Done, tested | `cargo test --offline` covers crash replay, compaction, GC, backup, and restart |
 | HTTP API and OTLP/OpenInference ingest | Done | `/v1/ingest`, `/v1/traces`, `/v1/search`, `/v1/sessions`, `/v1/metrics` |
 | Python and TypeScript SDKs | Done | deterministic event id parity with the Rust engine |
+| Embedded DB packages | Alpha | `@yitrace/db`, `yitrace-db` for Python, and Rust wrapper use the in-process engine API |
 | Chinese tokenizer and BM25 | Done in pure Rust | dictionary DAG + max-probability DP, embedded jieba dictionary, user dict support |
 | Vector recall | Done in engine | disk-backed multi-layer HNSW, filtered search, L2/Cosine/IP |
 | Console | Usable | React app can be embedded into the engine binary |
 | Eval loop | Alpha | rule scorer today, LLM judge is roadmap |
 | Production security | Roadmap | TLS, RBAC, encryption, rate limits, persistent audit logs |
+| Scale hardening | Roadmap | disk-paged attrs postings, dedicated loop/task indexes, million-span cold/warm benchmarks |
 | Query engine | Roadmap | hand-written query paths today, DataFusion integration pending |
 
 Run the verification suite:
 
 ```bash
-cd yitrace-engine
-cargo test --offline
+cargo test --offline --manifest-path yitrace-engine/Cargo.toml
+./scripts/package_mode_eval.sh
 ```
 
 Optional crates:
 
 ```bash
 cd yitrace-segstore-vortex && cargo build      # Vortex columnar segment store
-cd yitrace-tokenizer-jieba && cargo test       # jieba FFI wrapper, mock by default
-cd yitrace-vecindex-graph && cargo test        # graph_index FFI wrapper, mock by default
+cd yitrace-tokenizer-jieba && cargo test       # optional tokenizer adapter, mock by default
+cd yitrace-vecindex-graph && cargo test        # optional graph-index adapter, mock by default
 ```
 
 ---
@@ -343,9 +427,12 @@ yitrace-console/             # React console
 yitrace-sdk/
   python/                    # Python tracing SDK
   typescript/                # TypeScript tracing SDK
+yitrace-node/                # @yitrace/db for Node and Electron
+yitrace-db-python/           # yitrace-db embedded DB package for Python
+yitrace-db-rs/               # yitrace-db embedded DB crate for Rust
 yitrace-segstore-vortex/     # optional Vortex segment store
-yitrace-tokenizer-jieba/     # optional jieba FFI tokenizer
-yitrace-vecindex-graph/      # optional graph_index FFI vector index
+yitrace-tokenizer-jieba/     # optional external tokenizer adapter
+yitrace-vecindex-graph/      # optional external graph-index adapter
 docs/                        # design notes, API reference, current-state index
 ```
 

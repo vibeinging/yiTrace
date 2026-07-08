@@ -20,8 +20,10 @@ yiTrace/
 ├── yitrace-sdk/                 # Python / TypeScript 打点 SDK
 │   ├── python/
 │   └── typescript/
+├── yitrace-node/                # @yitrace/db, Node/Electron 嵌入式 DB
+├── yitrace-db-python/           # yitrace-db, Python 嵌入式 DB + 可选 server
+├── yitrace-db-rs/               # yitrace-db, Rust 嵌入式 DB crate
 ├── yitrace-console/             # (占位)Web 控制台
-├── tracevault-extension/            # 历史方案(openGauss 扩展),非当前态,保留参考
 └── docs/                            # 设计 / 分析 / 调研文档
 ```
 
@@ -29,7 +31,7 @@ yiTrace/
 
 ### Rust 引擎
 
-- **Rust ≥ 1.82**(edition 2021;用了 `OnceLock` 等稳定 API)
+- **Rust ≥ 1.80**(edition 2021;见 `yitrace-engine/Cargo.toml`)
 - 引擎工作区 `yitrace-engine/` **零外部依赖**,`cargo test --offline` 离线可过
 
 ### Vortex 列式段 crate(`yitrace-segstore-vortex/`)
@@ -40,8 +42,14 @@ yiTrace/
 
 ### Python SDK(`yitrace-sdk/python/`)
 
-- **Python ≥ 3.10**(代码用了 `int | None` union 语法)
+- **Python ≥ 3.8**
 - 纯标准库,**零第三方依赖**(不依赖 pytest;`python3 tests/test_sdk.py` 直接跑)
+
+### Python embedded DB(`yitrace-db-python/`)
+
+- **Python ≥ 3.8**
+- 构建 wheel 需要 maturin / PyO3；服务模式依赖可选 extra：`pip install "yitrace-db[server]"`
+- embedded 模式只支持单进程持有一个 writer。多 worker / 多容器共享同一 data dir 时，改用 `yitrace-db serve` 或独立 yiTrace server。
 
 ### TypeScript SDK(`yitrace-sdk/typescript/`)
 
@@ -54,7 +62,7 @@ yiTrace/
 ```bash
 # 1. Rust 引擎(零依赖,离线可跑)
 cd yitrace-engine
-cargo test --offline                    # 129 测试(9+105+6+3+2+4)
+cargo test --offline
 
 # 2. Vortex 列式段 crate(首次联网)
 cd ../yitrace-segstore-vortex
@@ -66,12 +74,20 @@ cd ../yitrace-vecindex-graph && cargo test      # 4 测试(mock)
 
 # 4. Python SDK
 cd ../yitrace-sdk/python
-python3 tests/test_sdk.py               # 8 测试(需 Python ≥ 3.10)
+python3 tests/test_sdk.py
 
 # 5. TypeScript SDK
 cd ../typescript
 npm install                             # 首次
-npx tsx --test test/test_sdk.ts         # 8 测试(需 Node ≥ 18)
+npm test                                # 需 Node ≥ 18
+
+# 6. 嵌入式 DB 包
+cd ../../yitrace-db-python && python -m pytest
+cd ../yitrace-db-rs && cargo test --offline
+
+# 7. 跨包形态回归(改包边界时必跑)
+cd ..
+./scripts/package_mode_eval.sh
 ```
 
 ## 跑示例
@@ -101,6 +117,7 @@ cargo run -p yt-engine --release --example bench_qps
 - [ ] `cargo clippy --offline -- -D warnings`(如果你改了引擎)
 - [ ] `cargo fmt --all -- --check`(格式)
 - [ ] 改了 SDK 的话,跑对应 SDK 测试
+- [ ] 改了 Node/Python/Rust 嵌入式 DB 包的话,跑对应包测试和 `./scripts/package_mode_eval.sh`
 - [ ] 改了 Vortex crate 的话,跑 `yitrace-segstore-vortex` 测试
 - [ ] 新功能加了**会失败的测试**(不是凑覆盖率)
 

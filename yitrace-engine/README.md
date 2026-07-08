@@ -1,6 +1,6 @@
 # yiTrace Engine
 
-> ⚠️ **状态:验证级骨架,不是生产就绪。** 技术前提用代码 + 会失败的测试钉死(156 测试),但分词/向量索引/安全合规未到生产级。**不要未经评估直接上生产。** 详见文末["距离开源还剩什么"](#距离开源还剩什么)。
+> ⚠️ **状态:alpha,不是生产完成态。** 技术前提用代码 + 会失败的测试钉死(156 测试),默认中文分词和磁盘向量索引已可用；安全合规、百万级规模基线、段内持久倒排等仍在路线图。**不要未经评估直接上生产。** 详见文末["距离生产就绪还剩什么"](#距离生产就绪还剩什么)。
 >
 > 许可证:**MIT**(见根目录 [LICENSE](../LICENSE))。内嵌 jieba 词典为 MIT(见 `data/JIEBA_DICT_NOTICE.md`),Vortex 为 Apache-2.0。
 
@@ -65,7 +65,7 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 
 | 功能 | 状态 | 说明 |
 |---|---|---|
-| **中文 BM25 检索** | ✅ | 真倒排 + BM25(k1/b)评分 + **block-max-WAND** 剪枝;**jieba 全量词典(34.9 万词)默认内嵌**,支持自有词典导入,纯 Rust 词级分词(词典 DAG + 最大概率 DP) |
+| **中文 BM25 检索** | ✅ | 内存真倒排 + BM25(k1/b)评分 + **block-max-WAND** 剪枝；**jieba 全量词典(34.9 万词)默认内嵌**,支持自有词典导入,纯 Rust 词级分词(词典 DAG + 最大概率 DP)。段内持久倒排和分块 postings 是上量优化 |
 | **磁盘型多层 HNSW** | ✅ | 落盘版 HNSW(参考 yiTrace graph_index):底层+向量在磁盘、上层稀疏骨架常驻内存、向量按需读页走缓冲池;重启不 rebuild |
 | **进图过滤召回** | ✅ | 过滤条件进图导航(ACORN 式),稀疏谓词召回不塌(实测 1% 选择性 post 0.17 → in-graph 1.00) |
 | 带属性过滤 | ✅ | 按 agent/status/time/trace 过滤(向量侧走进图、BM25 侧后置) |
@@ -121,7 +121,7 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | 向量检索 | ~1,000 QPS(热缓存) |
 | JSON 解析+灌入 | ~480,000 事件/s(单线程) |
 
-`bench_qps` 实例可复现。扩展性优化(段级 Bloom + block-max-WAND)在 5 万规模下 BM25 +66%、向量 +40%。
+`bench_qps` 实例可复现。当前优化包括段级 Bloom 和内存 BM25 WAND；百万级冷启动、低内存场景还需要段内持久倒排、磁盘分页 postings 和更正式的 scale bench。
 
 ---
 
@@ -140,36 +140,36 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | crate | 干什么 |
 |---|---|
 | `yitrace-segstore-vortex` | Vortex 列式段存储(实现 SegmentStore);谓词下推 + 投影下推 |
-| `yitrace-tokenizer-jieba` | cppjieba FFI 接入(crate,团队真库到位时 `--features link`);**引擎默认用纯 Rust 词级分词** |
-| `yitrace-vecindex-graph` | 团队 graph_index FFI 接入;**引擎默认用自研磁盘型 HNSW** |
+| `yitrace-tokenizer-jieba` | 可选外部分词 FFI 适配层；**引擎默认用纯 Rust 词级分词** |
+| `yitrace-vecindex-graph` | 可选外部图索引 FFI 适配层；**引擎默认用自研磁盘型 HNSW** |
 | `yitrace-sdk` | Python / TypeScript 打点 SDK |
 
 ---
 
-## 距离开源还剩什么
+## 距离生产就绪还剩什么
 
-### 🔴 必须补(开源前)
+### 🔴 必须补(生产前)
 
 | 项 | 说明 |
 |---|---|
-| **LICENSE** | 没有许可证文件 = 法律上不能复用。选 Apache-2.0 / MIT / AGPL 之一(见下"许可证决策") |
-| **环境门槛文档** | Rust MSRV、Python ≥3.10(`int\|None` 语法)、Node ≥18 + 平台匹配的 esbuild;现在环境一变 SDK 测试就挂 |
-| **外部 crate 的 vendoring / 镜像** | Vortex crate 联网拉依赖;开源用户/气隙环境要能离线构建(vendoring + build 说明) |
-| **README 的诚实定位** | "验证级骨架"必须醒目(否则误导使用者当生产级上);现状已写,但需顶部 badge/状态块更显眼 |
-| **统一构建脚本** | 多 crate 工作区 + 工作区外 crate + SDK,需要一篇"怎么从零构建 + 跑全部测试"的 CONTRIBUTING |
+| **生产安全** | TLS / RBAC / 落盘加密 / PII 脱敏 / 限流 / 持久审计日志 |
+| **规模基线** | 冷启动、热缓存、10 万 / 100 万 span、低选择性 / 高选择性过滤的正式压测 |
+| **BM25 段内持久倒排** | 当前已有内存 BM25 WAND；百万级冷启动和低内存场景需要段内倒排 + 分块 postings |
+| **attrs postings 磁盘分页** | 当前有内存预算保护和持久 cache；上量后需要按需分页的磁盘 buffer manager |
+| **独立读模型索引** | loop/task/trajectory 当前复用 `trace_rollup.dat`；上量后需要独立磁盘物化索引 |
 
-### 🟡 强烈建议(开源后第一周会被问)
+### 🟡 强烈建议(发版后第一周会被问)
 
 | 项 | 说明 |
 |---|---|
 | **CHANGELOG + 版本号** | 现在是 git main 一条线,没有 release tag / CHANGELOG |
 | **CI(GitHub Actions)** | 多 Rust 版本矩阵 + clippy + fmt + SDK 多版本 + Vortex crate;现在零 CI |
-| **示例完整化** | `demo`/`server` 有,但缺"端到端:SDK 打点 → server → 查询 → eval"一条龙示例 |
+| **示例完整化** | `demo`/`server` 有,还需要更多"端到端:SDK 打点 → server/embedded → 查询 → eval"案例 |
 | **架构图** | 五 crate + 外部 crate + 数据流图,文字 README 说不清;需要一张图 |
 | **测试矩阵明示** | "156 测试验什么"现在堆在一段里,需要表格化(功能清单已部分解决) |
 | **竞品对比页** | 会反复被问"跟 Langfuse/ClickHouse 比怎样";产品说明里有但 README 没指 |
 
-### 🟢 功能性缺口(不影响开源,但 README 要标"未实现")
+### 🟢 功能性缺口(不影响早期使用,但 README 要标"未实现")
 
 | 项 | 说明 |
 |---|---|
@@ -180,15 +180,15 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | 安全合规 | TLS / RBAC 物理隔离 / 落盘加密 / 持久防篡改审计 / 限流 / PII 脱敏 |
 | LLM-judge eval | 现在 KeywordScorer;接 LLM-judge 需出站 HTTP(气隙走本地小模型) |
 
-### 许可证决策(必须先定)
+### 许可证
 
 | 许可证 | 适合 |
 |---|---|
-| **Apache-2.0** | 最宽松、专利授权全、生态最广(Langfuse/Vortex/DuckDB 都是) |
-| MIT | 更短更简,但无专利授权条款 |
-| AGPL-3.0 | 防竞品白嫖(网络服务也得开源),但会劝退部分企业用户 |
+| **MIT** | 当前项目许可证,短、简单、便于复用 |
+| Apache-2.0 | 未来如果要强化专利授权条款,可以再评估 |
+| AGPL-3.0 | 防竞品白嫖,但会劝退部分企业用户 |
 
-> 注意:内嵌的 jieba 词典是 **MIT**(声明在 `data/JIEBA_DICT_NOTICE.md`);选 Apache-2.0 兼容它。Vortex 是 Apache-2.0。
+> 注意:内嵌的 jieba 词典是 **MIT**(声明在 `data/JIEBA_DICT_NOTICE.md`),Vortex 是 Apache-2.0。
 
 ---
 

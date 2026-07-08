@@ -3,10 +3,8 @@
 #
 # 默认跑主线必需测试：
 #   - Rust 引擎离线测试
-#   - Python SDK 测试
-#   - TypeScript SDK 测试
+#   - package-mode eval（Python/TypeScript SDK + Node/Python/Rust 嵌入式 DB）
 #   - 控制台数据层测试 + 构建
-#   - Node/Python/Rust 嵌入式 DB 包测试（目录存在时）
 #
 # 可选参数：
 #   --skip-node       跳过 Node 嵌入式 DB
@@ -75,37 +73,22 @@ need_dir() {
 need_dir "$ROOT_DIR/yitrace-engine" >/dev/null
 run cargo test --offline --manifest-path "$ROOT_DIR/yitrace-engine/Cargo.toml"
 
-if need_dir "$ROOT_DIR/yitrace-sdk/python"; then
-  run python "$ROOT_DIR/yitrace-sdk/python/tests/test_sdk.py"
+PACKAGE_ARGS=()
+if [[ "$RUN_PYTHON_DB" -eq 0 ]]; then
+  PACKAGE_ARGS+=("--skip-python-db")
 fi
-
-if need_dir "$ROOT_DIR/yitrace-sdk/typescript"; then
-  pushd "$ROOT_DIR/yitrace-sdk/typescript" >/dev/null
-  run npm test
-  popd >/dev/null
+if [[ "$RUN_RUST_DB" -eq 0 ]]; then
+  PACKAGE_ARGS+=("--skip-rust-db")
 fi
+if [[ "$RUN_NODE" -eq 0 ]]; then
+  PACKAGE_ARGS+=("--skip-node")
+fi
+run "$ROOT_DIR/scripts/package_mode_eval.sh" "${PACKAGE_ARGS[@]}"
 
 if [[ "$RUN_UI" -eq 1 ]] && need_dir "$ROOT_DIR/yitrace-console"; then
   pushd "$ROOT_DIR/yitrace-console" >/dev/null
   run npm test
   run npm run build
-  popd >/dev/null
-fi
-
-if [[ "$RUN_PYTHON_DB" -eq 1 ]] && need_dir "$ROOT_DIR/yitrace-db-python"; then
-  pushd "$ROOT_DIR/yitrace-db-python" >/dev/null
-  run python -m pytest
-  popd >/dev/null
-fi
-
-if [[ "$RUN_RUST_DB" -eq 1 ]] && need_dir "$ROOT_DIR/yitrace-db-rs"; then
-  run cargo test --offline --manifest-path "$ROOT_DIR/yitrace-db-rs/Cargo.toml"
-fi
-
-if [[ "$RUN_NODE" -eq 1 ]] && need_dir "$ROOT_DIR/yitrace-node"; then
-  pushd "$ROOT_DIR/yitrace-node" >/dev/null
-  run npm run build
-  run npm test
   popd >/dev/null
 fi
 

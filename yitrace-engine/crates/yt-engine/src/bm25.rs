@@ -2,12 +2,12 @@
 //! "原生中文检索" 这条差异化能不能立住。
 //!
 //! 三件事是真的（不是占位）：
-//! 1. **分词可替换**：分词从索引里解耦成 [`Tokenizer`] 接缝。默认 [`CjkBigramTokenizer`]（无词典 CJK
-//!    bigram，零依赖 std-only，验证级正路）；接团队 jieba 词级分词 = 实现一个 `Tokenizer` 注入进来，
-//!    **索引/评分这套自有逻辑一行不动**。这是「FFI 复用分词、自有倒排」分工的落点。
+//! 1. **分词可替换**：分词从索引里解耦成 [`Tokenizer`] 接缝。引擎默认注入纯 Rust
+//!    [`crate::ChineseTokenizer`]；`CjkBigramTokenizer` 是零依赖兜底。外部分词库只需要实现
+//!    `Tokenizer` 就能接入，**索引/评分这套自有逻辑一行不动**。
 //! 2. **BM25 打分**：真倒排（token → 每文档词频）+ idf + 文档长度归一。按相关性排序，不是子串"有/无"。
 //! 3. **bigram 召回正确**：相邻汉字两两成词（"疑似盗刷" → 疑似/似盗/盗刷），是 Elasticsearch CJK
-//!    analyzer 同款；接 jieba 是把词切得更准的**升级**，不是召回前置（bigram 已能正确召回+排序）。
+//!    analyzer 同款；词级分词是精度升级，不是召回前置（bigram 已能正确召回+排序）。
 //!
 //! 为什么这比子串强（模块自带会失败的测试证明）：查 "盗刷风控" 这种**非连续多概念**中文串，子串占位
 //! （`InMemoryBm25` 按空白切，整串当一个 token）要求文档里出现连续 "盗刷风控" 才命中 → 一条都召不回；
@@ -38,13 +38,13 @@ impl Ord for OrdF32 {
     }
 }
 
-/// **分词接缝**：把一段文本切成检索词。索引与评分对分词只认这个 trait —— 换分词器（bigram → 团队 jieba
-/// 词级）只换实现、不动倒排逻辑。实现方负责大小写归一、标点处理等；返回的每个 token 原样进倒排。
+/// **分词接缝**：把一段文本切成检索词。索引与评分对分词只认这个 trait —— 换分词器
+/// 只换实现、不动倒排逻辑。实现方负责大小写归一、标点处理等；返回的每个 token 原样进倒排。
 pub trait Tokenizer: Send + Sync {
     fn tokenize(&self, text: &str) -> Vec<String>;
 }
 
-/// 默认分词器：无词典 CJK bigram + ASCII/数字按串小写化。零依赖、std-only，接 jieba 前的验证级正路。
+/// 兜底分词器：无词典 CJK bigram + ASCII/数字按串小写化。零依赖、std-only。
 #[derive(Default)]
 pub struct CjkBigramTokenizer;
 
@@ -172,7 +172,7 @@ fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
 }
 
 /// 真 BM25 中文倒排索引。实现引擎的 `Bm25Index` trait，可直接替掉 `InMemoryBm25`。
-/// 分词器可注入：`new()` 用默认 bigram，`with_tokenizer` 换团队 jieba（同一套倒排/评分）。
+/// 分词器可注入：`new()` 用兜底 bigram，`with_tokenizer` 可换任意词级分词器（同一套倒排/评分）。
 pub struct Bm25TextIndex {
     state: Mutex<Bm25State>,
     tokenizer: Box<dyn Tokenizer>,
@@ -190,7 +190,7 @@ impl Bm25TextIndex {
         Self::with_tokenizer(Box::new(CjkBigramTokenizer))
     }
 
-    /// 注入自定义分词器（如团队 jieba 词级分词的 FFI 实现）。倒排与 BM25 评分不变。
+    /// 注入自定义分词器。倒排与 BM25 评分不变。
     pub fn with_tokenizer(tokenizer: Box<dyn Tokenizer>) -> Self {
         Self {
             state: Mutex::new(Bm25State::default()),

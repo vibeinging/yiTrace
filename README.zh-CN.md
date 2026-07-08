@@ -1,9 +1,9 @@
 # yiTrace
 
-**给 AI Agent 用的单机 trace 数据库。**
+**给 AI Agent 用的本地 trace SDK、回放界面和嵌入式 TraceDB。**
 
-一个 Rust 单二进制，把 Agent 的多轮对话、工具调用、多 Agent 协作 trace 灌进去，
-本地完成 trace 回放、中文检索、向量召回、成本归因和 eval，不把数据送出内网。
+可以本地起服务，也可以用 SDK / OTLP 接入，或者直接嵌入 Node、Electron、Python、Rust 进程。
+yiTrace 会在本地完成 trace 回放、中文检索、向量召回、成本归因和 eval，不把数据送出内网。
 
 中文 · [English](README.md)
 
@@ -26,8 +26,9 @@ yiTrace 适合正在做私有化 Agent 的团队：
 - 把失败 span 收进 eval 数据集，持续做回归评测
 - 单目录本地运行，引擎主体只用 Rust 标准库
 
-> 状态：alpha，可本地运行。存储、WAL 恢复、OTLP 摄入、SDK、中文检索、
-> 向量召回和 eval 都有离线测试覆盖。RBAC/TLS/托管部署仍在路线图中。
+> 状态：alpha，已经适合早期用户试用。存储、WAL 恢复、OTLP 摄入、SDK、
+> 嵌入式 DB 包、中文检索、向量召回、attrs 过滤、rollup 和 eval 基座都有离线测试覆盖。
+> RBAC/TLS/托管部署和百万 span 上量优化仍在路线图中。
 
 ---
 
@@ -96,6 +97,23 @@ curl localhost:7878/v1/traces \
   -H 'X-Tenant-Id: 1'
 ```
 
+## 在你的应用里怎么用
+
+按应用形态选最薄的一层接入：
+
+| 应用形态 | 用什么 | 说明 |
+|---|---|---|
+| 已经有 OpenTelemetry / OpenInference trace | `POST /v1/traces` | 标准 OTLP/HTTP JSON 端点 |
+| Python 应用只想打点上报 | `yitrace` SDK 或 `connect(url=...)` | 发到一个运行中的 yiTrace 服务 |
+| TypeScript / Node 应用只想打点上报 | `@yitrace/trace-sdk` | 发到一个运行中的 yiTrace 服务 |
+| Node 后端或 Electron 要本地搜索 | `@yitrace/db` | 通过 Node-API 嵌入 Rust engine，不启动本地 HTTP server |
+| Python 应用要本地搜索 | `yitrace.connect(path=...)`，底层用 `yitrace-db` | 通过 PyO3/maturin 嵌入 Rust engine |
+| Rust 应用要本地搜索 | `yitrace-db` crate | 同一套进程内 engine API 的薄封装 |
+| 自己写 Dashboard 或服务 | `/v1/*` HTTP API | 和自带控制台调用同一套端点 |
+
+alpha 阶段可能同时存在正式 registry 包和本地 tarball / wheel。内部项目要锁版本时，
+用各包自己的打包流程生成不可变产物，不要长期覆盖同名本地包文件。
+
 ## 控制台
 
 引擎可以把 React 控制台作为静态资源内嵌进二进制。从源码运行时，先构建前端并拷进引擎 crate：
@@ -114,7 +132,7 @@ cargo run -p yt-engine --example server
 然后打开 `http://127.0.0.1:7878/`。
 
 控制台没有私有接口，它和任何第三方前端一样调用 `/v1/*` JSON API。
-完整端点见 [HTTP API 文档](docs/API_REFERENCE.md)。
+完整端点见 [API 文档](docs/API_REFERENCE.md)。
 
 ---
 
@@ -174,6 +192,65 @@ trace 和 span detail 也会返回 `logEvents`，业务侧可以直接渲染 spa
 维护者打包和发布步骤见 [`yitrace-node/README.md`](yitrace-node/README.md)。
 公开 npm 发布前，可在 `yitrace-node/` 运行 `npm run pack:local` 生成可锁版本的 tarball，
 放进 AgenticData 仓库或内部 npm 源。
+
+---
+
+## Python / Rust 嵌入式 DB
+
+当应用需要本地可检索的 TraceDB，而不是只把事件发到一个服务时，用这些包。
+
+Python：
+
+```bash
+cd yitrace-db-python
+python -m pip install -e .
+```
+
+```python
+from yitrace import DbExporter, Tracer, connect
+
+with connect(path="./data", tenant_id=1) as db:
+    tracer = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
+    with tracer.trace("风控研判", tenant_id=1) as trace:
+        with trace.span("LLM 检查") as span:
+            span.log("疑似盗刷")
+    tracer.close()
+    print(db.search({"text": "盗刷", "k": 10}))
+```
+
+如果要把 embedded DB 暴露给多个应用 worker，不要让每个 worker 都打开同一个 data dir，
+而是起一个 yiTrace server：
+
+```bash
+python -m pip install "yitrace-db[server]"
+yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
+```
+
+embedded DB 适合单进程持有一个 writer。`uvicorn --workers 1` 可以嵌入；
+`uvicorn --workers N`、多个容器、多个服务共享同一个 data dir 时，应该走单独的 yiTrace server。
+
+Rust：
+
+```toml
+[dependencies]
+yitrace-db = { path = "../yitrace-db-rs" }
+```
+
+```rust
+use yitrace_db::{OpenOptions, SearchQuery, SpanEndOptions, SpanEventBuilder, YiTraceDb};
+
+let db = YiTraceDb::open_with_options(OpenOptions::new("./data").tenant_id(1))?;
+let mut events = SpanEventBuilder::new("run-uuid");
+events
+    .session_id("session-uuid")
+    .attr("project_id", "agentic-data")
+    .start_span("span-uuid", "风控研判")
+    .end_span_with("span-uuid", SpanEndOptions::ok().duration_ns(12_000_000));
+db.ingest_builder(&events)?;
+let hits = db.search(&SearchQuery::text("盗刷").k(10))?;
+```
+
+所有嵌入式包都调用同一套进程内 `EngineJsonApi`。应用代码不会直接解析 WAL、manifest 或 segment 文件。
 
 ---
 
@@ -272,7 +349,7 @@ BM25 / 向量 / 属性索引   读时折叠
 - **内容决定身份**：event id 是确定性的，重传和崩溃重放不会让 token 或成本算两遍。
 - **四源折叠读**：一个快照里合并内存表、不可变段、删除位图和晚到补写块，用 `event_id` 去重。
 
-引擎主体是 std-only Rust。Vortex 列式段、jieba FFI、外部 graph_index 这类重依赖都隔离在独立 crate，通过 trait 接缝接入。
+引擎主体是 std-only Rust。默认分词和向量索引都是自研实现；Vortex 列式段、外部分词/向量索引适配这类重依赖都隔离在独立 crate，通过 trait 接缝接入。
 
 ---
 
@@ -283,26 +360,28 @@ BM25 / 向量 / 属性索引   读时折叠
 | 存储、WAL、快照、重启恢复 | 已实现，有测试 | `cargo test --offline` 覆盖崩溃重放、compaction、GC、备份和重启 |
 | HTTP API 与 OTLP/OpenInference 摄入 | 已实现 | `/v1/ingest`、`/v1/traces`、`/v1/search`、`/v1/sessions`、`/v1/metrics` |
 | Python / TypeScript SDK | 已实现 | event id 与 Rust 引擎逐字节一致 |
+| 嵌入式 DB 包 | Alpha | `@yitrace/db`、Python `yitrace-db`、Rust wrapper 都走进程内 engine API |
 | 中文分词与 BM25 | 已实现，纯 Rust | 词典 DAG + 最大概率 DP，内嵌 jieba 词典，支持用户词典 |
 | 向量召回 | 引擎内已实现 | 磁盘多层 HNSW、带过滤搜索、L2/Cosine/IP |
 | 控制台 | 可用 | React 前端可内嵌进引擎二进制 |
 | eval 闭环 | Alpha | 当前是规则 scorer，LLM judge 在路线图中 |
 | 生产安全 | 路线图 | TLS、RBAC、落盘加密、限流、持久审计 |
+| 上量优化 | 路线图 | attrs postings 磁盘分页、独立 loop/task 索引、百万 span 冷/热压测 |
 | 查询引擎 | 路线图 | 当前是手写查询路径，DataFusion 待接 |
 
 运行验证：
 
 ```bash
-cd yitrace-engine
-cargo test --offline
+cargo test --offline --manifest-path yitrace-engine/Cargo.toml
+./scripts/package_mode_eval.sh
 ```
 
 可选 crate：
 
 ```bash
 cd yitrace-segstore-vortex && cargo build      # Vortex 列式段
-cd yitrace-tokenizer-jieba && cargo test       # jieba FFI wrapper，默认 mock
-cd yitrace-vecindex-graph && cargo test        # graph_index FFI wrapper，默认 mock
+cd yitrace-tokenizer-jieba && cargo test       # 可选分词适配层，默认 mock
+cd yitrace-vecindex-graph && cargo test        # 可选图索引适配层，默认 mock
 ```
 
 ---
@@ -321,9 +400,12 @@ yitrace-console/             # React 控制台
 yitrace-sdk/
   python/                    # Python 打点 SDK
   typescript/                # TypeScript 打点 SDK
+yitrace-node/                # Node / Electron 的 @yitrace/db
+yitrace-db-python/           # Python 嵌入式 DB 包 yitrace-db
+yitrace-db-rs/               # Rust 嵌入式 DB crate yitrace-db
 yitrace-segstore-vortex/     # 可选 Vortex 段存储
-yitrace-tokenizer-jieba/     # 可选 jieba FFI 分词
-yitrace-vecindex-graph/      # 可选 graph_index FFI 向量索引
+yitrace-tokenizer-jieba/     # 可选外部分词适配层
+yitrace-vecindex-graph/      # 可选外部图索引适配层
 docs/                        # 设计文档、API 文档、当前态索引
 ```
 

@@ -1,6 +1,6 @@
-# 团队 jieba C ABI 契约（提案 — 按真实符号调整）
+# 可选 cppjieba C ABI 契约（提案，按真实符号调整）
 
-本 crate 按下面这套 C ABI 调用团队 cppjieba 包装库。**这是提案契约**：若团队库现有符号名/签名不同，
+本 crate 按下面这套 C ABI 调用外部 cppjieba 包装库。**这是提案契约**：若真实库现有符号名/签名不同，
 改 `src/lib.rs` 的 `extern "C"` 块与 `JiebaTokenizer` 调用即可，trait 接缝（`yt_engine::Tokenizer`）不变。
 
 ```c
@@ -26,7 +26,7 @@ void  vexjieba_free(char* s);
 - **分隔符**：输出用 `\n` 连接词。词内部不含 `\n`（cppjieba 不会产出含换行的词）。
 - **所有权**：`vexjieba_cut` 的返回串归调用方，必须 `vexjieba_free`；句柄归调用方，必须 `vexjieba_close`。
 - **线程安全**：`vexjieba_cut` 在同一句柄上可被多线程并发调用（只读）。本 crate 的 `JiebaTokenizer`
-  据此 `unsafe impl Send + Sync`；若团队实现非线程安全，需去掉并在外层加锁。
+  据此 `unsafe impl Send + Sync`；若外部实现非线程安全，需去掉并在外层加锁。
 - **失败语义**：`open` 失败（词典缺失）返回 NULL → `JiebaTokenizer::open` 返回 Err；
   `cut` 返回 NULL → 该次分词降级为空（不 panic）。
 

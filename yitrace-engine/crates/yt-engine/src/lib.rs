@@ -4,9 +4,8 @@
 //! - **单写者**：所有改动 manifest 的提交（flush / compaction / delete / upgrade）都过同一把
 //!   `WriteCoordinator` 锁串行。这样没有写-写竞争，难点只剩「1 写者 vs N 读者」（由 yt-manifest 处理）。
 //! - **段五态生命周期**（草案 1 §D1.2）：building → sealed → live → compacting → dead。
-//! - **三块外部件的接口边界**：列式段存储（Vortex）、BM25 中文倒排、graph_index 向量。
-//!   这三块在决策文档里是「FFI 复用算法 / 重写存储」的对象，这里只立 trait，
-//!   真实实现分别接 Vortex、团队 BM25(cppjieba+倒排)、团队 graph_index。
+//! - **可替换的接口边界**：段存储、分词器、图向量索引都走 trait。默认实现是引擎内自研
+//!   `ChineseTokenizer` + `DiskGraphIndex`；Vortex 和外部分词/图索引只作为可选适配层接入。
 //! - **四源折叠读算子** `MergeOnReadExec` 的骨架：在固定快照上跨 memtable+段+deletion+upgrade
 //!   归并，去重键 = 确定性 event_id。真实实现是 DataFusion 的 `ExecutionPlan`。
 #![allow(dead_code)]
