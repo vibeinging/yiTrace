@@ -400,6 +400,18 @@ cargo test --offline --manifest-path yitrace-engine/Cargo.toml
 ./scripts/package_mode_eval.sh
 ```
 
+创建 tag 前先在本地打包：
+
+```bash
+./scripts/package_release_artifacts.sh
+```
+
+GitHub Actions 的打包 workflow 只在推送 `v*` tag 时触发。它按包拆 job；native job
+覆盖 `darwin-arm64`、`darwin-x64`、`linux-x64-gnu`、`linux-arm64-gnu`、
+`win32-x64-msvc`。每个 job 都运行同一个本地脚本 target，并把 `dist/tag-package`
+上传为 workflow artifact，所以先本地跑通，避免浪费 Actions 时间。要先试一个包，
+可以推 `v0.1.0-only-python-sdk` 这种 tag；正常 `v0.1.0` tag 会构建全部包。
+
 可选 crate：
 
 ```bash

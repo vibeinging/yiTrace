@@ -1,0 +1,167 @@
+name: Tag Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tag-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sdk:
+    name: Package ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - python-sdk
+          - typescript-sdk
+          - rust-sdk
+          - rust-db-source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        if: ${{ matrix.target == 'typescript-sdk' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: yitrace-sdk/typescript/package-lock.json
+
+      - name: Setup Rust
+        if: ${{ (matrix.target == 'rust-sdk' || matrix.target == 'rust-db-source') && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Python SDK packaging tools
+        if: ${{ matrix.target == 'python-sdk' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        run: python -m pip install --upgrade pip build
+
+      - name: Install TypeScript SDK dependencies
+        if: ${{ matrix.target == 'typescript-sdk' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        run: npm ci --prefix yitrace-sdk/typescript
+
+      - name: Build package
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        run: ./scripts/package_release_artifacts.sh --target "${{ matrix.target }}"
+
+      - name: Upload package
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yitrace-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/tag-package
+          if-no-files-found: error
+
+  native:
+    name: Package ${{ matrix.target }} (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: python-db
+            platform: darwin-arm64
+            runner: macos-14
+            maturin_args: ""
+          - target: python-db
+            platform: darwin-x64
+            runner: macos-15-intel
+            maturin_args: ""
+          - target: python-db
+            platform: linux-x64-gnu
+            runner: ubuntu-latest
+            maturin_args: "--compatibility manylinux2014"
+          - target: python-db
+            platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            maturin_args: "--compatibility manylinux2014"
+          - target: python-db
+            platform: win32-x64-msvc
+            runner: windows-latest
+            maturin_args: ""
+          - target: node-db
+            platform: darwin-arm64
+            runner: macos-14
+            maturin_args: ""
+          - target: node-db
+            platform: darwin-x64
+            runner: macos-15-intel
+            maturin_args: ""
+          - target: node-db
+            platform: linux-x64-gnu
+            runner: ubuntu-latest
+            maturin_args: ""
+          - target: node-db
+            platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            maturin_args: ""
+          - target: node-db
+            platform: win32-x64-msvc
+            runner: windows-latest
+            maturin_args: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        if: ${{ matrix.target == 'node-db' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: yitrace-node/package-lock.json
+
+      - name: Setup Rust
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Python DB packaging tools
+        if: ${{ matrix.target == 'python-db' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        run: python -m pip install --upgrade pip "maturin>=1.8,<2.0"
+
+      - name: Install Node DB dependencies
+        if: ${{ matrix.target == 'node-db' && (!contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target)) }}
+        run: npm ci --prefix yitrace-node
+
+      - name: Build package
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        shell: bash
+        env:
+          MATURIN_BUILD_ARGS: ${{ matrix.maturin_args }}
+        run: ./scripts/package_release_artifacts.sh --target "${{ matrix.target }}"
+
+      - name: Upload package
+        if: ${{ !contains(github.ref_name, '-only-') || contains(github.ref_name, matrix.target) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: yitrace-${{ github.ref_name }}-${{ matrix.target }}-${{ matrix.platform }}
+          path: dist/tag-package
+          if-no-files-found: error

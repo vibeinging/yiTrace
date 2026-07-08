@@ -427,6 +427,20 @@ cargo test --offline --manifest-path yitrace-engine/Cargo.toml
 ./scripts/package_mode_eval.sh
 ```
 
+Build release artifacts locally before creating a tag:
+
+```bash
+./scripts/package_release_artifacts.sh
+```
+
+The GitHub Actions packaging workflow only runs on `v*` tag pushes. It has one
+job per package. Native jobs run on `darwin-arm64`, `darwin-x64`,
+`linux-x64-gnu`, `linux-arm64-gnu`, and `win32-x64-msvc`. Each job runs the same
+local script target and uploads `dist/tag-package`, so run the script locally
+first to avoid spending Actions time on packaging mistakes. To test one package
+first, push a tag such as `v0.1.0-only-python-sdk`; normal `v0.1.0` tags build
+all package targets.
+
 Optional crates:
 
 ```bash

@@ -97,6 +97,7 @@ cd yitrace-sdk/rust && cargo test --offline   # 纯 std 打点 SDK
 cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI 包装
 cd yitrace-db-rs && cargo test --offline      # Rust embedded DB crate
 ./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归，含 Python SDK clean consumer
+./scripts/package_release_artifacts.sh        # 创建 v* tag 前先本地打包；GitHub Action 只在 tag push 时重复这条路径
 ```
 
 **Node / Electron 嵌入式 DB（`@yitrace/db`）：**
