@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const npmCache = join(tmpdir(), "yitrace-npm-cache");
 const platformPackage =
   {
     "darwin:arm64": "darwin-arm64",
@@ -47,9 +48,19 @@ for (const file of [rootTarball, platformTarball]) {
 
 const consumer = mkdtempSync(join(tmpdir(), "yitrace-pack-consumer-"));
 
+function npm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options);
+  }
+  return execFileSync("npm", args, {
+    ...options,
+    shell: process.platform === "win32",
+  });
+}
+
 try {
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ type: "module", private: true }, null, 2));
-  execFileSync("npm", ["install", "--cache", "/tmp/yitrace-npm-cache", rootTarball, platformTarball], {
+  npm(["install", "--cache", npmCache, rootTarball, platformTarball], {
     cwd: consumer,
     stdio: "inherit",
   });

@@ -47,6 +47,16 @@ function gitSucceeds(args) {
   }
 }
 
+function npm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options);
+  }
+  return execFileSync("npm", args, {
+    ...options,
+    shell: process.platform === "win32",
+  });
+}
+
 function timestampLabel(value) {
   return value
     .replace(/[-:]/g, "")
@@ -86,7 +96,7 @@ if (localPlatform) {
 }
 
 function npmPack(args, cwd = root) {
-  const output = execFileSync("npm", ["pack", ...args, "--pack-destination", dist], {
+  const output = npm(["pack", ...args, "--pack-destination", dist], {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "inherit"],
