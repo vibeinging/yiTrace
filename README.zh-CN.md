@@ -106,6 +106,7 @@ curl localhost:7878/v1/traces \
 | 已经有 OpenTelemetry / OpenInference trace | `POST /v1/traces` | 标准 OTLP/HTTP JSON 端点 |
 | Python 应用只想打点上报 | `yitrace` SDK 或 `connect(url=...)` | 发到一个运行中的 yiTrace 服务 |
 | TypeScript / Node 应用只想打点上报 | `@yitrace/trace-sdk` | 发到一个运行中的 yiTrace 服务 |
+| Rust 应用只想打点上报 | `yitrace` crate | 发到一个运行中的 yiTrace 服务 |
 | Node 后端或 Electron 要本地搜索 | `@yitrace/db` | 通过 Node-API 嵌入 Rust engine，不启动本地 HTTP server |
 | Python 应用要本地搜索 | `yitrace.connect(path=...)`，底层用 `yitrace-db` | 通过 PyO3/maturin 嵌入 Rust engine |
 | Rust 应用要本地搜索 | `yitrace-db` crate | 同一套进程内 engine API 的薄封装 |
@@ -202,8 +203,9 @@ trace 和 span detail 也会返回 `logEvents`，业务侧可以直接渲染 spa
 Python：
 
 ```bash
-cd yitrace-db-python
-python -m pip install -e .
+python -m pip install "yitrace[db]"
+# 或者分开安装:
+python -m pip install yitrace yitrace-db
 ```
 
 ```python
@@ -230,6 +232,28 @@ embedded DB 适合单进程持有一个 writer。`uvicorn --workers 1` 可以嵌
 `uvicorn --workers N`、多个容器、多个服务共享同一个 data dir 时，应该走单独的 yiTrace server。
 
 Rust：
+
+```toml
+[dependencies]
+yitrace = { path = "../yitrace-sdk/rust" }
+```
+
+```rust
+use yitrace::{HttpExporter, TraceOptions, Tracer};
+
+let exporter = HttpExporter::new("http://127.0.0.1:7878/v1/ingest")?.with_tenant_id(1);
+let mut tracer = Tracer::with_exporter(exporter, 1);
+tracer.trace_with_result("风控研判", TraceOptions::default().tenant_id(1), |trace| {
+    trace.span_result("LLM 检查", |span| {
+        span.log("疑似盗刷")?;
+        span.set_tokens(Some(900), Some(120));
+        Ok(())
+    })
+})?;
+tracer.close()?;
+```
+
+嵌入式 Rust：
 
 ```toml
 [dependencies]
@@ -400,6 +424,7 @@ yitrace-console/             # React 控制台
 yitrace-sdk/
   python/                    # Python 打点 SDK
   typescript/                # TypeScript 打点 SDK
+  rust/                      # Rust 打点 SDK
 yitrace-node/                # Node / Electron 的 @yitrace/db
 yitrace-db-python/           # Python 嵌入式 DB 包 yitrace-db
 yitrace-db-rs/               # Rust 嵌入式 DB crate yitrace-db

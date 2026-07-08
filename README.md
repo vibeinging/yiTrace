@@ -113,6 +113,7 @@ Pick the thinnest integration that matches your app:
 | TypeScript / Node app that only emits traces | `@yitrace/trace-sdk` | Sends to a running yiTrace service |
 | Node backend or Electron app that needs local search | `@yitrace/db` | Embeds the Rust engine through Node-API; no local HTTP server |
 | Python app that needs local search | `yitrace.connect(path=...)` backed by `yitrace-db` | Embeds the Rust engine through PyO3/maturin |
+| Rust app that only emits traces | `yitrace` crate | Sends to a running yiTrace service |
 | Rust app that needs local search | `yitrace-db` crate | Thin wrapper over the same in-process engine API |
 | Custom dashboard or service | `/v1/*` HTTP API | Same endpoints used by the bundled console |
 
@@ -220,8 +221,9 @@ events to a running service.
 Python:
 
 ```bash
-cd yitrace-db-python
-python -m pip install -e .
+python -m pip install "yitrace[db]"
+# Or install the two packages explicitly:
+python -m pip install yitrace yitrace-db
 ```
 
 ```python
@@ -249,6 +251,28 @@ can embed it; `uvicorn --workers N`, multiple containers, or multiple services
 sharing one data dir should talk to a single yiTrace server over HTTP.
 
 Rust:
+
+```toml
+[dependencies]
+yitrace = { path = "../yitrace-sdk/rust" }
+```
+
+```rust
+use yitrace::{HttpExporter, TraceOptions, Tracer};
+
+let exporter = HttpExporter::new("http://127.0.0.1:7878/v1/ingest")?.with_tenant_id(1);
+let mut tracer = Tracer::with_exporter(exporter, 1);
+tracer.trace_with_result("risk review", TraceOptions::default().tenant_id(1), |trace| {
+    trace.span_result("LLM check", |span| {
+        span.log("疑似盗刷")?;
+        span.set_tokens(Some(900), Some(120));
+        Ok(())
+    })
+})?;
+tracer.close()?;
+```
+
+Embedded Rust:
 
 ```toml
 [dependencies]
@@ -427,6 +451,7 @@ yitrace-console/             # React console
 yitrace-sdk/
   python/                    # Python tracing SDK
   typescript/                # TypeScript tracing SDK
+  rust/                      # Rust tracing SDK
 yitrace-node/                # @yitrace/db for Node and Electron
 yitrace-db-python/           # yitrace-db embedded DB package for Python
 yitrace-db-rs/               # yitrace-db embedded DB crate for Rust

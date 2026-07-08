@@ -125,6 +125,12 @@ with YiTraceDB.open("./data", tenant_id=1) as db:
 
 Or through the user-facing `yitrace` package:
 
+```bash
+python -m pip install "yitrace[db]"
+# Or install the two packages explicitly:
+python -m pip install yitrace yitrace-db
+```
+
 ```python
 from yitrace import DbExporter, Tracer, connect
 

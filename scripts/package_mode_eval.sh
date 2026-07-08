@@ -4,6 +4,7 @@
 # Covers the public package shapes that users install or embed:
 #   - Python yitrace facade: connect(url/path), DbExporter, HTTP client
 #   - TypeScript tracing SDK
+#   - Rust tracing SDK
 #   - Python yitrace-db embedded DB, FastAPI router, serve worker guard
 #   - Rust yitrace-db embedded crate
 #   - Node @yitrace/db embedded package
@@ -58,12 +59,17 @@ need_dir() {
 if [[ "$RUN_SDK" -eq 1 ]]; then
   if need_dir "$ROOT_DIR/yitrace-sdk/python"; then
     run python "$ROOT_DIR/yitrace-sdk/python/tests/test_sdk.py"
+    run python "$ROOT_DIR/scripts/verify_python_sdk_consumer.py"
   fi
 
   if need_dir "$ROOT_DIR/yitrace-sdk/typescript"; then
     pushd "$ROOT_DIR/yitrace-sdk/typescript" >/dev/null
     run npm test
     popd >/dev/null
+  fi
+
+  if need_dir "$ROOT_DIR/yitrace-sdk/rust"; then
+    run cargo test --offline --manifest-path "$ROOT_DIR/yitrace-sdk/rust/Cargo.toml"
   fi
 fi
 

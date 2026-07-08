@@ -1,0 +1,13 @@
+[package]
+name = "yitrace"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+description = "yiTrace instrumentation SDK for Rust agents"
+readme = "README.md"
+repository = "https://github.com/vibeinging/yiTrace"
+keywords = ["tracing", "ai-agents", "observability", "opentelemetry"]
+categories = ["development-tools::debugging"]
+
+[dependencies]

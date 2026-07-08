@@ -21,6 +21,13 @@
 
 暂不发布 `yitrace-client`，避免出现第三个名字。
 
+Rust 侧同样采用两层心智：
+
+| 包 | 用户心智 | 责任 |
+|---|---|---|
+| `yitrace` | Rust 只打点 | `Tracer`、`HttpExporter`、确定性 event_id，发到运行中的 yiTrace server |
+| `yitrace-db` | Rust 嵌入 DB | 打开本地 data dir，进程内 ingest/search/trace/span/read-model helpers |
+
 ## 参考项目
 
 ### Chroma
@@ -159,6 +166,22 @@ tracer = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
 
 这让 `Tracer` 既可以用 `HttpExporter` 发到 server，也可以用 `DbExporter` 直接写 embedded DB。
 
+Rust 只打点：
+
+```rust
+use yitrace::{HttpExporter, TraceOptions, Tracer};
+
+let exporter = HttpExporter::new("http://127.0.0.1:7878/v1/ingest")?.with_tenant_id(1);
+let mut tracer = Tracer::with_exporter(exporter, 1);
+tracer.trace_with_result("risk review", TraceOptions::default().tenant_id(1), |trace| {
+    trace.span_result("LLM check", |span| {
+        span.log("疑似盗刷")?;
+        Ok(())
+    })
+})?;
+tracer.close()?;
+```
+
 ### 4. 本地 embedded + Web 框架
 
 ```python
@@ -197,6 +220,7 @@ yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 3. `yitrace-db` 增加可选 FastAPI router。
 4. `yitrace-db` 增加 `yitrace-db serve` CLI，并拒绝 `--workers > 1`。
 5. `scripts/package_mode_eval.sh` 固化 package-mode eval，覆盖 Python facade、Python embedded DB、Node embedded DB、Rust embedded crate 和 TypeScript SDK。
+6. Rust 增加纯 std `yitrace` SDK crate，补齐“只打点上报”的 Rust 包形态。
 
 暂不做：
 

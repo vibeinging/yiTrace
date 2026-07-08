@@ -7,6 +7,17 @@ Python. It opens a yiTrace data directory in-process, calls the Rust engine
 through `EngineJsonApi`, and does not start an HTTP server or parse storage
 files in application code.
 
+If a Rust app only needs to emit traces to a running yiTrace service, use the
+pure SDK crate under `yitrace-sdk/rust` instead:
+
+```toml
+[dependencies]
+yitrace = { path = "../yitrace-sdk/rust" }
+```
+
+Use this `yitrace-db` crate only when the Rust app needs local searchable
+storage.
+
 It is an embedded crate, not a deployment server. One process may hold one
 writer handle for a data directory and serve many threads through that handle.
 Do not run multiple processes that all call `YiTraceDb::open("./data")` against

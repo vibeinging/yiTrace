@@ -131,8 +131,51 @@ const { YiTraceDB, createSpanEventBuilder } = require("@yitrace/db");
 `,
   );
 
+  writeFileSync(
+    join(consumer, "verify-native-path.cjs"),
+    `
+const assert = require("node:assert/strict");
+const { existsSync } = require("node:fs");
+const { mkdtemp, rm } = require("node:fs/promises");
+const { tmpdir } = require("node:os");
+const { dirname, join } = require("node:path");
+
+const platformPkgJson = require.resolve("@yitrace/db-${platformPackage}/package.json");
+const nativePath = join(dirname(platformPkgJson), "yitrace-db.${platformPackage}.node");
+assert.ok(existsSync(nativePath), nativePath);
+process.env.NAPI_RS_NATIVE_LIBRARY_PATH = nativePath;
+
+const { YiTraceDB, createSpanEventBuilder } = require("@yitrace/db");
+
+(async () => {
+  assert.equal(typeof YiTraceDB.open, "function");
+  const dir = await mkdtemp(join(tmpdir(), "yitrace-pack-native-path-"));
+  const db = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
+  try {
+    const builder = createSpanEventBuilder({
+      traceId: "native-path-run",
+      sessionId: "native-path-session",
+      attrs: { project_id: "agentic-data", skill: "pack-native-path", mode: "native-path" },
+    });
+    builder.startSpan({ spanId: "native-path-span", inputText: "native path 盗刷验证" });
+    builder.endSpan({ spanId: "native-path-span", status: 0, durationNs: 9, outputText: "ok" });
+    await builder.ingest(db);
+    const hits = await db.search({ text: "盗刷", filter: { attrs: { project_id: "agentic-data", skill: "pack-native-path" } } });
+    assert.equal(hits.length, 1);
+  } finally {
+    await db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+`,
+  );
+
   execFileSync("node", ["verify-esm.mjs"], { cwd: consumer, stdio: "inherit" });
   execFileSync("node", ["verify-cjs.cjs"], { cwd: consumer, stdio: "inherit" });
+  execFileSync("node", ["verify-native-path.cjs"], { cwd: consumer, stdio: "inherit" });
   console.log(`Verified @yitrace/db local tarballs in clean consumer: ${consumer}`);
 } finally {
   rmSync(consumer, { recursive: true, force: true });

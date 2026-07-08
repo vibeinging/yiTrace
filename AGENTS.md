@@ -40,7 +40,8 @@ yitrace-tokenizer-jieba/     # cppjieba FFI（可选；引擎默认用纯 Rust C
 yitrace-vecindex-graph/      # graph_index FFI（可选；引擎默认用自研磁盘 HNSW）
 yitrace-sdk/                 # 打点 SDK
 │   ├── python/                  # yitrace 包（pyproject.toml 已配，纯标准库）
-│   └── typescript/              # @yitrace/trace-sdk（tsconfig + build 已配）
+│   ├── typescript/              # @yitrace/trace-sdk（tsconfig + build 已配）
+│   └── rust/                    # yitrace crate（纯 std Rust 打点 SDK）
 yitrace-node/                # @yitrace/db：Node/Electron 嵌入式 DB（N-API，独立于 engine workspace）
 │   └── npm/                     # NAPI-RS optional platform packages（darwin/linux/win）
 yitrace-db-python/           # yitrace-db：Python 嵌入式 DB（PyO3/maturin，可选 FastAPI server）
@@ -86,6 +87,8 @@ python -m pytest                              # 跑测试
 # TypeScript
 cd yitrace-sdk/typescript && npm install && npm run build   # tsc 出 dist/
 npm test                                      # tsx 跑测试
+# Rust
+cd yitrace-sdk/rust && cargo test --offline   # 纯 std 打点 SDK
 ```
 
 **嵌入式 DB 包：**
@@ -93,7 +96,7 @@ npm test                                      # tsx 跑测试
 ```bash
 cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI 包装
 cd yitrace-db-rs && cargo test --offline      # Rust embedded DB crate
-./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归
+./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归，含 Python SDK clean consumer
 ```
 
 **Node / Electron 嵌入式 DB（`@yitrace/db`）：**
@@ -181,6 +184,23 @@ with tracer.trace("反洗钱筛查", tenant_id=1) as t:
 ```typescript
 import { Tracer, HttpExporter } from "@yitrace/trace-sdk";
 const tracer = new Tracer({ exporter: new HttpExporter("http://localhost:7878/v1/ingest"), nodeId: 1 });
+```
+
+**Rust**（只打点，不嵌入 DB）：
+
+```rust
+use yitrace::{HttpExporter, TraceOptions, Tracer};
+
+let exporter = HttpExporter::new("http://127.0.0.1:7878/v1/ingest")?.with_tenant_id(1);
+let mut tracer = Tracer::with_exporter(exporter, 1);
+tracer.trace_with_result("风控研判", TraceOptions::default().tenant_id(1), |trace| {
+    trace.span_result("LLM 检查", |span| {
+        span.log("疑似盗刷")?;
+        span.set_tokens(Some(900), Some(120));
+        Ok(())
+    })
+})?;
+tracer.close()?;
 ```
 
 ### 5.3 用 HTTP 直接对接（OTLP 生态入口，零改动接入）
@@ -275,6 +295,6 @@ await db.close();
 3. **改 event 编码 / 折叠逻辑 / 检索算子**，必须更新或新增对应测试（这些是承重不变量）。
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
 5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
-6. **改了 `yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响包边界，再跑 `./scripts/package_mode_eval.sh`。
+6. **改了 `yitrace-sdk/rust/`、`yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响包边界，再跑 `./scripts/package_mode_eval.sh`。
 7. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
 8. **提交信息不带 AI 工具名**，写清 what + why。

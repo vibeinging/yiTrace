@@ -16,8 +16,8 @@
 | `yitrace-segstore-vortex/` | **列式段存储（Vortex）**，实现引擎的 `SegmentStore`。独立 crate、工作区外，**不污染零依赖骨架**。 | 已落地：写读 + 谓词下推 + 投影下推 + 默认压缩，7 测试绿 |
 | `yitrace-tokenizer-jieba/` | **可选外部分词适配层**（FFI），实现引擎的 `Tokenizer`。Vortex 同款隔离、工作区外。 | 可选，不是默认依赖；默认已用自研纯 Rust `ChineseTokenizer` |
 | `yitrace-vecindex-graph/` | **可选外部向量索引适配层**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 可选，不是默认依赖；默认已用自研 `DiskGraphIndex` |
-| `yitrace-sdk/python`、`yitrace-sdk/typescript` | 打点 SDK，确定性 event_id 与引擎逐字节一致。 | 可用，各带测试 |
-| `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。Python 侧已有 `yitrace.connect(url/path)`、`DbExporter`、FastAPI router 和 `yitrace-db serve` 单 worker 服务入口。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试；`scripts/package_mode_eval.sh` 固化包形态回归；embedded 多进程共写仍禁止，走单 server |
+| `yitrace-sdk/python`、`yitrace-sdk/typescript`、`yitrace-sdk/rust` | 打点 SDK，确定性 event_id 与引擎逐字节一致。Rust SDK 是纯 std crate，适合只上报到 server 的 Rust agent。 | 可用，各带测试 |
+| `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。Python 侧已有 `yitrace.connect(url/path)`、`DbExporter`、FastAPI router 和 `yitrace-db serve` 单 worker 服务入口。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试；`scripts/package_mode_eval.sh` 固化包形态回归，并覆盖 Python SDK clean consumer 安装；Node `pack:verify` 覆盖 ESM/CJS/native-path clean consumer；embedded 多进程共写仍禁止，走单 server |
 
 **权威产品/技术入口**：`docs/2026-06-22_yitrace-产品说明.md`（决策层）、`docs/design/2026-06-22_yitrace-技术文档.md`（工程）、`docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`（列式段）。
 

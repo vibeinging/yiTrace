@@ -396,7 +396,10 @@ package or cross-language package contracts:
 ```
 
 That eval builds and tests `@yitrace/db` together with the Python, Rust, and
-TypeScript package surfaces, so package drift is caught in one place.
+TypeScript package surfaces, so package drift is caught in one place. For native
+packaging itself, run `npm run pack:verify`; it installs the root tarball and
+the current platform optional package in a clean consumer, then checks ESM,
+CommonJS, and `NAPI_RS_NATIVE_LIBRARY_PATH` loading.
 
 ## Publishing
 
@@ -416,7 +419,7 @@ npm run build:release -- --target x86_64-unknown-linux-gnu
 npm run release:artifacts
 npm run release:prepublish  # metadata only; this script skips automatic optional package publish
 npm run pack:check
-npm run pack:verify         # write commit-labeled tarballs and verify them in a clean consumer
+npm run pack:verify         # verify ESM/CJS/native-path loading in a clean consumer
 ```
 
 Then publish each platform package first, followed by the root package:

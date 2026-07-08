@@ -35,7 +35,7 @@ yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 No
 
 对外推荐顺序：
 
-1. **只是打点上报**：优先用 `yitrace` Python SDK 或 `@yitrace/trace-sdk`。
+1. **只是打点上报**：优先用 `yitrace` Python SDK、`@yitrace/trace-sdk` 或 Rust `yitrace` crate。
 2. **已经有 OTel/OpenInference**：直接把 OTLP/HTTP JSON 发到 `POST /v1/traces`。
 3. **应用内需要本地搜索和 trace 详情**：用 `@yitrace/db`、`yitrace-db` Python 包或 Rust crate。
 4. **自己写 UI / 服务**：直接调 `/v1/*`。

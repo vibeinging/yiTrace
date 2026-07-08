@@ -1,4 +1,5 @@
 """SDK 测试。可直接 `python3 tests/test_sdk.py` 跑，也兼容 pytest。"""
+import builtins
 import os
 import sys
 import types
@@ -328,6 +329,29 @@ def test_connect_selects_http_or_optional_embedded_package():
 
     assert local == "embedded-db"
     assert opened == {"path": "./data", "options": {"tenant_id": 9}}
+
+
+def test_connect_path_without_embedded_package_has_install_hint():
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yitrace_db":
+            raise ImportError("missing yitrace_db")
+        return real_import(name, *args, **kwargs)
+
+    try:
+        builtins.__import__ = fake_import
+        try:
+            connect(path="./data")
+        except RuntimeError as err:
+            message = str(err)
+        else:
+            raise AssertionError("connect(path=...) should fail when yitrace-db is missing")
+    finally:
+        builtins.__import__ = real_import
+
+    assert "pip install yitrace-db" in message
+    assert "pip install 'yitrace[db]'" in message
 
 
 if __name__ == "__main__":

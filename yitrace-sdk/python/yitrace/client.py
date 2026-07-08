@@ -202,7 +202,11 @@ def connect(
     try:
         from yitrace_db import YiTraceDB
     except ImportError as err:
-        raise RuntimeError("local yiTrace connections require the optional yitrace-db package") from err
+        raise RuntimeError(
+            "connect(path=...) requires the embedded DB package. "
+            "Install it with: pip install yitrace-db. "
+            "When using the published SDK extra, pip install 'yitrace[db]' also works."
+        ) from err
     return YiTraceDB.open(local_path, tenant_id=tenant_id, **options)
 
 

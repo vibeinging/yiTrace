@@ -61,12 +61,18 @@ print(client.search(text="盗刷", k=10))
 
 ### 3. 直接写本地 embedded DB
 
-先安装 `yitrace-db`，再用 `connect(path=...)`：
+先安装 embedded DB 包，再用 `connect(path=...)`：
+
+```bash
+python -m pip install "yitrace[db]"
+# 或者分开安装:
+python -m pip install yitrace yitrace-db
+```
 
 ```python
 from yitrace import DbExporter, Tracer, connect
 
-db = connect(path="./data", tenant_id=1)  # requires yitrace-db
+db = connect(path="./data", tenant_id=1)
 tr = Tracer(exporter=DbExporter(db, tenant_id=1), node_id=1)
 
 with tr.trace("反洗钱筛查", tenant_id=1) as t:

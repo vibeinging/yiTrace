@@ -19,7 +19,8 @@ yiTrace/
 ├── yitrace-vecindex-graph/      # graph_index FFI(可选;引擎默认用自研 HNSW)
 ├── yitrace-sdk/                 # Python / TypeScript 打点 SDK
 │   ├── python/
-│   └── typescript/
+│   ├── typescript/
+│   └── rust/
 ├── yitrace-node/                # @yitrace/db, Node/Electron 嵌入式 DB
 ├── yitrace-db-python/           # yitrace-db, Python 嵌入式 DB + 可选 server
 ├── yitrace-db-rs/               # yitrace-db, Rust 嵌入式 DB crate
@@ -81,11 +82,15 @@ cd ../typescript
 npm install                             # 首次
 npm test                                # 需 Node ≥ 18
 
-# 6. 嵌入式 DB 包
+# 6. Rust SDK
+cd ../rust
+cargo test --offline
+
+# 7. 嵌入式 DB 包
 cd ../../yitrace-db-python && python -m pytest
 cd ../yitrace-db-rs && cargo test --offline
 
-# 7. 跨包形态回归(改包边界时必跑)
+# 8. 跨包形态回归(改包边界时必跑)
 cd ..
 ./scripts/package_mode_eval.sh
 ```
@@ -116,7 +121,7 @@ cargo run -p yt-engine --release --example bench_qps
 - [ ] `cargo test --offline`(引擎工作区)全绿
 - [ ] `cargo clippy --offline -- -D warnings`(如果你改了引擎)
 - [ ] `cargo fmt --all -- --check`(格式)
-- [ ] 改了 SDK 的话,跑对应 SDK 测试
+- [ ] 改了 SDK 的话,跑对应 SDK 测试（Python / TypeScript / Rust）
 - [ ] 改了 Node/Python/Rust 嵌入式 DB 包的话,跑对应包测试和 `./scripts/package_mode_eval.sh`
 - [ ] 改了 Vortex crate 的话,跑 `yitrace-segstore-vortex` 测试
 - [ ] 新功能加了**会失败的测试**(不是凑覆盖率)
