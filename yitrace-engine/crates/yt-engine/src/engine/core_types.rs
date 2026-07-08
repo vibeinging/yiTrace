@@ -159,6 +159,8 @@ pub trait Bm25Index: Send + Sync {
     /// 中文检索，返回 (trace_id, span_id, 评分)，按分降序、取前 k。
     /// 真实实现作为 DataFusion 自定义扫描节点下推（@~@ + LIMIT）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)>;
+    /// 清空派生倒排。多进程 embedded 刷新时会从持久段 + WAL tail 重建。
+    fn clear(&self) {}
 }
 
 /// graph_index 向量 ANN。真实实现 = 团队自有图索引（algorithm/distance/PQ 经 C ABI FFI 复用）。
@@ -177,6 +179,10 @@ pub trait GraphIndex: Send + Sync {
     /// 落盘点（提交时调）：插入只写不刷的实现（如磁盘索引）在此批量 fsync。内存实现默认空操作。
     /// 我们的场景 **append 极多、删除少** —— 插入走"只写不刷"，靠这里在提交点批量持久，吞吐才扛得住。
     fn flush(&self) {}
+    /// 清空内存图。多进程 embedded 刷新时会从持久向量文件或磁盘图索引重建。
+    fn clear(&self) {}
+    /// 多进程 embedded 刷新时调用。持久图索引可重新打开元页/图文件，内存实现默认空操作。
+    fn reload(&self) {}
 }
 
 /// 朴素内存 BM25 骨架：按 span 存文本，检索按「查询子串命中数」打分。
@@ -207,6 +213,10 @@ impl Bm25Index for InMemoryBm25 {
         scored.truncate(k);
         scored
     }
+
+    fn clear(&self) {
+        self.docs.lock().unwrap().clear();
+    }
 }
 
 /// 朴素内存向量索引骨架：暴力 L2 距离。真实实现换团队 graph_index（图式 ANN + 带过滤导航）。
@@ -236,6 +246,10 @@ impl GraphIndex for InMemoryGraphIndex {
         scored.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
         scored.truncate(k);
         scored
+    }
+
+    fn clear(&self) {
+        self.vecs.lock().unwrap().clear();
     }
 }
 

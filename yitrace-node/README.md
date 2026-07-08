@@ -189,20 +189,16 @@ tenant filtering, BM25, and vector search still run through the database engine.
 Internally it calls yiTrace's `EngineJsonApi` in-process; it does not start an
 HTTP server, bind a port, or send traffic through a TCP socket.
 
-For Electron, open the database from the main process and expose narrow IPC
-methods to renderers. Do not let multiple app processes open the same `dataDir`
-for writing; yiTrace creates a `.yitrace.lock` file to enforce a single writer.
-The lock file records the owner `pid`, `host`, `created_unix_ms`, `data_dir`,
-and `executable`; second-writer errors include that owner block for stale-lock
-diagnosis.
+For Electron, the main process is still the cleanest owner for UI calls, but
+multiple local app processes may open the same `dataDir`. For Node servers,
+`cluster` or PM2 workers on the same machine may also open the same local data
+directory. yiTrace serializes open/write paths with internal data-dir locks and
+uses reader pins so `reclaim()` does not delete segment files while another
+process is reading a snapshot.
 
-For Node servers, the same rule applies. A single process may hold one
-`YiTraceDB` handle and serve many concurrent requests through that handle. Do
-not run `cluster`, PM2, or multiple containers where every worker opens the same
-`dataDir`. If the app needs multiple workers, run one yiTrace server process or
-one owner process for `YiTraceDB`, then have workers send trace data over HTTP
-or IPC. The embedded package deliberately fails fast on the second writer
-instead of pretending to be a multi-process database.
+Do not share one `dataDir` across machines or unreliable network filesystems.
+For multi-host deployments, run one yiTrace server process and send trace data
+over HTTP.
 
 String IDs are supported for direct `db.ingest()`. yiTrace keeps an internal
 stable `u64` hash for indexing and stores the original values in

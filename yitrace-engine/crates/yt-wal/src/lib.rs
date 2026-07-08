@@ -53,7 +53,11 @@ struct MemBatch {
 
 enum Backing {
     Mem(Vec<MemBatch>),
-    File { file: File, path: PathBuf },
+    File {
+        file: File,
+        path: PathBuf,
+        scanned_len: usize,
+    },
 }
 
 pub struct Wal {
@@ -80,7 +84,7 @@ impl Wal {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let existing = std::fs::read(&path).unwrap_or_default();
-        let frames = parse_frames(&existing);
+        let (frames, scanned_len) = parse_frames_with_consumed(&existing);
         // next_lsn = 最后一帧的 first_lsn + 其记录数（与 append 的 n.max(1) 递增一致）
         let next_lsn = frames
             .last()
@@ -93,7 +97,11 @@ impl Wal {
             .open(&path)?;
         Ok(Self {
             next_lsn,
-            backing: Backing::File { file, path },
+            backing: Backing::File {
+                file,
+                path,
+                scanned_len,
+            },
         })
     }
 
@@ -111,7 +119,9 @@ impl Wal {
                     committed: true,
                 });
             }
-            Backing::File { file, .. } => {
+            Backing::File {
+                file, scanned_len, ..
+            } => {
                 let payload = encode_batch(&records);
                 let crc = crc32_bytes(&payload);
                 let mut frame = Vec::with_capacity(payload.len() + 17);
@@ -122,6 +132,7 @@ impl Wal {
                 frame.push(1u8); // commit marker
                 let _ = file.write_all(&frame);
                 let _ = file.sync_data(); // ★ fsync：落盘后才算 ack
+                *scanned_len = scanned_len.saturating_add(frame.len());
             }
         }
         self.next_lsn += n.max(1);
@@ -162,15 +173,64 @@ impl Wal {
     pub fn committed_tail(&self) -> WalLsn {
         WalLsn::new(self.next_lsn - 1)
     }
+
+    /// 文件模式下重新扫描 WAL，吸收其它进程已经提交的帧，更新本进程的 next_lsn。
+    /// 内存模式无跨进程来源，保持原值。
+    pub fn refresh_from_disk(&mut self) -> WalLsn {
+        self.refresh_from_disk_after(WalLsn::new(u64::MAX)).0
+    }
+
+    /// 文件模式增量刷新：只解析上次已确认帧之后的新字节，并返回 `from` 之后的新记录。
+    /// 如果文件被截断或本地扫描位置失效，则退回全量扫描。
+    pub fn refresh_from_disk_after(&mut self, from: WalLsn) -> (WalLsn, Vec<(u64, WalRecord)>) {
+        let from = from.get();
+        let mut changed = Vec::new();
+        if let Backing::File {
+            path, scanned_len, ..
+        } = &mut self.backing
+        {
+            let file_len = std::fs::metadata(&*path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+            if file_len == *scanned_len {
+                return (self.committed_tail(), changed);
+            }
+
+            let existing = std::fs::read(&*path).unwrap_or_default();
+            if file_len < *scanned_len || existing.len() < *scanned_len {
+                let (frames, consumed) = parse_frames_with_consumed(&existing);
+                *scanned_len = consumed;
+                self.next_lsn = update_next_lsn_from_frames(&frames);
+                collect_after(&mut changed, from, &frames);
+                return (self.committed_tail(), changed);
+            }
+
+            let (frames, consumed) = parse_frames_with_consumed(&existing[*scanned_len..]);
+            *scanned_len = (*scanned_len).saturating_add(consumed);
+            if let Some(next) = frames
+                .last()
+                .map(|(first, recs)| first + (recs.len() as u64).max(1))
+            {
+                self.next_lsn = next;
+            }
+            collect_after(&mut changed, from, &frames);
+        }
+        (self.committed_tail(), changed)
+    }
 }
 
 // ───────────────────────── 帧解析 ─────────────────────────
 
 /// 解析文件里所有「已提交」帧（crc 通过 + marker=1）。遇撕裂/损坏即停（视为未 ack 的尾）。
 fn parse_frames(bytes: &[u8]) -> Vec<(u64, Vec<WalRecord>)> {
+    parse_frames_with_consumed(bytes).0
+}
+
+fn parse_frames_with_consumed(bytes: &[u8]) -> (Vec<(u64, Vec<WalRecord>)>, usize) {
     let mut out = Vec::new();
     let mut i = 0usize;
     loop {
+        let frame_start = i;
         if i + 12 > bytes.len() {
             break; // 不足 first_lsn(8)+len(4)
         }
@@ -179,6 +239,7 @@ fn parse_frames(bytes: &[u8]) -> Vec<(u64, Vec<WalRecord>)> {
         let len = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
         i += 4;
         if i + len + 5 > bytes.len() {
+            i = frame_start;
             break; // payload+crc(4)+marker(1) 不全 → 撕裂尾
         }
         let payload = &bytes[i..i + len];
@@ -188,14 +249,36 @@ fn parse_frames(bytes: &[u8]) -> Vec<(u64, Vec<WalRecord>)> {
         let marker = bytes[i];
         i += 1;
         if marker != 1 || crc != crc32_bytes(payload) {
+            i = frame_start;
             break; // 未提交 / 损坏 → 停
         }
         match decode_batch(payload) {
             Some(recs) => out.push((first, recs)),
-            None => break,
+            None => {
+                i = frame_start;
+                break;
+            }
         }
     }
-    out
+    (out, i)
+}
+
+fn update_next_lsn_from_frames(frames: &[(u64, Vec<WalRecord>)]) -> u64 {
+    frames
+        .last()
+        .map(|(first, recs)| first + (recs.len() as u64).max(1))
+        .unwrap_or(1)
+}
+
+fn collect_after(out: &mut Vec<(u64, WalRecord)>, from: u64, frames: &[(u64, Vec<WalRecord>)]) {
+    for (first, recs) in frames {
+        for (i, r) in recs.iter().enumerate() {
+            let lsn = first + i as u64;
+            if lsn > from {
+                out.push((lsn, r.clone()));
+            }
+        }
+    }
 }
 
 // ───────────────────────── 二进制编解码（std-only） ─────────────────────────
@@ -663,6 +746,36 @@ mod tests {
         assert_eq!(recs[0].1.identity.ext_span_id, "反洗钱");
         assert_eq!(recs[0].1.fields.logs, vec!["日志1"]);
         assert_eq!(recs[1].1.identity.ext_span_id, "盗刷");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_wal_incremental_refresh_sees_only_new_frames() {
+        let path = temp_path();
+        let mut wal_a = Wal::open(&path).unwrap();
+        let mut wal_b = Wal::open(&path).unwrap();
+
+        wal_a.append_committed(vec![rec("a", 1)]);
+        let (tail_b, rows_b) = wal_b.refresh_from_disk_after(WalLsn::new(0));
+        assert_eq!(tail_b, WalLsn::new(1));
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].0, 1);
+        assert_eq!(rows_b[0].1.identity.ext_span_id, "a");
+
+        wal_b.append_committed(vec![rec("b", 2), rec("c", 3)]);
+        let (tail_a, rows_a) = wal_a.refresh_from_disk_after(WalLsn::new(1));
+        assert_eq!(tail_a, WalLsn::new(3));
+        assert_eq!(
+            rows_a
+                .iter()
+                .map(|(lsn, r)| (*lsn, r.identity.ext_span_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "b"), (3, "c")]
+        );
+
+        let (tail_again, rows_again) = wal_a.refresh_from_disk_after(WalLsn::new(3));
+        assert_eq!(tail_again, WalLsn::new(3));
+        assert!(rows_again.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

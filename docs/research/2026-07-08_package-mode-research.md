@@ -8,9 +8,9 @@
 这篇调研参考的是**本地数据库 / 向量数据库**的包形态，不代表所有可观测平台。结论是：
 
 1. 用户不应该记很多包名。对外入口要收敛到一个清楚的 client API。
-2. 本地 embedded 和远程 server 可以共存，但必须把多进程边界说死。
+2. 本地 embedded 和远程 server 可以共存，但必须把边界说死：同机多进程可以，本地文件系统内由引擎串行化；跨机器共享 data dir 不可以。
 3. embedded 不是“直接读文件”，而是数据库引擎跑在当前进程，用本地目录落盘。
-4. 多 worker、多容器、多服务共享同一个 data dir 时，应该走 server 或单 writer 进程。
+4. 同机多 worker 可以 direct embedded；多机器、多容器跨主机或网络文件系统共享同一个 data dir 时，应该走 server 或外部队列。
 
 所以 yiTrace 采用两层包心智：
 
@@ -53,7 +53,7 @@ Chroma 的 issue 也说明 local persistent 模式容易在多进程/多 client 
 - https://github.com/chroma-core/chroma/issues/3792
 - https://github.com/chroma-core/chroma/issues/1234
 
-对 yiTrace 的决策不是“Chroma 官方承诺只支持单进程”，而是：**yiTrace 自己把 embedded 边界定成单进程、单 writer，更容易解释，也更安全**。
+对 yiTrace 的决策不是“Chroma 官方承诺只支持单进程”，而是：**如果要支持服务端多 worker，就必须在引擎内部补齐跨进程写锁、写前刷新和 reader pin，不能只靠 SDK 外层队列**。
 
 ### Qdrant
 
@@ -200,16 +200,17 @@ CLI：
 yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 ```
 
-## 单写者边界
+## embedded 边界
 
-`yitrace-db` 可以在同一进程内用队列处理并发请求，但它不能解决**多个进程同时写同一个 data dir**。
+`yitrace-db` 可以在同一台机器上让多个进程打开同一个本地 data dir。它不是多个进程同时乱写文件，而是通过 engine 内部锁串行化 open/write。写前会刷新 WAL、manifest 和 metadata：WAL 只追加时走 tail 增量应用，manifest 变化时才全量重建派生索引。
 
 必须写进 README/API 的边界：
 
 - 单进程 FastAPI、本地 agent、Electron main process：可以 embedded。
 - `uvicorn --workers 1`：可以 embedded。
-- `uvicorn --workers N`、多个容器、多个服务共享同一个 data dir：不要 embedded 共写，改用 `yitrace-db serve` / 独立 server / 单 writer 进程。
-- `.yitrace.lock` 要继续保留，误开第二个 embedded writer 时明确报错。
+- 同机 `uvicorn --workers N`、gunicorn worker、ARQ worker：可以 embedded，共享同一个本地 data dir。
+- 多机器、网络文件系统、跨主机容器共享同一个 data dir：不要 direct embedded，改用 `yitrace-db serve` / 独立 server / 外部队列。
+- README/API 要说明内部锁文件：`.yitrace.open.lock.d/`、`.yitrace.write.lock.d/` 和 `.yitrace.readers/`。
 
 ## 实现决策
 
@@ -218,7 +219,7 @@ yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 1. `yitrace` 增加 `YiTraceClient` 和 `connect()`。
 2. `yitrace` 增加 `DbExporter`，让现有 `Tracer` 能写 embedded DB。
 3. `yitrace-db` 增加可选 FastAPI router。
-4. `yitrace-db` 增加 `yitrace-db serve` CLI，并拒绝 `--workers > 1`。
+4. `yitrace-db` 增加 `yitrace-db serve` CLI，作为跨主机或想用 HTTP 边界时的模式。
 5. `scripts/package_mode_eval.sh` 固化 package-mode eval，覆盖 Python facade、Python embedded DB、Node embedded DB、Rust embedded crate 和 TypeScript SDK。
 6. Rust 增加纯 std `yitrace` SDK crate，补齐“只打点上报”的 Rust 包形态。
 
@@ -226,30 +227,30 @@ yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 
 - 不发布 `yitrace-client`。
 - 不让 Python 层直接读 WAL / manifest / segment 文件。
-- 不在 embedded 模式里支持多进程共写同一 data dir。
+- 不支持多机器或网络文件系统共享同一 data dir 做 direct embedded。
 - 不强制 `yitrace-db` 默认依赖 FastAPI/uvicorn；server 能力走 optional extra。
 
 ## AgenticData-on-fire 第一版接入建议
 
-客户追问“为什么需要独立 yiTrace 服务，不用 embedded DB”时，建议不要说成“必须独立服务”。更准确的说法是：
+客户追问“为什么需要独立 yiTrace 服务，不用 embedded DB”时，建议不要说成“必须独立服务”。现在更准确的说法是：
 
-> 独立服务不是最终唯一方案。第一版建议先用独立 yiTrace 服务，是因为当前 AgenticData-on-fire 更像一个服务端系统，不是单进程本地工具。第一版只需要旁路记录 trace 和去控制台查看，不需要在业务进程内低延迟搜索 trace。
+> 独立服务不是最终唯一方案。yiTrace 已支持同机多进程 embedded；AgenticData-on-fire 这类本机 API worker + ARQ worker 部署可以直接打开同一个本地 data dir。跨机器或网络盘共享 data dir 时，再切 yiTrace server。
 
-这只是保守接入建议，不代表服务端不能用 embedded DB。若产品目标是推动 AgenticData-on-fire 直接使用 embedded DB，应该补齐服务端接入层：单写者全局句柄、后台写入队列、启动降级、关闭 flush、锁诊断和安装验证。具体落地计划见 `docs/plans/2026-07-08_server-embedded-db-plan.md`。
+这不是让业务代码直接读写 yiTrace 文件；所有进程仍通过 embedded engine API 写入，由引擎内部处理 WAL、manifest、metadata、索引刷新和 reader pin。WAL tail 增量刷新可以避免每次写前全量重扫 WAL。具体落地计划见 `docs/plans/2026-07-08_server-embedded-db-plan.md`。
 
 推荐给客户解释 3 点：
 
-1. 写入边界更稳。embedded DB 同一个 data dir 只允许一个写者。AgenticData 后端可能有多 worker、后台任务、eval/tuner worker 并发运行。独立服务把写入集中到一个进程，业务后端只通过 HTTP 上报。
-2. 不把 trace 风险放进主服务启动链路。`yitrace-db` 是 native 包，会受 Python 版本、CPU 架构、wheel 构建和部署环境影响。第一版 trace 是旁路观察能力，不应该让它影响 AgenticData 主服务启动。
-3. 第一版不需要进程内查询。最小闭环是记录 `task_id`、`session_id`、tool、LLM、error，再到 yiTrace 控制台查。HTTP SDK 已够用。embedded DB 的价值是本地进程内低延迟查询，这不是第一版刚需。
+1. 同机多 worker 可以 direct embedded。引擎内部用 `.yitrace.open.lock.d/`、`.yitrace.write.lock.d/` 和 `.yitrace.readers/` 管理 open/write/read。
+2. `yitrace-db` 是 native 包，会受 Python 版本、CPU 架构、wheel 构建和部署环境影响，所以仍要保留 `fail_open`，trace 初始化失败不能拖垮 AgenticData 主服务。
+3. 如果客户只想旁路上报、集中看控制台，HTTP server 仍然是简单方案；如果要业务进程内直接查 trace，就用 embedded。
 
 什么时候可以用 embedded DB：
 
 - 单机 eval 包。
 - 桌面版或本地工具。
-- 明确只有一个 Python/Node 进程写同一个 data dir 的部署。
+- 同机 Python/Node/Rust 多 worker 服务端。
 - 未来需要业务进程内直接做 trace 搜索，且能接受 native 包进入主依赖链。
 
 一句话口径：
 
-> 保守第一版用独立服务，是为了把 trace 做成旁路能力，减少写锁、部署和启动风险；如果补齐服务端接入层，单进程服务端也可以默认用 embedded DB，多进程/多容器再切到单 writer 服务。
+> 保守第一版用独立服务，是为了把 trace 做成旁路能力，减少部署和启动风险；现在 engine 已补齐同机多进程 embedded，AgenticData-on-fire 这类同机多 worker 服务端可以 direct embedded。跨机器或网络盘共享 data dir 再切 yiTrace server / 外部队列。

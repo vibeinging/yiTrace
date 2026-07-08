@@ -253,7 +253,7 @@ with connect(path="./data", tenant_id=1) as db:
     print(db.search(text="盗刷", k=10))
 ```
 
-`connect(url=...)` 返回 HTTP client，`connect(path=...)` 返回本地 embedded DB handle。`yitrace-db` 也提供可选 FastAPI router 和 `yitrace-db serve` CLI。embedded 模式只适合单进程持有一个 writer；`uvicorn --workers N`、多个容器或多个服务共享同一个 data dir 时，改用一个 yiTrace server，其他 worker 走 HTTP。
+`connect(url=...)` 返回 HTTP client，`connect(path=...)` 返回本地 embedded DB handle。`yitrace-db` 也提供可选 FastAPI router 和 `yitrace-db serve` CLI。embedded 模式支持同机多个进程打开同一个本地 data dir；引擎内部用 data-dir 锁串行化 open/write，并用 reader pin 保护跨进程快照回收。多机器、网络文件系统或跨主机容器共享同一个 data dir 时，改用一个 yiTrace server，其他 worker 走 HTTP。
 
 ### 5.5 嵌入式 Node / Electron DB
 
@@ -281,7 +281,7 @@ const traces = await db.search({ text: "盗刷", k: 10, filter: { attrs: { proje
 await db.close();
 ```
 
-这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` 支持 search 和 sessions 精确过滤，JSON value 会按 string/number/bool/null/array/object round-trip。Electron 应用应在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。一个 data dir 同时只允许一个写者，`.yitrace.lock` 会阻止多进程同时打开。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成带 commit/label 后缀的 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；不要长期覆盖复用 `0.0.1.tgz`。AgenticData server 侧必须选定单一 native 架构：当前默认 x64 时 DuckDB、yiTrace、sqlite 都保持 x64；若切 arm64，先把 DuckDB/sqlite 也切到 arm64 或 optional per-platform 策略，不能混用架构。交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
+这不是直接读文件；它通过 Node-API 把 Rust engine 嵌进 Node 进程，并调用 `EngineJsonApi` 这个进程内 API 边界，仍然使用同一套 WAL 恢复、manifest、折叠、BM25、向量召回和租户过滤逻辑。推荐用 `createSpanEventBuilder` 隐藏 `seq`、`event_type`、`ext_span_id` 和 start/end 双事件；已有 wire event 时仍可直接 `db.ingest(events)`。direct `db.ingest()` 支持数字 ID 和 UUID 等外部字符串 ID：内部稳定 hash 成 `u64` 用于索引，原始值保留在 `external_trace_id` / `external_span_id` / `external_parent_span_id` / `external_session_id`；`attrs` 会贯穿 wire、折叠、WAL/segment/manifest 和查询输出，`project_id` / `skill` / `mode` / `call_site` 支持 search 和 sessions 精确过滤，JSON value 会按 string/number/bool/null/array/object round-trip。Electron 应用推荐在 main process 持有 `YiTraceDB`，renderer 通过 IPC 调用；打包时 `.node` 必须 asar unpack，不能裁剪 `@yitrace/db-*` optional native packages，可用 `NAPI_RS_NATIVE_LIBRARY_PATH` 指向自定义 native 文件。同机多个 Node 进程可以打开同一个本地 data dir；引擎内部用 `.yitrace.open.lock.d/`、`.yitrace.write.lock.d/` 和 `.yitrace.readers/` 管理跨进程 open/write/read。多机器或网络文件系统共享同一个 data dir 仍不支持。`OpenOptions.readOnly` 目前不暴露，传入会报错，直到 engine 提供真正只读打开路径。公开 npm 发布前，可用 `npm run pack:local` 生成带 commit/label 后缀的 root + 平台 optional package tarball，交给 AgenticData 用 `file:` 或内部 npm 源锁版本；不要长期覆盖复用 `0.0.1.tgz`。AgenticData server 侧必须选定单一 native 架构：当前默认 x64 时 DuckDB、yiTrace、sqlite 都保持 x64；若切 arm64，先把 DuckDB/sqlite 也切到 arm64 或 optional per-platform 策略，不能混用架构。交付前跑 `npm run pack:verify` 用干净 consumer 验证 ESM/CJS/native。
 
 ### 5.6 控制台
 

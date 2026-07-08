@@ -8,86 +8,32 @@ impl WriteCoordinator {
     /// - BM25 + 属性边车是**派生数据**：扫持久段(水位之前)+ 重放的 WAL 尾(水位之后)各喂一次,合起来覆盖全部、不重不漏。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
         olog::log(
             olog::Level::Info,
             "recover_start",
             &[("version", &self.current.version())],
         );
-        // 1) 派生索引：扫所有持久段(水位之前的数据)喂回 BM25 + 属性边车；顺带重建段级 key bloom。
-        let m = self.current.manifest();
-        let seg_count = m.segments.len();
-        let loaded_rollup = self.load_trace_rollup_segments(&m);
-        let loaded_filter_attrs = self.load_filter_attrs_segments(&m);
-        let mut segment_derived_dirty = false;
-        for entry in m.segments.values() {
-            if entry.deletion_seq > 0 || entry.upgrade_ref.is_some() {
-                segment_derived_dirty = true;
-            }
-            let recs = self.segments.scan_records(entry.segment_id);
-            let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
-            self.seg_key_bloom
-                .lock()
-                .unwrap()
-                .insert(entry.segment_id.get(), Arc::new(bloom));
-            for r in &recs {
-                match (loaded_rollup, loaded_filter_attrs) {
-                    (true, true) => self.index_record_without_rollup_and_filter_attrs(r),
-                    (true, false) => self.index_record_without_rollup(r),
-                    (false, true) => self.index_record_without_filter_attrs(r),
-                    (false, false) => self.index_record(r),
-                }
-            }
+        if let Some(state) = self.manifest_path.as_ref().and_then(persist::load) {
+            self.current.replace_from_disk(state.manifest);
+            *self.next_segment_id.lock().unwrap() = state.next_segment_id;
+            *self.next_chunk_id.lock().unwrap() = state.next_chunk_id;
         }
-        drop(m);
-        // 2) 向量：从独立向量文件重载,喂回图索引。
-        let mut vec_count = 0u64;
-        if let Some(p) = &self.vector_path {
-            for ((t, s), v) in vecstore::load(p) {
-                self.graph.index_embedding(t, s, v);
-                vec_count += 1;
-            }
-        }
-        // 3) WAL 重放：水位之后的尾巴进 MemTable,并喂派生索引(与段不重叠,因 manifest 水位与段同事务持久)。
-        let wal = self.wal.lock().unwrap();
-        let mut mt = self.memtable.lock().unwrap();
-        let mut wal_count = 0u64;
-        for (lsn, r) in wal.replay_after(WalLsn::new(self.current.memtable_watermark())) {
-            self.index_record(&r);
-            mt.append(MemRow {
-                commit_lsn: lsn,
-                trace_id: r.trace_id,
-                span_id: r.span_id,
-                ts: r.ts,
-                identity: r.identity.clone(), // seq 来自 WAL 原值，绝不重补
-                fields: r.fields.clone(),
-            });
-            wal_count += 1;
-        }
-        // 已提交尾从 WAL 恢复（重启后 committed_tail 不是持久态，由 WAL 重新确定）。
-        let tail = wal.committed_tail();
-        self.current.advance_committed_tail(tail);
-        drop(mt);
-        drop(wal);
-        if segment_derived_dirty && !loaded_rollup {
-            self.rebuild_trace_rollup_current();
-        }
-        if segment_derived_dirty && !loaded_filter_attrs {
-            self.rebuild_filter_attrs_current();
-        }
-        if !loaded_rollup || segment_derived_dirty {
-            self.persist_trace_rollup_segments();
-        }
-        if !loaded_filter_attrs || segment_derived_dirty {
-            self.persist_filter_attrs_segments();
-        }
+        self.wal.lock().unwrap().refresh_from_disk();
+        self.refresh_metadata_from_disk_locked();
+        self.rebuild_volatile_from_current_locked();
+        let seg_count = self.current.manifest().segments.len();
+        let wal_count = self.memtable.lock().unwrap().len() as u64;
+        let tail = self.current.committed_tail();
         olog::log(
             olog::Level::Info,
             "recover_done",
             &[
                 ("segs_scanned", &seg_count),
-                ("vectors_reloaded", &vec_count),
+                ("vectors_reloaded", &0u64),
                 ("wal_replayed", &wal_count),
-                ("committed_tail", &tail.get()),
+                ("committed_tail", &tail),
             ],
         );
     }
@@ -114,7 +60,9 @@ impl WriteCoordinator {
     /// flush 提交（sealed → live）：把一批已 ack 事件封段，新段 Live 进新版本，watermark 推进。
     /// 段加入 + watermark 推进必须在**同一次** commit 里原子生效（堵「既不在 memtable 又不在段」空窗）。
     pub fn commit_flush(&self, records: &[WalRecord], up_to_lsn: WalLsn) {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let seg = self.alloc_segment_id();
         self.segments.flush_to_segment(seg, records); // building→sealed（写完 fsync）
         let bloom = KeyBloom::build(
@@ -153,7 +101,9 @@ impl WriteCoordinator {
 
     /// 删除提交：给某段换一个新的 deletion 块（deletion_seq+1），绝不原地改旧块。
     pub fn commit_delete(&self, seg: SegmentId, row: u32) {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let chunk_id = self.alloc_chunk_id();
         let mut draft = self.current.cow_next();
         if let Some(entry) = draft.segments.get_mut(&seg.get()) {
@@ -178,7 +128,9 @@ impl WriteCoordinator {
         span_id: u64,
         fields: yt_core::fold::SpanFields,
     ) {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let chunk_id = self.alloc_chunk_id();
         let mut draft = self.current.cow_next();
         if let Some(entry) = draft.segments.get_mut(&seg.get()) {
@@ -201,7 +153,9 @@ impl WriteCoordinator {
     /// compaction 第 1 步：选段，记录选段瞬间各输入段的 (deletion_seq, upgrade_seq)。
     /// 返回的 plan 交给调用方在**锁外**做昂贵的段重建，再用 `compaction_finish` 提交。
     pub fn compaction_begin(&self, inputs: &[SegmentId]) -> CompactionPlan {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let m = self.current.manifest();
         let seqs_at_select = inputs
             .iter()
@@ -222,7 +176,9 @@ impl WriteCoordinator {
     /// 删除/补写**不会丢**：当前 deletion_vec 把后到的删除也滤掉，当前 upgrade 块也并进新段。
     /// 返回是否发生了重读合并（输入段 seq 变了），便于观测/测试。
     pub fn compaction_finish(&self, plan: &CompactionPlan) -> bool {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let m = self.current.manifest();
 
         let mut reconciled = false;
@@ -329,12 +285,21 @@ impl WriteCoordinator {
     /// **非持久模式**（gc.log 不存在）：reclaim 走旧的"直接删"路径——仅靠"段 id 永不复用 + compaction
     /// 只产新段"这两个不变量兜底，没有崩溃恢复。这是纯内存 / 测试场景可接受的退化。
     pub fn reclaim(&self) -> usize {
+        let _process = self.acquire_process_lock("write");
+        let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let safe = self.current.safe_version();
+        let has_process_readers = self
+            .process_lock
+            .as_ref()
+            .map(|mgr| mgr.has_active_readers())
+            .unwrap_or(false);
         let mut freed = 0;
         let mut dead = self.dead_set.lock().unwrap();
         let mut gc = self.gc_log.lock().unwrap();
         dead.retain(|r| {
             let ok = r.v_dead <= safe
+                && !has_process_readers
                 && !self.buffer_pins.is_pinned(r.seg)
                 && !self.current.contains_segment(r.seg);
             if !ok {

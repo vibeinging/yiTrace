@@ -66,4 +66,15 @@ impl GraphIndex for DurableGraphIndex {
             i.flush();
         }
     }
+
+    fn reload(&self) {
+        let reopened = if self.dir.join("meta").exists() {
+            DiskGraphIndex::open(&self.dir, 0, self.cfg)
+                .ok()
+                .map(std::sync::Arc::new)
+        } else {
+            None
+        };
+        *self.inner.lock().unwrap() = reopened;
+    }
 }

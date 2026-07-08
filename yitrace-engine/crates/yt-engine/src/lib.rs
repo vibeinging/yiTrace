@@ -1,8 +1,8 @@
 //! yt-engine —— 把各层串成一台引擎，并定义外部件的接口边界。
 //!
 //! 落地的设计：
-//! - **单写者**：所有改动 manifest 的提交（flush / compaction / delete / upgrade）都过同一把
-//!   `WriteCoordinator` 锁串行。这样没有写-写竞争，难点只剩「1 写者 vs N 读者」（由 yt-manifest 处理）。
+//! - **单写者提交**：同一进程内所有改动 manifest 的提交都过 `WriteCoordinator` 锁；持久模式下再叠加
+//!   data dir 内部的跨进程写锁。多个进程可以 `open_durable` 同一目录，但实际提交仍会串行。
 //! - **段五态生命周期**（草案 1 §D1.2）：building → sealed → live → compacting → dead。
 //! - **可替换的接口边界**：段存储、分词器、图向量索引都走 trait。默认实现是引擎内自研
 //!   `ChineseTokenizer` + `DiskGraphIndex`；Vortex 和外部分词/图索引只作为可选适配层接入。
@@ -43,6 +43,7 @@ mod segstore;
 pub use segstore::FileSegmentStore;
 
 mod persist;
+mod process_lock;
 mod vecstore;
 
 mod gc_log;

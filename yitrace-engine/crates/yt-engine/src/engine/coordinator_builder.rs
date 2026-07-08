@@ -78,6 +78,7 @@ impl CoordinatorBuilder {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -97,6 +98,7 @@ impl CoordinatorBuilder {
             None,
             self.bm25,
             self.graph,
+            None,
             None,
             None,
             None,

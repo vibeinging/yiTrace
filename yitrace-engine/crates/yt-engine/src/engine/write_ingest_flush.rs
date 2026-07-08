@@ -81,7 +81,9 @@ impl WriteCoordinator {
     /// 折叠在读时做，所以写路径不需要「脏队列」（决策文档已去掉 fold_dirty）。
     /// 整个过 write_lock 串行（单写者）。
     pub fn ingest(&self, records: Vec<WalRecord>) -> WalLsn {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let mut wal = self.wal.lock().unwrap();
         // 这批的起始 LSN（在 append 之前确定），逐条分配 commit_lsn。
         let first = wal.committed_tail().get() + 1;
@@ -173,7 +175,9 @@ impl WriteCoordinator {
 
     /// 主动把内存表当前内容封成一个段（周期刷盘 / 关机前）。
     pub fn flush_memtable(&self) {
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let before = self.memtable.lock().unwrap().len();
         let v_before = self.current.version();
         self.flush_memtable_locked();

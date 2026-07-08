@@ -168,14 +168,15 @@ Or start the small CLI server:
 yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 ```
 
-Embedded mode is single-process. `uvicorn --workers 1`, a local agent, or an
-Electron main process can hold one `YiTraceDB` handle. Do not run
-`uvicorn --workers N` or multiple containers that open the same data directory
-with embedded DB handles. For that case, run one yiTrace server process and send
-all workers to it over HTTP. `.yitrace.lock` keeps rejecting a second embedded
-writer instead of silently corrupting the data dir. The lock file records
-`pid`, `host`, `created_unix_ms`, `data_dir`, and `executable`; second-writer
-errors include that owner block to help diagnose stale locks.
+Embedded mode can be used by multiple local worker processes. Each worker may
+call `YiTraceDB.open("./data")`; the Rust engine serializes open/write paths
+inside the data dir. Before each write it refreshes WAL, manifest, and metadata:
+an unchanged WAL is skipped, an appended WAL is applied from its tail, and
+derived indexes are rebuilt only when the manifest changes. Cross-process reader
+pins stop `reclaim()` from physically deleting segment files while another
+process still holds a snapshot. Do not share one data directory across machines
+or unreliable network filesystems. For multi-host deployments, run one yiTrace
+server process and send workers to it over HTTP.
 
 The read-model helpers above are single-node implementations. Common filters
 such as `project_id`, `skill`, `task_fingerprint`, `loop_id`,

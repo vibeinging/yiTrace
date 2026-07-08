@@ -95,6 +95,18 @@ impl Current {
         self.global_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// 从磁盘恢复或多进程刷新时替换 current。
+    /// 这不是普通提交路径：磁盘 manifest 可能已经被另一个进程推进了多个版本，不能走 `commit`
+    /// 的严格 +1 断言。旧快照持有旧 Arc，替换后仍由正常 RAII 释放。
+    pub fn replace_from_disk(&self, manifest: Manifest) {
+        let epoch = manifest.epoch;
+        {
+            let mut g = self.inner.write().unwrap();
+            *g = Arc::new(manifest);
+        }
+        self.global_epoch.store(epoch, Ordering::Release);
+    }
+
     /// 读取当前 manifest 的写时复制草稿（写者用来在其上改段集合后 `commit`）。
     pub fn cow_next(&self) -> Manifest {
         let cur = self.inner.read().unwrap();
@@ -108,6 +120,22 @@ impl Current {
     /// 这样任何回收线程要么已看见该 slot（水位被压低、资源受保护），
     /// 要么没看见、但读者随后的 `current` 读必然观测到 commit 后的新值 → 校验失败重试。
     pub fn pin_snapshot(self: &Arc<Self>) -> Snapshot {
+        self.pin_snapshot_with_external_guard_inner(None)
+    }
+
+    /// 和 `pin_snapshot` 同一个协议，但快照会额外携带一份外部 guard。
+    /// 引擎用它把 data dir 里的跨进程 reader pin 与进程内 slot 绑定到同一生命周期。
+    pub fn pin_snapshot_with_external_guard(
+        self: &Arc<Self>,
+        guard: Box<dyn Send + Sync>,
+    ) -> Snapshot {
+        self.pin_snapshot_with_external_guard_inner(Some(guard))
+    }
+
+    fn pin_snapshot_with_external_guard_inner(
+        self: &Arc<Self>,
+        mut external_guard: Option<Box<dyn Send + Sync>>,
+    ) -> Snapshot {
         loop {
             // (a) 先读 epoch
             let local_epoch = self.global_epoch.load(Ordering::Acquire);
@@ -143,6 +171,7 @@ impl Current {
                     manifest: m,
                     slot,
                     current: Arc::clone(self),
+                    _external_guard: external_guard.take(),
                 };
             }
             // 校验失败：注销该 slot，重试（drop(m) 自动释放 Arc 引用）
@@ -264,6 +293,7 @@ pub struct Snapshot {
     pub live_lsn: WalLsn,
     slot: Arc<ReaderSlot>,
     current: Arc<Current>,
+    _external_guard: Option<Box<dyn Send + Sync>>,
 }
 
 impl Snapshot {

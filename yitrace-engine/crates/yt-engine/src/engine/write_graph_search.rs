@@ -119,6 +119,9 @@ impl WriteCoordinator {
     /// 开了持久化(`open_durable`)则**先追加写盘再进内存图** —— 向量段里推不出来,必须单独落盘,
     /// 否则重启后"找相似"全空。
     pub fn index_embedding(&self, trace_id: u64, span_id: u64, embedding: Vec<f32>) {
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         if let Some(p) = &self.vector_path {
             let _ = vecstore::append(p, trace_id, span_id, &embedding);
         }

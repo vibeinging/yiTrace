@@ -18,14 +18,12 @@ yitrace = { path = "../yitrace-sdk/rust" }
 Use this `yitrace-db` crate only when the Rust app needs local searchable
 storage.
 
-It is an embedded crate, not a deployment server. One process may hold one
-writer handle for a data directory and serve many threads through that handle.
-Do not run multiple processes that all call `YiTraceDb::open("./data")` against
-the same directory. For multi-process or multi-service deployments, run one
-yiTrace server process and send requests to it over HTTP, or keep one explicit
-writer process and talk to it through your own IPC. `.yitrace.lock` records the
-owner `pid`, `host`, `created_unix_ms`, `data_dir`, and `executable`, and a
-second writer error includes that owner block for stale-lock diagnosis.
+It is an embedded crate, not a remote deployment server. Multiple processes on
+the same machine may open the same local data directory; the engine serializes
+open/write paths with internal data-dir locks and protects cross-process reader
+snapshots from physical segment reclaim. Do not share one data directory across
+machines or unreliable network filesystems. For multi-host deployments, run a
+yiTrace server process and send requests to it over HTTP.
 
 ## Install
 

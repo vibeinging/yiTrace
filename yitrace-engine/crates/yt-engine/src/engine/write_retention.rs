@@ -84,7 +84,9 @@ impl WriteCoordinator {
             return result;
         }
 
+        let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let mut draft = self.current.cow_next();
         let mut deleted_traces = HashSet::new();
         let mut deleted_rows = 0usize;
@@ -185,7 +187,9 @@ impl WriteCoordinator {
         input: NewRetentionAuditRecord,
         tenant_id: Option<u64>,
     ) -> RetentionAuditRecord {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let audit_id = {
             let mut next = self.next_retention_audit_id.lock().unwrap();
             let id = *next;
@@ -230,6 +234,7 @@ impl WriteCoordinator {
     }
 
     pub fn retention_audits(&self, filter: &RetentionAuditFilter) -> Vec<RetentionAuditRecord> {
+        self.refresh_from_disk_for_read();
         let candidate_ids = self.metadata_index.lock().unwrap().audit_candidates(filter);
         let mut out: Vec<RetentionAuditRecord> = self
             .retention_audits
@@ -248,7 +253,9 @@ impl WriteCoordinator {
         input: NewRetentionPolicy,
         tenant_id: Option<u64>,
     ) -> RetentionPolicy {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let policy_id = {
             let mut next = self.next_retention_policy_id.lock().unwrap();
             let id = *next;
@@ -277,6 +284,7 @@ impl WriteCoordinator {
     }
 
     pub fn retention_policies(&self, filter: &RetentionPolicyFilter) -> Vec<RetentionPolicy> {
+        self.refresh_from_disk_for_read();
         let candidate_ids = self
             .metadata_index
             .lock()
@@ -300,7 +308,9 @@ impl WriteCoordinator {
         tenant_id: Option<u64>,
         now_ns: u64,
     ) -> Option<RetentionPolicy> {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let updated = {
             let mut policies = self.retention_policies.lock().unwrap();
             let policy = policies.iter_mut().find(|p| {

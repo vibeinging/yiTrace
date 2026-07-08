@@ -57,22 +57,35 @@ fn rust_embedded_db_ingests_searches_and_reads_details() {
 }
 
 #[test]
-fn rust_embedded_db_rejects_second_writer_lock() {
-    let dir = temp_dir("lock");
+fn rust_embedded_db_allows_multiple_handles_with_serialized_writes() {
+    let dir = temp_dir("multiprocess");
     let mut first = YiTraceDb::open(&dir).unwrap();
-    let lock_text = std::fs::read_to_string(dir.join(".yitrace.lock")).unwrap();
-    assert!(lock_text.contains("\"pid\""), "{lock_text}");
-    assert!(lock_text.contains(&dir.display().to_string()), "{lock_text}");
-    let second = YiTraceDb::open(&dir);
-    let err = match second {
-        Ok(_) => panic!("second writer should fail"),
-        Err(err) => err.to_string(),
-    };
-    assert!(err.contains("already open or locked"), "{err}");
-    assert!(err.contains("existing lock owner"), "{err}");
-    assert!(err.contains("\"pid\""), "{err}");
+    let mut second = YiTraceDb::open(&dir).unwrap();
+
+    let mut a = SpanEventBuilder::new("multi-rs-a");
+    a.start_span("span-a", "first handle")
+        .log("span-a", "first handle 盗刷")
+        .end_span("span-a", 0);
+    first.ingest_builder(&a).unwrap();
+
+    let mut b = SpanEventBuilder::new("multi-rs-b");
+    b.start_span("span-b", "second handle")
+        .log("span-b", "second handle 盗刷")
+        .end_span("span-b", 0);
+    second.ingest_builder(&b).unwrap();
+
+    first.flush().unwrap();
+    second.flush().unwrap();
+    let search = first.search(&SearchQuery::text("盗刷").k(10)).unwrap();
+    assert!(search.contains("multi-rs-a"), "{search}");
+    assert!(search.contains("multi-rs-b"), "{search}");
+
     first.close().unwrap();
-    YiTraceDb::open(&dir).unwrap();
+    second.close().unwrap();
+    let reopened = YiTraceDb::open(&dir).unwrap();
+    let search = reopened.search(&SearchQuery::text("盗刷").k(10)).unwrap();
+    assert!(search.contains("multi-rs-a"), "{search}");
+    assert!(search.contains("multi-rs-b"), "{search}");
 }
 
 #[test]

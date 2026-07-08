@@ -87,7 +87,7 @@ class YiTraceDB {
 - 已抽出 `EngineJsonApi` 作为非网络层 JSON API 边界，HTTP server 和 `@yitrace/db` 共同复用。✅
 - 后续再把 JSON 拼接逻辑逐步下沉成 typed API。
 - 明确 `WriteCoordinator::open_durable(data_dir)` 的嵌入式生命周期。
-- 增加 data-dir 文件锁：同一目录只允许一个写者打开；可选 read-only 多开后续再做。
+- data-dir 文件锁方案已更新：旧的“同一目录只允许一个写者打开”被 2026-07-08 的引擎级多进程 embedded 取代；现在用内部 open/write 锁和 reader pin 支持同机多进程打开同一个本地 data dir。
 
 ### 阶段 2：N-API binding
 

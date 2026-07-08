@@ -23,6 +23,7 @@ impl WriteCoordinator {
             None,
             None,
             None,
+            None,
         ))
     }
 
@@ -42,6 +43,13 @@ impl WriteCoordinator {
     ) -> std::io::Result<Arc<Self>> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
+        let process_lock = Arc::new(process_lock::ProcessLockManager::new(dir));
+        let _open_guard = process_lock
+            .acquire("open")
+            .map_err(|e| std::io::Error::new(e.kind(), format!("open durable lock failed: {e}")))?;
+        let _write_guard = process_lock
+            .acquire("write")
+            .map_err(|e| std::io::Error::new(e.kind(), format!("open durable write lock failed: {e}")))?;
         let segments = Arc::new(FileSegmentStore::open(dir.join("segments"))?);
         let wal = Wal::open(dir.join("wal.log"))?;
         let manifest_path = dir.join("manifest.dat");
@@ -76,6 +84,7 @@ impl WriteCoordinator {
             metadata::load(&metadata_path),
             Some(metadata_path),
             Some(dir.to_path_buf()),
+            Some(process_lock),
         );
         // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
         let entries = gc_log::GcLog::scan(&gc_log_path).unwrap_or_default();
@@ -108,6 +117,7 @@ impl WriteCoordinator {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -125,6 +135,7 @@ impl WriteCoordinator {
         metadata_state: Option<metadata::MetadataState>,
         metadata_path: Option<std::path::PathBuf>,
         dir: Option<std::path::PathBuf>,
+        process_lock: Option<Arc<process_lock::ProcessLockManager>>,
     ) -> Arc<Self> {
         let metadata_state = metadata_state.unwrap_or_default();
         let filter_attrs_path = dir.as_ref().map(|dir| dir.join("filter_attrs.dat"));
@@ -176,6 +187,7 @@ impl WriteCoordinator {
             seg_key_bloom: Mutex::new(HashMap::new()),
             gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
             dir,
+            process_lock,
         })
     }
 
@@ -226,6 +238,183 @@ impl WriteCoordinator {
         );
     }
 
+    fn acquire_process_lock(&self, name: &str) -> Option<process_lock::ProcessLockGuard> {
+        self.process_lock.as_ref().map(|mgr| {
+            mgr.acquire(name)
+                .unwrap_or_else(|e| panic!("yiTrace {name} process lock failed: {e}"))
+        })
+    }
+
+    fn refresh_from_disk_for_read(&self) {
+        if self.manifest_path.is_none() {
+            return;
+        }
+        let Ok(_local) = self.write_lock.try_lock() else {
+            return;
+        };
+        let Some(mgr) = self.process_lock.as_ref() else {
+            return;
+        };
+        let Ok(Some(_process)) = mgr.try_acquire("write") else {
+            return;
+        };
+        self.refresh_from_disk_locked();
+    }
+
+    fn refresh_from_disk_locked(&self) {
+        if self.manifest_path.is_none() {
+            return;
+        }
+        let persisted = self.manifest_path.as_ref().and_then(persist::load);
+        let old_tail = self.current.committed_tail();
+        let (tail, tail_records) = self
+            .wal
+            .lock()
+            .unwrap()
+            .refresh_from_disk_after(WalLsn::new(old_tail));
+        let disk_version = persisted
+            .as_ref()
+            .map(|s| s.manifest.version.get())
+            .unwrap_or(0);
+        let disk_watermark = persisted
+            .as_ref()
+            .map(|s| s.manifest.memtable_watermark.get())
+            .unwrap_or(0);
+        let manifest_changed =
+            disk_version != self.current.version() || disk_watermark != self.current.memtable_watermark();
+        self.refresh_metadata_from_disk_locked();
+        if !manifest_changed {
+            if tail.get() != old_tail {
+                self.apply_wal_tail_records_locked(tail_records);
+                self.current.advance_committed_tail(tail);
+            }
+            return;
+        }
+        if let Some(state) = persisted {
+            self.current.replace_from_disk(state.manifest);
+            *self.next_segment_id.lock().unwrap() = state.next_segment_id;
+            *self.next_chunk_id.lock().unwrap() = state.next_chunk_id;
+        }
+        self.rebuild_volatile_from_current_locked();
+    }
+
+    fn apply_wal_tail_records_locked(&self, rows: Vec<(u64, WalRecord)>) {
+        if rows.is_empty() {
+            return;
+        }
+        let watermark = self.current.memtable_watermark();
+        let mut mt = self.memtable.lock().unwrap();
+        for (lsn, r) in rows {
+            if lsn <= watermark {
+                continue;
+            }
+            self.index_record(&r);
+            mt.append(MemRow {
+                commit_lsn: lsn,
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                ts: r.ts,
+                identity: r.identity,
+                fields: r.fields,
+            });
+        }
+    }
+
+    fn refresh_metadata_from_disk_locked(&self) {
+        let Some(path) = &self.metadata_path else {
+            return;
+        };
+        let Some(state) = metadata::load(path) else {
+            return;
+        };
+        *self.annotations.lock().unwrap() = state.annotations;
+        *self.dataset_associations.lock().unwrap() = state.dataset_associations;
+        *self.retention_audits.lock().unwrap() = state.retention_audits;
+        *self.retention_policies.lock().unwrap() = state.retention_policies;
+        *self.next_annotation_id.lock().unwrap() = state.next_annotation_id;
+        *self.next_dataset_association_id.lock().unwrap() = state.next_dataset_association_id;
+        *self.next_retention_audit_id.lock().unwrap() = state.next_retention_audit_id;
+        *self.next_retention_policy_id.lock().unwrap() = state.next_retention_policy_id;
+        self.rebuild_metadata_index();
+    }
+
+    fn clear_volatile_indexes_locked(&self) {
+        *self.memtable.lock().unwrap() = MemTable::new();
+        self.bm25.clear();
+        self.graph.clear();
+        self.graph.reload();
+        *self.filter_attrs.lock().unwrap() = FilterAttrsIndex::default();
+        *self.trace_rollup.lock().unwrap() = TraceAggregateRollupIndex::default();
+        *self.session_idx.lock().unwrap() = SessionIndex::default();
+        *self.seg_fold_cache.lock().unwrap() = SegFoldCache::new(2_000_000);
+        self.seg_key_bloom.lock().unwrap().clear();
+    }
+
+    fn rebuild_volatile_from_current_locked(&self) {
+        self.clear_volatile_indexes_locked();
+        let m = self.current.manifest();
+        let loaded_rollup = self.load_trace_rollup_segments(&m);
+        let loaded_filter_attrs = self.load_filter_attrs_segments(&m);
+        let mut segment_derived_dirty = false;
+        for entry in m.segments.values() {
+            if entry.deletion_seq > 0 || entry.upgrade_ref.is_some() {
+                segment_derived_dirty = true;
+            }
+            let recs = self.segments.scan_records(entry.segment_id);
+            let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
+            self.seg_key_bloom
+                .lock()
+                .unwrap()
+                .insert(entry.segment_id.get(), Arc::new(bloom));
+            for r in &recs {
+                match (loaded_rollup, loaded_filter_attrs) {
+                    (true, true) => self.index_record_without_rollup_and_filter_attrs(r),
+                    (true, false) => self.index_record_without_rollup(r),
+                    (false, true) => self.index_record_without_filter_attrs(r),
+                    (false, false) => self.index_record(r),
+                }
+            }
+        }
+        drop(m);
+
+        if let Some(p) = &self.vector_path {
+            for ((t, s), v) in vecstore::load(p) {
+                self.graph.index_embedding(t, s, v);
+            }
+        }
+
+        let wal = self.wal.lock().unwrap();
+        let mut mt = self.memtable.lock().unwrap();
+        for (lsn, r) in wal.replay_after(WalLsn::new(self.current.memtable_watermark())) {
+            self.index_record(&r);
+            mt.append(MemRow {
+                commit_lsn: lsn,
+                trace_id: r.trace_id,
+                span_id: r.span_id,
+                ts: r.ts,
+                identity: r.identity.clone(),
+                fields: r.fields.clone(),
+            });
+        }
+        let tail = wal.committed_tail();
+        self.current.advance_committed_tail(tail);
+        drop(mt);
+        drop(wal);
+
+        if segment_derived_dirty && !loaded_rollup {
+            self.rebuild_trace_rollup_current();
+        }
+        if segment_derived_dirty && !loaded_filter_attrs {
+            self.rebuild_filter_attrs_current();
+        }
+        if !loaded_rollup || segment_derived_dirty {
+            self.persist_trace_rollup_segments();
+        }
+        if !loaded_filter_attrs || segment_derived_dirty {
+            self.persist_filter_attrs_segments();
+        }
+    }
+
     /// 提交新 manifest 版本并（若开了持久化）落盘。所有 commit 走这里,保证段集合改动都持久。
     fn commit_and_persist(&self, draft: Manifest) {
         self.current.commit(draft);
@@ -234,6 +423,15 @@ impl WriteCoordinator {
 
     /// 读者入口：pin 一个一致快照（委托给 yt-manifest）。
     pub fn pin_snapshot(&self) -> Snapshot {
-        self.current.pin_snapshot()
+        self.refresh_from_disk_for_read();
+        if let Some(mgr) = &self.process_lock {
+            let guard = mgr
+                .pin_reader()
+                .unwrap_or_else(|e| panic!("yiTrace reader pin failed: {e}"));
+            self.current
+                .pin_snapshot_with_external_guard(Box::new(guard))
+        } else {
+            self.current.pin_snapshot()
+        }
     }
 }

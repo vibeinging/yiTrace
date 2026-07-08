@@ -5,7 +5,9 @@ impl WriteCoordinator {
         mut input: NewTraceAnnotation,
         tenant_id: Option<u64>,
     ) -> TraceAnnotation {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let annotation_id = {
             let mut next = self.next_annotation_id.lock().unwrap();
             let id = *next;
@@ -47,6 +49,7 @@ impl WriteCoordinator {
 
     /// 查询标注。默认隐藏 Deleted；需要回收站视图时设置 `include_deleted=true`。
     pub fn annotations(&self, filter: &TraceAnnotationFilter) -> Vec<TraceAnnotation> {
+        self.refresh_from_disk_for_read();
         let candidate_ids = self
             .metadata_index
             .lock()
@@ -71,7 +74,9 @@ impl WriteCoordinator {
         tenant_id: Option<u64>,
         update: UpdateTraceAnnotation,
     ) -> Option<TraceAnnotation> {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let updated = {
             let mut annotations = self.annotations.lock().unwrap();
             let ann = annotations.iter_mut().find(|a| {
@@ -138,7 +143,9 @@ impl WriteCoordinator {
         mut input: NewDatasetAssociation,
         tenant_id: Option<u64>,
     ) -> DatasetAssociation {
+        let _process = self.acquire_process_lock("write");
         let _guard = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
         let association_id = {
             let mut next = self.next_dataset_association_id.lock().unwrap();
             let id = *next;
@@ -180,6 +187,7 @@ impl WriteCoordinator {
         &self,
         filter: &DatasetAssociationFilter,
     ) -> Vec<DatasetAssociation> {
+        self.refresh_from_disk_for_read();
         let candidate_ids = self
             .metadata_index
             .lock()

@@ -68,6 +68,8 @@ pub struct WriteCoordinator {
     gc_log: Mutex<Option<gc_log::GcLog>>,
     /// 数据目录路径（持久模式 = Some）。`backup_snapshot` 用它知道拷哪些文件。
     dir: Option<std::path::PathBuf>,
+    /// 持久模式下的跨进程写锁管理器。None = 纯内存 / 测试模式，不做进程间协调。
+    process_lock: Option<Arc<process_lock::ProcessLockManager>>,
 }
 
 /// 递归拷贝目录（备份用，零依赖）。

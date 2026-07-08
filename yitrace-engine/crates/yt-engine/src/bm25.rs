@@ -355,6 +355,10 @@ impl Bm25Index for Bm25TextIndex {
         scored.truncate(k);
         scored
     }
+
+    fn clear(&self) {
+        *self.state.lock().unwrap() = Bm25State::default();
+    }
 }
 
 impl Bm25TextIndex {

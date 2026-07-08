@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{File, OpenOptions as FsOpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use yt_engine::{EngineJsonApi, WriteCoordinator};
 
@@ -39,38 +36,6 @@ impl From<std::io::Error> for YiTraceError {
     }
 }
 
-fn host_name() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn lock_metadata(dir: &Path) -> String {
-    let created_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let executable = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    format!(
-        "{{\"pid\":{},\"host\":\"{}\",\"created_unix_ms\":{},\"data_dir\":\"{}\",\"executable\":\"{}\"}}\n",
-        std::process::id(),
-        json_escape(&host_name()),
-        created_unix_ms,
-        json_escape(&dir.display().to_string()),
-        json_escape(&executable),
-    )
-}
-
-fn existing_lock_owner(lock_path: &Path) -> String {
-    match std::fs::read_to_string(lock_path) {
-        Ok(text) if !text.trim().is_empty() => format!("; existing lock owner: {}", text.trim()),
-        Ok(_) => "; existing lock owner: <empty lock file>".to_string(),
-        Err(e) => format!("; existing lock owner: unreadable ({e})"),
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     pub data_dir: PathBuf,
@@ -95,8 +60,6 @@ pub struct YiTraceDb {
     coord: Arc<WriteCoordinator>,
     api: EngineJsonApi,
     tenant_id: Option<u64>,
-    lock_path: PathBuf,
-    lock_file: Option<File>,
     closed: bool,
 }
 
@@ -106,7 +69,7 @@ impl YiTraceDb {
     }
 
     pub fn open_with_options(options: OpenOptions) -> Result<Self> {
-        let (lock_path, lock_file) = lock_data_dir(&options.data_dir)?;
+        std::fs::create_dir_all(&options.data_dir)?;
         let coord = WriteCoordinator::open_durable(&options.data_dir)?;
         coord.recover();
         let api = EngineJsonApi::new(Arc::clone(&coord));
@@ -114,8 +77,6 @@ impl YiTraceDb {
             coord,
             api,
             tenant_id: options.tenant_id,
-            lock_path,
-            lock_file: Some(lock_file),
             closed: false,
         })
     }
@@ -315,8 +276,6 @@ impl YiTraceDb {
             return Ok(());
         }
         self.coord.flush_memtable();
-        self.lock_file.take();
-        let _ = std::fs::remove_file(&self.lock_path);
         self.closed = true;
         Ok(())
     }
@@ -334,8 +293,6 @@ impl Drop for YiTraceDb {
     fn drop(&mut self) {
         if !self.closed {
             self.coord.flush_memtable();
-            self.lock_file.take();
-            let _ = std::fs::remove_file(&self.lock_path);
             self.closed = true;
         }
     }
@@ -895,31 +852,6 @@ impl SearchFilter {
         }
         format!("{{{}}}", fields.join(","))
     }
-}
-
-fn lock_data_dir(dir: &Path) -> Result<(PathBuf, File)> {
-    std::fs::create_dir_all(dir)?;
-    let lock_path = dir.join(".yitrace.lock");
-    let mut lock_file = FsOpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .map_err(|e| {
-            YiTraceError::InvalidInput(format!(
-                "data dir is already open or locked: {} ({e}){}",
-                lock_path.display(),
-                existing_lock_owner(&lock_path),
-            ))
-        })?;
-    let metadata = lock_metadata(dir);
-    if let Err(e) = lock_file
-        .write_all(metadata.as_bytes())
-        .and_then(|_| lock_file.sync_all())
-    {
-        let _ = std::fs::remove_file(&lock_path);
-        return Err(e.into());
-    }
-    Ok((lock_path, lock_file))
 }
 
 fn now_ns() -> i64 {

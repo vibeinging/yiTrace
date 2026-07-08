@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -383,25 +382,49 @@ def test_python_sdk_server_embedded_exporters_write_real_db():
             assert "helper 疑似盗刷" in helper_messages
 
 
-def test_python_embedded_db_rejects_double_writer_lock():
+def test_python_embedded_db_allows_multiple_handles_with_serialized_writes():
     with tempfile.TemporaryDirectory() as tmp:
-        db = YiTraceDB.open(tmp, tenant_id=1)
+        first = YiTraceDB.open(tmp, tenant_id=1)
+        second = YiTraceDB.open(tmp, tenant_id=1)
         try:
-            lock_text = Path(tmp, ".yitrace.lock").read_text(encoding="utf-8")
-            lock_info = json.loads(lock_text)
-            assert lock_info["pid"] > 0
-            assert lock_info["data_dir"] == tmp
-            with pytest.raises(RuntimeError, match="already open or locked") as err:
-                YiTraceDB.open(tmp, tenant_id=1)
-            message = str(err.value)
-            assert "existing lock owner" in message
-            assert '"pid"' in message
-            assert tmp in message
+            first.ingest([
+                {
+                    "trace_id": "multi-python-a",
+                    "span_id": "span-a",
+                    "ts": 1,
+                    "seq": 1,
+                    "event_type": 2,
+                    "ext_span_id": "span-a",
+                    "logs": ["first handle 盗刷"],
+                }
+            ])
+            second.ingest([
+                {
+                    "trace_id": "multi-python-b",
+                    "span_id": "span-b",
+                    "ts": 2,
+                    "seq": 1,
+                    "event_type": 2,
+                    "ext_span_id": "span-b",
+                    "logs": ["second handle 盗刷"],
+                }
+            ])
+            first.flush()
+            second.flush()
+            hits = first.search({"text": "盗刷", "k": 10})
+            trace_ids = {hit["external_trace_id"] for hit in hits}
+            assert {"multi-python-a", "multi-python-b"}.issubset(trace_ids)
         finally:
-            db.close()
+            first.close()
+            second.close()
 
         reopened = YiTraceDB.open(tmp, tenant_id=1)
-        reopened.close()
+        try:
+            hits = reopened.search({"text": "盗刷", "k": 10})
+            trace_ids = {hit["external_trace_id"] for hit in hits}
+            assert {"multi-python-a", "multi-python-b"}.issubset(trace_ids)
+        finally:
+            reopened.close()
 
 
 def test_python_embedded_db_general_route_json_and_closed_errors():

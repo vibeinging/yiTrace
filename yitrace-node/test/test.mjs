@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,14 +15,20 @@ try {
   );
 
   const db = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
-  const lockText = await readFile(join(dir, ".yitrace.lock"), "utf8");
-  assert.match(lockText, /"pid"/, "lock file should include owner pid");
-
-  await assert.rejects(
-    () => YiTraceDB.open({ dataDir: dir, tenantId: 1 }),
-    /already open or locked.*existing lock owner.*"pid"/s,
-    "same data dir must be single-writer locked",
-  );
+  const secondDb = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
+  await secondDb.ingest([
+    {
+      trace_id: "multi-node-second",
+      span_id: "span-second",
+      ts: 90,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "span-second",
+      logs: ["second db 盗刷"],
+    },
+  ]);
+  await secondDb.flush();
+  await secondDb.close();
 
   await db.ingest([
     {
@@ -55,16 +61,14 @@ try {
   ]);
 
   const hits = await db.search({ text: "盗刷", k: 10 });
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].trace_id, 1);
+  assert.ok(hits.some((hit) => hit.trace_id === 1));
+  assert.ok(hits.some((hit) => hit.external_trace_id === "multi-node-second"));
 
   const traces = await db.traces();
-  assert.equal(traces.length, 1);
-  assert.equal(traces[0].trace_id, 1);
+  assert.ok(traces.some((trace) => trace.trace_id === 1));
 
   const sessions = await db.sessions();
-  assert.equal(sessions.items.length, 1);
-  assert.equal(sessions.items[0].sessionId, "700");
+  assert.ok(sessions.items.some((session) => session.sessionId === "700"));
 
   const trace = await db.trace(1);
   assert.equal(trace.summary.traceId, "1");
@@ -408,8 +412,12 @@ try {
 
   const reopened = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
   const recovered = await reopened.traces();
-  assert.equal(recovered.length, 7);
+  assert.ok(recovered.length >= 8);
   assert.equal(recovered.find((t) => t.external_trace_id === "run-uuid")?.external_trace_id, "run-uuid");
+  assert.equal(
+    recovered.find((t) => t.external_trace_id === "multi-node-second")?.external_trace_id,
+    "multi-node-second",
+  );
   const recoveredAnnotations = await reopened.annotations({ projectId: "agentic-data", includeDeleted: true });
   assert.equal(recoveredAnnotations.total, 1);
   assert.equal(recoveredAnnotations.items[0].status, "deleted");
