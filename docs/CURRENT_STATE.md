@@ -16,8 +16,8 @@
 | `yitrace-segstore-vortex/` | **列式段存储（Vortex）**，实现引擎的 `SegmentStore`。独立 crate、工作区外，**不污染零依赖骨架**。 | 已落地：写读 + 谓词下推 + 投影下推 + 默认压缩，7 测试绿 |
 | `yitrace-tokenizer-jieba/` | **可选外部分词适配层**（FFI），实现引擎的 `Tokenizer`。Vortex 同款隔离、工作区外。 | 可选，不是默认依赖；默认已用自研纯 Rust `ChineseTokenizer` |
 | `yitrace-vecindex-graph/` | **可选外部向量索引适配层**（FFI），实现引擎的 `GraphIndex`。含**进图过滤回调**（C 遍历回调 Rust 谓词）。Vortex 同款隔离。 | 可选，不是默认依赖；默认已用自研 `DiskGraphIndex` |
-| `yitrace-sdk/python`、`yitrace-sdk/typescript`、`yitrace-sdk/rust` | 打点 SDK，确定性 event_id 与引擎逐字节一致。Rust SDK 是纯 std crate，适合只上报到 server 的 Rust agent。 | 可用，各带测试 |
-| `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。Python 侧已有 `yitrace.connect(url/path)`、`DbExporter`、FastAPI router 和 `yitrace-db serve` 单 worker 服务入口。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试；`scripts/package_mode_eval.sh` 固化包形态回归，并覆盖 Python SDK clean consumer 安装；Node `pack:verify` 覆盖 ESM/CJS/native-path clean consumer；embedded 多进程共写仍禁止，走单 server |
+| `yitrace-sdk/python`、`yitrace-sdk/typescript`、`yitrace-sdk/rust` | 打点 SDK，确定性 event_id 与引擎逐字节一致。Rust SDK 是纯 std crate，适合只上报到 server 的 Rust agent。Python SDK 还提供服务端 embedded 接入层：`BufferedDbExporter` 后台单写线程、`SpoolDbExporter`/`SpoolConsumer` 落盘队列、`init_yitrace`/`shutdown_yitrace` 启停 helper、`yitrace consume-spool` CLI。 | 可用，各带测试；Python SDK clean consumer 验证覆盖 console script 和没有 `yitrace-db` 时的 fail-open |
+| `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。Python 侧已有 `yitrace.connect(url/path)`、`DbExporter`、FastAPI router 和 `yitrace-db serve` 单 worker 服务入口；native 调用在 open/recover/route/flush/close 释放 GIL，避免长 IO 卡住 Python 线程。三种 embedded 包都会写 `.yitrace.lock` owner JSON（pid/host/data_dir/executable 等），第二个 writer 报错会带已有 owner。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试；`scripts/package_mode_eval.sh` 固化包形态回归，覆盖 Python SDK clean consumer、真实 Python embedded DB eval（buffered/spool/helper）、Rust/Node/Python lock 诊断；Node `pack:verify` 覆盖 ESM/CJS/native-path clean consumer；embedded 多进程共写仍禁止，服务端接入用单 writer helper 或落盘队列 |
 
 **权威产品/技术入口**：`docs/2026-06-22_yitrace-产品说明.md`（决策层）、`docs/design/2026-06-22_yitrace-技术文档.md`（工程）、`docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`（列式段）。
 
@@ -52,9 +52,9 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 
 **当前元数据和 retention 账本（有测试）**：`/v1/annotations` 和 `/v1/dataset-associations` 已有单机持久版，支持 tenant 隔离、attrs 过滤、annotation 更新/软删除、dataset item 关联，并接入 Node/Python/Rust 嵌入式包；annotation/dataset 查询会先走内存 metadata postings，再做最终校验。`/v1/retention-plan`、`/v1/retention/apply`、`/v1/retention-audits`、`/v1/retention-policies`、`/v1/retention-policies/run-due` 已迁入主线：先 dry-run，再显式 apply；默认保护 annotation、dataset、snapshot、eval link、path memory 引用；只软删除已 flush 的 segment row，跳过 MemTable/WAL tail 热 trace；audit/policy 随 `metadata.dat` 持久化，查询按 id/tenant/source/name/enabled 走内存 postings。它不复制 trace 大字段，也不改 WAL/segment 格式。后台自动执行仍是后续优化。
 
-**仍是占位/待接**：BM25 段内持久倒排 + 分块 postings + 段内 block-max-WAND（当前已有内存倒排 WAND，够 2 万级 demo 和早期 dogfood；百万级、冷启动和低内存场景需要升级）、LLM-judge eval、DataFusion 查询执行、索引驱动的 Vortex 随机取行。外部 jieba / graph_index FFI 只算可选适配和对标，不是核心缺口。
+**仍是占位/待接**：BM25 段内持久倒排 + 分块 postings + 段内 block-max-WAND（当前已有内存倒排 WAND，够 2 万级 demo 和早期 dogfood；百万级、冷启动和低内存场景需要升级）、LLM-judge eval、DataFusion 查询执行、索引驱动的 Vortex 随机取行、`yitrace-db` wheel clean consumer 全链路验证。外部 jieba / graph_index FFI 只算可选适配和对标，不是核心缺口。
 
-**P1 当前处理口径**：默认自研分词和默认自研磁盘图索引已经是主线能力，不再把“接外部 jieba / graph_index”列为 P1。P1 继续关注两类事：第一是生产入口（配置、强制 tenant、审计、限流）；第二是索引规模化（attrs postings 磁盘分页、loop/task/trajectory 独立物化索引、正式规模压测、BM25 段内持久倒排、删除/更新 postings、ANN 量化/SIMD）。可选 FFI 只有在客户或团队项目明确要复用外部库时再做。
+**P1 当前处理口径**：默认自研分词和默认自研磁盘图索引已经是主线能力，不再把“接外部 jieba / graph_index”列为 P1。P1 继续关注两类事：第一是生产入口（服务端 embedded helper/spool 已落地，继续补配置、强制 tenant、审计、限流、健康指标）；第二是索引规模化（attrs postings 磁盘分页、loop/task/trajectory 独立物化索引、正式规模压测、BM25 段内持久倒排、删除/更新 postings、ANN 量化/SIMD）。可选 FFI 只有在客户或团队项目明确要复用外部库时再做。
 
 **已暂缓但有止损点**：等保三级 / TLS / RBAC / 落盘加密 / PII 脱敏 / 持久防篡改审计。**止损条件**：任一真实金融/政企 PoC 立项 → TLS + RBAC + 持久审计日志必须先于该 PoC 落地（PoC 安全评审最低门槛）。
 

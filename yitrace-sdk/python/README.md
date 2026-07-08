@@ -86,6 +86,53 @@ db.close()
 
 `connect(url=...)` 返回 HTTP client；`connect(path=...)` 返回 `yitrace-db` 的 embedded DB handle。
 
+服务端推荐不要让请求线程直接写 DB，而是用后台单写线程：
+
+```python
+from yitrace import init_yitrace, shutdown_yitrace
+
+runtime = init_yitrace(path="./data/yitrace", tenant_id=1, node_id=1)
+tr = runtime.tracer
+
+# 请求线程只入队；后台线程批量写 embedded DB。
+with tr.trace("tuner-run", tenant_id=1) as t:
+    with t.span("llm-call") as s:
+        s.log("model returned")
+
+shutdown_yitrace()  # 等待队列 flush，并关闭 embedded DB
+```
+
+默认 `fail_open=True`。如果 native 包缺失、data dir 被锁、恢复失败，`init_yitrace(...)` 会返回 no-op tracer，主服务继续启动；`runtime.enabled == False`，`runtime.error` 里保留原因。
+
+多 worker 服务端不要让每个 worker 都 `connect(path=...)`。可以让 worker 写本地 spool，再由唯一消费者写 DB：
+
+```python
+from yitrace import SpoolConsumer, SpoolDbExporter, Tracer, connect
+
+# worker 进程：只写 spool 文件，不打开 YiTraceDB。
+tr = Tracer(exporter=SpoolDbExporter("./data/yitrace-spool", tenant_id=1), node_id=1)
+with tr.trace("worker-task", tenant_id=1) as t:
+    with t.span("tool-call") as s:
+        s.log("ok")
+tr.close()
+
+# 单独的消费者进程：唯一打开 embedded DB 的写者。
+db = connect(path="./data/yitrace", tenant_id=1)
+consumer = SpoolConsumer(db, "./data/yitrace-spool")
+consumer.consume_once()
+db.close()
+```
+
+也可以直接跑 CLI：
+
+```bash
+yitrace consume-spool --data-dir ./data/yitrace --spool-dir ./data/yitrace-spool
+```
+
+脚本或测试里可用 `--once` 消费一轮后退出。
+
+`SpoolDbExporter` 是 at-least-once 语义：消费者写 DB 成功前文件会留在 `ready/` 或 `inflight/`，重启后可继续消费。重复消费由引擎按确定性 `event_id` 去重。
+
 ## 关键保证：event_id 跨语言逐字节一致
 
 `event_id = FNV-1a(ext_span_id ++ seq(8字节小端) ++ [event_type_tag])`，与引擎 `yt-core::event`
@@ -103,7 +150,9 @@ db.close()
 | `client.py` | `YiTraceClient` / `connect()`，用同一入口连接远程 server 或本地 embedded DB |
 | `event.py` | `EventType` / `event_id`（与引擎一致的 FNV）/ `SpanEvent`（对应引擎 WalRecord） |
 | `tracer.py` | `Tracer` / `Trace` / `Span` 打点 API（上下文管理器） |
-| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `DbExporter`（写 embedded DB）/ `BatchExporter`（攒批）/ `HttpExporter`（批量 POST + 失败缓冲） |
+| `exporter.py` | `ConsoleExporter`（调试）/ `CollectingExporter`（测试）/ `DbExporter`（同步写 embedded DB）/ `BufferedDbExporter`（后台单写线程）/ `SpoolDbExporter` + `SpoolConsumer`（多 worker 本地 spool）/ `NoopExporter`（fail-open）/ `BatchExporter`（攒批）/ `HttpExporter`（批量 POST + 失败缓冲） |
+| `service.py` | `init_yitrace` / `shutdown_yitrace` / `YiTraceRuntime` 服务端生命周期 helper |
+| `cli.py` | `yitrace consume-spool` 本地 spool 消费者命令 |
 | `_snowflake.py` | 单调雪花 ID（trace/span id） |
 
 引擎侧 `cargo run -p yt-engine --example server` 起 HTTP 摄入服务即可接收；`curl localhost:7878/v1/traces` 查回。
@@ -113,8 +162,10 @@ db.close()
 - `HttpExporter` 失败时把整批退回缓冲队首，下次 `flush/close` 重试；`on_error(err, dropped)` 会暴露错误和超上限丢弃数。
 - `buffered_count()` / `sent_count()` / `dropped_count()` 可接监控。
 - 语义是 at-least-once：网络“已送达但响应丢失”会重发，同一事件由引擎按确定性 `event_id` 去重，token/成本不会翻倍。
-- 当前 `flush/close` 是同步阻塞调用；进程退出前调用 `tr.close()`。
+- `BufferedDbExporter` 用一个后台线程独占 `YiTraceDB`，请求线程只入队；`sent_count()` / `dropped_count()` / `write_error_count()` 可接监控。
+- `SpoolDbExporter` 把事件写入本地 `spool/ready` 文件；`SpoolConsumer` 是唯一 DB 写者，失败时文件留在 ready 供下次重试。
+- 当前 `flush/close` 会等待队列或本地 spool 写完；进程退出前调用 `tr.close()`。
 
 ## 还没做
 
-- 后台异步发送；采样；上下文跨进程传播(traceparent)；可选落盘缓冲。
+- 采样；上下文跨进程传播(traceparent)；spool 消费者健康检查和指标。

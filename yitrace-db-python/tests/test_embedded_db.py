@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
 from yitrace_db import YiTraceDB, create_span_event_builder
+
+SDK_PYTHON_DIR = Path(__file__).resolve().parents[2] / "yitrace-sdk" / "python"
+if SDK_PYTHON_DIR.exists():
+    sys.path.insert(0, str(SDK_PYTHON_DIR))
 
 
 def test_python_embedded_db_ingests_searches_and_reads_span_detail():
@@ -310,12 +317,86 @@ def test_python_embedded_db_ingests_searches_and_reads_span_detail():
             assert recovered_policies["items"][0]["lastRunAtNs"] == "2"
 
 
+def test_python_sdk_server_embedded_exporters_write_real_db():
+    from yitrace import BufferedDbExporter, SpoolConsumer, SpoolDbExporter, Tracer, init_yitrace
+
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "db"
+        helper_data_dir = Path(tmp) / "helper-db"
+        spool_dir = Path(tmp) / "spool"
+        with YiTraceDB.open(data_dir, tenant_id=1) as db:
+            buffered = BufferedDbExporter(
+                db,
+                tenant_id=1,
+                max_batch=16,
+                flush_interval=0.01,
+                register_atexit=False,
+            )
+            tracer = Tracer(exporter=buffered, node_id=1)
+            with tracer.trace("buffered trace", tenant_id=1) as trace:
+                with trace.span("buffered span") as span:
+                    span.log("buffered 疑似盗刷")
+            tracer.close()
+            assert buffered.sent_count() == 3
+
+            spool = SpoolDbExporter(spool_dir, tenant_id=1, max_batch=16, fsync=False)
+            spool_tracer = Tracer(exporter=spool, node_id=1)
+            with spool_tracer.trace("spool trace", tenant_id=1) as trace:
+                with trace.span("spool span") as span:
+                    span.log("spool 疑似盗刷")
+            spool_tracer.close()
+            assert spool.written_count() == 3
+            assert len(list((spool_dir / "ready").iterdir())) == 1
+
+            consumer = SpoolConsumer(db, spool_dir)
+            assert consumer.consume_once() == 3
+            assert consumer.consumed_count() == 3
+            assert not list((spool_dir / "ready").iterdir())
+
+            hits = db.search({"text": "盗刷", "k": 10})
+            messages = "\n".join(
+                message
+                for hit in hits
+                for message in hit.get("logs", [])
+            )
+            assert "buffered 疑似盗刷" in messages
+            assert "spool 疑似盗刷" in messages
+
+        runtime = init_yitrace(
+            path=helper_data_dir,
+            tenant_id=1,
+            node_id=1,
+            flush_interval=0.01,
+            register_atexit=False,
+        )
+        with runtime.tracer.trace("helper trace", tenant_id=1) as trace:
+            with trace.span("helper span") as span:
+                span.log("helper 疑似盗刷")
+        runtime.close()
+        with YiTraceDB.open(helper_data_dir, tenant_id=1) as db:
+            hits = db.search({"text": "盗刷", "k": 10})
+            helper_messages = "\n".join(
+                message
+                for hit in hits
+                for message in hit.get("logs", [])
+            )
+            assert "helper 疑似盗刷" in helper_messages
+
+
 def test_python_embedded_db_rejects_double_writer_lock():
     with tempfile.TemporaryDirectory() as tmp:
         db = YiTraceDB.open(tmp, tenant_id=1)
         try:
-            with pytest.raises(RuntimeError, match="already open or locked"):
+            lock_text = Path(tmp, ".yitrace.lock").read_text(encoding="utf-8")
+            lock_info = json.loads(lock_text)
+            assert lock_info["pid"] > 0
+            assert lock_info["data_dir"] == tmp
+            with pytest.raises(RuntimeError, match="already open or locked") as err:
                 YiTraceDB.open(tmp, tenant_id=1)
+            message = str(err.value)
+            assert "existing lock owner" in message
+            assert '"pid"' in message
+            assert tmp in message
         finally:
             db.close()
 

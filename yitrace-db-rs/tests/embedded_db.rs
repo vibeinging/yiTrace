@@ -60,8 +60,17 @@ fn rust_embedded_db_ingests_searches_and_reads_details() {
 fn rust_embedded_db_rejects_second_writer_lock() {
     let dir = temp_dir("lock");
     let mut first = YiTraceDb::open(&dir).unwrap();
+    let lock_text = std::fs::read_to_string(dir.join(".yitrace.lock")).unwrap();
+    assert!(lock_text.contains("\"pid\""), "{lock_text}");
+    assert!(lock_text.contains(&dir.display().to_string()), "{lock_text}");
     let second = YiTraceDb::open(&dir);
-    assert!(second.is_err());
+    let err = match second {
+        Ok(_) => panic!("second writer should fail"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("already open or locked"), "{err}");
+    assert!(err.contains("existing lock owner"), "{err}");
+    assert!(err.contains("\"pid\""), "{err}");
     first.close().unwrap();
     YiTraceDb::open(&dir).unwrap();
 }

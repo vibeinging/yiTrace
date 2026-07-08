@@ -29,6 +29,9 @@ dependencies = []  # 纯标准库，零运行时依赖
 [project.optional-dependencies]
 db = ["yitrace-db==0.1.0"]
 
+[project.scripts]
+yitrace = "yitrace.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/vibeinging/yiTrace"
 Repository = "https://github.com/vibeinging/yiTrace"

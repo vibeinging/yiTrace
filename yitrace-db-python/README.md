@@ -173,7 +173,9 @@ Electron main process can hold one `YiTraceDB` handle. Do not run
 `uvicorn --workers N` or multiple containers that open the same data directory
 with embedded DB handles. For that case, run one yiTrace server process and send
 all workers to it over HTTP. `.yitrace.lock` keeps rejecting a second embedded
-writer instead of silently corrupting the data dir.
+writer instead of silently corrupting the data dir. The lock file records
+`pid`, `host`, `created_unix_ms`, `data_dir`, and `executable`; second-writer
+errors include that owner block to help diagnose stale locks.
 
 The read-model helpers above are single-node implementations. Common filters
 such as `project_id`, `skill`, `task_fingerprint`, `loop_id`,

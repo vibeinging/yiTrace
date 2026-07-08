@@ -23,7 +23,9 @@ writer handle for a data directory and serve many threads through that handle.
 Do not run multiple processes that all call `YiTraceDb::open("./data")` against
 the same directory. For multi-process or multi-service deployments, run one
 yiTrace server process and send requests to it over HTTP, or keep one explicit
-writer process and talk to it through your own IPC.
+writer process and talk to it through your own IPC. `.yitrace.lock` records the
+owner `pid`, `host`, `created_unix_ms`, `data_dir`, and `executable`, and a
+second writer error includes that owner block for stale-lock diagnosis.
 
 ## Install
 

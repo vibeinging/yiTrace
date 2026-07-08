@@ -228,3 +228,28 @@ yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 - 不让 Python 层直接读 WAL / manifest / segment 文件。
 - 不在 embedded 模式里支持多进程共写同一 data dir。
 - 不强制 `yitrace-db` 默认依赖 FastAPI/uvicorn；server 能力走 optional extra。
+
+## AgenticData-on-fire 第一版接入建议
+
+客户追问“为什么需要独立 yiTrace 服务，不用 embedded DB”时，建议不要说成“必须独立服务”。更准确的说法是：
+
+> 独立服务不是最终唯一方案。第一版建议先用独立 yiTrace 服务，是因为当前 AgenticData-on-fire 更像一个服务端系统，不是单进程本地工具。第一版只需要旁路记录 trace 和去控制台查看，不需要在业务进程内低延迟搜索 trace。
+
+这只是保守接入建议，不代表服务端不能用 embedded DB。若产品目标是推动 AgenticData-on-fire 直接使用 embedded DB，应该补齐服务端接入层：单写者全局句柄、后台写入队列、启动降级、关闭 flush、锁诊断和安装验证。具体落地计划见 `docs/plans/2026-07-08_server-embedded-db-plan.md`。
+
+推荐给客户解释 3 点：
+
+1. 写入边界更稳。embedded DB 同一个 data dir 只允许一个写者。AgenticData 后端可能有多 worker、后台任务、eval/tuner worker 并发运行。独立服务把写入集中到一个进程，业务后端只通过 HTTP 上报。
+2. 不把 trace 风险放进主服务启动链路。`yitrace-db` 是 native 包，会受 Python 版本、CPU 架构、wheel 构建和部署环境影响。第一版 trace 是旁路观察能力，不应该让它影响 AgenticData 主服务启动。
+3. 第一版不需要进程内查询。最小闭环是记录 `task_id`、`session_id`、tool、LLM、error，再到 yiTrace 控制台查。HTTP SDK 已够用。embedded DB 的价值是本地进程内低延迟查询，这不是第一版刚需。
+
+什么时候可以用 embedded DB：
+
+- 单机 eval 包。
+- 桌面版或本地工具。
+- 明确只有一个 Python/Node 进程写同一个 data dir 的部署。
+- 未来需要业务进程内直接做 trace 搜索，且能接受 native 包进入主依赖链。
+
+一句话口径：
+
+> 保守第一版用独立服务，是为了把 trace 做成旁路能力，减少写锁、部署和启动风险；如果补齐服务端接入层，单进程服务端也可以默认用 embedded DB，多进程/多容器再切到单 writer 服务。

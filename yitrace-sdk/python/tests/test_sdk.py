@@ -2,11 +2,28 @@
 import builtins
 import os
 import sys
+import tempfile
 import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from yitrace import CollectingExporter, DbExporter, EventType, HttpExporter, Tracer, YiTraceClient, connect, event_id  # noqa: E402
+from yitrace import (  # noqa: E402
+    BufferedDbExporter,
+    CollectingExporter,
+    DbExporter,
+    EventType,
+    HttpExporter,
+    NoopExporter,
+    SpoolConsumer,
+    SpoolDbExporter,
+    Tracer,
+    YiTraceClient,
+    connect,
+    event_id,
+    get_yitrace_runtime,
+    init_yitrace,
+    shutdown_yitrace,
+)
 
 # 引擎基准值：cargo run -p yt-core --example print_event_id
 ENGINE_BASELINE = {
@@ -263,6 +280,294 @@ def test_db_exporter_writes_tracer_events_to_embedded_db_handle():
         EventType.LOG.value,
         EventType.SPAN_END.value,
     ]
+
+
+def test_buffered_db_exporter_writes_from_background_thread():
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class FakeDb:
+        def __init__(self):
+            self.calls = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append((events, tenant_id))
+            return {"ingested": len(events)}
+
+    db = FakeDb()
+    exporter = BufferedDbExporter(
+        db,
+        tenant_id=7,
+        max_batch=10,
+        flush_interval=0.01,
+        register_atexit=False,
+    )
+    events = [
+        SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i)
+        for i in range(3)
+    ]
+    exporter.export_batch(events)
+    assert exporter.flush(timeout=2.0)
+    exporter.close()
+
+    written = [event for batch, _tenant in db.calls for event in batch]
+    assert len(written) == 3
+    assert all(tenant == 7 for _batch, tenant in db.calls)
+    assert exporter.sent_count() == 3
+    assert exporter.dropped_count() == 0
+
+
+def test_buffered_db_exporter_drops_after_retry_budget():
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class FailingDb:
+        def ingest(self, events, tenant_id=None):
+            raise RuntimeError("db down")
+
+    errors = []
+    exporter = BufferedDbExporter(
+        FailingDb(),
+        max_batch=10,
+        flush_interval=0.01,
+        retry_interval=0.01,
+        max_retries=1,
+        on_error=lambda err, dropped: errors.append((str(err), dropped)),
+        register_atexit=False,
+    )
+    exporter.export(
+        SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id="s1", ts=1)
+    )
+    assert exporter.flush(timeout=2.0)
+    exporter.close()
+
+    assert exporter.sent_count() == 0
+    assert exporter.dropped_count() == 1
+    assert exporter.write_error_count() == 2
+    assert errors[-1] == ("db down", 1)
+
+
+def test_spool_exporter_writes_files_and_consumer_ingests_once():
+    from pathlib import Path  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class FakeDb:
+        def __init__(self):
+            self.calls = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append((events, tenant_id))
+            return {"ingested": len(events)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exporter = SpoolDbExporter(tmp, tenant_id=3, max_batch=10, fsync=False)
+        exporter.export_batch([
+            SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                      event_type=EventType.SPAN_START, ext_span_id="s1", ts=1),
+            SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=2,
+                      event_type=EventType.LOG, ext_span_id="s1", ts=2, logs=["hello"]),
+        ])
+        exporter.close()
+
+        assert exporter.written_count() == 2
+        assert len(list((Path(tmp) / "ready").iterdir())) == 1
+
+        db = FakeDb()
+        consumer = SpoolConsumer(db, tmp)
+        assert consumer.consume_once() == 2
+        assert consumer.consumed_count() == 2
+        assert not list((Path(tmp) / "ready").iterdir())
+        assert db.calls[0][1] == "3"
+        assert [event["event_type"] for event in db.calls[0][0]] == [
+            EventType.SPAN_START.value,
+            EventType.LOG.value,
+        ]
+
+
+def test_spool_consumer_keeps_ready_file_when_db_write_fails():
+    from pathlib import Path  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class FlakyDb:
+        def __init__(self):
+            self.calls = 0
+
+        def ingest(self, events, tenant_id=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary down")
+            return {"ingested": len(events)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exporter = SpoolDbExporter(tmp, fsync=False)
+        exporter.export(
+            SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                      event_type=EventType.SPAN_START, ext_span_id="s1", ts=1)
+        )
+        exporter.close()
+
+        errors = []
+        db = FlakyDb()
+        consumer = SpoolConsumer(db, tmp, on_error=lambda err, path: errors.append((str(err), path.name)))
+        assert consumer.consume_once() == 0
+        assert errors[0][0] == "temporary down"
+        assert len(list((Path(tmp) / "ready").iterdir())) == 1
+
+        assert consumer.consume_once() == 1
+        assert not list((Path(tmp) / "ready").iterdir())
+        assert db.calls == 2
+
+
+def test_init_yitrace_buffered_runtime_opens_db_and_closes_it():
+    class FakeDb:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append((events, tenant_id))
+            return {"ingested": len(events)}
+
+        def close(self):
+            self.closed = True
+
+    opened = {}
+
+    class FakeYiTraceDB:
+        @classmethod
+        def open(cls, path, **options):
+            opened["path"] = str(path)
+            opened["options"] = options
+            return FakeDb()
+
+    old_module = sys.modules.get("yitrace_db")
+    sys.modules["yitrace_db"] = types.SimpleNamespace(YiTraceDB=FakeYiTraceDB)
+    try:
+        runtime = init_yitrace(
+            path="./data",
+            tenant_id=5,
+            node_id=1,
+            flush_interval=0.01,
+            register_atexit=False,
+        )
+        with runtime.tracer.trace("service", tenant_id=5) as trace:
+            with trace.span("span") as span:
+                span.log("hello")
+        runtime.close()
+    finally:
+        shutdown_yitrace()
+        if old_module is None:
+            sys.modules.pop("yitrace_db", None)
+        else:
+            sys.modules["yitrace_db"] = old_module
+
+    assert runtime.enabled is True
+    assert opened == {"path": "./data", "options": {"tenant_id": 5}}
+    assert runtime.db.closed is True
+    assert runtime.exporter.sent_count() == 3
+    assert all(tenant == 5 for _events, tenant in runtime.db.calls)
+
+
+def test_init_yitrace_fail_open_returns_noop_runtime():
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yitrace_db":
+            raise ImportError("missing yitrace_db")
+        return real_import(name, *args, **kwargs)
+
+    try:
+        builtins.__import__ = fake_import
+        runtime = init_yitrace(path="./data", node_id=1, fail_open=True, register_atexit=False)
+        with runtime.tracer.trace("service") as trace:
+            with trace.span("span") as span:
+                span.log("hello")
+        runtime.close()
+    finally:
+        shutdown_yitrace()
+        builtins.__import__ = real_import
+
+    assert runtime.enabled is False
+    assert isinstance(runtime.exporter, NoopExporter)
+    assert runtime.exporter.dropped_count() == 3
+    assert "pip install yitrace-db" in str(runtime.error)
+
+
+def test_init_yitrace_spool_mode_writes_ready_file():
+    from pathlib import Path  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime = init_yitrace(
+            mode="spool",
+            spool_dir=tmp,
+            tenant_id=4,
+            node_id=1,
+            max_batch=10,
+            fsync=False,
+            register_atexit=False,
+        )
+        with runtime.tracer.trace("spool", tenant_id=4) as trace:
+            with trace.span("span") as span:
+                span.log("hello")
+        runtime.close()
+
+        ready_files = list((Path(tmp) / "ready").iterdir())
+        assert len(ready_files) == 1
+        assert runtime.exporter.written_count() == 3
+
+
+def test_cli_consume_spool_once_writes_embedded_db():
+    import contextlib  # noqa: E402
+    import io  # noqa: E402
+    from pathlib import Path  # noqa: E402
+    from yitrace.cli import main  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class FakeDb:
+        def __init__(self):
+            self.calls = []
+            self.closed = False
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append((events, tenant_id))
+            return {"ingested": len(events)}
+
+        def close(self):
+            self.closed = True
+
+    fake_db = FakeDb()
+
+    class FakeYiTraceDB:
+        @classmethod
+        def open(cls, path, **options):
+            return fake_db
+
+    old_module = sys.modules.get("yitrace_db")
+    sys.modules["yitrace_db"] = types.SimpleNamespace(YiTraceDB=FakeYiTraceDB)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            spool_dir = Path(tmp) / "spool"
+            exporter = SpoolDbExporter(spool_dir, tenant_id=8, fsync=False)
+            exporter.export(
+                SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                          event_type=EventType.SPAN_START, ext_span_id="s1", ts=1)
+            )
+            exporter.close()
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                assert main(["consume-spool", "--data-dir", str(Path(tmp) / "db"), "--spool-dir", str(spool_dir), "--once"]) == 0
+            assert out.getvalue().strip() == "consumed=1"
+            assert not list((spool_dir / "ready").iterdir())
+    finally:
+        if old_module is None:
+            sys.modules.pop("yitrace_db", None)
+        else:
+            sys.modules["yitrace_db"] = old_module
+
+    assert fake_db.closed is True
+    assert fake_db.calls[0][1] == "8"
+    assert fake_db.calls[0][0][0]["event_type"] == EventType.SPAN_START.value
 
 
 def test_yitrace_client_routes_json_with_auth_and_tenant_headers():

@@ -6,7 +6,19 @@
 from ._snowflake import Snowflake
 from .client import YiTraceClient, connect
 from .event import EventType, SpanEvent, event_id
-from .exporter import BatchExporter, CollectingExporter, ConsoleExporter, DbExporter, Exporter, HttpExporter
+from .exporter import (
+    BatchExporter,
+    BufferedDbExporter,
+    CollectingExporter,
+    ConsoleExporter,
+    DbExporter,
+    Exporter,
+    HttpExporter,
+    NoopExporter,
+    SpoolConsumer,
+    SpoolDbExporter,
+)
+from .service import YiTraceRuntime, get_yitrace_runtime, init_yitrace, shutdown_yitrace
 from .tracer import Span, Trace, Tracer
 
 __all__ = [
@@ -20,8 +32,16 @@ __all__ = [
     "ConsoleExporter",
     "CollectingExporter",
     "DbExporter",
+    "BufferedDbExporter",
+    "SpoolDbExporter",
+    "SpoolConsumer",
     "BatchExporter",
     "HttpExporter",
+    "NoopExporter",
+    "YiTraceRuntime",
+    "init_yitrace",
+    "shutdown_yitrace",
+    "get_yitrace_runtime",
     "Tracer",
     "Trace",
     "Span",

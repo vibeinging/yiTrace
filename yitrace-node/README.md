@@ -192,6 +192,9 @@ HTTP server, bind a port, or send traffic through a TCP socket.
 For Electron, open the database from the main process and expose narrow IPC
 methods to renderers. Do not let multiple app processes open the same `dataDir`
 for writing; yiTrace creates a `.yitrace.lock` file to enforce a single writer.
+The lock file records the owner `pid`, `host`, `created_unix_ms`, `data_dir`,
+and `executable`; second-writer errors include that owner block for stale-lock
+diagnosis.
 
 For Node servers, the same rule applies. A single process may hold one
 `YiTraceDB` handle and serve many concurrent requests through that handle. Do

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,10 +15,12 @@ try {
   );
 
   const db = await YiTraceDB.open({ dataDir: dir, tenantId: 1 });
+  const lockText = await readFile(join(dir, ".yitrace.lock"), "utf8");
+  assert.match(lockText, /"pid"/, "lock file should include owner pid");
 
   await assert.rejects(
     () => YiTraceDB.open({ dataDir: dir, tenantId: 1 }),
-    /already open or locked/,
+    /already open or locked.*existing lock owner.*"pid"/s,
     "same data dir must be single-writer locked",
   );
 
