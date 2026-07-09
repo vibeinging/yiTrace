@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "yitrace"
-version = "0.0.1"
+version = "0.1.0"
 description = "yiTrace instrumentation SDK — emit trace events with deterministic, engine-matching event_id"
 readme = "README.md"
 requires-python = ">=3.8"
