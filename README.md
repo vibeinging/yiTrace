@@ -12,8 +12,8 @@ execution history back into Agent Memory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![npm](https://img.shields.io/badge/npm-%40yitrace%2Fdb%200.1.1-cb3837?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
-[![PyPI](https://img.shields.io/badge/PyPI-yitrace--db%200.1.0-3775a9?logo=pypi)](https://pypi.org/project/yitrace-db/)
+[![npm](https://img.shields.io/badge/npm-%40yitrace%2Fdb%200.1.2-cb3837?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
+[![PyPI](https://img.shields.io/badge/PyPI-yitrace--db%200.1.2-3775a9?logo=pypi)](https://pypi.org/project/yitrace-db/)
 
 ![yiTrace console](docs/images/console-overview.png)
 
@@ -184,8 +184,8 @@ The full HTTP contract is in [API Reference](docs/API_REFERENCE.md).
 
 Current public versions:
 
-- npm: `@yitrace/db@0.1.1`, `@yitrace/trace-sdk@0.1.1`
-- PyPI: `yitrace==0.1.0`, `yitrace-db==0.1.0`
+- npm: `@yitrace/db@0.1.2`, `@yitrace/trace-sdk@0.1.2`
+- PyPI: `yitrace==0.1.2`, `yitrace-db==0.1.2`
 
 ## Embedded Mode vs Server Mode
 
