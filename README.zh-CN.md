@@ -112,8 +112,10 @@ curl localhost:7878/v1/traces \
 | Rust 应用要本地搜索 | `yitrace-db` crate | 同一套进程内 engine API 的薄封装 |
 | 自己写 Dashboard 或服务 | `/v1/*` HTTP API | 和自带控制台调用同一套端点 |
 
-alpha 阶段可能同时存在正式 registry 包和本地 tarball / wheel。内部项目要锁版本时，
-用各包自己的打包流程生成不可变产物，不要长期覆盖同名本地包文件。
+当前公开包版本：npm 包（`@yitrace/db` 和 `@yitrace/trace-sdk`）是 `0.1.1`；
+PyPI 包（`yitrace` 和 `yitrace-db`）是 `0.1.0`。alpha 阶段可能同时存在正式
+registry 包和本地 tarball / wheel。内部项目要锁版本时，用各包自己的打包流程生成
+不可变产物，不要长期覆盖同名本地包文件。
 
 ## 控制台
 
@@ -410,7 +412,7 @@ GitHub Actions 的打包 workflow 只在推送 `v*` tag 时触发。它按包拆
 覆盖 `darwin-arm64`、`darwin-x64`、`linux-x64-gnu`、`linux-arm64-gnu`、
 `win32-x64-msvc`。每个 job 都运行同一个本地脚本 target，并把 `dist/tag-package`
 上传为 workflow artifact，所以先本地跑通，避免浪费 Actions 时间。要先试一个包，
-可以推 `v0.1.0-only-python-sdk` 这种 tag；正常 `v0.1.0` tag 会构建全部包。
+可以推 `vX.Y.Z-only-python-sdk` 这种 tag；正常 `vX.Y.Z` tag 会构建全部包。
 
 可选 crate：
 

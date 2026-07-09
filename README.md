@@ -117,9 +117,11 @@ Pick the thinnest integration that matches your app:
 | Rust app that needs local search | `yitrace-db` crate | Thin wrapper over the same in-process engine API |
 | Custom dashboard or service | `/v1/*` HTTP API | Same endpoints used by the bundled console |
 
-During alpha, published registry packages and local tarballs may coexist. For
-locked internal installs, use the package-specific `pack` or wheel build flow
-and depend on immutable artifacts instead of mutable local filenames.
+Current public package versions: npm packages (`@yitrace/db` and
+`@yitrace/trace-sdk`) are `0.1.1`; PyPI packages (`yitrace` and `yitrace-db`)
+are `0.1.0`. During alpha, published registry packages and local tarballs may
+coexist. For locked internal installs, use the package-specific `pack` or wheel
+build flow and depend on immutable artifacts instead of mutable local filenames.
 
 ## Console
 
@@ -449,7 +451,7 @@ job per package. Native jobs run on `darwin-arm64`, `darwin-x64`,
 `linux-x64-gnu`, `linux-arm64-gnu`, and `win32-x64-msvc`. Each job runs the same
 local script target and uploads `dist/tag-package`, so run the script locally
 first to avoid spending Actions time on packaging mistakes. To test one package
-first, push a tag such as `v0.1.0-only-python-sdk`; normal `v0.1.0` tags build
+first, push a tag such as `vX.Y.Z-only-python-sdk`; normal `vX.Y.Z` tags build
 all package targets.
 
 Optional crates:
