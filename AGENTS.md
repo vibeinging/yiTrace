@@ -47,10 +47,10 @@ yitrace-node/                # @yitrace/db：Node/Electron 嵌入式 DB（N-API�
 yitrace-db-python/           # yitrace-db：Python 嵌入式 DB（PyO3/maturin，可选 FastAPI server）
 yitrace-db-rs/               # yitrace-db：Rust 嵌入式 DB crate
 yitrace-console/             # 控制台前端（React + Vite + TS，构建产物内嵌进引擎单二进制）
-docs/                        # 设计文档 / 现状索引 / 分析
+docs/                        # 公开 API 文档 / 现状索引 / 截图
 ```
 
-> **`docs/CURRENT_STATE.md` 是现状的唯一权威入口**，新读者从那里看，别被历史过程文档带偏。
+> **`docs/CURRENT_STATE.md` 是现状的唯一权威入口**，新读者从那里看。
 
 ---
 
@@ -297,5 +297,5 @@ await db.close();
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
 5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
 6. **改了 `yitrace-sdk/rust/`、`yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响 embedded 多进程、`connect(path=...)`、spool、FastAPI/CLI 或包边界，再跑 `./scripts/package_mode_eval.sh`。Python embedded 多 worker 必须保留真实 `multiprocessing` 子进程测试，不要只用同进程多 handle 代替。
-7. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
+7. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威。
 8. **提交信息不带 AI 工具名**，写清 what + why。

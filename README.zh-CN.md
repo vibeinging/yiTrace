@@ -443,7 +443,7 @@ yitrace-db-rs/               # Rust 嵌入式 DB crate yitrace-db
 yitrace-segstore-vortex/     # 可选 Vortex 段存储
 yitrace-tokenizer-jieba/     # 可选外部分词适配层
 yitrace-vecindex-graph/      # 可选外部图索引适配层
-docs/                        # 设计文档、API 文档、当前态索引
+docs/                        # 公开 API 文档、当前态索引、截图
 ```
 
 想看工程实情，先读 [Current State](docs/CURRENT_STATE.md)。那里明确写了哪些已验证、哪些是 alpha、哪些仍在路线图中。

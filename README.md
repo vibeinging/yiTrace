@@ -483,7 +483,7 @@ yitrace-db-rs/               # yitrace-db embedded DB crate for Rust
 yitrace-segstore-vortex/     # optional Vortex segment store
 yitrace-tokenizer-jieba/     # optional external tokenizer adapter
 yitrace-vecindex-graph/      # optional external graph-index adapter
-docs/                        # design notes, API reference, current-state index
+docs/                        # public API reference, current-state index, screenshots
 ```
 
 Start with [Current State](docs/CURRENT_STATE.md) if you want the engineering

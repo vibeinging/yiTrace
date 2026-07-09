@@ -1,7 +1,7 @@
 # yiTrace 当前态（唯一权威现状索引）
 
 > 更新：2026-07-08
-> 这篇是**现状的唯一权威入口**。docs/ 下文档很多（41+ 篇，含多轮红队过程产物），新读者从这里看，不要被历史过程文档带偏。
+> 这篇是**现状的唯一权威入口**。公开仓库只保留 API、当前状态和必要截图；过程性的设计、调研和计划文档不放在主仓。
 > 一句话：**项目走过一次大转向（openGauss 扩展 → 自研 Rust 引擎），当前承重的是 Rust 引擎；仓库里两套代码并存，本文讲清哪套是当前态。**
 
 > **命名沿革**：项目原名 yiTrace（crate 前缀 `yt-`），2026-06-29 全面更名 **yiTrace**（顶层目录 `yitrace-*`、crate `yt-*`、Rust 标识符 `yt_`、Prometheus 指标 `yt_*`、Python SDK 包 `yitrace`）。文档里的历史叙事仍以 yiTrace 指代原 yiTrace。废弃的 openGauss 扩展（tracevault-extension）已随更名删除。
@@ -19,17 +19,17 @@
 | `yitrace-sdk/python`、`yitrace-sdk/typescript`、`yitrace-sdk/rust` | 打点 SDK，确定性 event_id 与引擎逐字节一致。Rust SDK 是纯 std crate，适合只上报到 server 的 Rust agent。Python SDK 还提供服务端 embedded 接入层：`BufferedDbExporter` 后台单写线程、`SpoolDbExporter`/`SpoolConsumer` 落盘队列、`init_yitrace`/`shutdown_yitrace` 启停 helper、`yitrace consume-spool` CLI。 | 可用，各带测试；Python SDK clean consumer 验证覆盖 console script 和没有 `yitrace-db` 时的 fail-open |
 | `yitrace-node/`、`yitrace-db-python/`、`yitrace-db-rs/` | Node/Electron、Python、Rust 的嵌入式 DB 包。都通过 `EngineJsonApi` 进程内调用引擎，不直接解析 WAL/manifest/segment 文件。Python 侧已有 `yitrace.connect(url/path)`、`DbExporter`、FastAPI router 和 `yitrace-db serve` 入口；native 调用在 open/recover/route/flush/close 释放 GIL，避免长 IO 卡住 Python 线程。持久模式支持同机多个进程打开同一个本地 data dir：内部用 `.yitrace.open.lock.d/` 和 `.yitrace.write.lock.d/` 串行化 open/write，用 `.yitrace.readers/` reader pin 保护跨进程快照回收。 | 可用：ingest/search/trace/span/sessions/traceSearch/aggregate/storageStats/trajectory/diff/loop/task/annotation/dataset association/retention helpers 有包级测试；`scripts/package_mode_eval.sh` 固化包形态回归，覆盖 Python SDK clean consumer、真实 Python embedded DB eval（buffered/spool/helper）；Node `pack:verify` 覆盖 ESM/CJS/native-path clean consumer；同机多进程 embedded 已有真实子进程测试，跨机器/网络盘共享 data dir 仍不支持 |
 
-**权威产品/技术入口**：`docs/2026-06-22_yitrace-产品说明.md`（决策层）、`docs/design/2026-06-22_yitrace-技术文档.md`（工程）、`docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`（列式段）。
+**公开入口**：README 负责快速上手；`docs/API_REFERENCE.md` 负责 HTTP / embedded API；本文负责说明当前实现边界。
 
 ## 2. 历史 / 非当前态（别当现状读）
 
 | 目录/文档 | 是什么 | 处置 |
 |---|---|---|
 | `tracevault-extension/` | **路线甲**：openGauss/yiTrace 内核扩展（SQL + 内核 AM），用内核自带 DiskANN/BM25/vex_jieba。曾自称"产物③ 数据库本体"。 | **已放弃为交付物**，作 schema/词典/trace 函数的**设计参考保留**。讲"自有 IP"不以它为准（算法是内核的）。 |
-| `docs/design/appendix-A … appendix-Q` | 路线甲时期的设计 + 多轮红队过程产物（多在讨论 openGauss/内核边界/信创约束）。 | **历史溯源，非当前态。** 当前态以本文 + 产品/技术文档为准。 |
-| `2026-06-16/17 的 tracevault-* 与 l1-datafusion-lance` 等 | 早期架构稿（含已否决的 Lance 方案）。 | 历史。Lance 已否决，列式定 Vortex。 |
+| 早期设计、调研、红队和路线计划文档 | 路线甲时期的设计 + 多轮红队过程产物，多在讨论 openGauss/内核边界/信创约束。 | 不放在公开主仓；当前态以本文为准。 |
+| `2026-06-16/17` 前后的 tracevault / L1 方案 | 早期架构稿（含已否决的 Lance 方案）。 | 历史。Lance 已否决，列式定 Vortex。 |
 
-## 3. 路线转向一句话（详见产品说明 §8 + `2026-06-17_yitrace-engine-decision.md`）
+## 3. 路线转向一句话
 
 openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给一个能顺手做掉你的竞品；且买 ClickHouse/openGauss 会把自有 BM25/graph_index 挤成旁路 sidecar，"自有 IP 当一等索引"的产品命题塌。→ **自研 Rust 引擎，让两块索引作一等公民**；列式格式是整套存储里唯一值得买现成的一件 → Vortex。
 
@@ -44,7 +44,7 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 
 ## 5. 已验证 vs 占位（诚实边界）
 
-**性能（本机单机 release，2 万 span/128 维实测，仅供量级参考）**：摄入 ~4 万 span/s；向量建图 ~1.5k 点/s（HNSW 建图本就重，ef_construction 可调速度/召回）；BM25 检索 ~1500 QPS（0.65ms）；向量检索 ~1000 QPS（0.9ms）。关键优化：缓存 O(1) 访问、节点/向量缓存、段折叠缓存、**段级 key Bloom（跳无关段）+ 内存 BM25 WAND（剪枝，与暴力逐位一致）**。旋钮 `CoordinatorBuilder.with_ef_construction/with_ef_search/with_vector_cache_bytes`。跨段/TB 扩展性分析见 `docs/analysis/2026-06-24_检索跨段扩展性分析.md`。
+**性能（本机单机 release，2 万 span/128 维实测，仅供量级参考）**：摄入 ~4 万 span/s；向量建图 ~1.5k 点/s（HNSW 建图本就重，ef_construction 可调速度/召回）；BM25 检索 ~1500 QPS（0.65ms）；向量检索 ~1000 QPS（0.9ms）。关键优化：缓存 O(1) 访问、节点/向量缓存、段折叠缓存、**段级 key Bloom（跳无关段）+ 内存 BM25 WAND（剪枝，与暴力逐位一致）**。旋钮 `CoordinatorBuilder.with_ef_construction/with_ef_search/with_vector_cache_bytes`。
 
 **已是真的（有测试）**：确定性 event_id（跨语言逐字节一致）、四源读时折叠、快照隔离、崩溃重放幂等（含 upgrade 重叠窗口）、时间分层 compaction、重启不丢；中文 BM25 多概念召回完胜子串；**纯 Rust 中文词级分词**（词典 DAG + 最大概率 DP，jieba 全量词典内嵌默认装、引擎默认用，歧义"研究生命→研究/生命"判对、自有词典叠加、接 BM25 端到端，8 测）；自研磁盘型多层 HNSW + 带过滤 ANN 召回表驱动实测（1% 选择性 post-filter 0.17 / in-graph 1.00，到 20% 收敛）；列式段谓词+投影下推；端到端 SDK/OTLP→HTTP→折叠→检索/eval/成本。
 
@@ -60,7 +60,7 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 
 ## 6. 已知工程债（骨架够用、上量必换，按优先级）
 
-- ~~**GC 回收的安全条件 (3) 是近似**~~ → **已修复（2026-06-26）**：`reclaim` 现走持久化 GC 日志（`gc_log` 模块）—— MARK→fsync→unlink→DONE→fsync；`open_durable` 重启时扫 gc.log 补删"MARK 没 DONE"的段。崩溃安全测试 `gc_log_crash_after_mark_completes_delete_on_restart` 钉死。见 `docs/plans/2026-06-26_生产就绪路线.md` §1.1。
+- ~~**GC 回收的安全条件 (3) 是近似**~~ → **已修复（2026-06-26）**：`reclaim` 现走持久化 GC 日志（`gc_log` 模块）—— MARK→fsync→unlink→DONE→fsync；`open_durable` 重启时扫 gc.log 补删"MARK 没 DONE"的段。崩溃安全测试 `gc_log_crash_after_mark_completes_delete_on_restart` 钉死。
 - ~~**`safe_version` 对 Tentative 读者返回 0**~~ → **已修复（2026-06-26）**：Tentative slot 现用 `observed_min_version`（登记时的 current 版本）当精确下限，不再"有未落定读者就完全不回收"。测试 `tentative_reader_uses_observed_min_version_not_zero` 钉死。避免高并发读时 dead_set 无限堆积。
 - **Snapshot 强引用 `Arc<Current>`**：单例下不泄漏，无锁化（crossbeam-epoch）时要重设计。
 - **CRC32 已换查表**（零依赖，已做）；BM25 logs 编码已换可逆转义（含 NUL/二进制/CJK 安全，已做）。
@@ -72,4 +72,4 @@ openGauss 是华为 IP，用它做信创护城河等于把叙事控制权交给�
 
 ---
 
-*相关：产品说明 §8 路线选择、技术文档、列式段落地计划、引擎选型决策 `2026-06-17_yitrace-engine-decision.md`。*
+*本文只记录公开主仓当前态；过程性路线文档不随主仓发布。*
