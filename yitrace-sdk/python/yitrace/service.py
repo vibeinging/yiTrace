@@ -22,6 +22,11 @@ class YiTraceRuntime:
     enabled: bool = True
     error: Exception | None = None
     owns_db: bool = False
+    mode: str = "unknown"
+    data_dir: str | None = None
+    spool_dir: str | None = None
+    url: str | None = None
+    requested_mode: str | None = None
 
     def close(self, timeout: float | None = 5.0) -> None:
         try:
@@ -33,6 +38,93 @@ class YiTraceRuntime:
         finally:
             if self.owns_db and self.db is not None:
                 self.db.close()
+
+    def health(self) -> dict[str, Any]:
+        exporter = _exporter_health(self.exporter)
+        lock = _db_lock_health(self.db)
+        last_error = str(self.error) if self.error is not None else exporter.get("last_error")
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "requested_mode": self.requested_mode,
+            "data_dir": self.data_dir,
+            "spool_dir": self.spool_dir,
+            "url": self.url,
+            "queue": exporter.get("queue", {"queued": None, "max": None}),
+            "sent": exporter.get("sent"),
+            "written": exporter.get("written"),
+            "dropped": exporter.get("dropped", 0),
+            "write_errors": exporter.get("write_errors", 0),
+            "last_error": last_error,
+            "lock": lock,
+            "exporter": exporter,
+        }
+
+
+def _path_text(value: str | Path | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _requested_mode(
+    *,
+    url: str | None,
+    path: str | Path | None,
+    data_dir: str | Path | None,
+    spool_dir: str | Path | None,
+    mode: str,
+) -> str:
+    if url is not None:
+        return "http"
+    normalized = mode.replace("-", "_")
+    if normalized == "spool" or spool_dir is not None:
+        return "spool"
+    if path is not None or data_dir is not None:
+        return normalized
+    return normalized
+
+
+def _exporter_health(exporter: Exporter) -> dict[str, Any]:
+    health = getattr(exporter, "health", None)
+    if callable(health):
+        value = health()
+        if isinstance(value, dict):
+            return value
+    state: dict[str, Any] = {"type": exporter.__class__.__name__, "queue": {"queued": None, "max": None}}
+    for key, method_name in (
+        ("sent", "sent_count"),
+        ("dropped", "dropped_count"),
+        ("written", "written_count"),
+        ("write_errors", "write_error_count"),
+        ("last_error", "last_error"),
+    ):
+        method = getattr(exporter, method_name, None)
+        if callable(method):
+            try:
+                state[key] = method()
+            except Exception as err:
+                state.setdefault("last_error", str(err))
+    queued = getattr(exporter, "queued_count", None)
+    if callable(queued):
+        try:
+            state["queue"] = {"queued": queued(), "max": None}
+        except Exception as err:
+            state.setdefault("last_error", str(err))
+    return state
+
+
+def _db_lock_health(db: Any | None) -> dict[str, Any]:
+    if db is None:
+        return {"enabled": False}
+    lock_metrics = getattr(db, "lock_metrics", None)
+    if not callable(lock_metrics):
+        return {"enabled": None}
+    try:
+        metrics = lock_metrics()
+    except Exception as err:
+        return {"enabled": True, "error": str(err)}
+    if isinstance(metrics, dict):
+        return metrics
+    return {"enabled": True, "raw": metrics}
 
 
 _runtime_lock = threading.Lock()
@@ -86,6 +178,17 @@ def init_yitrace(
             exporter=exporter,
             enabled=False,
             error=err,
+            mode="noop",
+            requested_mode=_requested_mode(
+                url=url,
+                path=path,
+                data_dir=data_dir,
+                spool_dir=spool_dir,
+                mode=mode,
+            ),
+            data_dir=_path_text(data_dir if data_dir is not None else path),
+            spool_dir=_path_text(spool_dir),
+            url=url,
         )
     with _runtime_lock:
         _runtime = runtime
@@ -126,7 +229,13 @@ def _init_yitrace_strict(
             timeout=options.pop("timeout", 5.0),
             max_batch=options.pop("max_batch", 256),
         )
-        return YiTraceRuntime(tracer=Tracer(exporter=exporter, node_id=node_id), exporter=exporter)
+        return YiTraceRuntime(
+            tracer=Tracer(exporter=exporter, node_id=node_id),
+            exporter=exporter,
+            mode="http",
+            requested_mode="http",
+            url=ingest_url,
+        )
 
     normalized_mode = mode.replace("-", "_")
     if normalized_mode == "spool":
@@ -138,7 +247,13 @@ def _init_yitrace_strict(
             max_batch=options.pop("max_batch", 256),
             fsync=options.pop("fsync", True),
         )
-        return YiTraceRuntime(tracer=Tracer(exporter=exporter, node_id=node_id), exporter=exporter)
+        return YiTraceRuntime(
+            tracer=Tracer(exporter=exporter, node_id=node_id),
+            exporter=exporter,
+            mode="spool",
+            requested_mode="spool",
+            spool_dir=_path_text(spool_dir),
+        )
 
     local_path = data_dir if data_dir is not None else path
     if local_path is None:
@@ -161,7 +276,15 @@ def _init_yitrace_strict(
     else:
         db.close()
         raise ValueError(f"unknown yitrace mode: {mode}")
-    return YiTraceRuntime(tracer=Tracer(exporter=exporter, node_id=node_id), exporter=exporter, db=db, owns_db=True)
+    return YiTraceRuntime(
+        tracer=Tracer(exporter=exporter, node_id=node_id),
+        exporter=exporter,
+        db=db,
+        owns_db=True,
+        mode=normalized_mode,
+        requested_mode=normalized_mode,
+        data_dir=_path_text(local_path),
+    )
 
 
 def get_yitrace_runtime() -> YiTraceRuntime | None:

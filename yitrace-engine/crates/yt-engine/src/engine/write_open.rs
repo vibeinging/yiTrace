@@ -434,4 +434,28 @@ impl WriteCoordinator {
             self.current.pin_snapshot()
         }
     }
+
+    pub fn process_lock_metrics(&self) -> Option<ProcessLockMetricsSnapshot> {
+        self.process_lock.as_ref().map(|mgr| mgr.metrics_snapshot())
+    }
+
+    pub fn process_lock_metrics_json(&self) -> String {
+        let Some(m) = self.process_lock_metrics() else {
+            return r#"{"enabled":false,"acquire_count":0,"try_acquire_count":0,"wait_count":0,"active_wait_count":0,"wait_ns":0,"wait_ms":0.0,"timeout_count":0,"try_busy_count":0,"stale_lock_cleared_count":0,"reader_pin_count":0,"stale_reader_cleared_count":0}"#.to_string();
+        };
+        format!(
+            "{{\"enabled\":true,\"acquire_count\":{},\"try_acquire_count\":{},\"wait_count\":{},\"active_wait_count\":{},\"wait_ns\":{},\"wait_ms\":{},\"timeout_count\":{},\"try_busy_count\":{},\"stale_lock_cleared_count\":{},\"reader_pin_count\":{},\"stale_reader_cleared_count\":{}}}",
+            m.acquire_count,
+            m.try_acquire_count,
+            m.wait_count,
+            m.active_wait_count,
+            m.wait_ns,
+            (m.wait_ns as f64) / 1_000_000.0,
+            m.timeout_count,
+            m.try_busy_count,
+            m.stale_lock_cleared_count,
+            m.reader_pin_count,
+            m.stale_reader_cleared_count,
+        )
+    }
 }

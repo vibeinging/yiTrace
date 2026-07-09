@@ -428,6 +428,9 @@ def test_init_yitrace_buffered_runtime_opens_db_and_closes_it():
             self.calls.append((events, tenant_id))
             return {"ingested": len(events)}
 
+        def lock_metrics(self):
+            return {"enabled": True, "wait_count": 2, "wait_ms": 3.5}
+
         def close(self):
             self.closed = True
 
@@ -466,6 +469,16 @@ def test_init_yitrace_buffered_runtime_opens_db_and_closes_it():
     assert runtime.db.closed is True
     assert runtime.exporter.sent_count() == 3
     assert all(tenant == 5 for _events, tenant in runtime.db.calls)
+    health = runtime.health()
+    assert health["enabled"] is True
+    assert health["mode"] == "buffered"
+    assert health["data_dir"] == "./data"
+    assert health["queue"]["queued"] == 0
+    assert health["sent"] == 3
+    assert health["dropped"] == 0
+    assert health["last_error"] is None
+    assert health["lock"]["wait_count"] == 2
+    assert health["lock"]["wait_ms"] == 3.5
 
 
 def test_init_yitrace_fail_open_returns_noop_runtime():
@@ -491,6 +504,13 @@ def test_init_yitrace_fail_open_returns_noop_runtime():
     assert isinstance(runtime.exporter, NoopExporter)
     assert runtime.exporter.dropped_count() == 3
     assert "pip install yitrace-db" in str(runtime.error)
+    health = runtime.health()
+    assert health["enabled"] is False
+    assert health["mode"] == "noop"
+    assert health["requested_mode"] == "buffered"
+    assert health["data_dir"] == "./data"
+    assert health["dropped"] == 3
+    assert "pip install yitrace-db" in health["last_error"]
 
 
 def test_init_yitrace_spool_mode_writes_ready_file():
@@ -514,6 +534,13 @@ def test_init_yitrace_spool_mode_writes_ready_file():
         ready_files = list((Path(tmp) / "ready").iterdir())
         assert len(ready_files) == 1
         assert runtime.exporter.written_count() == 3
+        health = runtime.health()
+        assert health["enabled"] is True
+        assert health["mode"] == "spool"
+        assert health["spool_dir"] == tmp
+        assert health["written"] == 3
+        assert health["dropped"] == 0
+        assert health["lock"]["enabled"] is False
 
 
 def test_cli_consume_spool_once_writes_embedded_db():

@@ -62,6 +62,15 @@ class NoopExporter(Exporter):
     def dropped_count(self) -> int:
         return self._dropped
 
+    def health(self) -> dict:
+        return {
+            "type": "noop",
+            "queue": {"queued": 0, "max": 0},
+            "sent": 0,
+            "dropped": self.dropped_count(),
+            "last_error": None,
+        }
+
 
 class DbExporter(Exporter):
     """把 SDK 事件直接写进 embedded YiTraceDB。"""
@@ -82,6 +91,15 @@ class DbExporter(Exporter):
 
     def sent_count(self) -> int:
         return self._sent
+
+    def health(self) -> dict:
+        return {
+            "type": "db",
+            "queue": {"queued": 0, "max": 0},
+            "sent": self.sent_count(),
+            "dropped": 0,
+            "last_error": None,
+        }
 
 
 class BufferedDbExporter(Exporter):
@@ -182,6 +200,18 @@ class BufferedDbExporter(Exporter):
 
     def queued_count(self) -> int:
         return self._queue.qsize()
+
+    def health(self) -> dict:
+        return {
+            "type": "buffered_db",
+            "queue": {"queued": self.queued_count(), "max": self._queue.maxsize},
+            "sent": self.sent_count(),
+            "dropped": self.dropped_count(),
+            "write_errors": self.write_error_count(),
+            "last_error": self.last_error(),
+            "closed": self._closed.is_set(),
+            "thread_alive": self._thread.is_alive(),
+        }
 
     def _run(self) -> None:
         while not self._closed.is_set() or not self._queue.empty():
@@ -316,6 +346,20 @@ class SpoolDbExporter(Exporter):
     def dropped_count(self) -> int:
         with self._lock:
             return self._dropped
+
+    def queued_count(self) -> int:
+        with self._lock:
+            return len(self._buf)
+
+    def health(self) -> dict:
+        return {
+            "type": "spool_db",
+            "spool_dir": str(self.spool_dir),
+            "queue": {"queued": self.queued_count(), "max": self.max_batch},
+            "written": self.written_count(),
+            "dropped": self.dropped_count(),
+            "last_error": None,
+        }
 
     def _next_name(self) -> str:
         with self._lock:
@@ -510,6 +554,7 @@ class HttpExporter(Exporter):
         self._buf: list[SpanEvent] = []
         self._sent = 0
         self._dropped = 0
+        self._last_error: str | None = None
 
     def export(self, event: SpanEvent) -> None:
         self._buf.append(event)
@@ -538,6 +583,19 @@ class HttpExporter(Exporter):
         """因超过最大缓冲上限而丢弃的事件数。"""
         return self._dropped
 
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    def health(self) -> dict:
+        return {
+            "type": "http",
+            "url": self.url,
+            "queue": {"queued": self.buffered_count(), "max": self.max_buffered},
+            "sent": self.sent_count(),
+            "dropped": self.dropped_count(),
+            "last_error": self.last_error(),
+        }
+
     def _post(self, events: list[SpanEvent]) -> None:
         if not events:
             return
@@ -553,6 +611,7 @@ class HttpExporter(Exporter):
         try:
             self._post(events)
         except Exception as err:
+            self._last_error = str(err)
             # POST 是批级别的全有或全无。失败时退回队首；引擎端用确定性 event_id 去重，
             # 所以网络"已达但响应丢"时重试仍是安全的 at-least-once 语义。
             self._buf = list(events) + self._buf

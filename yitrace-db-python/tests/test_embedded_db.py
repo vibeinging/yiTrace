@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,36 @@ from yitrace_db import YiTraceDB, create_span_event_builder
 SDK_PYTHON_DIR = Path(__file__).resolve().parents[2] / "yitrace-sdk" / "python"
 if SDK_PYTHON_DIR.exists():
     sys.path.insert(0, str(SDK_PYTHON_DIR))
+
+
+def _python_multiworker_write(data_dir: str, worker_id: int, count: int, queue) -> None:
+    try:
+        with YiTraceDB.open(data_dir, tenant_id=1) as db:
+            for i in range(count):
+                trace_id = f"py-worker-{worker_id}-{i}"
+                db.ingest(
+                    [
+                        {
+                            "trace_id": trace_id,
+                            "span_id": f"{trace_id}-span",
+                            "ts": 1_000 + worker_id * 100 + i,
+                            "seq": 1,
+                            "event_type": 2,
+                            "ext_span_id": f"{trace_id}-span",
+                            "logs": [f"python 多worker盗刷 {trace_id}"],
+                            "attrs": {
+                                "project_id": "python-multiworker",
+                                "skill": "embedded",
+                                "worker_id": str(worker_id),
+                            },
+                        }
+                    ]
+                )
+            db.flush()
+        queue.put(("ok", worker_id, count))
+    except Exception:
+        queue.put(("error", worker_id, traceback.format_exc()))
+        raise
 
 
 def test_python_embedded_db_ingests_searches_and_reads_span_detail():
@@ -77,6 +109,12 @@ def test_python_embedded_db_ingests_searches_and_reads_span_detail():
             assert storage["total"]["spanCount"] == 1
             assert storage["total"]["estimatedBytes"] > 0
             assert storage["readPlan"]["usedFilterIndex"] is True
+
+            lock = db.lock_metrics()
+            assert lock["enabled"] is True
+            assert lock["acquire_count"] >= 2
+            assert "wait_count" in lock
+            assert "wait_ms" in lock
 
             db.ingest(
                 [
@@ -425,6 +463,55 @@ def test_python_embedded_db_allows_multiple_handles_with_serialized_writes():
             assert {"multi-python-a", "multi-python-b"}.issubset(trace_ids)
         finally:
             reopened.close()
+
+
+def test_python_embedded_db_real_multiprocess_workers_share_data_dir():
+    workers = 4
+    per_worker = 12
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        processes = [
+            ctx.Process(target=_python_multiworker_write, args=(tmp, worker, per_worker, queue))
+            for worker in range(workers)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=20)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                pytest.fail(f"python worker pid={process.pid} timed out")
+            assert process.exitcode == 0
+
+        messages = []
+        while not queue.empty():
+            messages.append(queue.get())
+        errors = [message for message in messages if message[0] == "error"]
+        assert not errors, errors
+        assert len([message for message in messages if message[0] == "ok"]) == workers
+
+        with YiTraceDB.open(tmp, tenant_id=1) as reopened:
+            result = reopened.trace_search(
+                {
+                    "filter": {"projectId": "python-multiworker", "skill": "embedded"},
+                    "limit": workers * per_worker + 10,
+                }
+            )
+            assert result["total"] == workers * per_worker
+            trace_ids = {item["externalTraceId"] for item in result["items"]}
+            expected = {
+                f"py-worker-{worker}-{i}"
+                for worker in range(workers)
+                for i in range(per_worker)
+            }
+            assert trace_ids == expected
+
+            hits = reopened.search({"text": "多worker盗刷", "k": workers * per_worker + 10})
+            hit_ids = {hit["external_trace_id"] for hit in hits}
+            assert expected.issubset(hit_ids)
 
 
 def test_python_embedded_db_general_route_json_and_closed_errors():

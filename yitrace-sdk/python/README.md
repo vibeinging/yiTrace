@@ -104,7 +104,21 @@ shutdown_yitrace()  # 等待队列 flush，并关闭 embedded DB
 
 默认 `fail_open=True`。如果 native 包缺失、data dir 被锁、恢复失败，`init_yitrace(...)` 会返回 no-op tracer，主服务继续启动；`runtime.enabled == False`，`runtime.error` 里保留原因。
 
-多 worker 服务端不要让每个 worker 都 `connect(path=...)`。可以让 worker 写本地 spool，再由唯一消费者写 DB：
+服务端可以把 `runtime.health()` 接到自己的 `/healthz` 或日志里。它会返回 `enabled`、`mode`、`data_dir`、`queue`、`dropped`、`last_error` 和 `lock`；其中 `lock.active_wait_count`、`lock.wait_count`、`lock.wait_ms` 能看出是不是正在等 embedded DB 锁。
+
+同一台机器上的多 worker 服务端可以让每个 worker 都 `connect(path=...)` 打开同一个本地 data dir。引擎内部会串行化 open/write，并在写前刷新 WAL、manifest 和 metadata：
+
+```python
+from yitrace import init_yitrace
+
+# 每个本机 worker 进程都可以这样初始化。
+runtime = init_yitrace(path="./data/yitrace", tenant_id=1, node_id=1)
+tr = runtime.tracer
+```
+
+不要让多台机器、网络文件系统或跨主机容器共享同一个 embedded data dir；这些场景用 yiTrace server 或外部队列。
+
+如果希望 worker 完全不加载 native DB、需要落盘削峰，或者不想让请求路径等待 DB 锁，可以改用 spool：
 
 ```python
 from yitrace import SpoolConsumer, SpoolDbExporter, Tracer, connect
@@ -116,7 +130,7 @@ with tr.trace("worker-task", tenant_id=1) as t:
         s.log("ok")
 tr.close()
 
-# 单独的消费者进程：唯一打开 embedded DB 的写者。
+# 单独的消费者进程：打开 embedded DB 消费 spool。
 db = connect(path="./data/yitrace", tenant_id=1)
 consumer = SpoolConsumer(db, "./data/yitrace-spool")
 consumer.consume_once()

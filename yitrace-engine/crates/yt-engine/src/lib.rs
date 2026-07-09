@@ -44,6 +44,7 @@ pub use segstore::FileSegmentStore;
 
 mod persist;
 mod process_lock;
+pub use process_lock::ProcessLockMetricsSnapshot;
 mod vecstore;
 
 mod gc_log;

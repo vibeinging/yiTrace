@@ -37,6 +37,27 @@ fn multiple_processes_open_same_data_dir_and_write() {
     let coord = WriteCoordinator::open_durable(&dir).unwrap();
     coord.recover();
     let snap = coord.pin_snapshot();
+    let lock_metrics = coord.process_lock_metrics().unwrap();
+    assert!(
+        lock_metrics.acquire_count >= 2,
+        "open_durable should report open/write lock acquisitions"
+    );
+    assert!(
+        lock_metrics.reader_pin_count >= 1,
+        "pin_snapshot should report reader pin creation"
+    );
+    assert!(
+        coord
+            .metrics()
+            .contains("yt_process_lock_wait_seconds_total"),
+        "/v1/metrics should include embedded lock wait counters"
+    );
+    assert!(
+        coord
+            .process_lock_metrics_json()
+            .contains("\"enabled\":true"),
+        "embedded DB wrappers need JSON lock metrics for health output"
+    );
     let traces = coord
         .read_spans(&snap)
         .into_iter()

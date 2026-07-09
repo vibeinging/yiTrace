@@ -238,17 +238,28 @@ with connect(path="./data", tenant_id=1) as db:
     print(db.search({"text": "盗刷", "k": 10}))
 ```
 
-To expose the embedded DB to multiple app workers, run one server process
-instead of opening the same data directory from every worker:
+Multiple local app workers may open the same embedded data directory directly.
+The engine serializes open/write paths inside the data dir and refreshes WAL,
+manifest, and metadata before writes:
+
+```python
+# In each local worker process on the same machine:
+db = connect(path="./data", tenant_id=1)
+```
+
+For service integrations through `init_yitrace(...)`, `runtime.health()` returns
+the active mode, data directory, queue length, dropped events, last error, and
+embedded lock wait counters. The raw embedded handle also exposes
+`db.lock_metrics()` for debugging lock waits.
+
+Do not share one embedded data directory across machines, unreliable network
+filesystems, or cross-host containers. For those deployments, run one yiTrace
+server process and send workers to it over HTTP:
 
 ```bash
 python -m pip install "yitrace-db[server]"
 yitrace-db serve --data-dir ./data --bind 0.0.0.0:7878
 ```
-
-Embedded DB is for one process holding one writer handle. `uvicorn --workers 1`
-can embed it; `uvicorn --workers N`, multiple containers, or multiple services
-sharing one data dir should talk to a single yiTrace server over HTTP.
 
 Rust:
 

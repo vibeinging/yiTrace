@@ -94,7 +94,7 @@ cd yitrace-sdk/rust && cargo test --offline   # 纯 std 打点 SDK
 **嵌入式 DB 包：**
 
 ```bash
-cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI 包装
+cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI + 真实多进程 worker 测试
 cd yitrace-db-rs && cargo test --offline      # Rust embedded DB crate
 ./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归，含 Python SDK clean consumer
 ./scripts/package_release_artifacts.sh        # 创建 v* tag 前先本地打包；GitHub Action 只在 tag push 时重复这条路径
@@ -253,7 +253,7 @@ with connect(path="./data", tenant_id=1) as db:
     print(db.search(text="盗刷", k=10))
 ```
 
-`connect(url=...)` 返回 HTTP client，`connect(path=...)` 返回本地 embedded DB handle。`yitrace-db` 也提供可选 FastAPI router 和 `yitrace-db serve` CLI。embedded 模式支持同机多个进程打开同一个本地 data dir；引擎内部用 data-dir 锁串行化 open/write，并用 reader pin 保护跨进程快照回收。多机器、网络文件系统或跨主机容器共享同一个 data dir 时，改用一个 yiTrace server，其他 worker 走 HTTP。
+`connect(url=...)` 返回 HTTP client，`connect(path=...)` 返回本地 embedded DB handle。`yitrace-db` 也提供可选 FastAPI router 和 `yitrace-db serve` CLI。embedded 模式支持同机多个进程打开同一个本地 data dir；引擎内部用 data-dir 锁串行化 open/write，并用 reader pin 保护跨进程快照回收。服务端用 `init_yitrace(...)` 时，可用 `runtime.health()` 查看 `enabled`、`mode`、`data_dir`、队列、drop、`last_error` 和锁等待；直接用 `YiTraceDB` 时可用 `db.lock_metrics()` 排查是否在等 DB 锁。多机器、网络文件系统或跨主机容器共享同一个 data dir 时，改用一个 yiTrace server，其他 worker 走 HTTP。`SpoolDbExporter` 是削峰、隔离 native 包或避免请求路径等待 DB 锁的可选方案，不再是同机多 worker 的必需方案。
 
 ### 5.5 嵌入式 Node / Electron DB
 
@@ -296,6 +296,6 @@ await db.close();
 3. **改 event 编码 / 折叠逻辑 / 检索算子**，必须更新或新增对应测试（这些是承重不变量）。
 4. **改了前端**，记得重新 build 并拷到 `console_dist/`（否则引擎内嵌的是旧版）。
 5. **改了 `yitrace-node/`**，至少跑 `npm run build && npm test`；如果影响发布结构，同步更新 `yitrace-node/README.md` 和本文件。
-6. **改了 `yitrace-sdk/rust/`、`yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响包边界，再跑 `./scripts/package_mode_eval.sh`。
+6. **改了 `yitrace-sdk/rust/`、`yitrace-db-python/` 或 `yitrace-db-rs/`**，至少跑对应包测试；如果影响 embedded 多进程、`connect(path=...)`、spool、FastAPI/CLI 或包边界，再跑 `./scripts/package_mode_eval.sh`。Python embedded 多 worker 必须保留真实 `multiprocessing` 子进程测试，不要只用同进程多 handle 代替。
 7. **不确定就先读 `docs/CURRENT_STATE.md`**，它是现状权威，别被 docs/ 下的历史过程文档误导。
 8. **提交信息不带 AI 工具名**，写清 what + why。

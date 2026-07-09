@@ -554,6 +554,12 @@ class YiTraceDB:
         self._ensure_open()
         self._native.flush()
 
+    def lock_metrics(self) -> Any:
+        self._ensure_open()
+        return _json_loads(self._native.lock_metrics_json())
+
+    lockMetrics = lock_metrics
+
     def close(self) -> None:
         if self._closed:
             return

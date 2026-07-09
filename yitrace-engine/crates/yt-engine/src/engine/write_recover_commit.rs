@@ -411,6 +411,7 @@ impl WriteCoordinator {
         let fold_cache_entries = self.seg_fold_cache.lock().unwrap().map.len();
         let bloom_count = self.seg_key_bloom.lock().unwrap().len();
         let datasets = self.datasets.lock().unwrap().len();
+        let process_lock_metrics = self.process_lock_metrics();
 
         // 确定性 manifest 版本（每次 commit +1）。
         out.push_str("# HELP yt_manifest_version Manifest 版本号（每次 commit +1）。\n");
@@ -472,6 +473,75 @@ impl WriteCoordinator {
         out.push_str("# HELP yt_seg_bloom_count 段级 key Bloom 条目数。\n");
         out.push_str("# TYPE yt_seg_bloom_count gauge\n");
         out.push_str(&format!("yt_seg_bloom_count {bloom_count}\n\n"));
+
+        if let Some(lock) = process_lock_metrics {
+            out.push_str("# HELP yt_process_lock_acquire_total embedded 进程锁 acquire 次数。\n");
+            out.push_str("# TYPE yt_process_lock_acquire_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_acquire_total {}\n\n",
+                lock.acquire_count
+            ));
+
+            out.push_str("# HELP yt_process_lock_try_acquire_total embedded 进程锁 try_acquire 次数。\n");
+            out.push_str("# TYPE yt_process_lock_try_acquire_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_try_acquire_total {}\n\n",
+                lock.try_acquire_count
+            ));
+
+            out.push_str("# HELP yt_process_lock_wait_total embedded 进程锁发生等待的次数。\n");
+            out.push_str("# TYPE yt_process_lock_wait_total counter\n");
+            out.push_str(&format!("yt_process_lock_wait_total {}\n\n", lock.wait_count));
+
+            out.push_str("# HELP yt_process_lock_active_waiters 当前正在等 embedded 进程锁的线程数。\n");
+            out.push_str("# TYPE yt_process_lock_active_waiters gauge\n");
+            out.push_str(&format!(
+                "yt_process_lock_active_waiters {}\n\n",
+                lock.active_wait_count
+            ));
+
+            out.push_str("# HELP yt_process_lock_wait_seconds_total embedded 进程锁累计等待秒数。\n");
+            out.push_str("# TYPE yt_process_lock_wait_seconds_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_wait_seconds_total {}\n\n",
+                (lock.wait_ns as f64) / 1_000_000_000.0
+            ));
+
+            out.push_str("# HELP yt_process_lock_timeout_total embedded 进程锁等待超时次数。\n");
+            out.push_str("# TYPE yt_process_lock_timeout_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_timeout_total {}\n\n",
+                lock.timeout_count
+            ));
+
+            out.push_str("# HELP yt_process_lock_try_busy_total try_acquire 发现锁正忙的次数。\n");
+            out.push_str("# TYPE yt_process_lock_try_busy_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_try_busy_total {}\n\n",
+                lock.try_busy_count
+            ));
+
+            out.push_str("# HELP yt_process_lock_stale_cleared_total 清掉 stale 进程锁的次数。\n");
+            out.push_str("# TYPE yt_process_lock_stale_cleared_total counter\n");
+            out.push_str(&format!(
+                "yt_process_lock_stale_cleared_total {}\n\n",
+                lock.stale_lock_cleared_count
+            ));
+
+            out.push_str("# HELP yt_process_reader_pin_total 跨进程 reader pin 创建次数。\n");
+            out.push_str("# TYPE yt_process_reader_pin_total counter\n");
+            out.push_str(&format!(
+                "yt_process_reader_pin_total {}\n\n",
+                lock.reader_pin_count
+            ));
+
+            out.push_str("# HELP yt_process_reader_stale_cleared_total 清掉 stale reader pin 的次数。\n");
+            out.push_str("# TYPE yt_process_reader_stale_cleared_total counter\n");
+            out.push_str(&format!(
+                "yt_process_reader_stale_cleared_total {}\n\n",
+                lock.stale_reader_cleared_count
+            ));
+        }
 
         out.push_str("# HELP yt_datasets 评测数据集数。\n");
         out.push_str("# TYPE yt_datasets gauge\n");

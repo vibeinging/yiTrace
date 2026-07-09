@@ -41,7 +41,12 @@ impl NativeYiTraceDb {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| py_runtime_err(format!("create data dir failed: {e}")))?;
             let coord = WriteCoordinator::open_durable(&dir)
-                .map_err(|e| py_runtime_err(format!("open yiTrace data dir failed: {e}")))?;
+                .map_err(|e| {
+                    py_runtime_err(format!(
+                        "open yiTrace data dir failed for data_dir={}: {e}. If startup or writes are slow, check db.lock_metrics() or YiTraceRuntime.health()['lock']; lock timeouts include the owner process.",
+                        dir.display()
+                    ))
+                })?;
             coord.recover();
             Ok::<_, PyErr>(coord)
         })?;
@@ -84,6 +89,11 @@ impl NativeYiTraceDb {
         let coord = Arc::clone(&self.coord);
         py.detach(move || coord.flush_memtable());
         Ok(())
+    }
+
+    pub fn lock_metrics_json(&self) -> PyResult<String> {
+        self.ensure_open()?;
+        Ok(self.coord.process_lock_metrics_json())
     }
 
     pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {

@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ static NEXT_READER_PIN: AtomicU64 = AtomicU64::new(0);
 pub struct ProcessLockManager {
     dir: PathBuf,
     timeout: Duration,
+    metrics: Arc<ProcessLockMetrics>,
 }
 
 pub struct ProcessLockGuard {
@@ -26,32 +28,81 @@ pub struct ProcessReaderGuard {
     pin_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessLockMetricsSnapshot {
+    pub acquire_count: u64,
+    pub try_acquire_count: u64,
+    pub wait_count: u64,
+    pub active_wait_count: u64,
+    pub wait_ns: u64,
+    pub timeout_count: u64,
+    pub try_busy_count: u64,
+    pub stale_lock_cleared_count: u64,
+    pub reader_pin_count: u64,
+    pub stale_reader_cleared_count: u64,
+}
+
+#[derive(Default)]
+struct ProcessLockMetrics {
+    acquire_count: AtomicU64,
+    try_acquire_count: AtomicU64,
+    wait_count: AtomicU64,
+    active_wait_count: AtomicU64,
+    wait_ns: AtomicU64,
+    timeout_count: AtomicU64,
+    try_busy_count: AtomicU64,
+    stale_lock_cleared_count: AtomicU64,
+    reader_pin_count: AtomicU64,
+    stale_reader_cleared_count: AtomicU64,
+}
+
 impl ProcessLockManager {
     pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
             dir: dir.as_ref().to_path_buf(),
             timeout: Duration::from_secs(30),
+            metrics: Arc::new(ProcessLockMetrics::default()),
         }
     }
 
     pub fn acquire(&self, name: &str) -> io::Result<ProcessLockGuard> {
+        self.metrics.acquire_count.fetch_add(1, Ordering::Relaxed);
         let lock_dir = self.dir.join(format!(".yitrace.{name}.lock.d"));
         let start = Instant::now();
+        let mut wait_started: Option<Instant> = None;
         loop {
             match fs::create_dir(&lock_dir) {
                 Ok(()) => {
+                    if let Some(wait_started) = wait_started {
+                        self.finish_wait(wait_started);
+                    }
                     write_owner(&lock_dir, &self.dir)?;
                     return Ok(ProcessLockGuard { lock_dir });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     if clear_stale_lock(&lock_dir) {
+                        self.metrics
+                            .stale_lock_cleared_count
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    if wait_started.is_none() {
+                        self.metrics.wait_count.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .active_wait_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        wait_started = Some(Instant::now());
+                    }
                     if start.elapsed() >= self.timeout {
+                        if let Some(wait_started) = wait_started {
+                            self.finish_wait(wait_started);
+                        }
+                        self.metrics.timeout_count.fetch_add(1, Ordering::Relaxed);
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             format!(
-                                "timed out waiting for yiTrace {name} lock at {}{}",
+                                "timed out after {}ms waiting for yiTrace {name} lock at {}; another local process is using this embedded data dir. If this keeps happening, inspect owner.json or YiTraceRuntime.health()['lock']{}",
+                                self.timeout.as_millis(),
                                 lock_dir.display(),
                                 owner_suffix(&lock_dir)
                             ),
@@ -59,25 +110,39 @@ impl ProcessLockManager {
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(wait_started) = wait_started {
+                        self.finish_wait(wait_started);
+                    }
+                    return Err(e);
+                }
             }
         }
     }
 
     pub fn try_acquire(&self, name: &str) -> io::Result<Option<ProcessLockGuard>> {
+        self.metrics
+            .try_acquire_count
+            .fetch_add(1, Ordering::Relaxed);
         let lock_dir = self.dir.join(format!(".yitrace.{name}.lock.d"));
-        match fs::create_dir(&lock_dir) {
-            Ok(()) => {
-                write_owner(&lock_dir, &self.dir)?;
-                Ok(Some(ProcessLockGuard { lock_dir }))
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                if clear_stale_lock(&lock_dir) {
-                    return self.try_acquire(name);
+        loop {
+            match fs::create_dir(&lock_dir) {
+                Ok(()) => {
+                    write_owner(&lock_dir, &self.dir)?;
+                    return Ok(Some(ProcessLockGuard { lock_dir }));
                 }
-                Ok(None)
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if clear_stale_lock(&lock_dir) {
+                        self.metrics
+                            .stale_lock_cleared_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    self.metrics.try_busy_count.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -96,6 +161,9 @@ impl ProcessLockManager {
                 Ok(mut f) => {
                     f.write_all(owner_json(&self.dir).as_bytes())?;
                     f.sync_all()?;
+                    self.metrics
+                        .reader_pin_count
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(ProcessReaderGuard { pin_path });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -143,9 +211,43 @@ impl ProcessLockManager {
                 continue;
             };
             if !process_is_alive(pid) {
-                let _ = fs::remove_file(path);
+                if fs::remove_file(path).is_ok() {
+                    self.metrics
+                        .stale_reader_cleared_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
+    }
+
+    pub fn metrics_snapshot(&self) -> ProcessLockMetricsSnapshot {
+        ProcessLockMetricsSnapshot {
+            acquire_count: self.metrics.acquire_count.load(Ordering::Relaxed),
+            try_acquire_count: self.metrics.try_acquire_count.load(Ordering::Relaxed),
+            wait_count: self.metrics.wait_count.load(Ordering::Relaxed),
+            active_wait_count: self.metrics.active_wait_count.load(Ordering::Relaxed),
+            wait_ns: self.metrics.wait_ns.load(Ordering::Relaxed),
+            timeout_count: self.metrics.timeout_count.load(Ordering::Relaxed),
+            try_busy_count: self.metrics.try_busy_count.load(Ordering::Relaxed),
+            stale_lock_cleared_count: self
+                .metrics
+                .stale_lock_cleared_count
+                .load(Ordering::Relaxed),
+            reader_pin_count: self.metrics.reader_pin_count.load(Ordering::Relaxed),
+            stale_reader_cleared_count: self
+                .metrics
+                .stale_reader_cleared_count
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn finish_wait(&self, wait_started: Instant) {
+        self.metrics
+            .wait_ns
+            .fetch_add(duration_ns(wait_started.elapsed()), Ordering::Relaxed);
+        self.metrics
+            .active_wait_count
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -210,6 +312,10 @@ fn clear_stale_lock(lock_dir: &Path) -> bool {
         return false;
     }
     fs::remove_dir_all(lock_dir).is_ok()
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 fn parse_json_u32(text: &str, key: &str) -> Option<u32> {

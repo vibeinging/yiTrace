@@ -123,6 +123,11 @@ with YiTraceDB.open("./data", tenant_id=1) as db:
     print(db.search(text="盗刷", k=10))
 ```
 
+Use `db.lock_metrics()` when a service feels slow around embedded writes. It
+returns whether embedded locking is enabled, lock acquire counts, wait counts,
+active waiters, wait milliseconds, timeout counts, stale lock cleanup counts,
+and reader pin counts.
+
 Or through the user-facing `yitrace` package:
 
 ```bash
