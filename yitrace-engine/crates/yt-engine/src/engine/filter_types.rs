@@ -2,6 +2,7 @@
 /// 让向量检索能按真实查询维度（agent / 状态 / 时间）过滤，而不只按 (trace,span) id。
 #[derive(Clone, Debug, Default)]
 struct FilterAttrs {
+    external_trace_id: Option<String>,
     status: Option<u8>,
     agent_name: Option<String>,
     tool_name: Option<String>,
@@ -18,6 +19,7 @@ struct FilterAttrs {
 #[derive(Default, Clone)]
 pub struct SearchFilter {
     pub trace_id: Option<u64>,
+    pub external_trace_id: Option<String>,
     pub agent_name: Option<String>,
     pub tool_name: Option<String>,
     pub model: Option<String>,
@@ -37,7 +39,8 @@ impl SearchFilter {
 
     /// 是否带"要查属性边车"的约束。仅 trace_id 约束不算（trace_id 在 key 里直接判）。
     fn needs_attrs(&self) -> bool {
-        self.agent_name.is_some()
+        self.external_trace_id.is_some()
+            || self.agent_name.is_some()
             || self.tool_name.is_some()
             || self.model.is_some()
             || self.status.is_some()
@@ -52,6 +55,11 @@ impl SearchFilter {
         // 租户隔离：tenant 不符直接出局（最先判，隔离优先）。
         if let Some(t) = self.tenant_id {
             if a.tenant_id != Some(t) {
+                return false;
+            }
+        }
+        if let Some(external_trace_id) = &self.external_trace_id {
+            if a.external_trace_id.as_deref() != Some(external_trace_id.as_str()) {
                 return false;
             }
         }

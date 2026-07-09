@@ -50,11 +50,18 @@ fn json_id_or_hash(v: &crate::wire::Json) -> Option<u64> {
         .or_else(|| v.as_str().map(|s| yt_core::event::fnv1a64(s.as_bytes())))
 }
 
+fn json_id_text(v: &crate::wire::Json) -> Option<String> {
+    match v {
+        crate::wire::Json::Num(s) | crate::wire::Json::Str(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 fn json_id_with_external(v: &crate::wire::Json) -> Option<(u64, Option<String>)> {
     match v {
-        crate::wire::Json::Num(s) => s.parse::<u64>().ok().map(|id| (id, None)),
+        crate::wire::Json::Num(s) => s.parse::<u64>().ok().map(|id| (id, Some(s.clone()))),
         crate::wire::Json::Str(s) => match s.parse::<u64>() {
-            Ok(id) => Some((id, None)),
+            Ok(id) => Some((id, Some(s.clone()))),
             Err(_) => Some((yt_core::event::fnv1a64(s.as_bytes()), Some(s.clone()))),
         },
         _ => None,

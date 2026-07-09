@@ -342,6 +342,68 @@ fn search_indexes_rebuilt_after_restart() {
 }
 
 #[test]
+fn durable_recover_defers_segment_scan_when_read_model_caches_hit() {
+    // P0: open/recover 命中 rollup/filter 缓存时不能再全量扫 segment。
+    // BM25 + segment bloom 也命中时，全文检索不再触发段扫描补建。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_fast_recover_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        let mut e = ev(7, 70, 1, Some(0), Some(100), &["疑似盗刷"]);
+        e.fields.external_trace_id = Some("run-fast".into());
+        wc.ingest(vec![e]);
+        wc.flush_memtable();
+    }
+
+    let wc2 = WriteCoordinator::open_durable(&dir).unwrap();
+    wc2.recover();
+    assert!(
+        !*wc2.segment_scan_indexes_stale.lock().unwrap(),
+        "BM25/bloom 缓存命中后全文检索索引应直接可用"
+    );
+    assert_eq!(
+        wc2.seg_key_bloom.lock().unwrap().len(),
+        1,
+        "recover 应从 segment_bloom.dat 加载 bloom，不预扫历史 segment"
+    );
+
+    let filter = SearchFilter {
+        external_trace_id: Some("run-fast".into()),
+        ..Default::default()
+    };
+    let (spans, stats) = wc2
+        .trace_aggregate_rollup_spans(&TraceQuery::all(), &filter)
+        .expect("rollup cache should answer external trace id lookup");
+    assert_eq!(stats.scanned_segments, 0);
+    assert_eq!(stats.matched_spans, 1);
+    assert_eq!(spans[0].external_trace_id.as_deref(), Some("run-fast"));
+    assert_eq!(
+        wc2.seg_key_bloom.lock().unwrap().len(),
+        1,
+        "纯外部 ID 查询走 rollup，不改变已加载 bloom"
+    );
+
+    let snap = wc2.pin_snapshot();
+    let hits = wc2.search_text(&snap, "盗刷", 10);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (7, 70));
+    assert!(
+        !*wc2.segment_scan_indexes_stale.lock().unwrap(),
+        "全文检索应直接使用持久 BM25/bloom"
+    );
+    assert_eq!(wc2.seg_key_bloom.lock().unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn durable_uses_disk_vector_index_and_survives_restart_without_rebuild() {
     // 阶段 3：持久引擎默认用**磁盘图索引**——向量+图都落盘到 dir/vecindex，不用 vecstore，
     // 重启从盘恢复、不全量 rebuild。append 多删除少场景：插入只写、提交点批量刷。

@@ -161,6 +161,24 @@ pub trait Bm25Index: Send + Sync {
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)>;
     /// 清空派生倒排。多进程 embedded 刷新时会从持久段 + WAL tail 重建。
     fn clear(&self) {}
+    /// 加载持久化倒排。自定义 BM25 实现可不支持；不支持时引擎会回退到段扫描重建。
+    fn load_cache(
+        &self,
+        _path: &std::path::Path,
+        _manifest_version: u64,
+        _memtable_watermark: u64,
+    ) -> bool {
+        false
+    }
+    /// 保存持久化倒排。返回 Ok(false) 表示当前实现不支持持久化。
+    fn save_cache(
+        &self,
+        _path: &std::path::Path,
+        _manifest_version: u64,
+        _memtable_watermark: u64,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// graph_index 向量 ANN。真实实现 = 团队自有图索引（algorithm/distance/PQ 经 C ABI FFI 复用）。

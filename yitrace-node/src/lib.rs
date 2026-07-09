@@ -67,6 +67,30 @@ impl NativeYiTraceDb {
         self.route("POST", "/v1/search", &query_json, tenant_id)
     }
 
+    #[napi(js_name = "indexEmbedding")]
+    pub fn index_embedding(
+        &self,
+        trace_id: String,
+        span_id: String,
+        embedding: Vec<f64>,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if embedding.is_empty() {
+            return Err(napi_err("embedding must not be empty"));
+        }
+        let trace_id = parse_id_or_hash(&trace_id)?;
+        let span_id = parse_id_or_hash(&span_id)?;
+        let mut vector = Vec::with_capacity(embedding.len());
+        for (i, value) in embedding.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(napi_err(format!("embedding[{i}] must be a finite number")));
+            }
+            vector.push(value as f32);
+        }
+        self.coord.index_embedding(trace_id, span_id, vector);
+        Ok(())
+    }
+
     #[napi(js_name = "traceSearchJson")]
     pub fn trace_search_json(
         &self,
@@ -444,4 +468,25 @@ fn url_encode_component(s: &str) -> String {
         }
     }
     out
+}
+
+fn parse_id_or_hash(value: &str) -> Result<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(napi_err("traceId/spanId must not be empty"));
+    }
+    Ok(value
+        .parse::<u64>()
+        .unwrap_or_else(|_| fnv1a64(value.as_bytes())))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }

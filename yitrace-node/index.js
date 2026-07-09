@@ -66,7 +66,13 @@ function normalizeSearchQuery(query = {}) {
   const out = { ...query };
   if (query.filter) {
     out.filter = { ...query.filter };
-    if (out.filter.traceId !== undefined && out.filter.trace_id === undefined) out.filter.trace_id = out.filter.traceId;
+    const traceId = out.filter.traceId ?? out.filter.trace_id;
+    if (traceId !== undefined && traceId !== null) {
+      if (out.filter.externalTraceId === undefined && out.filter.external_trace_id === undefined) {
+        out.filter.externalTraceId = String(traceId);
+      }
+      delete out.filter.trace_id;
+    }
     if (out.filter.agentName !== undefined && out.filter.agent_name === undefined) out.filter.agent_name = out.filter.agentName;
     if (out.filter.timeFrom !== undefined && out.filter.time_from === undefined) out.filter.time_from = out.filter.timeFrom;
     if (out.filter.timeTo !== undefined && out.filter.time_to === undefined) out.filter.time_to = out.filter.timeTo;
@@ -76,6 +82,83 @@ function normalizeSearchQuery(query = {}) {
     delete out.filter.timeTo;
   }
   return out;
+}
+
+function normalizeVector(value, label = "embedding") {
+  if (value === undefined || value === null || typeof value === "string") {
+    throw new Error(`${label} must be a non-empty numeric array`);
+  }
+  const vector = Array.from(value, (item, i) => {
+    const number = Number(item);
+    if (!Number.isFinite(number)) {
+      throw new Error(`${label}[${i}] must be a finite number`);
+    }
+    return number;
+  });
+  if (vector.length === 0) {
+    throw new Error(`${label} must not be empty`);
+  }
+  return vector;
+}
+
+function normalizeEmbedder(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "function") {
+    return {
+      embedQuery: value,
+      embedDocuments: async (texts) => Promise.all(texts.map((text) => value(text))),
+    };
+  }
+  if (!plainObject(value)) {
+    throw new Error("embedder must be a function or an object");
+  }
+  const embedQuery = value.embedQuery ?? value.embed;
+  const embedDocuments = value.embedDocuments ?? value.embedBatch;
+  if (typeof embedQuery !== "function" && typeof embedDocuments !== "function") {
+    throw new Error("embedder requires embedQuery/embed or embedDocuments/embedBatch");
+  }
+  return {
+    model: value.model,
+    dimensions: value.dimensions ?? value.dimension ?? value.dim,
+    embedQuery,
+    embedDocuments,
+  };
+}
+
+function searchableTextFromEvent(event) {
+  if (!plainObject(event)) return "";
+  const parts = [];
+  for (const key of ["input_text", "inputText", "output_text", "outputText", "agent_name", "agentName", "tool_name", "toolName", "model"]) {
+    const value = event[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") parts.push(String(value));
+  }
+  for (const key of ["logs", "messages"]) {
+    if (!Array.isArray(event[key])) continue;
+    for (const item of event[key]) {
+      if (item !== undefined && item !== null && String(item).trim() !== "") parts.push(String(item));
+    }
+  }
+  return parts.join(" ");
+}
+
+function embeddingDocsFromEvents(events = []) {
+  const byKey = new Map();
+  for (const event of events) {
+    if (!plainObject(event)) continue;
+    const traceId = optionValue(event, "trace_id", "traceId");
+    const spanId = optionValue(event, "span_id", "spanId");
+    if (traceId === undefined || traceId === null || spanId === undefined || spanId === null) continue;
+    const text = searchableTextFromEvent(event);
+    if (!text) continue;
+    const key = `${String(traceId)}\u0000${String(spanId)}`;
+    const current = byKey.get(key);
+    if (current) {
+      current.text += ` ${text}`;
+    } else {
+      byKey.set(key, { traceId, spanId, text });
+    }
+  }
+  return [...byKey.values()];
 }
 
 function normalizeAttrs(options = {}) {
@@ -228,13 +311,15 @@ export class SpanEventBuilder {
       event_type: eventType,
       ext_span_id: extSpanId,
     };
-    setIfDefined(event, "parent_span_id", optionValue(options, "parent_span_id", "parentSpanId"));
-    setIfDefined(event, "session_id", optionValue(options, "session_id", "sessionId") ?? optionValue(this.#defaults, "session_id", "sessionId"));
+    const parentSpanId = optionValue(options, "parent_span_id", "parentSpanId");
+    const sessionId = optionValue(options, "session_id", "sessionId") ?? optionValue(this.#defaults, "session_id", "sessionId");
+    setIfDefined(event, "parent_span_id", parentSpanId);
+    setIfDefined(event, "session_id", sessionId);
     setIfDefined(event, "tenant_id", optionValue(options, "tenant_id", "tenantId") ?? optionValue(this.#defaults, "tenant_id", "tenantId"));
-    setIfDefined(event, "external_trace_id", optionValue(options, "external_trace_id", "externalTraceId"));
-    setIfDefined(event, "external_span_id", optionValue(options, "external_span_id", "externalSpanId"));
-    setIfDefined(event, "external_parent_span_id", optionValue(options, "external_parent_span_id", "externalParentSpanId"));
-    setIfDefined(event, "external_session_id", optionValue(options, "external_session_id", "externalSessionId"));
+    setIfDefined(event, "external_trace_id", optionValue(options, "external_trace_id", "externalTraceId") ?? (typeof traceId === "string" ? traceId : undefined));
+    setIfDefined(event, "external_span_id", optionValue(options, "external_span_id", "externalSpanId") ?? (typeof spanId === "string" ? spanId : undefined));
+    setIfDefined(event, "external_parent_span_id", optionValue(options, "external_parent_span_id", "externalParentSpanId") ?? (typeof parentSpanId === "string" ? parentSpanId : undefined));
+    setIfDefined(event, "external_session_id", optionValue(options, "external_session_id", "externalSessionId") ?? (typeof sessionId === "string" ? sessionId : undefined));
     const attrs = {
       ...(plainObject(this.#defaults.attrs) ? this.#defaults.attrs : {}),
       ...(plainObject(options.attrs) ? options.attrs : {}),
@@ -269,11 +354,21 @@ export function createSpanEventBuilder(defaults = {}) {
 export class YiTraceDB {
   #native;
   #tenantId;
+  #embedder;
+  #embeddingDimensions;
+  #autoIndexEmbeddings;
   #closed = false;
 
   constructor(native, options = {}) {
     this.#native = native;
     this.#tenantId = tenantId(options);
+    this.#embedder = normalizeEmbedder(options.embedder ?? options.embedding);
+    const dimensions = options.embeddingDimensions ?? options.dimensions ?? this.#embedder?.dimensions;
+    this.#embeddingDimensions = dimensions === undefined || dimensions === null ? undefined : Number(dimensions);
+    if (this.#embeddingDimensions !== undefined && (!Number.isInteger(this.#embeddingDimensions) || this.#embeddingDimensions <= 0)) {
+      throw new Error("embedding dimensions must be a positive integer");
+    }
+    this.#autoIndexEmbeddings = options.autoIndexEmbeddings === true;
   }
 
   static async open(pathOrOptions) {
@@ -290,7 +385,11 @@ export class YiTraceDB {
   async ingest(events, options = {}) {
     this.#ensureOpen();
     const response = this.#native.ingestJson(JSON.stringify(events), tenantId(options) ?? this.#tenantId);
-    return parseJson(response);
+    const result = parseJson(response);
+    if (options.indexEmbeddings === true || (options.indexEmbeddings !== false && this.#autoIndexEmbeddings)) {
+      await this.indexEmbeddings(embeddingDocsFromEvents(events));
+    }
+    return result;
   }
 
   async ingestOtlp(body, options = {}) {
@@ -304,8 +403,65 @@ export class YiTraceDB {
 
   async search(query, options = {}) {
     this.#ensureOpen();
-    const response = this.#native.searchJson(JSON.stringify(normalizeSearchQuery(query)), tenantId(options) ?? this.#tenantId);
+    const response = this.#native.searchJson(JSON.stringify(await this.#prepareSearchQuery(query)), tenantId(options) ?? this.#tenantId);
     return parseJson(response);
+  }
+
+  async indexEmbedding(input, options = {}) {
+    this.#ensureOpen();
+    const item = plainObject(input) ? input : {};
+    const traceId = item.traceId ?? item.trace_id;
+    const spanId = item.spanId ?? item.span_id;
+    if (traceId === undefined || traceId === null) throw new Error("indexEmbedding requires traceId");
+    if (spanId === undefined || spanId === null) throw new Error("indexEmbedding requires spanId");
+    const vector = await this.#vectorForEmbeddingInput(item);
+    this.#native.indexEmbedding(String(traceId), String(spanId), vector);
+    return { indexed: 1 };
+  }
+
+  async indexEmbeddings(items, options = {}) {
+    this.#ensureOpen();
+    const list = Array.isArray(items) ? items : [];
+    if (list.length === 0) return { indexed: 0 };
+
+    const vectors = [];
+    const textItems = [];
+    const textPositions = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const item = list[i];
+      if (!plainObject(item)) throw new Error(`indexEmbeddings[${i}] must be an object`);
+      const vector = item.vector ?? item.embedding;
+      if (vector !== undefined && vector !== null && vector !== "auto") {
+        vectors[i] = this.#checkEmbeddingVector(vector, `indexEmbeddings[${i}].embedding`);
+      } else {
+        const text = item.text ?? item.inputText ?? item.input_text ?? item.outputText ?? item.output_text;
+        if (text === undefined || text === null || String(text).trim() === "") {
+          throw new Error(`indexEmbeddings[${i}] requires embedding/vector or text`);
+        }
+        textItems.push(String(text));
+        textPositions.push(i);
+      }
+    }
+    if (textItems.length > 0) {
+      const embedded = await this.#embedDocuments(textItems);
+      if (!Array.isArray(embedded) || embedded.length !== textItems.length) {
+        throw new Error("embedDocuments must return one embedding per input text");
+      }
+      for (let i = 0; i < embedded.length; i += 1) {
+        vectors[textPositions[i]] = this.#checkEmbeddingVector(embedded[i], `embedding[${textPositions[i]}]`);
+      }
+    }
+
+    let indexed = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const traceId = list[i].traceId ?? list[i].trace_id;
+      const spanId = list[i].spanId ?? list[i].span_id;
+      if (traceId === undefined || traceId === null) throw new Error(`indexEmbeddings[${i}] requires traceId`);
+      if (spanId === undefined || spanId === null) throw new Error(`indexEmbeddings[${i}] requires spanId`);
+      this.#native.indexEmbedding(String(traceId), String(spanId), vectors[i]);
+      indexed += 1;
+    }
+    return { indexed };
   }
 
   async traceSearch(query = {}, options = {}) {
@@ -504,6 +660,78 @@ export class YiTraceDB {
     if (this.#closed) return;
     this.#native.close();
     this.#closed = true;
+  }
+
+  async #prepareSearchQuery(query = {}) {
+    const out = normalizeSearchQuery(query);
+    const mode = String(out.mode ?? out.searchMode ?? "").toLowerCase();
+    const text = out.text ?? out.q;
+    const semanticValue = String(out.semantic ?? "").toLowerCase();
+    const semanticOnly = mode === "semantic" || mode === "vector" || out.semantic === true || semanticValue === "true";
+    const hybrid = mode === "hybrid" || out.hybrid === true || semanticValue === "hybrid";
+    const autoVector = out.vector === "auto" || out.vector === true;
+    if (out.vector !== undefined && out.vector !== null && out.vector !== "auto" && out.vector !== true) {
+      out.vector = this.#checkEmbeddingVector(out.vector, "query.vector");
+    } else if (semanticOnly || hybrid || autoVector) {
+      if (text === undefined || text === null || String(text).trim() === "") {
+        throw new Error("semantic/hybrid search requires text");
+      }
+      out.vector = await this.#embedQuery(String(text));
+      if (semanticOnly) {
+        delete out.text;
+        delete out.q;
+      } else if (out.text === undefined && out.q !== undefined) {
+        out.text = String(out.q);
+      }
+    }
+    delete out.mode;
+    delete out.searchMode;
+    delete out.hybrid;
+    delete out.semantic;
+    return out;
+  }
+
+  async #vectorForEmbeddingInput(item) {
+    const vector = item.vector ?? item.embedding;
+    if (vector !== undefined && vector !== null && vector !== "auto") {
+      return this.#checkEmbeddingVector(vector, "embedding");
+    }
+    const text = item.text ?? item.inputText ?? item.input_text ?? item.outputText ?? item.output_text;
+    if (text === undefined || text === null || String(text).trim() === "") {
+      throw new Error("indexEmbedding requires embedding/vector or text");
+    }
+    return this.#embedQuery(String(text));
+  }
+
+  async #embedQuery(text) {
+    if (!this.#embedder) throw new Error("YiTraceDB.open requires embedder for semantic/hybrid search or text embedding indexing");
+    if (typeof this.#embedder.embedQuery === "function") {
+      return this.#checkEmbeddingVector(await this.#embedder.embedQuery(text), "query embedding");
+    }
+    const docs = await this.#embedDocuments([text]);
+    if (!Array.isArray(docs) || docs.length !== 1) throw new Error("embedDocuments must return one embedding for query text");
+    return this.#checkEmbeddingVector(docs[0], "query embedding");
+  }
+
+  async #embedDocuments(texts) {
+    if (!this.#embedder) throw new Error("YiTraceDB.open requires embedder for text embedding indexing");
+    if (typeof this.#embedder.embedDocuments === "function") {
+      return this.#embedder.embedDocuments(texts);
+    }
+    if (typeof this.#embedder.embedQuery === "function") {
+      return Promise.all(texts.map((text) => this.#embedder.embedQuery(text)));
+    }
+    throw new Error("embedder requires embedDocuments/embedBatch or embedQuery/embed");
+  }
+
+  #checkEmbeddingVector(value, label) {
+    const vector = normalizeVector(value, label);
+    if (this.#embeddingDimensions === undefined) {
+      this.#embeddingDimensions = vector.length;
+    } else if (vector.length !== this.#embeddingDimensions) {
+      throw new Error(`${label} dimension ${vector.length} does not match expected ${this.#embeddingDimensions}`);
+    }
+    return vector;
   }
 
   #ensureOpen() {

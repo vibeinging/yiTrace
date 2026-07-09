@@ -116,6 +116,8 @@ impl WriteCoordinator {
         self.session_idx.lock().unwrap().dirty = true;
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
+        self.rebuild_bm25_current();
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.persist_read_model_sidecars();
         result.deleted_trace_ids = deleted_traces.into_iter().collect();
         result.deleted_trace_ids.sort_unstable();

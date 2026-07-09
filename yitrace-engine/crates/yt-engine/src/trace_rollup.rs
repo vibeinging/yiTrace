@@ -352,6 +352,11 @@ impl TraceAggregateRollupRow {
                 return false;
             }
         }
+        if let Some(external_trace_id) = &filter.external_trace_id {
+            if self.external_trace_id.as_deref() != Some(external_trace_id.as_str()) {
+                return false;
+            }
+        }
         if let Some(agent_name) = &filter.agent_name {
             if self.agent_name.as_deref() != Some(agent_name.as_str()) {
                 return false;

@@ -1,3 +1,6 @@
+const SEG_BLOOM_CACHE_MAGIC: u32 = 0x5954_424c; // "YTBL"
+const SEG_BLOOM_CACHE_VERSION: u32 = 1;
+
 impl WriteCoordinator {
     pub fn trace_aggregate_rollup_spans(
         &self,
@@ -179,6 +182,133 @@ impl WriteCoordinator {
         true
     }
 
+    fn load_bm25_segments(&self, manifest: &Manifest) -> bool {
+        let Some(path) = &self.bm25_path else {
+            return false;
+        };
+        if !self
+            .bm25
+            .load_cache(path, manifest.version.get(), manifest.memtable_watermark.get())
+        {
+            return false;
+        }
+        olog::log(
+            olog::Level::Info,
+            "bm25_cache_load",
+            &[
+                ("version", &manifest.version.get()),
+                ("watermark", &manifest.memtable_watermark.get()),
+            ],
+        );
+        true
+    }
+
+    fn persist_bm25_segments(&self) {
+        let Some(path) = &self.bm25_path else {
+            return;
+        };
+        if *self.segment_scan_indexes_stale.lock().unwrap() {
+            return;
+        }
+        let manifest = self.current.manifest();
+        match self
+            .bm25
+            .save_cache(path, manifest.version.get(), manifest.memtable_watermark.get())
+        {
+            Ok(true) | Ok(false) => {}
+            Err(err) => olog::log(
+                olog::Level::Warn,
+                "bm25_cache_save_failed",
+                &[("error", &err.to_string())],
+            ),
+        }
+    }
+
+    fn rebuild_bm25_from_snapshot(&self, snap: &Snapshot) {
+        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all());
+        self.bm25.clear();
+        for span in spans {
+            self.index_folded_span_text(&span);
+        }
+    }
+
+    fn rebuild_bm25_current(&self) {
+        let snap = self.pin_snapshot();
+        self.rebuild_bm25_from_snapshot(&snap);
+    }
+
+    fn index_folded_span_text(&self, span: &FoldedSpan) {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(text) = span.input_text.as_deref() {
+            parts.push(text);
+        }
+        if let Some(text) = span.output_text.as_deref() {
+            parts.push(text);
+        }
+        for field in [&span.agent_name, &span.tool_name, &span.model] {
+            if let Some(text) = field.as_deref() {
+                parts.push(text);
+            }
+        }
+        for log in &span.logs {
+            parts.push(log);
+        }
+        if !parts.is_empty() {
+            self.bm25
+                .index_text(span.trace_id, span.span_id, &parts.join(" "));
+        }
+    }
+
+    fn load_seg_key_bloom_segments(&self, manifest: &Manifest) -> bool {
+        let Some(path) = &self.seg_key_bloom_path else {
+            return false;
+        };
+        let Some(blooms) = load_seg_key_bloom_cache(
+            path,
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+            manifest,
+        ) else {
+            return false;
+        };
+        let count = blooms.len();
+        *self.seg_key_bloom.lock().unwrap() = blooms;
+        olog::log(
+            olog::Level::Info,
+            "segment_bloom_cache_load",
+            &[
+                ("segments", &count),
+                ("version", &manifest.version.get()),
+                ("watermark", &manifest.memtable_watermark.get()),
+            ],
+        );
+        true
+    }
+
+    fn persist_seg_key_bloom_segments(&self) {
+        let Some(path) = &self.seg_key_bloom_path else {
+            return;
+        };
+        if *self.segment_scan_indexes_stale.lock().unwrap() {
+            return;
+        }
+        let manifest = self.current.manifest();
+        let blooms = self.seg_key_bloom.lock().unwrap();
+        if let Err(err) = save_seg_key_bloom_cache(
+            path,
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+            &manifest,
+            &blooms,
+        ) {
+            olog::log(
+                olog::Level::Warn,
+                "segment_bloom_cache_save_failed",
+                &[("error", &err.to_string())],
+            );
+        }
+    }
+
     fn persist_filter_attrs_segments(&self) {
         let Some(path) = &self.filter_attrs_path else {
             return;
@@ -207,6 +337,8 @@ impl WriteCoordinator {
     fn persist_read_model_sidecars(&self) {
         self.persist_trace_rollup_segments();
         self.persist_filter_attrs_segments();
+        self.persist_bm25_segments();
+        self.persist_seg_key_bloom_segments();
     }
 
     fn filter_candidate_span_keys(&self, filter: &SearchFilter) -> HashSet<(u64, u64)> {
@@ -214,5 +346,121 @@ impl WriteCoordinator {
             .lock()
             .unwrap()
             .candidate_span_keys(filter)
+    }
+}
+
+fn save_seg_key_bloom_cache(
+    path: &std::path::Path,
+    manifest_version: u64,
+    memtable_watermark: u64,
+    manifest: &Manifest,
+    blooms: &HashMap<u64, Arc<KeyBloom>>,
+) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut out = Vec::new();
+    sidecar_put_u32(&mut out, SEG_BLOOM_CACHE_MAGIC);
+    sidecar_put_u32(&mut out, SEG_BLOOM_CACHE_VERSION);
+    sidecar_put_u64(&mut out, manifest_version);
+    sidecar_put_u64(&mut out, memtable_watermark);
+    sidecar_put_u64(&mut out, manifest.segments.len() as u64);
+    for &seg_id in manifest.segments.keys() {
+        let Some(bloom) = blooms.get(&seg_id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing segment bloom for segment {seg_id}"),
+            ));
+        };
+        sidecar_put_u64(&mut out, seg_id);
+        sidecar_put_u32(&mut out, bloom.k);
+        sidecar_put_u64(&mut out, bloom.bits.len() as u64);
+        for &word in &bloom.bits {
+            sidecar_put_u64(&mut out, word);
+        }
+    }
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut file, &out)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)
+}
+
+fn load_seg_key_bloom_cache(
+    path: &std::path::Path,
+    manifest_version: u64,
+    memtable_watermark: u64,
+    manifest: &Manifest,
+) -> Option<HashMap<u64, Arc<KeyBloom>>> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut cur = SidecarCursor { bytes: &bytes, pos: 0 };
+    if cur.u32()? != SEG_BLOOM_CACHE_MAGIC || cur.u32()? != SEG_BLOOM_CACHE_VERSION {
+        return None;
+    }
+    if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
+        return None;
+    }
+    let count = cur.u64()? as usize;
+    let mut out = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let seg_id = cur.u64()?;
+        let k = cur.u32()?;
+        let bit_words = cur.u64()? as usize;
+        let mut bits = Vec::with_capacity(bit_words);
+        for _ in 0..bit_words {
+            bits.push(cur.u64()?);
+        }
+        let bloom = KeyBloom::from_bits(bits, k)?;
+        out.insert(seg_id, Arc::new(bloom));
+    }
+    if cur.pos != bytes.len() || out.len() != manifest.segments.len() {
+        return None;
+    }
+    if manifest
+        .segments
+        .keys()
+        .any(|seg_id| !out.contains_key(seg_id))
+    {
+        return None;
+    }
+    Some(out)
+}
+
+fn sidecar_put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn sidecar_put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+struct SidecarCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SidecarCursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
+        Some(out)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(self.take(4)?);
+        Some(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        Some(u64::from_le_bytes(b))
     }
 }

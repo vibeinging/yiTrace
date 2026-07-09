@@ -267,11 +267,7 @@ impl EngineJsonApi {
         let f = field(v, "filter").unwrap_or(v);
         let mut q = TraceQuery::all();
         q.tenant_id = tenant;
-        if let Some(trace_id) =
-            json_field_alias(f, &["trace_id", "traceId"]).and_then(json_id_or_hash)
-        {
-            q.trace_id = Some(trace_id);
-        }
+        let trace_id_value = json_field_alias(f, &["trace_id", "traceId"]);
         if let Some(from) =
             json_field_alias(f, &["time_from", "timeFrom", "createdFrom"]).and_then(Json::as_i64)
         {
@@ -287,7 +283,8 @@ impl EngineJsonApi {
             span_id: json_field_alias(f, &["span_id", "spanId"]).and_then(json_id_or_hash),
             external_trace_id: json_field_alias(f, &["external_trace_id", "externalTraceId"])
                 .and_then(Json::as_str)
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| trace_id_value.and_then(json_id_text)),
             external_span_id: json_field_alias(f, &["external_span_id", "externalSpanId"])
                 .and_then(Json::as_str)
                 .map(str::to_string),
@@ -321,6 +318,7 @@ impl EngineJsonApi {
             .to_string();
         let index_filter = SearchFilter {
             trace_id: q.trace_id,
+            external_trace_id: spec.external_trace_id.clone(),
             agent_name: spec.agent_name.clone(),
             tool_name: spec.tool_name.clone(),
             model: spec.model.clone(),
@@ -355,6 +353,26 @@ impl EngineJsonApi {
     ) -> Result<TraceSearchRead, String> {
         let v = crate::wire::parse(body)?;
         let parsed = self.parse_trace_search_value(&v, tenant);
+        if parsed.spec.text.is_none() {
+            if let Some((spans, mut read_plan)) = self
+                .coord
+                .trace_aggregate_rollup_spans(&parsed.query, &parsed.index_filter)
+            {
+                let spans = spans
+                    .into_iter()
+                    .filter(|span| trace_search_matches(span, &parsed.spec))
+                    .collect::<Vec<_>>();
+                read_plan.source = Some("trajectory_rollup".to_string());
+                read_plan.matched_spans = spans.len();
+                return Ok(TraceSearchRead {
+                    spans,
+                    read_plan,
+                    cursor: parsed.cursor,
+                    limit: parsed.limit,
+                    sort_by: parsed.sort_by,
+                });
+            }
+        }
         let snap = self.coord.pin_snapshot();
         let (spans, mut read_plan) = self.coord.read_spans_query_indexed(
             &snap,

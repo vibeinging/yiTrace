@@ -143,6 +143,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(FoldedSpan, f32)> {
+        self.ensure_segment_scan_indexes_current();
         let mut cands = self.bm25.search(query, k.max(50));
         cands.retain(|&(t, s, _)| filter(t, s));
         cands.truncate(k);
@@ -195,6 +196,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(FoldedSpan, f32)> {
+        self.ensure_segment_scan_indexes_current();
         let pool = k.max(10);
         let mut bm = self.bm25.search(text, pool);
         bm.retain(|&(t, s, _)| filter(t, s)); // 关键词侧：后置过滤
@@ -255,6 +257,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
+        self.ensure_segment_scan_indexes_current();
         let cands = self.with_filter_pred(filter, |pred| {
             let mut c = self.bm25.search(query, k.max(50));
             c.retain(|&(t, s, _)| pred(t, s));
@@ -273,6 +276,7 @@ impl WriteCoordinator {
         k: usize,
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
+        self.ensure_segment_scan_indexes_current();
         let pool = k.max(10);
         let (bm, vec) = self.with_filter_pred(filter, |pred| {
             let mut bm = self.bm25.search(text, pool);
@@ -294,6 +298,11 @@ impl WriteCoordinator {
     /// 把检索候选 (trace, span, 分) join 上「在快照里折叠出的完整 span」，保持检索的排序。
     /// **只折叠命中行**：把候选 key 集喂给 `fold_query`，不折叠全库（大数据下检索不再为几条命中折叠整库）。
     fn join_folded(&self, snap: &Snapshot, cands: Vec<(u64, u64, f32)>) -> Vec<(FoldedSpan, f32)> {
+        let mut seen = std::collections::HashSet::new();
+        let cands: Vec<(u64, u64, f32)> = cands
+            .into_iter()
+            .filter(|(t, s, _)| seen.insert((*t, *s)))
+            .collect();
         let keys: std::collections::HashSet<(u64, u64)> =
             cands.iter().map(|&(t, s, _)| (t, s)).collect();
         // 检索结果要展示原文（命中片段），读全列。

@@ -267,7 +267,7 @@ fn trace_search_aggregate_and_storage_stats_are_tenant_scoped() {
     assert_contains(&storage, r#""traceCount":2"#);
     assert_contains(&storage, r#""spanCount":2"#);
     assert_contains(&storage, r#""estimatedBytes":"#);
-    assert_contains(&storage, r#""readPlan":{"source":"filter_index""#);
+    assert_contains(&storage, r#""readPlan":{"source":"trajectory_rollup""#);
 
     let (status, hidden) = api.route_with_tenant("POST", "/v1/trace-search", search_body, Some(2));
     assert_eq!(status, 200, "{hidden}");
@@ -451,7 +451,10 @@ fn durable_reopen_preserves_searchable_trace() {
         let (status, indexed_search) =
             api.route_with_tenant("POST", "/v1/trace-search", search_body, Some(880));
         assert_eq!(status, 200, "{indexed_search}");
-        assert_contains(&indexed_search, r#""readPlan":{"source":"filter_index""#);
+        assert_contains(
+            &indexed_search,
+            r#""readPlan":{"source":"trajectory_rollup""#,
+        );
         assert_contains(&indexed_search, r#""candidateSpanKeys":1"#);
         assert_contains(&indexed_search, r#""total":1"#);
     }
@@ -481,7 +484,10 @@ fn durable_reopen_preserves_searchable_trace() {
         let (status, indexed_search) =
             api.route_with_tenant("POST", "/v1/trace-search", search_body, Some(880));
         assert_eq!(status, 200, "{indexed_search}");
-        assert_contains(&indexed_search, r#""readPlan":{"source":"filter_index""#);
+        assert_contains(
+            &indexed_search,
+            r#""readPlan":{"source":"trajectory_rollup""#,
+        );
         assert_contains(&indexed_search, r#""total":1"#);
     }
     let _ = std::fs::remove_dir_all(dir);

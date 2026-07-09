@@ -137,6 +137,51 @@ console.log(page.readPlan?.source, page.readPlan?.candidateSpanKeys);
 await db.close();
 ```
 
+Semantic / hybrid search is opt-in. Pass an embedder when opening the DB, then
+explicitly choose `mode: "semantic"` or `mode: "hybrid"` for query-time
+embedding. Plain `search({ text })` stays BM25-only and does not call the model.
+
+```ts
+const db = await YiTraceDB.open({
+  dataDir: "./data",
+  embedder: {
+    model: "your-embedding-model",
+    dimensions: 1536,
+    embedQuery: async (text) => {
+      // Call OpenAI, a local model, or your own embedding service here.
+      return vector;
+    },
+    embedDocuments: async (texts) => {
+      return vectors;
+    },
+  },
+});
+
+await db.ingest(events);
+await db.indexEmbeddings([
+  { traceId: "run-uuid", spanId: "span-uuid", text: "疑似盗刷订单 建议人工复核" },
+]);
+
+const semantic = await db.search({ text: "相似的风控失败", mode: "semantic", k: 10 });
+const hybrid = await db.search({ text: "盗刷", mode: "hybrid", k: 10 });
+```
+
+Use cases:
+
+- Use `search({ text })` for cheap keyword/BM25 search. It never calls the embedder.
+- Use `search({ text, mode: "semantic" })` for vector-only search from query text.
+- Use `search({ text, mode: "hybrid" })` or `vector: "auto"` for BM25 + vector fusion.
+- Use `search({ vector })` when the caller already has a query vector.
+- Use `indexEmbedding({ traceId, spanId, vector })` when the caller already has a span vector.
+- Use `indexEmbeddings([{ traceId, spanId, text }])` to batch document embedding through the configured embedder.
+- Use `ingest(events, { indexEmbeddings: true })` only when the ingest path is allowed to wait for embedding calls. The default is off so trace ingestion is not blocked by model latency.
+
+Do not mix different embedding models or dimensions in the same data dir. The
+wrapper validates vector dimensions in the current process, and the disk graph
+also rejects wrong dimensions, but same-dimension different-model vectors are a
+caller-level contract. Index finalized span text once where possible; repeated
+indexing of the same span is accepted, but it adds extra graph nodes.
+
 `traceSearch` / `traceAggregate` / `storageStats` / `traceTrajectories` / `trajectoryGroups` /
 `loops` / `loop` / `taskTraces` return `readPlan`. `source: "filter_index"` means the query
 first used the attrs sidecar postings to narrow span keys. Postings are memory-budgeted:
@@ -149,6 +194,11 @@ filter only contains `text` or unknown attrs.
 persistent data dirs write a `trace_rollup.dat` segment cache, and reopen recovery loads it before
 replaying the WAL tail. The cache is disposable: deletes, retention apply, segment upgrades, stale
 versions, or corrupt cache contents rebuild it from the current snapshot.
+Persistent data dirs also write `bm25.dat` and `segment_bloom.dat`. When all four caches
+(`trace_rollup.dat`, `filter_attrs.dat`, `bm25.dat`, `segment_bloom.dat`) match the manifest,
+reopen recovery does not scan historical segments, and the first text / hybrid search does not
+do a catch-up segment scan. If the BM25 or bloom cache is missing, only the first text / hybrid
+search rebuilds those derived indexes.
 Trajectory, loop, and task helpers can return `source: "trajectory_rollup"` for no-text path
 summaries and reuse the same `trace_rollup.dat` cache after reopen. When those helpers expand
 complete traces after finding candidates, `readPlan.traceFetchSource` shows whether that second
@@ -200,12 +250,14 @@ Do not share one `dataDir` across machines or unreliable network filesystems.
 For multi-host deployments, run one yiTrace server process and send trace data
 over HTTP.
 
-String IDs are supported for direct `db.ingest()`. yiTrace keeps an internal
-stable `u64` hash for indexing and stores the original values in
-`external_trace_id`, `external_span_id`, `external_parent_span_id`, and
-`external_session_id`. You can query with either numeric IDs or the original
-string IDs. `attrs` is persisted through the engine and returned as JSON on
-search, trace, and span detail responses.
+IDs passed to `db.ingest()` are treated as business IDs, whether they are JSON
+strings or numbers. yiTrace keeps internal numeric IDs for indexing and stores
+the original values in `external_trace_id`, `external_span_id`,
+`external_parent_span_id`, and `external_session_id`. For public queries,
+`filter.traceId: "business-run-id"` and `filter.traceId: 123456` are both
+treated as external trace IDs and use the filter sidecar fast path. `attrs` is
+persisted through the engine and returned as JSON on search, trace, and span
+detail responses.
 
 Trace and span detail responses also return raw `logEvents`, so applications do
 not need to mirror log lines into `attrs.event_logs`. Each event keeps its

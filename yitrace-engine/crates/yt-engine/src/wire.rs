@@ -128,9 +128,9 @@ fn json_escape(s: &str) -> String {
 
 fn parse_id_value(v: &Json) -> Option<(u64, Option<String>)> {
     match v {
-        Json::Num(s) => s.parse::<u64>().ok().map(|id| (id, None)),
+        Json::Num(s) => s.parse::<u64>().ok().map(|id| (id, Some(s.clone()))),
         Json::Str(s) => match s.parse::<u64>() {
-            Ok(id) => Some((id, None)),
+            Ok(id) => Some((id, Some(s.clone()))),
             Err(_) => Some((fnv1a64(s.as_bytes()), Some(s.clone()))),
         },
         _ => None,
@@ -406,6 +406,12 @@ mod tests {
         let recs = parse_wire_batch(ts_json).unwrap();
         assert_eq!(recs[0].trace_id, 855355598420578304);
         assert_eq!(recs[0].parent_span_id, Some(5));
+        assert_eq!(
+            recs[0].external_trace_id.as_deref(),
+            Some("855355598420578304")
+        );
+        assert_eq!(recs[0].external_span_id.as_deref(), Some("5"));
+        assert_eq!(recs[0].external_parent_span_id.as_deref(), Some("5"));
         assert_eq!(recs[0].duration_ns, Some(9000));
         assert_eq!(recs[0].input_tokens, Some(1200));
     }

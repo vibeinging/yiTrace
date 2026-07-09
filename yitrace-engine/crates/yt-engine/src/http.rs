@@ -429,7 +429,12 @@ impl EngineJsonApi {
             .unwrap_or_default();
         let mut filter = crate::SearchFilter::default();
         if let Some(f) = field(&v, "filter") {
-            filter.trace_id = field(f, "trace_id").and_then(json_id_or_hash);
+            let trace_id_value = json_field_alias(f, &["trace_id", "traceId"]);
+            filter.external_trace_id =
+                json_field_alias(f, &["external_trace_id", "externalTraceId"])
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+                    .or_else(|| trace_id_value.and_then(json_id_text));
             filter.agent_name = field(f, "agent_name")
                 .and_then(Json::as_str)
                 .map(|s| s.to_string());

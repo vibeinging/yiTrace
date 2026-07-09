@@ -16,12 +16,16 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::Bm25Index;
 
 const K1: f32 = 1.5;
 const B: f32 = 0.75;
+const CACHE_MAGIC: u32 = 0x5954_424d; // "YTBM"
+const CACHE_VERSION: u32 = 1;
 
 /// f32 全序包装（NaN 也定序），WAND 的 top-k 阈值堆用。
 #[derive(Clone, Copy, PartialEq)]
@@ -359,6 +363,38 @@ impl Bm25Index for Bm25TextIndex {
     fn clear(&self) {
         *self.state.lock().unwrap() = Bm25State::default();
     }
+
+    fn load_cache(&self, path: &Path, manifest_version: u64, memtable_watermark: u64) -> bool {
+        let Some(state) = Bm25State::load_cache(path, manifest_version, memtable_watermark) else {
+            return false;
+        };
+        *self.state.lock().unwrap() = state;
+        true
+    }
+
+    fn save_cache(
+        &self,
+        path: &Path,
+        manifest_version: u64,
+        memtable_watermark: u64,
+    ) -> std::io::Result<bool> {
+        let Some(parent) = path.parent() else {
+            return Ok(true);
+        };
+        std::fs::create_dir_all(parent)?;
+        let bytes = self
+            .state
+            .lock()
+            .unwrap()
+            .encode_cache(manifest_version, memtable_watermark);
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(tmp, path)?;
+        Ok(true)
+    }
 }
 
 impl Bm25TextIndex {
@@ -396,6 +432,178 @@ impl Bm25TextIndex {
         });
         scored.truncate(k);
         scored
+    }
+}
+
+impl Bm25State {
+    fn encode_cache(&mut self, manifest_version: u64, memtable_watermark: u64) -> Vec<u8> {
+        self.ensure_sorted();
+        let mut out = Vec::new();
+        put_u32(&mut out, CACHE_MAGIC);
+        put_u32(&mut out, CACHE_VERSION);
+        put_u64(&mut out, manifest_version);
+        put_u64(&mut out, memtable_watermark);
+        put_u64(&mut out, self.total_len);
+
+        let mut docs: Vec<((u64, u64), u32)> =
+            self.doc_len.iter().map(|(&doc, &len)| (doc, len)).collect();
+        docs.sort_unstable_by_key(|&(doc, _)| doc);
+        put_u64(&mut out, docs.len() as u64);
+        for ((trace_id, span_id), len) in docs {
+            put_u64(&mut out, trace_id);
+            put_u64(&mut out, span_id);
+            put_u32(&mut out, len);
+        }
+
+        let mut tokens: Vec<&String> = self.postings.keys().collect();
+        tokens.sort_unstable();
+        put_u64(&mut out, tokens.len() as u64);
+        for token in tokens {
+            put_string(&mut out, token);
+            let mut postings: Vec<((u64, u64), u32)> = self.postings[token]
+                .iter()
+                .map(|(&doc, &tf)| (doc, tf))
+                .collect();
+            postings.sort_unstable_by_key(|&(doc, _)| doc);
+            put_u64(&mut out, postings.len() as u64);
+            for ((trace_id, span_id), tf) in postings {
+                put_u64(&mut out, trace_id);
+                put_u64(&mut out, span_id);
+                put_u32(&mut out, tf);
+            }
+        }
+        out
+    }
+
+    fn load_cache(path: &Path, manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        Self::decode_cache(&bytes, manifest_version, memtable_watermark)
+    }
+
+    fn decode_cache(bytes: &[u8], manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
+        let mut cur = CacheCursor { bytes, pos: 0 };
+        if cur.u32()? != CACHE_MAGIC || cur.u32()? != CACHE_VERSION {
+            return None;
+        }
+        if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
+            return None;
+        }
+        let total_len = cur.u64()?;
+        let doc_count = cur.u64()? as usize;
+        let mut doc_len = HashMap::with_capacity(doc_count);
+        for _ in 0..doc_count {
+            let trace_id = cur.u64()?;
+            let span_id = cur.u64()?;
+            let len = cur.u32()?;
+            doc_len.insert((trace_id, span_id), len);
+        }
+
+        let token_count = cur.u64()? as usize;
+        let mut postings: HashMap<String, HashMap<(u64, u64), u32>> =
+            HashMap::with_capacity(token_count);
+        let mut sorted: HashMap<String, Postings> = HashMap::with_capacity(token_count);
+        for _ in 0..token_count {
+            let token = cur.string()?;
+            let posting_count = cur.u64()? as usize;
+            let mut map = HashMap::with_capacity(posting_count);
+            let mut docs = Vec::with_capacity(posting_count);
+            for _ in 0..posting_count {
+                let trace_id = cur.u64()?;
+                let span_id = cur.u64()?;
+                let tf = cur.u32()?;
+                let doc = (trace_id, span_id);
+                if !doc_len.contains_key(&doc) {
+                    return None;
+                }
+                map.insert(doc, tf);
+                docs.push((doc, tf));
+            }
+            docs.sort_unstable_by_key(|&(doc, _)| doc);
+            let blocks = build_blocks(&docs, &doc_len)?;
+            sorted.insert(token.clone(), Postings { docs, blocks });
+            postings.insert(token, map);
+        }
+        if cur.pos != bytes.len() {
+            return None;
+        }
+        Some(Self {
+            postings,
+            doc_len,
+            total_len,
+            sorted,
+            dirty: false,
+        })
+    }
+}
+
+fn build_blocks(
+    docs: &[((u64, u64), u32)],
+    doc_len: &HashMap<(u64, u64), u32>,
+) -> Option<Vec<BlockMeta>> {
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < docs.len() {
+        let end = (i + BLOCK_SIZE).min(docs.len());
+        let mut max_tf = 0u32;
+        let mut min_dl = u32::MAX;
+        for &(doc, tf) in &docs[i..end] {
+            max_tf = max_tf.max(tf);
+            min_dl = min_dl.min(*doc_len.get(&doc)?);
+        }
+        blocks.push(BlockMeta {
+            end,
+            max_tf,
+            min_dl,
+        });
+        i = end;
+    }
+    Some(blocks)
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(out: &mut Vec<u8>, value: &str) {
+    put_u64(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+struct CacheCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CacheCursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        let out = &self.bytes[self.pos..end];
+        self.pos = end;
+        Some(out)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(self.take(4)?);
+        Some(u32::from_le_bytes(b))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(self.take(8)?);
+        Some(u64::from_le_bytes(b))
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let len = self.u64()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).ok()
     }
 }
 
@@ -522,5 +730,37 @@ mod tests {
         bg.index_text(1, 1, "盗刷 风控");
         bg.index_text(2, 2, "盗刷风控");
         assert_eq!(bg.search("风控", 10).len(), 2, "bigram 下两条都含 风控");
+    }
+
+    #[test]
+    fn bm25_cache_roundtrip_preserves_results() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_cache_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+
+        let bm = Bm25TextIndex::new();
+        bm.index_text(1, 10, "风控系统拦截疑似盗刷");
+        bm.index_text(2, 20, "正常登录完成转账");
+        bm.index_text(3, 30, "疑似盗刷需要人工复核");
+        let before = bm.search("盗刷 风控", 10);
+        assert!(bm.save_cache(&path, 7, 3).unwrap());
+
+        let loaded = Bm25TextIndex::new();
+        assert!(loaded.load_cache(&path, 7, 3));
+        assert_eq!(loaded.search("盗刷 风控", 10), before);
+        assert!(
+            !loaded.load_cache(&path, 8, 3),
+            "manifest version mismatch must reject stale cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

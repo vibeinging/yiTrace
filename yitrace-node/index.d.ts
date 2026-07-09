@@ -1,13 +1,35 @@
 export type TenantId = string | number;
 export type WireNumber = number | string;
+export type EmbeddingVector = ReadonlyArray<number> | Float32Array | Float64Array;
+export type EmbedText = (text: string) => EmbeddingVector | Promise<EmbeddingVector>;
+
+export interface Embedder {
+  model?: string;
+  dimensions?: number;
+  dimension?: number;
+  dim?: number;
+  embedQuery?: EmbedText;
+  embed?: EmbedText;
+  embedDocuments?: (texts: string[]) => EmbeddingVector[] | Promise<EmbeddingVector[]>;
+  embedBatch?: (texts: string[]) => EmbeddingVector[] | Promise<EmbeddingVector[]>;
+}
 
 export interface OpenOptions {
   dataDir: string;
   tenantId?: TenantId;
+  embedder?: Embedder | EmbedText;
+  embedding?: Embedder | EmbedText;
+  dimensions?: number;
+  embeddingDimensions?: number;
+  autoIndexEmbeddings?: boolean;
 }
 
 export interface TenantOptions {
   tenantId?: TenantId;
+}
+
+export interface IngestOptions extends TenantOptions {
+  indexEmbeddings?: boolean;
 }
 
 export type TraceAttrKey =
@@ -113,10 +135,34 @@ export interface SearchFilter {
 
 export interface SearchQuery {
   text?: string;
-  vector?: number[];
+  q?: string;
+  vector?: EmbeddingVector | "auto" | true;
+  mode?: "bm25" | "keyword" | "semantic" | "vector" | "hybrid" | string;
+  searchMode?: "bm25" | "keyword" | "semantic" | "vector" | "hybrid" | string;
+  hybrid?: boolean;
+  semantic?: boolean;
   k?: number;
   filter?: SearchFilter;
   [key: string]: unknown;
+}
+
+export interface EmbeddingInput {
+  traceId?: TenantId;
+  trace_id?: TenantId;
+  spanId?: TenantId;
+  span_id?: TenantId;
+  text?: string;
+  inputText?: string;
+  input_text?: string;
+  outputText?: string;
+  output_text?: string;
+  vector?: EmbeddingVector | "auto";
+  embedding?: EmbeddingVector | "auto";
+  [key: string]: unknown;
+}
+
+export interface IndexEmbeddingsResult {
+  indexed: number;
 }
 
 export interface TraceSearchQuery {
@@ -553,7 +599,7 @@ export declare class SpanEventBuilder {
   endSpan(options: SpanBuilderEventOptions): SpanEvent;
   events(): SpanEvent[];
   clear(): void;
-  ingest(db: YiTraceDB, options?: TenantOptions): Promise<IngestResult>;
+  ingest(db: YiTraceDB, options?: IngestOptions): Promise<IngestResult>;
 }
 
 export declare function createSpanEventBuilder(defaults?: SpanBuilderDefaults): SpanEventBuilder;
@@ -561,9 +607,11 @@ export declare function createSpanEventBuilder(defaults?: SpanBuilderDefaults): 
 export declare class YiTraceDB {
   static open(pathOrOptions: string | OpenOptions): Promise<YiTraceDB>;
 
-  ingest(events: SpanEvent[], options?: TenantOptions): Promise<IngestResult>;
+  ingest(events: SpanEvent[], options?: IngestOptions): Promise<IngestResult>;
   ingestOtlp(body: unknown, options?: TenantOptions): Promise<IngestResult>;
   search<T = SearchHit>(query?: SearchQuery, options?: TenantOptions): Promise<T[]>;
+  indexEmbedding(input: EmbeddingInput, options?: TenantOptions): Promise<IndexEmbeddingsResult>;
+  indexEmbeddings(items: EmbeddingInput[], options?: TenantOptions): Promise<IndexEmbeddingsResult>;
   traceSearch<T = Record<string, unknown>>(query?: TraceSearchQuery, options?: TenantOptions): Promise<TraceSearchPage<T>>;
   traceAggregate<T = Record<string, unknown>>(query?: TraceAggregateQuery, options?: TenantOptions): Promise<TraceAggregateResult<T>>;
   storageStats<T = Record<string, unknown>>(query?: TraceAggregateQuery, options?: TenantOptions): Promise<StorageStatsResult<T>>;

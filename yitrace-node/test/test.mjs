@@ -5,6 +5,13 @@ import { join } from "node:path";
 
 import { YiTraceDB, createSpanEventBuilder } from "../index.js";
 
+function vectorForText(text) {
+  const lower = String(text).toLowerCase();
+  if (lower.includes("manual")) return [1, 0];
+  if (lower.includes("target") || lower.includes("needle")) return [0, 0];
+  return [9, 0];
+}
+
 const dir = await mkdtemp(join(tmpdir(), "yitrace-node-"));
 
 try {
@@ -64,6 +71,77 @@ try {
   assert.ok(hits.some((hit) => hit.trace_id === 1));
   assert.ok(hits.some((hit) => hit.external_trace_id === "multi-node-second"));
 
+  let queryEmbeddingCalls = 0;
+  let documentEmbeddingCalls = 0;
+  const embeddingDb = await YiTraceDB.open({
+    dataDir: join(dir, "embedding"),
+    tenantId: 1,
+    embedder: {
+      dimensions: 2,
+      embedQuery: async (text) => {
+        queryEmbeddingCalls += 1;
+        return vectorForText(text);
+      },
+      embedDocuments: async (texts) => {
+        documentEmbeddingCalls += 1;
+        return texts.map(vectorForText);
+      },
+    },
+  });
+  await embeddingDb.ingest(
+    [
+      {
+        trace_id: "embed-target",
+        span_id: "embed-span",
+        ts: 160,
+        seq: 1,
+        event_type: 2,
+        ext_span_id: "embed-span",
+        input_text: "semantic target span",
+      },
+      {
+        trace_id: "embed-far",
+        span_id: "embed-far-span",
+        ts: 161,
+        seq: 1,
+        event_type: 2,
+        ext_span_id: "embed-far-span",
+        input_text: "unrelated span",
+      },
+    ],
+    { indexEmbeddings: true },
+  );
+  assert.equal(documentEmbeddingCalls, 1, "ingest({ indexEmbeddings: true }) should batch document embeddings");
+  queryEmbeddingCalls = 0;
+  await embeddingDb.search({ text: "needle", k: 3 });
+  assert.equal(queryEmbeddingCalls, 0, "plain text search must stay BM25-only and avoid embedding cost");
+  const semanticHits = await embeddingDb.search({ text: "needle", mode: "semantic", k: 3 });
+  assert.equal(queryEmbeddingCalls, 1);
+  assert.equal(semanticHits[0].external_trace_id, "embed-target");
+  const hybridHits = await embeddingDb.search({ text: "target", mode: "hybrid", k: 3 });
+  assert.equal(hybridHits[0].external_trace_id, "embed-target");
+
+  await embeddingDb.ingest([
+    {
+      trace_id: "manual-embed",
+      span_id: "manual-span",
+      ts: 162,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "manual-span",
+      input_text: "manual vector span",
+    },
+  ]);
+  const indexed = await embeddingDb.indexEmbeddings([{ traceId: "manual-embed", spanId: "manual-span", text: "manual vector span" }]);
+  assert.equal(indexed.indexed, 1);
+  const manualHits = await embeddingDb.search({ text: "manual query", mode: "semantic", k: 3 });
+  assert.equal(manualHits[0].external_trace_id, "manual-embed");
+  await assert.rejects(
+    () => embeddingDb.indexEmbedding({ traceId: "bad-dim", spanId: "bad-dim-span", vector: [1, 2, 3] }),
+    /dimension 3 does not match expected 2/,
+  );
+  await embeddingDb.close();
+
   const traces = await db.traces();
   assert.ok(traces.some((trace) => trace.trace_id === 1));
 
@@ -97,6 +175,20 @@ try {
         call_site: "worker.ts:10",
       },
     },
+    {
+      trace_id: "123456",
+      span_id: "numeric-business-span",
+      ts: 220,
+      seq: 1,
+      event_type: 2,
+      ext_span_id: "numeric-business-span",
+      status: 0,
+      input_text: "数字字符串业务主键",
+      attrs: {
+        project_id: "agentic-data",
+        skill: "review",
+      },
+    },
   ]);
 
   const uuidHits = await db.search({ text: "外部", k: 10, filter: { traceId: "run-uuid" } });
@@ -113,6 +205,24 @@ try {
   const uuidSpan = await db.span("run-uuid", "span-uuid");
   assert.equal(uuidSpan.externalSpanId, "span-uuid");
   assert.equal(uuidSpan.attrs.skill, "review");
+
+  const numericBusinessTrace = await db.traceSearch({
+    filter: { traceId: "123456" },
+    limit: 1,
+  });
+  assert.equal(numericBusinessTrace.total, 1);
+  assert.equal(numericBusinessTrace.items[0].externalTraceId, "123456");
+  assert.equal(numericBusinessTrace.readPlan.usedFilterIndex, true);
+  assert.equal(numericBusinessTrace.readPlan.candidateSpanKeys, 1);
+
+  const numericBusinessTraceFromNumber = await db.traceSearch({
+    filter: { traceId: 123456 },
+    limit: 1,
+  });
+  assert.equal(numericBusinessTraceFromNumber.total, 1);
+  assert.equal(numericBusinessTraceFromNumber.items[0].externalTraceId, "123456");
+  assert.equal(numericBusinessTraceFromNumber.readPlan.usedFilterIndex, true);
+  assert.equal(numericBusinessTraceFromNumber.readPlan.candidateSpanKeys, 1);
 
   const builder = createSpanEventBuilder({
     traceId: "builder-run",
@@ -138,6 +248,9 @@ try {
     builtEvents.map((event) => event.seq),
     [1, 2, 3],
   );
+  assert.equal(builtEvents[0].external_trace_id, "builder-run");
+  assert.equal(builtEvents[0].external_span_id, "builder-span");
+  assert.equal(builtEvents[0].external_session_id, "builder-session");
   await builder.ingest(db);
 
   const attrHits = await db.search({
@@ -165,6 +278,23 @@ try {
   assert.equal(traceSearch.readPlan.source, "filter_index");
   assert.equal(traceSearch.readPlan.usedFilterIndex, true);
   assert.equal(traceSearch.readPlan.candidateSpanKeys, 1);
+
+  const externalRunExists = await db.traceSearch({
+    filter: { externalTraceId: "builder-run" },
+    limit: 1,
+  });
+  assert.equal(externalRunExists.total, 1);
+  assert.equal(externalRunExists.items[0].externalTraceId, "builder-run");
+  assert.equal(externalRunExists.readPlan.usedFilterIndex, true);
+  assert.equal(externalRunExists.readPlan.candidateSpanKeys, 1);
+
+  const externalRunMiss = await db.traceSearch({
+    filter: { externalTraceId: "builder-run-missing" },
+    limit: 1,
+  });
+  assert.equal(externalRunMiss.total, 0);
+  assert.equal(externalRunMiss.readPlan.usedFilterIndex, true);
+  assert.equal(externalRunMiss.readPlan.candidateSpanKeys, 0);
 
   const aggregate = await db.traceAggregate({
     filter: { projectId: "agentic-data" },

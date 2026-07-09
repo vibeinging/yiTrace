@@ -10,7 +10,7 @@ use yt_wal::WalRecord;
 type SpanKey = (u64, u64);
 
 const CACHE_MAGIC: u32 = 0x5954_4641; // "YTFA"
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const DEFAULT_POSTING_ENTRY_BUDGET: usize = 2_000_000;
 const DEFAULT_POSTING_SET_BUDGET: usize = 200_000;
 
@@ -136,6 +136,16 @@ impl FilterAttrsIndex {
                 PostingLookup::Missing => return HashSet::new(),
             }
         }
+        if let Some(external_trace_id) = &filter.external_trace_id {
+            match self.posting_lookup(&PostingKey::new(
+                "external_trace_id",
+                external_trace_id.as_str(),
+            )) {
+                PostingLookup::Resident(set) => sets.push(set),
+                PostingLookup::Disabled => {}
+                PostingLookup::Missing => return HashSet::new(),
+            }
+        }
         if let Some(tenant_id) = filter.tenant_id {
             match self.posting_lookup(&PostingKey::new("tenant_id", tenant_id.to_string())) {
                 PostingLookup::Resident(set) => sets.push(set),
@@ -240,6 +250,12 @@ impl FilterAttrsIndex {
 
     fn add_postings(&mut self, key: SpanKey, row: &FilterAttrs) {
         self.add_posting(PostingKey::new("trace_id", key.0.to_string()), key);
+        if let Some(external_trace_id) = &row.external_trace_id {
+            self.add_posting(
+                PostingKey::new("external_trace_id", external_trace_id.as_str()),
+                key,
+            );
+        }
         if let Some(tenant_id) = row.tenant_id {
             self.add_posting(PostingKey::new("tenant_id", tenant_id.to_string()), key);
         }
@@ -262,6 +278,12 @@ impl FilterAttrsIndex {
 
     fn remove_postings(&mut self, key: SpanKey, row: &FilterAttrs) {
         self.remove_posting(&PostingKey::new("trace_id", key.0.to_string()), key);
+        if let Some(external_trace_id) = &row.external_trace_id {
+            self.remove_posting(
+                &PostingKey::new("external_trace_id", external_trace_id.as_str()),
+                key,
+            );
+        }
         if let Some(tenant_id) = row.tenant_id {
             self.remove_posting(&PostingKey::new("tenant_id", tenant_id.to_string()), key);
         }
@@ -407,6 +429,9 @@ impl FilterAttrs {
     }
 
     fn apply_fields(&mut self, fields: &SpanFields) {
+        if fields.external_trace_id.is_some() {
+            self.external_trace_id = fields.external_trace_id.clone();
+        }
         if fields.status.is_some() {
             self.status = fields.status;
         }
@@ -430,6 +455,7 @@ impl FilterAttrs {
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
+        put_opt_string(out, self.external_trace_id.as_deref());
         put_opt_u8(out, self.status);
         put_opt_string(out, self.agent_name.as_deref());
         put_opt_string(out, self.tool_name.as_deref());
@@ -445,6 +471,7 @@ impl FilterAttrs {
     }
 
     fn decode(cur: &mut CacheCursor<'_>) -> Option<Self> {
+        let external_trace_id = cur.opt_string()?;
         let status = cur.opt_u8()?;
         let agent_name = cur.opt_string()?;
         let tool_name = cur.opt_string()?;
@@ -458,6 +485,7 @@ impl FilterAttrs {
             attrs.insert(cur.string()?, cur.string()?);
         }
         Some(Self {
+            external_trace_id,
             status,
             agent_name,
             tool_name,
@@ -643,6 +671,29 @@ mod tests {
 
         let keys = index.candidate_span_keys(&attr_filter(&[("project_id", "budgeted")]));
         assert_eq!(keys, HashSet::from([(10, 7)]));
+    }
+
+    #[test]
+    fn external_trace_id_posting_supports_fast_positive_and_negative_lookup() {
+        let mut index = FilterAttrsIndex::with_posting_budget(64, 64);
+        let mut first = record(11, 1, "p", "a");
+        first.fields.external_trace_id = Some("run-a".to_string());
+        let mut second = record(12, 1, "p", "b");
+        second.fields.external_trace_id = Some("run-b".to_string());
+        index.apply_record(&first);
+        index.apply_record(&second);
+
+        let hit = index.candidate_span_keys(&SearchFilter {
+            external_trace_id: Some("run-a".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(hit, HashSet::from([(11, 1)]));
+
+        let miss = index.candidate_span_keys(&SearchFilter {
+            external_trace_id: Some("run-missing".to_string()),
+            ..Default::default()
+        });
+        assert!(miss.is_empty(), "不存在的外部 trace id 应直接空候选");
     }
 
     #[test]

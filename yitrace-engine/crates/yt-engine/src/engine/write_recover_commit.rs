@@ -4,8 +4,10 @@ impl WriteCoordinator {
     /// 重放只取 watermark 之后的记录；即便段与重放有重叠（崩溃窗口里段已落、水位未推进），
     /// 读时的确定性 event_id 去重也保证不重复折叠 —— 这正是「seq 原样持久化、不重补」的意义。
     ///
-    /// 检索索引(BM25/属性边车/向量)是内存态,重启全空,这里一并重建,否则重启后"按内容搜/找相似"返回空:
-    /// - BM25 + 属性边车是**派生数据**：扫持久段(水位之前)+ 重放的 WAL 尾(水位之后)各喂一次,合起来覆盖全部、不重不漏。
+    /// 检索索引(BM25/属性边车/向量)是派生态。重启时优先加载已持久化的缓存：
+    /// - rollup/filter/BM25/bloom 都命中时先快速可用，不扫历史 segment。
+    /// - 只有 BM25 或 bloom 缓存缺失时，首次全文检索才补扫历史 segment。
+    /// - 缓存缺失或段有删除/补写时，再扫持久段(水位之前)+ 重放 WAL 尾(水位之后)重建。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
         let _process = self.acquire_process_lock("write");
@@ -22,8 +24,7 @@ impl WriteCoordinator {
         }
         self.wal.lock().unwrap().refresh_from_disk();
         self.refresh_metadata_from_disk_locked();
-        self.rebuild_volatile_from_current_locked();
-        let seg_count = self.current.manifest().segments.len();
+        let seg_count = self.rebuild_volatile_from_current_locked();
         let wal_count = self.memtable.lock().unwrap().len() as u64;
         let tail = self.current.committed_tail();
         olog::log(
@@ -115,6 +116,8 @@ impl WriteCoordinator {
         self.session_idx.lock().unwrap().dirty = true; // 删除改了段，边车下次读重建
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
+        self.rebuild_bm25_current();
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.persist_read_model_sidecars();
     }
 
@@ -147,6 +150,8 @@ impl WriteCoordinator {
         self.session_idx.lock().unwrap().dirty = true; // 补写改了段，边车下次读重建
         self.rebuild_trace_rollup_current();
         self.rebuild_filter_attrs_current();
+        self.rebuild_bm25_current();
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.persist_read_model_sidecars();
     }
 

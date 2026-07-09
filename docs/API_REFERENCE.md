@@ -39,7 +39,37 @@ yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 No
 3. **应用内需要本地搜索和 trace 详情**：用 `@yitrace/db`、`yitrace-db` Python 包或 Rust crate。
 4. **自己写 UI / 服务**：直接调 `/v1/*`。
 
-alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、annotation/dataset/retention 基座。仍在路线图里的上量项包括 attrs postings 磁盘分页、独立 loop/task/trajectory 索引、百万 span 冷/热性能基线、段内持久 BM25 倒排。
+alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、持久 BM25 缓存、annotation/dataset/retention 基座。`@yitrace/db` 侧已支持外部 embedding 回调：engine 不调用模型，调用方通过 `embedQuery` / `embedDocuments` 生成 vector 后写入或查询；普通 `search({ text })` 不会触发模型调用。仍在路线图里的上量项包括 attrs postings 磁盘分页、独立 loop/task/trajectory 索引、百万 span 冷/热性能基线、BM25 段内分页 postings。
+
+---
+
+## Node embedding 回调
+
+`@yitrace/db` 不内置任何 embedding 模型。调用方在打开本地库时传入回调，yiTrace 只接收回调产出的向量并写入磁盘图索引。
+
+```ts
+const db = await YiTraceDB.open({
+  dataDir: "./data",
+  embedder: {
+    model: "your-embedding-model",
+    dimensions: 1536,
+    embedQuery: async (text) => vector,
+    embedDocuments: async (texts) => vectors,
+  },
+});
+```
+
+使用规则：
+
+- `db.search({ text: "盗刷" })`：只走 BM25，不调用 embedding 回调。
+- `db.search({ text: "相似的失败", mode: "semantic" })`：调用 `embedQuery`，只走向量检索。
+- `db.search({ text: "盗刷", mode: "hybrid" })`：调用 `embedQuery`，走 BM25 + 向量融合。
+- `db.search({ vector })`：调用方已经有 query vector，不调用 embedding 回调。
+- `db.indexEmbedding({ traceId, spanId, vector })`：调用方已经有 span vector，直接写入向量索引。
+- `db.indexEmbeddings([{ traceId, spanId, text }])`：批量调用 `embedDocuments` 后写入向量索引。
+- `db.ingest(events, { indexEmbeddings: true })`：摄入后同步建 span 向量；默认关闭，避免模型延迟、费用或失败阻塞 trace 摄入。
+
+注意：同一个 data dir 不应混用不同 embedding 模型。维度不一致会被 wrapper 和磁盘图索引拒绝；同维度但不同模型只能由调用方通过配置约束。
 
 ---
 
@@ -132,8 +162,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `trace_id` | u64 或 string | 数字会作为内部 id；UUID/字符串会稳定 hash 成内部 `u64`，原文保存在 `external_trace_id` |
-| `span_id` | u64 或 string | 数字会作为内部 id；UUID/字符串会稳定 hash 成内部 `u64`，原文保存在 `external_span_id` |
+| `trace_id` | u64 或 string | 外部业务主键；原文保留到 `external_trace_id`，内部 id 用可解析数字或稳定 hash |
+| `span_id` | u64 或 string | 外部业务主键；原文保留到 `external_span_id`，内部 id 用可解析数字或稳定 hash |
 | `ts` | i64 | 纳秒时间戳 |
 | `seq` | u32 | 同一 span 内的事件序号（去重键的一部分） |
 | `event_type` | u8 | **1=SpanStart，2=SpanEnd**，3+=属性补写/日志 |
@@ -292,7 +322,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ## 单机读模型 API（原始 API，camelCase 响应）
 
-这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时会禁用对应 postings，并回退扫描 sidecar 行，保证结果不丢。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`；重启时先加载缓存，再叠加 WAL tail。缓存不是数据源，删掉、损坏或版本不匹配都会自动扫描 segment 重建。带 `text` 的聚合和路径查询仍会回到正确扫描。把 postings 做成按需分页的磁盘 buffer manager、以及 loop/task 独立磁盘索引仍是后续优化。
+这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`external_trace_id`、`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时会禁用对应 postings，并回退扫描 sidecar 行，保证结果不丢。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`，把全文倒排和段 key bloom 写成 `bm25.dat`、`segment_bloom.dat`；重启时先加载缓存，再叠加 WAL tail。四份缓存命中且没有 delete/upgrade 脏段时，recover 不扫历史 segment，第一次全文检索也不补扫。只有 `bm25.dat` 或 `segment_bloom.dat` 缺失时，全文检索首次使用才补建段扫描索引。缓存不是数据源，删掉、损坏或版本不匹配都会自动扫描 segment 重建。带 `text` 的聚合和路径查询仍会回到正确扫描。把 postings 做成按需分页的磁盘 buffer manager、以及 loop/task 独立磁盘索引仍是后续优化。
 
 ### POST /v1/trace-search  —— 结构化 span 搜索
 
@@ -318,10 +348,10 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 | 字段 | 说明 |
 |---|---|
-| `filter.traceId` / `trace_id` | 内部数字 id 或外部字符串 id |
+| `filter.traceId` / `trace_id` | 外部业务 trace id，number/string 都按业务主键精确匹配 |
 | `filter.spanId` / `span_id` | 内部数字 id 或外部字符串 id |
 | `filter.sessionId` / `session_id` | 内部数字 id 或外部字符串 id |
-| `filter.externalTraceId` / `external_trace_id` | 外部 trace id 精确匹配 |
+| `filter.externalTraceId` / `external_trace_id` | 外部 trace id 精确匹配，会走 filter sidecar，适合按 runId 做存在性快查 |
 | `filter.externalSpanId` / `external_span_id` | 外部 span id 精确匹配 |
 | `filter.externalSessionId` / `external_session_id` | 外部 session id 精确匹配 |
 | `filter.status` | 0=ok，非 0=error |
@@ -375,7 +405,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 }
 ```
 
-`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。如果 `source` 是 `scan`，说明本次没有可用索引，例如只有 `text` contains 过滤或只用了未知 attrs key；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；如果某个 postings 被预算禁用，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
+`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。如果 `source` 是 `scan`，说明本次没有可用索引，例如只有 `text` contains 过滤或只用了未知 attrs key；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；如果某个 postings 被预算禁用，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar，从 `bm25.dat` 恢复全文倒排，从 `segment_bloom.dat` 恢复候选 key 跳段 bloom。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
 
 ### POST /v1/trace-aggregate  —— 对搜索结果做 groupBy
 

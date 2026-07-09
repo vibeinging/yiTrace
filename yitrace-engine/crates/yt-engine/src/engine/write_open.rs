@@ -138,6 +138,8 @@ impl WriteCoordinator {
         process_lock: Option<Arc<process_lock::ProcessLockManager>>,
     ) -> Arc<Self> {
         let metadata_state = metadata_state.unwrap_or_default();
+        let bm25_path = dir.as_ref().map(|dir| dir.join("bm25.dat"));
+        let seg_key_bloom_path = dir.as_ref().map(|dir| dir.join("segment_bloom.dat"));
         let filter_attrs_path = dir.as_ref().map(|dir| dir.join("filter_attrs.dat"));
         let trace_rollup_path = dir.as_ref().map(|dir| dir.join("trace_rollup.dat"));
         let metadata_index = MetadataIndex::build(
@@ -178,6 +180,8 @@ impl WriteCoordinator {
             manifest_path,
             metadata_path,
             vector_path,
+            bm25_path,
+            seg_key_bloom_path,
             filter_attrs_path,
             trace_rollup_path,
             filter_attrs: Mutex::new(FilterAttrsIndex::default()),
@@ -185,6 +189,7 @@ impl WriteCoordinator {
             session_idx: Mutex::new(SessionIndex::default()),
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
             seg_key_bloom: Mutex::new(HashMap::new()),
+            segment_scan_indexes_stale: Mutex::new(false),
             gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
             dir,
             process_lock,
@@ -340,27 +345,60 @@ impl WriteCoordinator {
 
     fn clear_volatile_indexes_locked(&self) {
         *self.memtable.lock().unwrap() = MemTable::new();
-        self.bm25.clear();
+        self.clear_segment_scan_indexes_locked();
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
         self.graph.clear();
         self.graph.reload();
         *self.filter_attrs.lock().unwrap() = FilterAttrsIndex::default();
         *self.trace_rollup.lock().unwrap() = TraceAggregateRollupIndex::default();
+    }
+
+    fn clear_segment_scan_indexes_locked(&self) {
+        self.bm25.clear();
         *self.session_idx.lock().unwrap() = SessionIndex::default();
         *self.seg_fold_cache.lock().unwrap() = SegFoldCache::new(2_000_000);
         self.seg_key_bloom.lock().unwrap().clear();
     }
 
-    fn rebuild_volatile_from_current_locked(&self) {
+    fn rebuild_volatile_from_current_locked(&self) -> usize {
         self.clear_volatile_indexes_locked();
         let m = self.current.manifest();
         let loaded_rollup = self.load_trace_rollup_segments(&m);
         let loaded_filter_attrs = self.load_filter_attrs_segments(&m);
-        let mut segment_derived_dirty = false;
+        let loaded_bm25 = self.load_bm25_segments(&m);
+        let loaded_seg_key_bloom = self.load_seg_key_bloom_segments(&m);
+        let segment_derived_dirty = m
+            .segments
+            .values()
+            .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
+
+        if loaded_rollup && loaded_filter_attrs && !segment_derived_dirty {
+            let seg_count = m.segments.len();
+            drop(m);
+            *self.segment_scan_indexes_stale.lock().unwrap() =
+                !(loaded_bm25 && loaded_seg_key_bloom);
+            self.session_idx.lock().unwrap().dirty = true;
+            self.reload_legacy_vectors_locked();
+            self.replay_wal_tail_into_memtable_locked();
+            olog::log(
+                olog::Level::Info,
+                "recover_fast_ready",
+                &[("segments_deferred", &seg_count)],
+            );
+            return 0;
+        }
+
+        if loaded_bm25 {
+            self.bm25.clear();
+        }
+        if loaded_seg_key_bloom {
+            self.seg_key_bloom.lock().unwrap().clear();
+        }
+
+        let mut scanned = 0usize;
         for entry in m.segments.values() {
-            if entry.deletion_seq > 0 || entry.upgrade_ref.is_some() {
-                segment_derived_dirty = true;
-            }
             let recs = self.segments.scan_records(entry.segment_id);
+            scanned += 1;
             let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
             self.seg_key_bloom
                 .lock()
@@ -377,12 +415,40 @@ impl WriteCoordinator {
         }
         drop(m);
 
+        self.reload_legacy_vectors_locked();
+        self.replay_wal_tail_into_memtable_locked();
+
+        if segment_derived_dirty {
+            self.rebuild_trace_rollup_current();
+        }
+        if segment_derived_dirty {
+            self.rebuild_filter_attrs_current();
+        }
+        if !loaded_rollup || segment_derived_dirty {
+            self.persist_trace_rollup_segments();
+        }
+        if !loaded_filter_attrs || segment_derived_dirty {
+            self.persist_filter_attrs_segments();
+        }
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
+        if !loaded_bm25 || segment_derived_dirty {
+            self.persist_bm25_segments();
+        }
+        if !loaded_seg_key_bloom || segment_derived_dirty {
+            self.persist_seg_key_bloom_segments();
+        }
+        scanned
+    }
+
+    fn reload_legacy_vectors_locked(&self) {
         if let Some(p) = &self.vector_path {
             for ((t, s), v) in vecstore::load(p) {
                 self.graph.index_embedding(t, s, v);
             }
         }
+    }
 
+    fn replay_wal_tail_into_memtable_locked(&self) {
         let wal = self.wal.lock().unwrap();
         let mut mt = self.memtable.lock().unwrap();
         for (lsn, r) in wal.replay_after(WalLsn::new(self.current.memtable_watermark())) {
@@ -398,21 +464,63 @@ impl WriteCoordinator {
         }
         let tail = wal.committed_tail();
         self.current.advance_committed_tail(tail);
-        drop(mt);
-        drop(wal);
+    }
 
-        if segment_derived_dirty && !loaded_rollup {
-            self.rebuild_trace_rollup_current();
+    fn ensure_segment_scan_indexes_current(&self) {
+        if !*self.segment_scan_indexes_stale.lock().unwrap() {
+            return;
         }
-        if segment_derived_dirty && !loaded_filter_attrs {
-            self.rebuild_filter_attrs_current();
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
+        if !*self.segment_scan_indexes_stale.lock().unwrap() {
+            return;
         }
-        if !loaded_rollup || segment_derived_dirty {
-            self.persist_trace_rollup_segments();
+        let scanned = self.rebuild_segment_scan_indexes_locked();
+        *self.segment_scan_indexes_stale.lock().unwrap() = false;
+        self.persist_bm25_segments();
+        self.persist_seg_key_bloom_segments();
+        olog::log(
+            olog::Level::Info,
+            "segment_scan_indexes_rebuild_done",
+            &[("segs_scanned", &scanned)],
+        );
+    }
+
+    fn rebuild_segment_scan_indexes_locked(&self) -> usize {
+        self.clear_segment_scan_indexes_locked();
+        let mut scanned = 0usize;
+        let m = self.current.manifest();
+        for entry in m.segments.values() {
+            let recs = self.segments.scan_records(entry.segment_id);
+            scanned += 1;
+            let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
+            self.seg_key_bloom
+                .lock()
+                .unwrap()
+                .insert(entry.segment_id.get(), Arc::new(bloom));
+            for r in &recs {
+                self.index_record_without_rollup_and_filter_attrs(r);
+            }
         }
-        if !loaded_filter_attrs || segment_derived_dirty {
-            self.persist_filter_attrs_segments();
+        drop(m);
+
+        let mem_rows = {
+            let mt = self.memtable.lock().unwrap();
+            mt.iter()
+                .map(|r| WalRecord {
+                    trace_id: r.trace_id,
+                    span_id: r.span_id,
+                    ts: r.ts,
+                    identity: r.identity.clone(),
+                    fields: r.fields.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for r in &mem_rows {
+            self.index_record_without_rollup_and_filter_attrs(r);
         }
+        scanned
     }
 
     /// 提交新 manifest 版本并（若开了持久化）落盘。所有 commit 走这里,保证段集合改动都持久。

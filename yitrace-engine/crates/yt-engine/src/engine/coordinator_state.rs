@@ -45,6 +45,10 @@ pub struct WriteCoordinator {
     /// 向量独立落盘路径。Some = `index_embedding` 追加写盘、`recover` 重载（向量不在 trace 数据里,
     /// 段重建不出来,只能单独持久）；None = 纯内存。
     vector_path: Option<std::path::PathBuf>,
+    /// BM25 持久倒排缓存路径。只缓存已进入 segment 的文本倒排；WAL tail 重启时仍从 WAL 叠加。
+    bm25_path: Option<std::path::PathBuf>,
+    /// 段级 key bloom 持久缓存路径。用于全文检索候选 key join 时跳过无关段。
+    seg_key_bloom_path: Option<std::path::PathBuf>,
     /// attrs 过滤边车缓存路径。只缓存已进入 segment 的过滤小字段；WAL tail 重启时仍从 WAL 叠加。
     filter_attrs_path: Option<std::path::PathBuf>,
     /// trace rollup 缓存路径。只缓存已进入 segment 的小字段 rollup；WAL tail 重启时仍从 WAL 叠加。
@@ -61,8 +65,12 @@ pub struct WriteCoordinator {
     seg_fold_cache: Mutex<SegFoldCache>,
     /// **段级 key Bloom**（对齐 ClickHouse bloom_filter 跳过索引）：seg_id → 该段 (trace,span) 的 bloom。
     /// 检索折叠定位时，bloom 判"这个段肯定没有任何候选 key" → 整段跳过，不碰折叠缓存。派生数据：flush
-    /// 时建、recover 时随重建索引一起重建、unlink 时移除。每段几 KB，常驻内存可控。
+    /// 时建、recover 时优先从 `segment_bloom.dat` 恢复，坏了再从段重建。每段几 KB，常驻内存可控。
     seg_key_bloom: Mutex<HashMap<u64, Arc<KeyBloom>>>,
+    /// 全文检索必需的段扫描派生索引（BM25 / seg_key_bloom）是否还没从历史 segment 补建。
+    /// open/recover 命中 rollup/filter 但缺 `bm25.dat` 或 `segment_bloom.dat` 时，先快速可用；
+    /// 需要全文检索时再补。控制台 session index 有独立 dirty 标记，不混在这里。
+    segment_scan_indexes_stale: Mutex<bool>,
     /// **GC 日志**（崩溃安全）：Some = reclaim 走"MARK→fsync→unlink→DONE→fsync"，崩溃在中途重启补删；
     /// None = 纯内存态（非持久模式，reclaim 直接删，旧路径）。
     gc_log: Mutex<Option<gc_log::GcLog>>,
@@ -127,6 +135,17 @@ impl KeyBloom {
         (0..self.k as u64).all(|i| {
             let p = (h1.wrapping_add(i.wrapping_mul(h2)) as usize) & self.mask;
             self.bits[p >> 6] & (1u64 << (p & 63)) != 0
+        })
+    }
+    fn from_bits(bits: Vec<u64>, k: u32) -> Option<Self> {
+        if bits.is_empty() || !bits.len().is_power_of_two() {
+            return None;
+        }
+        let m_bits = bits.len().checked_mul(64)?;
+        Some(Self {
+            bits,
+            mask: m_bits - 1,
+            k,
         })
     }
 }

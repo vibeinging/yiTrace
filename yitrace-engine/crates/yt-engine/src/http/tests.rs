@@ -28,7 +28,8 @@ fn route_ingest_then_query() {
 #[test]
 fn route_ingest_accepts_external_ids_and_attrs() {
     let s = server();
-    let batch = r#"[{
+    let batch = r#"[
+    {
       "trace_id":"run-uuid",
       "span_id":"span-uuid",
       "session_id":"session-uuid",
@@ -41,6 +42,17 @@ fn route_ingest_accepts_external_ids_and_attrs() {
       "agent_name":"risk",
       "input_text":"疑似盗刷",
       "attrs":{"external_run_id":"run-uuid","project_id":"agentic-data","skill":"review","mode":"auto","call_site":"worker.ts:10"}
+    },
+    {
+      "trace_id":"123456",
+      "span_id":"numeric-business-span",
+      "ts":120,
+      "seq":1,
+      "event_type":2,
+      "ext_span_id":"numeric-business-span",
+      "status":0,
+      "input_text":"数字业务主键",
+      "attrs":{"project_id":"agentic-data","skill":"review"}
     }]"#;
     let (status, body) = s.route("POST", "/v1/ingest", batch);
     assert_eq!(status, 200, "{body}");
@@ -72,6 +84,49 @@ fn route_ingest_accepts_external_ids_and_attrs() {
     );
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""external_trace_id":"run-uuid""#), "{body}");
+
+    let (status, body) = s.route(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"externalTraceId":"run-uuid"},"limit":1}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""total":1"#), "{body}");
+    assert!(body.contains(r#""externalTraceId":"run-uuid""#), "{body}");
+    assert!(body.contains(r#""usedFilterIndex":true"#), "{body}");
+    assert!(body.contains(r#""candidateSpanKeys":1"#), "{body}");
+
+    let (status, body) = s.route(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"traceId":"123456"},"limit":1}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""total":1"#), "{body}");
+    assert!(body.contains(r#""externalTraceId":"123456""#), "{body}");
+    assert!(body.contains(r#""usedFilterIndex":true"#), "{body}");
+    assert!(body.contains(r#""candidateSpanKeys":1"#), "{body}");
+
+    let (status, body) = s.route(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"traceId":123456},"limit":1}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""total":1"#), "{body}");
+    assert!(body.contains(r#""externalTraceId":"123456""#), "{body}");
+    assert!(body.contains(r#""usedFilterIndex":true"#), "{body}");
+    assert!(body.contains(r#""candidateSpanKeys":1"#), "{body}");
+
+    let (status, body) = s.route(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"externalTraceId":"run-missing"},"limit":1}"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""total":0"#), "{body}");
+    assert!(body.contains(r#""usedFilterIndex":true"#), "{body}");
+    assert!(body.contains(r#""candidateSpanKeys":0"#), "{body}");
 
     let (status, body) = s.route(
         "POST",
