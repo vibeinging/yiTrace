@@ -1,11 +1,12 @@
 # yiTrace
 
-**Searchable execution traces for AI agents.**
+**A local TraceDB for agentic engineering.**
 
-yiTrace records the path an agent took, then makes it searchable: conversations,
-tool calls, model calls, tokens, errors, logs, and eval signals. Use it to
-debug agent runs, replay decisions, build eval datasets, and give Agent Memory
-a real execution history to learn from.
+Agentic engineering needs more than prompts, logs, and chat memory. You need to
+see the real path an agent took: prompts, tool calls, spans, errors, tokens,
+model outputs, and the step that worked. yiTrace stores that path in a local
+TraceDB so you can search it, replay it, turn it into eval data, and feed useful
+execution history back into Agent Memory.
 
 [中文](README.zh-CN.md) · English
 
@@ -18,18 +19,18 @@ a real execution history to learn from.
 
 ## Why
 
-Agents need more than chat history. They need a record of the path they took:
-which tools were called, which spans failed, what the model saw, what it
-returned, how much it cost, and which path worked best last time.
+Building agents is not just prompt engineering. It is engineering a system that
+can call tools, recover from failures, compare runs, and improve over time.
 
-yiTrace gives you that record locally:
+The missing layer is execution memory: not just what the user said, but what
+the agent actually did. yiTrace gives you that layer locally:
 
-- trace replay for multi-turn, tool-heavy agent runs
-- Chinese BM25 search, vector recall, and hybrid search
-- exact filters for tenant, agent, status, time, and custom attrs
-- token and cost attribution by trace, session, and agent
-- eval and dataset hooks for failed or interesting spans
-- embedded DB packages for Python, Node, Electron, and Rust
+- replay multi-turn, tool-heavy agent runs
+- search prompts, logs, tool calls, errors, and model outputs
+- filter by tenant, agent, status, time, and custom attrs
+- track token and cost by trace, session, and agent
+- collect failed or useful spans into eval datasets
+- reuse successful run paths as evidence for Agent Memory
 
 ## Quick Start
 
@@ -311,8 +312,9 @@ That makes retries and crash replay safe: the same event is counted once.
 
 ## Available Today
 
-yiTrace is built for local development, debugging, eval workflows, and product
-integrations that need private, searchable agent traces.
+yiTrace is built for teams doing agentic engineering: debugging real runs,
+building eval loops, inspecting tool behavior, and keeping execution history
+private and searchable.
 
 | Area | What you get |
 |---|---|
@@ -325,6 +327,7 @@ integrations that need private, searchable agent traces.
 | Filtering | Tenant, agent, status, time, attrs |
 | Replay | Session, trace, span, and log event views |
 | Eval data | Annotation and dataset hooks |
+| Agent Memory | Searchable execution history for what worked and what failed |
 | Console | Local replay UI |
 
 For implementation boundaries, see [Current State](docs/CURRENT_STATE.md).

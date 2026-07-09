@@ -1,10 +1,11 @@
 # yiTrace
 
-**给 AI Agent 用的可搜索执行轨迹。**
+**给 Agent 工程用的本地 TraceDB。**
 
-yiTrace 记录 Agent 真实走过的路径，并让这些路径可以被搜索：多轮对话、工具调用、模型调用、
-token、错误、日志和 eval 信号。你可以用它排查 Agent run、回放决策过程、构建 eval 数据集，
-也可以把它作为 Agent Memory 的执行历史底座。
+Agent 工程，也就是 agentic engineering，需要的不只是 prompt、日志和聊天记忆。你需要看到
+Agent 真实走过的路径：prompt、工具调用、span、错误、token、模型输出，以及最后真正有效的那一步。
+yiTrace 把这些路径存进本地 TraceDB，让你可以搜索、回放、沉淀 eval 数据，也能把有用的执行历史
+交给 Agent Memory。
 
 中文 · [English](README.md)
 
@@ -17,17 +18,16 @@ token、错误、日志和 eval 信号。你可以用它排查 Agent run、回�
 
 ## 为什么做
 
-Agent 需要的不只是聊天记录。它需要知道一次任务是怎么走的：调用了哪些工具，哪个 span
-失败了，模型看到了什么、返回了什么，花了多少钱，上次哪条路径最有效。
+做 Agent 不是只写 prompt。它更像在做一个会调用工具、会失败、需要比较多次运行结果、还要持续改进的系统。
 
-yiTrace 给你一份本地可查的执行记录：
+这里缺的一层是执行记忆：不只是用户说过什么，而是 Agent 实际做过什么。yiTrace 在本地给你补上这一层：
 
 - 回放多轮对话、工具调用、复杂 agent run
-- 中文 BM25 检索、向量召回、混合检索
+- 搜索 prompt、日志、工具调用、错误和模型输出
 - 按 tenant、agent、状态、时间、自定义 attrs 精确过滤
 - 按 trace、session、agent 汇总 token 和成本
-- 把失败或有价值的 span 收进 eval / dataset
-- Python、Node、Electron、Rust 都能嵌入本地 DB
+- 把失败或有价值的 span 收进 eval dataset
+- 把成功路径作为 Agent Memory 的证据
 
 ## 快速开始
 
@@ -299,7 +299,8 @@ event_id = hash(ext_span_id, seq, event_type)
 
 ## 现在能用什么
 
-yiTrace 面向本地开发、问题排查、eval 流程和产品集成，适合需要私有、可搜索 Agent Trace 的团队。
+yiTrace 面向正在做 Agent 工程的团队：排查真实 run、构建 eval 闭环、查看工具行为，
+并把执行历史保存在本地、保持可搜索。
 
 | 能力 | 你能得到什么 |
 |---|---|
@@ -312,6 +313,7 @@ yiTrace 面向本地开发、问题排查、eval 流程和产品集成，适合�
 | 过滤 | tenant、agent、状态、时间、attrs |
 | 回放 | session、trace、span、log event 视图 |
 | eval 数据 | annotation 和 dataset hooks |
+| Agent Memory | 可搜索的执行历史，记录什么有效、什么失败 |
 | 控制台 | 本地回放 UI |
 
 实现边界见 [Current State](docs/CURRENT_STATE.md)。
