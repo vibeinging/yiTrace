@@ -1,22 +1,33 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
 
 use crate::{ConsoleSession, ReadPlanStats, SearchFilter, TraceQuery};
 use yt_core::fold::{FoldedSpan, SpanFields};
 use yt_wal::WalRecord;
 
-const CACHE_MAGIC: u32 = 0x5954_524f; // "YTRO"
-const CACHE_VERSION: u32 = 1;
+mod disk;
+use disk::DiskTraceRollup;
 
-#[derive(Default)]
 pub(crate) struct TraceAggregateRollupIndex {
     rows: HashMap<(u64, u64), TraceAggregateRollupRow>,
     by_trace: BTreeMap<u64, Vec<u64>>,
+    disk: Option<DiskTraceRollup>,
     dirty: bool,
     session_cache: std::sync::Mutex<
         HashMap<(Option<u64>, i64, i64, Vec<(String, String)>), Vec<ConsoleSession>>,
     >,
+}
+
+impl Default for TraceAggregateRollupIndex {
+    fn default() -> Self {
+        Self {
+            rows: HashMap::new(),
+            by_trace: BTreeMap::new(),
+            disk: None,
+            dirty: false,
+            session_cache: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl TraceAggregateRollupIndex {
@@ -26,6 +37,15 @@ impl TraceAggregateRollupIndex {
             return;
         }
         let key = (record.trace_id, record.span_id);
+        if !self.rows.contains_key(&key) {
+            if let Some(existing) = self
+                .disk
+                .as_mut()
+                .and_then(|disk| disk.find_row(record.trace_id, record.span_id))
+            {
+                self.rows.insert(key, existing);
+            }
+        }
         if !self.rows.contains_key(&key) {
             self.by_trace
                 .entry(record.trace_id)
@@ -69,25 +89,27 @@ impl TraceAggregateRollupIndex {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.rows.len()
+        self.rows.len() + self.disk.as_ref().map_or(0, DiskTraceRollup::row_count)
     }
 
     pub(crate) fn save_cache(
-        &self,
+        &mut self,
         path: &Path,
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> std::io::Result<()> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
+        let mut rows = match self.disk.as_mut() {
+            Some(disk) => disk.all_rows().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trace rollup page is corrupt",
+                )
+            })?,
+            None => Vec::new(),
         };
-        std::fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&self.encode_cache(manifest_version, memtable_watermark))?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(tmp, path)
+        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.extend(self.rows.values().cloned());
+        disk::write_atomic(path, manifest_version, memtable_watermark, &mut rows)
     }
 
     pub(crate) fn load_cache(
@@ -95,12 +117,18 @@ impl TraceAggregateRollupIndex {
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
-        Self::decode_cache(&bytes, manifest_version, memtable_watermark)
+        Some(Self {
+            disk: Some(DiskTraceRollup::open(
+                path,
+                manifest_version,
+                memtable_watermark,
+            )?),
+            ..Self::default()
+        })
     }
 
     pub(crate) fn query(
-        &self,
+        &mut self,
         query: &TraceQuery,
         filter: &SearchFilter,
     ) -> Option<(Vec<FoldedSpan>, ReadPlanStats)> {
@@ -112,13 +140,15 @@ impl TraceAggregateRollupIndex {
             };
             return Some((Vec::new(), stats));
         }
-        let mut spans = Vec::new();
-        for row in self.rows.values() {
-            if !row.matches_query(query) || !row.matches_filter(filter) {
-                continue;
-            }
-            spans.push(row.to_folded_span());
-        }
+        let rows = self.matching_rows(query, filter)?;
+        let (pages_read, pages_total) = self
+            .disk
+            .as_ref()
+            .map_or((0, 0), DiskTraceRollup::last_read_stats);
+        let mut spans: Vec<_> = rows
+            .iter()
+            .map(TraceAggregateRollupRow::to_folded_span)
+            .collect();
         spans.sort_by_key(|span| (span.trace_id, span.span_id));
         let stats = ReadPlanStats {
             source: Some("aggregate_rollup".to_string()),
@@ -126,13 +156,15 @@ impl TraceAggregateRollupIndex {
             candidate_span_keys: Some(spans.len()),
             scanned_segments: 0,
             matched_spans: spans.len(),
+            rollup_pages_read: Some(pages_read),
+            rollup_pages_total: Some(pages_total),
             ..ReadPlanStats::default()
         };
         Some((spans, stats))
     }
 
     pub(crate) fn query_trace_ids(
-        &self,
+        &mut self,
         trace_ids: &[u64],
         tenant: Option<u64>,
     ) -> Option<(BTreeMap<u64, Vec<FoldedSpan>>, ReadPlanStats)> {
@@ -144,26 +176,31 @@ impl TraceAggregateRollupIndex {
             };
             return Some((BTreeMap::new(), stats));
         }
+        let trace_ids: std::collections::BTreeSet<_> = trace_ids.iter().copied().collect();
+        let mut rows = match self.disk.as_mut() {
+            Some(disk) => disk.rows_for_trace_ids(&trace_ids, tenant)?,
+            None => Vec::new(),
+        };
+        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.extend(
+            self.rows
+                .values()
+                .filter(|row| {
+                    trace_ids.contains(&row.trace_id)
+                        && tenant.is_none_or(|tenant| row.tenant_id == Some(tenant))
+                })
+                .cloned(),
+        );
+        let matched = rows.len();
+        let (pages_read, pages_total) = self
+            .disk
+            .as_ref()
+            .map_or((0, 0), DiskTraceRollup::last_read_stats);
         let mut out: BTreeMap<u64, Vec<FoldedSpan>> = BTreeMap::new();
-        let mut matched = 0usize;
-        for trace_id in trace_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            let Some(span_ids) = self.by_trace.get(&trace_id) else {
-                continue;
-            };
-            for span_id in span_ids {
-                let Some(row) = self.rows.get(&(trace_id, *span_id)) else {
-                    continue;
-                };
-                if tenant.is_some() && row.tenant_id != tenant {
-                    continue;
-                }
-                out.entry(trace_id).or_default().push(row.to_folded_span());
-                matched += 1;
-            }
+        for row in rows {
+            out.entry(row.trace_id)
+                .or_default()
+                .push(row.to_folded_span());
         }
         for spans in out.values_mut() {
             spans.sort_by_key(|span| span.span_id);
@@ -173,6 +210,8 @@ impl TraceAggregateRollupIndex {
             candidate_span_keys: Some(matched),
             scanned_segments: 0,
             matched_spans: matched,
+            rollup_pages_read: Some(pages_read),
+            rollup_pages_total: Some(pages_total),
             ..ReadPlanStats::default()
         };
         Some((out, stats))
@@ -180,7 +219,7 @@ impl TraceAggregateRollupIndex {
 
     /// 从小字段 rollup 直接聚合会话列表，避免 tenant 视图为每个请求重新扫描原始 segment。
     pub(crate) fn query_sessions(
-        &self,
+        &mut self,
         query: &TraceQuery,
         filter: &SearchFilter,
     ) -> Option<Vec<ConsoleSession>> {
@@ -215,11 +254,9 @@ impl TraceAggregateRollupIndex {
             None
         } else {
             let mut ids = HashSet::new();
-            for row in self.rows.values() {
-                if row.matches_query(query) && row.matches_filter(filter) {
-                    if let Some(session_id) = row.session_id {
-                        ids.insert(session_id);
-                    }
+            for row in self.matching_rows(query, filter)? {
+                if let Some(session_id) = row.session_id {
+                    ids.insert(session_id);
                 }
             }
             Some(ids)
@@ -227,10 +264,7 @@ impl TraceAggregateRollupIndex {
         let mut aggregate_filter = filter.clone();
         aggregate_filter.attrs.clear();
         let mut sessions: BTreeMap<u64, Acc> = BTreeMap::new();
-        for row in self.rows.values() {
-            if !row.matches_query(query) || !row.matches_filter(&aggregate_filter) {
-                continue;
-            }
+        for row in self.matching_rows(query, &aggregate_filter)? {
             let Some(session_id) = row.session_id else {
                 continue;
             };
@@ -283,47 +317,23 @@ impl TraceAggregateRollupIndex {
         Some(rows)
     }
 
-    fn encode_cache(&self, manifest_version: u64, memtable_watermark: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        put_u32(&mut out, CACHE_MAGIC);
-        put_u32(&mut out, CACHE_VERSION);
-        put_u64(&mut out, manifest_version);
-        put_u64(&mut out, memtable_watermark);
-        let mut rows: Vec<&TraceAggregateRollupRow> = self.rows.values().collect();
-        rows.sort_by_key(|row| (row.trace_id, row.span_id));
-        put_u64(&mut out, rows.len() as u64);
-        for row in rows {
-            row.encode(&mut out);
-        }
-        out
-    }
-
-    fn decode_cache(bytes: &[u8], manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
-        let mut cur = CacheCursor { bytes, pos: 0 };
-        if cur.u32()? != CACHE_MAGIC || cur.u32()? != CACHE_VERSION {
-            return None;
-        }
-        if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
-            return None;
-        }
-        let count = cur.u64()? as usize;
-        let mut rows = HashMap::with_capacity(count);
-        let mut by_trace: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for _ in 0..count {
-            let row = TraceAggregateRollupRow::decode(&mut cur)?;
-            // cache 按 (trace, span) 排序写出；解码时顺手建 trace 目录，不再二次遍历和排序。
-            by_trace.entry(row.trace_id).or_default().push(row.span_id);
-            rows.insert((row.trace_id, row.span_id), row);
-        }
-        if cur.pos != bytes.len() {
-            return None;
-        }
-        Some(Self {
-            rows,
-            by_trace,
-            dirty: false,
-            session_cache: std::sync::Mutex::new(HashMap::new()),
-        })
+    fn matching_rows(
+        &mut self,
+        query: &TraceQuery,
+        filter: &SearchFilter,
+    ) -> Option<Vec<TraceAggregateRollupRow>> {
+        let mut rows = match self.disk.as_mut() {
+            Some(disk) => disk.matching_rows(query, filter)?,
+            None => Vec::new(),
+        };
+        rows.retain(|row| !self.rows.contains_key(&(row.trace_id, row.span_id)));
+        rows.extend(
+            self.rows
+                .values()
+                .filter(|row| row.matches_query(query) && row.matches_filter(filter))
+                .cloned(),
+        );
+        Some(rows)
     }
 }
 
@@ -352,6 +362,11 @@ struct TraceAggregateRollupRow {
 }
 
 impl TraceAggregateRollupRow {
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        Self::new(0, 0)
+    }
+
     fn new(trace_id: u64, span_id: u64) -> Self {
         Self {
             trace_id,

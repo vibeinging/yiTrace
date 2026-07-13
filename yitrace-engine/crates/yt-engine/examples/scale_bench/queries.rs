@@ -1,5 +1,6 @@
 use super::generator::DatasetStats;
 
+#[derive(Clone)]
 pub struct Query {
     pub name: &'static str,
     pub selectivity: &'static str,
@@ -9,6 +10,7 @@ pub struct Query {
     pub body: String,
     pub expected_fragments: Vec<String>,
     pub expected_read_source: Option<&'static str>,
+    pub expect_point_lookup: bool,
 }
 
 pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
@@ -38,6 +40,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"text":"任务执行","k":10}"#.to_string(),
             expected_fragments: vec!["\"trace_id\"".to_string()],
             expected_read_source: None,
+            expect_point_lookup: false,
         },
         Query {
             name: "search_common_text_project",
@@ -48,6 +51,21 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"text":"任务执行","k":10,"filter":{"attrs":{"project_id":"scale-a"}}}"#.to_string(),
             expected_fragments: vec!["\"trace_id\"".to_string()],
             expected_read_source: None,
+            expect_point_lookup: false,
+        },
+        Query {
+            name: "trace_search_common_text_point",
+            selectivity: "low",
+            count: scan_count,
+            method: "POST",
+            path: "/v1/trace-search".to_string(),
+            body: r#"{"text":"任务执行","limit":10}"#.to_string(),
+            expected_fragments: vec![
+                "\"usedFilterIndex\":true".to_string(),
+                "\"fallbackReason\":null".to_string(),
+            ],
+            expected_read_source: Some("filter_index"),
+            expect_point_lookup: true,
         },
         Query {
             name: "search_rare_text",
@@ -58,6 +76,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"text":"月蚀校验码","k":10}"#.to_string(),
             expected_fragments: rare_fragments,
             expected_read_source: None,
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_search_low_cardinality",
@@ -71,6 +90,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
                 "\"usedFilterIndex\":true".to_string(),
             ],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_search_high_cardinality",
@@ -84,6 +104,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
                 "\"usedFilterIndex\":true".to_string(),
             ],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_search_text_tenant_index",
@@ -97,6 +118,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
                 "\"fallbackReason\":null".to_string(),
             ],
             expected_read_source: Some("filter_index"),
+            expect_point_lookup: true,
         },
         Query {
             name: "trace_aggregate_rollup",
@@ -107,6 +129,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"filter":{"projectId":"scale-a"},"groupBy":["validationStatus","toolName"],"limit":20}"#.to_string(),
             expected_fragments: vec!["\"groupBy\"".to_string()],
             expected_read_source: Some("aggregate_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "storage_stats_rollup",
@@ -117,6 +140,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"filter":{"projectId":"scale-a"},"groupBy":["projectId","validationStatus"]}"#.to_string(),
             expected_fragments: vec!["\"spanCount\"".to_string()],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_trajectories_rollup",
@@ -127,6 +151,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"filter":{"projectId":"scale-a","taskFingerprint":"risk-review"},"limit":20}"#.to_string(),
             expected_fragments: vec!["\"items\"".to_string()],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "trajectory_groups_rollup",
@@ -137,6 +162,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: r#"{"filter":{"projectId":"scale-a","taskFingerprint":"risk-review"},"limit":20}"#.to_string(),
             expected_fragments: vec!["\"items\"".to_string()],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "loops_page_rollup",
@@ -147,6 +173,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: String::new(),
             expected_fragments: vec!["\"items\"".to_string()],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "task_traces_rollup",
@@ -157,6 +184,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: String::new(),
             expected_fragments: vec!["\"items\"".to_string()],
             expected_read_source: Some("trajectory_rollup"),
+            expect_point_lookup: false,
         },
         Query {
             name: "sessions_page_index",
@@ -167,6 +195,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: String::new(),
             expected_fragments: vec!["\"items\"".to_string()],
             expected_read_source: None,
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_detail",
@@ -177,6 +206,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             body: String::new(),
             expected_fragments: vec![format!("\"externalTraceId\":\"run-{trace_id}\"")],
             expected_read_source: None,
+            expect_point_lookup: false,
         },
         Query {
             name: "trace_diff",
@@ -190,6 +220,7 @@ pub fn build_queries(count: usize, dataset: &DatasetStats) -> Vec<Query> {
             ),
             expected_fragments: vec!["\"sameSignature\"".to_string()],
             expected_read_source: None,
+            expect_point_lookup: false,
         },
     ]
 }

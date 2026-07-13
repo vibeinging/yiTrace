@@ -95,6 +95,34 @@ impl Projection {
 
 /// 列式不可变段存储。真实实现接 **Vortex**（layouts + zone-map + 统计）；
 /// 删除/manifest/版本不归它管（那是本引擎自己的事，见 yt-core::manifest）。
+#[derive(Default)]
+pub struct KeyedSegmentScan {
+    pub rows: Vec<(u32, FoldInput)>,
+    /// true 表示存储层按磁盘 key 目录点查，没有先解码整段。
+    pub used_point_index: bool,
+    /// 本次真正解码的物理记录数。
+    pub decoded_rows: usize,
+    /// 点查实际读取的索引字节数，包含首次完整校验索引的成本。
+    pub index_bytes_read: u64,
+    /// 点查实际读取的段数据字节数，包含首次完整校验段 CRC 的成本。
+    pub data_bytes_read: u64,
+    /// 本次首次校验通过的索引数。
+    pub indexes_validated: usize,
+    /// 本次缺失或损坏后重建成功的索引数。
+    pub indexes_rebuilt: usize,
+}
+
+#[derive(Default)]
+struct FoldQueryStats {
+    scanned_segments: usize,
+    point_lookup_segments: usize,
+    decoded_segment_rows: usize,
+    index_bytes_read: u64,
+    data_bytes_read: u64,
+    indexes_validated: usize,
+    indexes_rebuilt: usize,
+}
+
 pub trait SegmentStore: Send + Sync {
     /// 把一批已 ack 事件写成段 `seg`（building→sealed）。
     /// seg 由协调器分配（单写者、全局唯一、永不复用），不由存储自选。
@@ -113,7 +141,7 @@ pub trait SegmentStore: Send + Sync {
         &self,
         _seg: SegmentId,
         _keys: &HashSet<(u64, u64)>,
-    ) -> Option<Vec<(u32, FoldInput)>> {
+    ) -> Option<KeyedSegmentScan> {
         None
     }
 
@@ -192,9 +220,44 @@ impl BufferPins {
 pub trait Bm25Index: Send + Sync {
     /// 把某 span 的文本喂进倒排（ingest/flush 时调用）。真实实现走 jieba 分词 + 段内倒排。
     fn index_text(&self, trace_id: u64, span_id: u64, text: &str);
+    /// 按确定性 event_id 幂等建索引。默认适配器仍按普通文本处理；原生持久索引会记住
+    /// 已见 event_id，SDK 重试和 WAL 重放不会重复增加词频。
+    fn index_event(&self, event_id: u64, trace_id: u64, span_id: u64, text: &str) {
+        let _ = event_id;
+        self.index_text(trace_id, span_id, text);
+    }
+    /// 只登记已见 event_id，不增加文本。用于从折叠 span 重建文本后补齐幂等状态。
+    fn mark_event(&self, _event_id: u64) {}
     /// 中文检索，返回 (trace_id, span_id, 评分)，按分降序、取前 k。
     /// 真实实现作为 DataFusion 自定义扫描节点下推（@~@ + LIMIT）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)>;
+    /// 带 key 过滤的中文检索。默认实现逐步扩大候选窗，旧适配器无需立即修改；原生实现应在
+    /// 倒排打分阶段应用过滤，避免同一批高频词候选被重复打分。
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut pool = k.max(50);
+        loop {
+            let mut candidates = self.search(query, pool);
+            let exhausted = candidates.len() < pool;
+            candidates.retain(|&(trace_id, span_id, _)| filter(trace_id, span_id));
+            if candidates.len() >= k || exhausted {
+                candidates.truncate(k);
+                return candidates;
+            }
+            let next = pool.saturating_mul(4);
+            if next == pool {
+                return candidates;
+            }
+            pool = next;
+        }
+    }
     /// 清空派生倒排。多进程 embedded 刷新时会从持久段 + WAL tail 重建。
     fn clear(&self) {}
     /// 加载持久化倒排。自定义 BM25 实现可不支持；不支持时引擎会回退到段扫描重建。
@@ -264,6 +327,30 @@ impl Bm25Index for InMemoryBm25 {
             })
             .collect();
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        scored.truncate(k);
+        scored
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        let qtokens: Vec<&str> = query.split_whitespace().collect();
+        let g = self.docs.lock().unwrap();
+        let mut scored: Vec<_> = g
+            .iter()
+            .filter(|&(&(trace_id, span_id), _)| filter(trace_id, span_id))
+            .filter_map(|(&(trace_id, span_id), text)| {
+                let score = qtokens.iter().filter(|token| text.contains(**token)).count() as f32;
+                (score > 0.0).then_some((trace_id, span_id, score))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then((a.0, a.1).cmp(&(b.0, b.1)))
+        });
         scored.truncate(k);
         scored
     }

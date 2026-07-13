@@ -22,4 +22,8 @@ fn main() {
     let conv = WriteCoordinator::new(Arc::new(InMemorySegmentStore::default()));
     let sreport = evalkit::run_session_harness(&conv, 30, 20_260_623);
     evalkit::print_session_report(&sreport);
+
+    // ③ 检索质量：固定相关性标签，输出 Recall@k / MRR@k / NDCG@k。
+    let search_report = evalkit::run_search_quality_harness();
+    evalkit::print_search_quality_report(&search_report);
 }

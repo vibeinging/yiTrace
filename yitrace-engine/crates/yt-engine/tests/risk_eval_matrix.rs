@@ -416,6 +416,21 @@ fn durable_reopen_preserves_searchable_trace() {
         assert_contains(&body, r#""trace_id":88001"#);
         assert_contains(&body, r#""project_id":"reopen-risk""#);
 
+        let (status, point_read) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"text":"盗刷","filter":{"projectId":"reopen-risk"},"limit":10}"#,
+            Some(880),
+        );
+        assert_eq!(status, 200, "{point_read}");
+        assert_contains(&point_read, r#""pointLookupSegments":1"#);
+        assert_contains(&point_read, r#""decodedSegmentRows":1"#);
+        assert_contains(&point_read, r#""indexBytesRead":"#);
+        assert_contains(&point_read, r#""dataBytesRead":"#);
+        assert_contains(&point_read, r#""indexesValidated":"#);
+        assert_contains(&point_read, r#""indexesRebuilt":"#);
+        assert_contains(&point_read, r#""total":1"#);
+
         let aggregate_body =
             r#"{"filter":{"projectId":"reopen-risk"},"groupBy":["skill"],"limit":10}"#;
         let (status, aggregate) =

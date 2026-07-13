@@ -15,15 +15,120 @@
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
-use crate::bm25_disk::{self, CacheMetadata, DiskBm25Cache};
+use crate::bm25_disk::{self, CacheMetadata, DiskBlockMeta, DiskBm25Cache};
 use crate::Bm25Index;
 
 const K1: f32 = 1.5;
 const B: f32 = 0.75;
+const DISK_QUERY_BLOCK_BATCH: usize = 64;
+const DEFAULT_QUERY_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+type SearchHit = (u64, u64, f32);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct QueryCacheKey {
+    query: String,
+    k: usize,
+}
+
+struct QueryCacheEntry {
+    hits: Arc<Vec<SearchHit>>,
+    byte_len: usize,
+    recently_used: bool,
+}
+
+struct QueryResultCache {
+    entries: HashMap<QueryCacheKey, QueryCacheEntry>,
+    clock: VecDeque<QueryCacheKey>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl Default for QueryResultCache {
+    fn default() -> Self {
+        Self::with_budget(query_cache_budget())
+    }
+}
+
+impl QueryResultCache {
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, key: &QueryCacheKey) -> Option<Vec<SearchHit>> {
+        let entry = self.entries.get_mut(key)?;
+        entry.recently_used = true;
+        Some(entry.hits.as_ref().clone())
+    }
+
+    fn insert(&mut self, key: QueryCacheKey, hits: &[SearchHit]) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        let hits = Arc::new(hits.to_vec());
+        let key_bytes = std::mem::size_of::<QueryCacheKey>().saturating_add(key.query.capacity());
+        let byte_len = key_bytes
+            .saturating_mul(2)
+            .saturating_add(
+                hits.capacity()
+                    .saturating_mul(std::mem::size_of::<SearchHit>()),
+            )
+            .saturating_add(std::mem::size_of::<QueryCacheEntry>());
+        if byte_len > self.budget {
+            return;
+        }
+        while self.bytes.saturating_add(byte_len) > self.budget {
+            let Some(oldest) = self.clock.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.get_mut(&oldest) {
+                if entry.recently_used {
+                    entry.recently_used = false;
+                    self.clock.push_back(oldest);
+                    continue;
+                }
+            }
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.byte_len);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(byte_len);
+        self.clock.push_back(key.clone());
+        self.entries.insert(
+            key,
+            QueryCacheEntry {
+                hits,
+                byte_len,
+                recently_used: false,
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.entries.clear();
+        self.clock.clear();
+        self.bytes = 0;
+    }
+}
+
+fn query_cache_budget() -> usize {
+    std::env::var("YT_BM25_QUERY_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_QUERY_CACHE_BYTES)
+}
 
 /// f32 全序包装（NaN 也定序），WAND 的 top-k 阈值堆用。
 #[derive(Clone, Copy, PartialEq)]
@@ -150,11 +255,18 @@ struct Bm25State {
     doc_len: HashMap<(u64, u64), u32>,
     /// 所有文档词数之和（算 avgdl）。
     total_len: u64,
+    /// 当前增量里已经建过索引的确定性 event_id。磁盘基线保留排序表，这里只存新写入。
+    seen_events: HashSet<u64>,
     /// WAND 用：token → 分块的有序 postings（脏时从 `postings` 重建、查询期缓存，build-then-query 摊销）。
     sorted: HashMap<String, Postings>,
     dirty: bool,
     /// 已提交的倒排基线。打开时只保留文档长度和词目录，postings 按查询词读取。
     disk: Option<DiskBm25Cache>,
+    /// 磁盘基线被 clear/load 替换时递增。锁外打分按它检查文档目录和 posting 块仍属同一代。
+    disk_epoch: u64,
+    /// 只缓存无过滤查询；索引一有变化就递增并清空，避免并发查询把旧结果写回缓存。
+    query_epoch: u64,
+    query_cache: QueryResultCache,
 }
 
 impl Default for Bm25State {
@@ -163,9 +275,13 @@ impl Default for Bm25State {
             postings: HashMap::new(),
             doc_len: HashMap::new(),
             total_len: 0,
+            seen_events: HashSet::new(),
             sorted: HashMap::new(),
             dirty: false,
             disk: None,
+            disk_epoch: 0,
+            query_epoch: 0,
+            query_cache: QueryResultCache::default(),
         }
     }
 }
@@ -235,6 +351,22 @@ impl Bm25State {
                         .is_none()
                 })
                 .count()
+    }
+
+    fn has_event(&self, event_id: u64) -> bool {
+        self.seen_events.contains(&event_id)
+            || self
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.contains_event(event_id))
+    }
+
+    fn mark_event(&mut self, event_id: u64) -> bool {
+        if self.has_event(event_id) {
+            return false;
+        }
+        self.seen_events.insert(event_id);
+        true
     }
 
     fn doc_len(&self, doc: (u64, u64)) -> Option<u32> {
@@ -334,7 +466,7 @@ fn merge_sorted_postings(
 }
 
 /// BM25 词频长度归一（tf·(k1+1) / (tf + k1·(1-b+b·dl/avgdl))）。上确界 = k1+1（tf→∞）。
-fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
+pub(crate) fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
     tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * dl / avgdl))
 }
 
@@ -343,6 +475,22 @@ fn bm25_norm(tf: f32, dl: f32, avgdl: f32) -> f32 {
 pub struct Bm25TextIndex {
     state: Mutex<Bm25State>,
     tokenizer: Box<dyn Tokenizer>,
+    query_inflight: Mutex<HashSet<QueryCacheKey>>,
+    query_ready: Condvar,
+}
+
+struct QueryInflightGuard<'a> {
+    key: QueryCacheKey,
+    inflight: &'a Mutex<HashSet<QueryCacheKey>>,
+    ready: &'a Condvar,
+}
+
+impl Drop for QueryInflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut inflight = self.inflight.lock().unwrap_or_else(|err| err.into_inner());
+        inflight.remove(&self.key);
+        self.ready.notify_all();
+    }
 }
 
 impl Default for Bm25TextIndex {
@@ -362,8 +510,221 @@ impl Bm25TextIndex {
         Self {
             state: Mutex::new(Bm25State::default()),
             tokenizer,
+            query_inflight: Mutex::new(HashSet::new()),
+            query_ready: Condvar::new(),
         }
     }
+}
+
+struct DiskQueryTerm {
+    token: String,
+    idf: f32,
+    blocks: Vec<DiskBlockMeta>,
+}
+
+/// clean reopen 的磁盘 block-max 路径。锁只保护共享文件和 CLOCK 缓存，每个块的过滤、
+/// 打分和 top-k 都在锁外完成，多个查询不会再因为一个全局锁完全串行。
+fn disk_query_terms(
+    state: &Bm25State,
+    tokens: &[String],
+    doc_count: usize,
+) -> Option<(Vec<DiskQueryTerm>, Arc<Vec<((u64, u64), u32)>>, u64)> {
+    let disk = state.disk.as_ref()?;
+    let docs = disk.docs_arc();
+    let mut terms = Vec::new();
+    for token in tokens {
+        let Some(df) = disk.token_doc_freq(token) else {
+            continue;
+        };
+        let df = df as f32;
+        let idf = (1.0 + (doc_count as f32 - df + 0.5) / (df + 0.5)).ln();
+        terms.push(DiskQueryTerm {
+            token: token.clone(),
+            idf,
+            blocks: disk.block_metadata(token)?,
+        });
+    }
+    if terms.is_empty() {
+        return Some((terms, docs, state.disk_epoch));
+    }
+    let layout = &terms[0].blocks;
+    if terms.iter().skip(1).any(|term| {
+        term.blocks.len() != layout.len()
+            || term.blocks.iter().zip(layout).any(|(left, right)| {
+                left.first_doc != right.first_doc || left.last_doc != right.last_doc
+            })
+    }) {
+        return None;
+    }
+
+    Some((terms, docs, state.disk_epoch))
+}
+
+impl Bm25TextIndex {
+    fn search_disk_block_max(
+        &self,
+        tokens: &[String],
+        k: usize,
+        doc_count: usize,
+        avgdl: f32,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Option<Vec<(u64, u64, f32)>> {
+        let (terms, doc_lengths, disk_epoch) = {
+            let state = self.state.lock().unwrap();
+            disk_query_terms(&state, tokens, doc_count)?
+        };
+        if terms.is_empty() {
+            return Some(Vec::new());
+        }
+        let layout = terms[0].blocks.clone();
+
+        // 文档顺序不代表得分顺序。先处理上界最高的块，通常用一个块就能建立接近
+        // 最终值的 top-k 门槛；后续低上界块可以直接停止，不必按文件顺序扫到高分块。
+        // 同上界时先处理 doc 较小的块，既符合稳定排序，也让相同得分的尾块可安全跳过。
+        let mut block_order: Vec<(usize, f32)> = (0..layout.len())
+            .map(|block| {
+                let upper = terms
+                    .iter()
+                    .map(|term| term.idf * term.blocks[block].max_norm)
+                    .sum();
+                (block, upper)
+            })
+            .collect();
+        block_order.sort_unstable_by(|&(left_block, left_upper), &(right_block, right_upper)| {
+            right_upper.total_cmp(&left_upper).then(
+                layout[left_block]
+                    .first_doc
+                    .cmp(&layout[right_block].first_doc),
+            )
+        });
+
+        let mut topk = BinaryHeap::new();
+        let mut batch_start = 0usize;
+        while batch_start < block_order.len() {
+            // 首块单独处理，先尽快建立 top-k 阈值；否则首批会在没有阈值时把大量
+            // 本可跳过的块提前读进缓存。
+            let batch_end = if batch_start == 0 {
+                1
+            } else {
+                (batch_start + DISK_QUERY_BLOCK_BATCH).min(block_order.len())
+            };
+            let wanted = block_order[batch_start..batch_end]
+                .iter()
+                .copied()
+                .take_while(|&(block, upper)| {
+                    !upper_cannot_enter(&topk, k, upper, layout[block].first_doc)
+                })
+                .collect::<Vec<_>>();
+            if wanted.is_empty() {
+                break;
+            }
+            let loaded = {
+                let mut state = self.state.lock().unwrap();
+                if state.disk_epoch != disk_epoch {
+                    return None;
+                }
+                let disk = state.disk.as_mut()?;
+                let mut loaded = Vec::with_capacity(wanted.len());
+                for (block, upper) in wanted {
+                    let mut postings = Vec::with_capacity(terms.len());
+                    for term in &terms {
+                        postings.push(disk.load_block(&term.token, block)?);
+                    }
+                    loaded.push((block, upper, postings));
+                }
+                loaded
+            };
+            for (block, upper, postings_by_term) in loaded {
+                if upper_cannot_enter(&topk, k, upper, layout[block].first_doc) {
+                    break;
+                }
+                // 每个词的 posting 本身已有序，直接做多路归并。旧路径每 128 条建一个
+                // HashMap 再排序，百万数据会重复几千次分配和哈希。
+                let mut positions = vec![0usize; postings_by_term.len()];
+                let first = postings_by_term
+                    .iter()
+                    .filter_map(|postings| postings.first().map(|posting| posting.0))
+                    .min()?;
+                let mut doc_index = doc_lengths
+                    .binary_search_by_key(&first, |&(doc, _)| doc)
+                    .ok()?;
+                loop {
+                    let next_doc = postings_by_term
+                        .iter()
+                        .zip(&positions)
+                        .filter_map(|(postings, &position)| {
+                            postings.get(position).map(|posting| posting.0)
+                        })
+                        .min();
+                    let Some(doc) = next_doc else { break };
+                    while doc_index < doc_lengths.len() && doc_lengths[doc_index].0 < doc {
+                        doc_index += 1;
+                    }
+                    if doc_index >= doc_lengths.len() || doc_lengths[doc_index].0 != doc {
+                        return None;
+                    }
+                    let mut score = 0.0f32;
+                    for ((term, postings), position) in
+                        terms.iter().zip(&postings_by_term).zip(&mut positions)
+                    {
+                        if postings
+                            .get(*position)
+                            .is_some_and(|posting| posting.0 == doc)
+                        {
+                            let tf = postings[*position].1;
+                            score += term.idf
+                                * bm25_norm(tf as f32, doc_lengths[doc_index].1 as f32, avgdl);
+                            *position += 1;
+                        }
+                    }
+                    if filter(doc.0, doc.1) {
+                        push_topk(&mut topk, k, doc, score);
+                    }
+                }
+            }
+            batch_start = batch_end;
+        }
+
+        let mut scored: Vec<_> = topk
+            .into_iter()
+            .map(|item| (item.doc.0, item.doc.1, item.score.0))
+            .collect();
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
+        Some(scored)
+    }
+}
+
+fn upper_cannot_enter(
+    heap: &BinaryHeap<RankedScore>,
+    k: usize,
+    upper: f32,
+    first_doc: (u64, u64),
+) -> bool {
+    if heap.len() < k {
+        return false;
+    }
+    let worst = heap.peek().unwrap();
+    match upper.total_cmp(&worst.score.0) {
+        Ordering::Less => true,
+        Ordering::Equal => first_doc > worst.doc,
+        Ordering::Greater => false,
+    }
+}
+
+fn index_tokens(st: &mut Bm25State, trace_id: u64, span_id: u64, toks: Vec<String>) {
+    st.query_epoch = st.query_epoch.wrapping_add(1);
+    st.query_cache.clear();
+    let doc = (trace_id, span_id);
+    st.total_len += toks.len() as u64;
+    *st.doc_len.entry(doc).or_insert(0) += toks.len() as u32;
+    for token in toks {
+        *st.postings
+            .entry(token)
+            .or_default()
+            .entry(doc)
+            .or_insert(0) += 1;
+    }
+    st.dirty = true;
 }
 
 impl Bm25Index for Bm25TextIndex {
@@ -373,31 +734,105 @@ impl Bm25Index for Bm25TextIndex {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        let doc = (trace_id, span_id);
-        st.total_len += toks.len() as u64;
-        *st.doc_len.entry(doc).or_insert(0) += toks.len() as u32;
-        for t in toks {
-            *st.postings.entry(t).or_default().entry(doc).or_insert(0) += 1;
-        }
-        st.dirty = true;
+        index_tokens(&mut st, trace_id, span_id, toks);
     }
 
-    /// **block-max-WAND**（DAAT + 上界剪枝 + 块跳过）。剪枝用**严格 `<` 阈值**（θ = 当前第 k 高分）：
-    /// 被剪文档/块的上界严格小于 θ → 实际分严格小于最终第 k 高分 → 绝不进 top-k（含同分边界安全）。
+    fn index_event(&self, event_id: u64, trace_id: u64, span_id: u64, text: &str) {
+        let toks = self.tokenizer.tokenize(text);
+        let mut st = self.state.lock().unwrap();
+        if !st.mark_event(event_id) || toks.is_empty() {
+            return;
+        }
+        index_tokens(&mut st, trace_id, span_id, toks);
+    }
+
+    fn mark_event(&self, event_id: u64) {
+        self.state.lock().unwrap().mark_event(event_id);
+    }
+
+    /// **block-max-WAND**（DAAT + 上界剪枝 + 块跳过）。上界低于当前第 k 高分时直接剪枝；
+    /// 上界同分时结合稳定排序的 doc id，只跳过不可能替换当前结果的后续块。
     /// 候选全量打分后**终排（分降序、(trace,span) 升序）取 top-k**，与暴力逐位一致（有测试钉死）。
     /// 单词查询走块跳过（块上界 = idf·norm(max_tf,min_dl) < θ → 整块跳）；多词查询走 term 级 WAND（剪掉只命中弱词的文档）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
-        let mut st = self.state.lock().unwrap();
-        let n = st.doc_count();
+        if k == 0 {
+            return Vec::new();
+        }
+        let key = QueryCacheKey {
+            query: query.to_owned(),
+            k,
+        };
+        let query_epoch = loop {
+            let mut inflight = self.query_inflight.lock().unwrap();
+            if inflight.contains(&key) {
+                drop(self.query_ready.wait(inflight).unwrap());
+                continue;
+            }
+
+            // 在登记计算者前再查一次，补上“首次查缓存”和“拿到 inflight 锁”之间
+            // 另一个线程已经算完的窗口。
+            let mut state = self.state.lock().unwrap();
+            if let Some(hits) = state.query_cache.get(&key) {
+                return hits;
+            }
+            let query_epoch = state.query_epoch;
+            inflight.insert(key.clone());
+            break query_epoch;
+        };
+        let _inflight_guard = QueryInflightGuard {
+            key: key.clone(),
+            inflight: &self.query_inflight,
+            ready: &self.query_ready,
+        };
+
+        let hits = self.search_filtered(query, k, &|_, _| true);
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.query_epoch == query_epoch {
+                state.query_cache.insert(key, &hits);
+            }
+        }
+        hits
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        let (n, avgdl, clean_disk) = {
+            let st = self.state.lock().unwrap();
+            let n = st.doc_count();
+            let avgdl = if n == 0 {
+                0.0
+            } else {
+                st.total_len as f32 / n as f32
+            };
+            let clean_disk = st.doc_len.is_empty()
+                && st.sorted.is_empty()
+                && st.postings.is_empty()
+                && st.disk.is_some();
+            (n, avgdl, clean_disk)
+        };
         if n == 0 || k == 0 {
             return Vec::new();
         }
-        let avgdl = st.total_len as f32 / n as f32;
 
         // 查询词去重 + 排序（确定性求和顺序：按 token 序加各词贡献，与暴力一致）。
         let mut toks: Vec<String> = self.tokenizer.tokenize(query);
         toks.sort_unstable();
         toks.dedup();
+
+        // clean reopen 没有 WAL 增量时，直接用磁盘块目录做 block-max。只有块可能进入
+        // top-k 才读取 postings；块布局不一致的多词查询回到下面通用 WAND 路径。
+        if clean_disk {
+            if let Some(scored) = self.search_disk_block_max(&toks, k, n, avgdl, filter) {
+                return scored;
+            }
+        }
+
+        let mut st = self.state.lock().unwrap();
 
         // 只读取查询命中的词。持久基线 postings 从磁盘按偏移分页，WAL tail 从内存增量合并。
         let mut hits: Vec<(f32, QueryPostings)> = Vec::new();
@@ -443,6 +878,9 @@ impl Bm25Index for Bm25TextIndex {
                     continue; // 整块跳
                 }
                 for (offset, &(doc, tf)) in pp.docs[i..blk.end].iter().enumerate() {
+                    if !filter(doc.0, doc.1) {
+                        continue;
+                    }
                     let dl = pp.doc_lens[i + offset] as f32;
                     let sc = *idf * bm25_norm(tf as f32, dl, avgdl);
                     push_topk(&mut topk, k, doc, sc);
@@ -489,18 +927,20 @@ impl Bm25Index for Bm25TextIndex {
                 let pivot_doc = curs[order[poi]].docs[curs[order[poi]].pos].0;
                 let first_doc = curs[order[0]].docs[curs[order[0]].pos].0;
                 if first_doc == pivot_doc {
-                    let mut sc = 0.0f32;
-                    let dl = curs
-                        .iter()
-                        .find(|c| c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc)
-                        .map(|c| c.doc_lens[c.pos] as f32)
-                        .unwrap();
-                    for c in curs.iter() {
-                        if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
-                            sc += c.idf * bm25_norm(c.docs[c.pos].1 as f32, dl, avgdl);
+                    if filter(pivot_doc.0, pivot_doc.1) {
+                        let mut sc = 0.0f32;
+                        let dl = curs
+                            .iter()
+                            .find(|c| c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc)
+                            .map(|c| c.doc_lens[c.pos] as f32)
+                            .unwrap();
+                        for c in curs.iter() {
+                            if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
+                                sc += c.idf * bm25_norm(c.docs[c.pos].1 as f32, dl, avgdl);
+                            }
                         }
+                        push_topk(&mut topk, k, pivot_doc, sc);
                     }
-                    push_topk(&mut topk, k, pivot_doc, sc);
                     for c in curs.iter_mut() {
                         if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
                             c.pos += 1;
@@ -535,7 +975,14 @@ impl Bm25Index for Bm25TextIndex {
     }
 
     fn clear(&self) {
-        *self.state.lock().unwrap() = Bm25State::default();
+        let mut state = self.state.lock().unwrap();
+        let disk_epoch = state.disk_epoch.wrapping_add(1);
+        let query_epoch = state.query_epoch.wrapping_add(1);
+        *state = Bm25State {
+            disk_epoch,
+            query_epoch,
+            ..Bm25State::default()
+        };
     }
 
     fn load_cache(&self, path: &Path, manifest_version: u64, memtable_watermark: u64) -> bool {
@@ -543,9 +990,14 @@ impl Bm25Index for Bm25TextIndex {
             return false;
         };
         let total_len = disk.total_len();
-        *self.state.lock().unwrap() = Bm25State {
+        let mut state = self.state.lock().unwrap();
+        let disk_epoch = state.disk_epoch.wrapping_add(1);
+        let query_epoch = state.query_epoch.wrapping_add(1);
+        *state = Bm25State {
             total_len,
             disk: Some(disk),
+            disk_epoch,
+            query_epoch,
             ..Bm25State::default()
         };
         true
@@ -566,10 +1018,20 @@ impl Bm25Index for Bm25TextIndex {
 }
 
 impl Bm25TextIndex {
-    /// 暴力全量打分（**测试基准**）：对命中词的所有文档逐一打分（无剪枝），求和顺序与 WAND 一致
-    /// （按 token 序：外层 token、内层 doc 累加）。WAND 的结果必须与它逐位一致。
-    #[cfg(test)]
-    fn search_exhaustive(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
+    /// Eval 用完整评分：扫描查询词的全部 posting，不走 WAND、block 跳过、结果缓存或
+    /// singleflight。它是优化查询的慢速正确性基准，不应放进在线请求路径。
+    pub fn search_exact_for_eval(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
+        self.search_exact_filtered_for_eval(query, k, &|_, _| true)
+    }
+
+    /// 带过滤的 Eval 完整评分。内存只保留每个查询词的 posting 和 top-k，不为全部命中
+    /// 文档建立分数 HashMap，因此百万档高频词也可以运行。
+    pub fn search_exact_filtered_for_eval(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
         let mut st = self.state.lock().unwrap();
         let n = st.doc_count();
         if n == 0 || k == 0 {
@@ -579,26 +1041,49 @@ impl Bm25TextIndex {
         let mut toks: Vec<String> = self.tokenizer.tokenize(query);
         toks.sort_unstable();
         toks.dedup();
-        let mut scores: HashMap<(u64, u64), f32> = HashMap::new();
+        let mut hits = Vec::new();
         for tok in &toks {
             if let Some(docs) = st.postings_for(tok) {
                 let df = docs.len() as f32;
                 let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
                 let doc_lens = st.doc_lens_for_sorted(&docs).unwrap();
-                for (&(doc, tf), &dl) in docs.iter().zip(&doc_lens) {
-                    *scores.entry(doc).or_insert(0.0) +=
-                        idf * bm25_norm(tf as f32, dl as f32, avgdl);
-                }
+                hits.push((idf, docs, doc_lens));
             }
         }
-        let mut scored: Vec<(u64, u64, f32)> =
-            scores.into_iter().map(|((t, s), sc)| (t, s, sc)).collect();
-        scored.sort_by(|a, b| {
-            b.2.partial_cmp(&a.2)
-                .unwrap()
-                .then((a.0, a.1).cmp(&(b.0, b.1)))
-        });
-        scored.truncate(k);
+        if hits.is_empty() {
+            return Vec::new();
+        }
+
+        // posting 按 doc 有序。这里逐个 doc 完整求和，只用 top-k 堆限制结果内存；与
+        // 在线路径不同，它不会根据任何上界提前停止或跳块。
+        let mut positions = vec![0usize; hits.len()];
+        let mut topk = BinaryHeap::new();
+        loop {
+            let next_doc = hits
+                .iter()
+                .zip(&positions)
+                .filter_map(|((_, docs, _), &position)| docs.get(position).map(|posting| posting.0))
+                .min();
+            let Some(doc) = next_doc else { break };
+            let mut score = 0.0f32;
+            for ((idf, docs, doc_lens), position) in hits.iter().zip(&mut positions) {
+                if docs.get(*position).is_some_and(|posting| posting.0 == doc) {
+                    let tf = docs[*position].1;
+                    let dl = doc_lens[*position];
+                    score += *idf * bm25_norm(tf as f32, dl as f32, avgdl);
+                    *position += 1;
+                }
+            }
+            if filter(doc.0, doc.1) {
+                push_topk(&mut topk, k, doc, score);
+            }
+        }
+
+        let mut scored = topk
+            .into_iter()
+            .map(|item| (item.doc.0, item.doc.1, item.score.0))
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| b.2.total_cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
         scored
     }
 }
@@ -626,8 +1111,14 @@ impl Bm25State {
         }
         token_set.extend(self.sorted.keys().cloned());
         let tokens: Vec<String> = token_set.into_iter().collect();
-        let doc_count = docs.len() as u64;
-
+        let mut event_ids = self
+            .disk
+            .as_ref()
+            .map(|disk| disk.event_ids().to_vec())
+            .unwrap_or_default();
+        event_ids.extend(self.seen_events.iter().copied());
+        event_ids.sort_unstable();
+        event_ids.dedup();
         bm25_disk::write_atomic(
             path,
             CacheMetadata {
@@ -635,8 +1126,8 @@ impl Bm25State {
                 memtable_watermark,
                 total_len: self.total_len,
             },
-            docs,
-            doc_count,
+            &docs,
+            &event_ids,
             &tokens,
             |token| {
                 let delta = self
@@ -830,8 +1321,14 @@ mod tests {
             let query = q.join(" ");
             for &k in &[1usize, 5, 10, 50] {
                 let wand = bm.search(&query, k);
-                let exhaustive = bm.search_exhaustive(&query, k);
+                let exhaustive = bm.search_exact_for_eval(&query, k);
                 assert_eq!(wand, exhaustive, "WAND≠暴力: query={query:?} k={k}");
+                let filter = |trace_id: u64, span_id: u64| trace_id % 3 == 0 && span_id % 5 != 0;
+                assert_eq!(
+                    bm.search_filtered(&query, k, &filter),
+                    bm.search_exact_filtered_for_eval(&query, k, &filter),
+                    "过滤 WAND≠暴力: query={query:?} k={k}"
+                );
             }
         }
     }
@@ -840,6 +1337,96 @@ mod tests {
     fn empty_index_returns_nothing() {
         let bm = Bm25TextIndex::new();
         assert!(bm.search("盗刷", 5).is_empty());
+    }
+
+    #[test]
+    fn unfiltered_query_cache_is_bounded_and_invalidated_on_write() {
+        let bm = Bm25TextIndex::new();
+        for doc in 1..=512 {
+            bm.index_text(doc, 1, "common phrase filler");
+        }
+        let before = bm.search("common phrase", 10);
+        assert_eq!(bm.search("common phrase", 10), before);
+        {
+            let state = bm.state.lock().unwrap();
+            assert_eq!(state.query_cache.entries.len(), 1);
+            assert!(state
+                .query_cache
+                .entries
+                .values()
+                .all(|entry| entry.recently_used));
+        }
+
+        bm.index_text(999, 1, "common common common common phrase");
+        assert!(bm.state.lock().unwrap().query_cache.entries.is_empty());
+        let after = bm.search("common phrase", 10);
+        assert_ne!(after, before);
+        assert_eq!((after[0].0, after[0].1), (999, 1));
+
+        let mut cache = QueryResultCache::with_budget(usize::MAX);
+        cache.insert(
+            QueryCacheKey {
+                query: "first".to_owned(),
+                k: 1,
+            },
+            &[(1, 1, 1.0)],
+        );
+        cache.budget = cache.bytes;
+        cache.insert(
+            QueryCacheKey {
+                query: "other".to_owned(),
+                k: 1,
+            },
+            &[(2, 2, 2.0)],
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.keys().any(|key| key.query == "other"));
+        assert!(cache.bytes <= cache.budget);
+    }
+
+    #[test]
+    fn concurrent_identical_queries_share_one_computation() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Barrier;
+
+        struct SlowQueryTokenizer {
+            query_calls: Arc<AtomicUsize>,
+        }
+        impl Tokenizer for SlowQueryTokenizer {
+            fn tokenize(&self, text: &str) -> Vec<String> {
+                if text == "needle" {
+                    self.query_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                text.split_whitespace().map(str::to_owned).collect()
+            }
+        }
+
+        let query_calls = Arc::new(AtomicUsize::new(0));
+        let bm = Arc::new(Bm25TextIndex::with_tokenizer(Box::new(
+            SlowQueryTokenizer {
+                query_calls: Arc::clone(&query_calls),
+            },
+        )));
+        for doc in 1..=512 {
+            bm.index_text(doc, 1, "needle filler");
+        }
+        let barrier = Arc::new(Barrier::new(16));
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let bm = Arc::clone(&bm);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(bm.search("needle", 10).len(), 10);
+                });
+            }
+        });
+        assert_eq!(
+            query_calls.load(AtomicOrdering::Relaxed),
+            1,
+            "并发相同查询只能计算一次"
+        );
     }
 
     /// 接缝验证：注入一个"只认整词、不切 bigram"的分词器，索引/评分逻辑照旧走，
@@ -897,6 +1484,11 @@ mod tests {
         let loaded = Bm25TextIndex::new();
         assert!(loaded.load_cache(&path, 7, 3));
         assert_eq!(loaded.search("盗刷 风控", 10), before);
+        let only_odd_traces = |trace_id: u64, _: u64| trace_id % 2 == 1;
+        assert_eq!(
+            loaded.search_filtered("盗刷 风控", 10, &only_odd_traces),
+            loaded.search_exact_filtered_for_eval("盗刷 风控", 10, &only_odd_traces)
+        );
 
         // 持久主索引只保留排序 postings；WAL tail 增量要能合并回主索引，不能覆盖历史文档。
         loaded.index_text(1, 10, "补充风控证据");
@@ -917,5 +1509,193 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_index_is_idempotent_before_and_after_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_event_dedup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+
+        let built = Bm25TextIndex::new();
+        built.index_event(101, 1, 10, "任务执行 支付风控");
+        let once = built.search_exact_for_eval("支付风控", 10);
+        built.index_event(101, 1, 10, "任务执行 支付风控");
+        assert_eq!(
+            built.search_exact_for_eval("支付风控", 10),
+            once,
+            "同一 event_id 重试不能重复增加词频"
+        );
+        built.index_event(102, 2, 20, "任务执行 普通检查");
+        assert!(built.save_cache(&path, 7, 2).unwrap());
+
+        let reopened = Bm25TextIndex::new();
+        assert!(reopened.load_cache(&path, 7, 2));
+        let before_retry = reopened.search_exact_for_eval("支付风控", 10);
+        reopened.index_event(101, 1, 10, "任务执行 支付风控");
+        assert_eq!(
+            reopened.search_exact_for_eval("支付风控", 10),
+            before_retry,
+            "磁盘 event_id 表必须挡住重开后的迟到重试"
+        );
+
+        reopened.index_event(103, 1, 10, "支付风控");
+        assert_ne!(
+            reopened.search_exact_for_eval("支付风控", 10),
+            before_retry,
+            "不同 event_id 仍必须正常增加文本"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_block_max_is_stable_under_parallel_queries() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_parallel_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+
+        let built = Bm25TextIndex::new();
+        for doc in 1..=4096 {
+            let text = if doc % 97 == 0 {
+                "任务执行 月蚀校验码"
+            } else {
+                "任务执行 工具调用"
+            };
+            built.index_text(doc, 1, text);
+        }
+        assert!(built.save_cache(&path, 5, 4096).unwrap());
+
+        let loaded = Arc::new(Bm25TextIndex::new());
+        assert!(loaded.load_cache(&path, 5, 4096));
+        let expected_common = loaded.search("任务执行", 10);
+        let expected_rare = loaded.search("月蚀校验码", 10);
+        std::thread::scope(|scope| {
+            for worker in 0..16 {
+                let loaded = Arc::clone(&loaded);
+                let expected_common = expected_common.clone();
+                let expected_rare = expected_rare.clone();
+                scope.spawn(move || {
+                    for round in 0..20 {
+                        if (worker + round) % 2 == 0 {
+                            assert_eq!(loaded.search("任务执行", 10), expected_common);
+                        } else {
+                            assert_eq!(loaded.search("月蚀校验码", 10), expected_rare);
+                        }
+                    }
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_block_max_skips_equal_score_tail_blocks() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_block_max_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+
+        let built = Bm25TextIndex::new();
+        for doc in 1..=1024 {
+            built.index_text(doc, 1, "common phrase");
+        }
+        assert!(built.save_cache(&path, 3, 1024).unwrap());
+
+        let loaded = Bm25TextIndex::new();
+        assert!(loaded.load_cache(&path, 3, 1024));
+        let hits = loaded.search("common phrase", 10);
+        assert_eq!(
+            hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>()
+        );
+        let state = loaded.state.lock().unwrap();
+        let disk = state.disk.as_ref().unwrap();
+        assert_eq!(
+            disk.cached_block_count(),
+            2,
+            "两个词都只应读取首块，后续同分且 doc 更大的块应由磁盘上界跳过"
+        );
+        drop(state);
+
+        assert_eq!(hits, loaded.search_exact_for_eval("common phrase", 10));
+        let tail_only = |trace_id: u64, _: u64| trace_id >= 900;
+        let tail_hits = loaded.search_filtered("common phrase", 10, &tail_only);
+        assert_eq!(
+            tail_hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            (900..910).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            tail_hits,
+            loaded.search_exact_filtered_for_eval("common phrase", 10, &tail_only)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_block_max_reads_highest_upper_bound_block_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_bm25_best_block_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bm25.dat");
+
+        let built = Bm25TextIndex::new();
+        for doc in 1..=1024 {
+            let text = if doc <= 896 {
+                "common phrase filler filler filler filler filler filler"
+            } else {
+                "common phrase"
+            };
+            built.index_text(doc, 1, text);
+        }
+        assert!(built.save_cache(&path, 4, 1024).unwrap());
+
+        let loaded = Bm25TextIndex::new();
+        assert!(loaded.load_cache(&path, 4, 1024));
+        let hits = loaded.search("common phrase", 10);
+        assert_eq!(
+            hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            (897..907).collect::<Vec<_>>()
+        );
+        let state = loaded.state.lock().unwrap();
+        let disk = state.disk.as_ref().unwrap();
+        assert_eq!(
+            disk.cached_block_count(),
+            2,
+            "两个查询词都只应读取文件尾部的最高上界块"
+        );
+        drop(state);
+
+        assert_eq!(hits, loaded.search_exact_for_eval("common phrase", 10));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

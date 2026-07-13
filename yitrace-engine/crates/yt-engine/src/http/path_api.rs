@@ -410,26 +410,23 @@ impl EngineJsonApi {
             .saturating_add(parsed.limit)
             .clamp(1, 500);
         let snap = self.coord.pin_snapshot();
-        let spans = self
+        let (hits, mut read_plan) = self
             .coord
-            .search_text_attr(&snap, text, k, &parsed.index_filter)
+            .search_text_attr_with_read_plan(&snap, text, k, &parsed.index_filter);
+        let spans = hits
             .into_iter()
             .map(|(span, _score)| span)
             .filter(|span| trace_search_matches(span, &parsed.spec))
             .collect::<Vec<_>>();
         let indexed = parsed.index_filter.needs_indexed_filter();
-        let read_plan = ReadPlanStats {
-            source: Some(if indexed {
-                "filter_index".to_string()
-            } else {
-                "bm25".to_string()
-            }),
-            used_filter_index: indexed,
-            candidate_span_keys: Some(spans.len()),
-            matched_spans: spans.len(),
-            fallback_reason: (!indexed).then(|| "no_indexed_filter".to_string()),
-            ..Default::default()
-        };
+        read_plan.source = Some(if indexed {
+            "filter_index".to_string()
+        } else {
+            "bm25".to_string()
+        });
+        read_plan.used_filter_index = indexed;
+        read_plan.matched_spans = spans.len();
+        read_plan.fallback_reason = (!indexed).then(|| "no_indexed_filter".to_string());
         TraceSearchRead {
             spans,
             read_plan,

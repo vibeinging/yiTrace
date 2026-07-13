@@ -38,6 +38,12 @@ pub(crate) enum PostingLookup {
     Missing,
 }
 
+struct CachedPostingSet {
+    keys: Arc<HashSet<SpanKey>>,
+    byte_len: usize,
+    recently_used: bool,
+}
+
 pub(crate) struct DiskFilterCache {
     path: PathBuf,
     manifest_version: u64,
@@ -47,7 +53,7 @@ pub(crate) struct DiskFilterCache {
     posting_entries: usize,
     disabled_postings: usize,
     directory: HashMap<(String, String), PostingRef>,
-    cached: HashMap<(String, String), Arc<HashSet<SpanKey>>>,
+    cached: HashMap<(String, String), CachedPostingSet>,
     lru: VecDeque<(String, String)>,
     cached_bytes: usize,
     cache_budget: usize,
@@ -204,6 +210,13 @@ impl DiskFilterCache {
         self.disabled_postings
     }
 
+    pub(crate) fn posting_cardinality(&self, field: &str, value: &str) -> Option<usize> {
+        let entry = self.directory.get(&(field.to_owned(), value.to_owned()))?;
+        (!entry.disabled)
+            .then(|| usize::try_from(entry.count).ok())
+            .flatten()
+    }
+
     pub(crate) fn row_keys(&self) -> impl Iterator<Item = SpanKey> + '_ {
         self.rows.iter().map(|row| row.key)
     }
@@ -225,9 +238,9 @@ impl DiskFilterCache {
         if entry.disabled {
             return PostingLookup::Disabled;
         }
-        if let Some(set) = self.cached.get(&key).cloned() {
-            self.touch(&key);
-            return PostingLookup::Resident(set);
+        if let Some(cached) = self.cached.get_mut(&key) {
+            cached.recently_used = true;
+            return PostingLookup::Resident(Arc::clone(&cached.keys));
         }
         let Some(byte_len) = entry.count.checked_mul(POSTING_LEN) else {
             return PostingLookup::Missing;
@@ -252,29 +265,44 @@ impl DiskFilterCache {
             };
             set.insert((trace_id, span_id));
         }
+        let heap_bytes = posting_set_heap_bytes(&set);
         let set = Arc::new(set);
-        if byte_len <= self.cache_budget {
-            while self.cached_bytes.saturating_add(byte_len) > self.cache_budget {
+        if heap_bytes <= self.cache_budget {
+            while self.cached_bytes.saturating_add(heap_bytes) > self.cache_budget {
                 let Some(oldest) = self.lru.pop_front() else {
                     break;
                 };
+                if let Some(cached) = self.cached.get_mut(&oldest) {
+                    if cached.recently_used {
+                        cached.recently_used = false;
+                        self.lru.push_back(oldest);
+                        continue;
+                    }
+                }
                 if let Some(removed) = self.cached.remove(&oldest) {
-                    self.cached_bytes = self
-                        .cached_bytes
-                        .saturating_sub(removed.len().saturating_mul(POSTING_LEN as usize));
+                    self.cached_bytes = self.cached_bytes.saturating_sub(removed.byte_len);
                 }
             }
-            self.cached.insert(key.clone(), Arc::clone(&set));
+            self.cached.insert(
+                key.clone(),
+                CachedPostingSet {
+                    keys: Arc::clone(&set),
+                    byte_len: heap_bytes,
+                    recently_used: false,
+                },
+            );
             self.lru.push_back(key);
-            self.cached_bytes = self.cached_bytes.saturating_add(byte_len);
+            self.cached_bytes = self.cached_bytes.saturating_add(heap_bytes);
         }
         PostingLookup::Resident(set)
     }
+}
 
-    fn touch(&mut self, key: &(String, String)) {
-        self.lru.retain(|cached| cached != key);
-        self.lru.push_back(key.clone());
-    }
+fn posting_set_heap_bytes(set: &HashSet<SpanKey>) -> usize {
+    // std 不暴露每个 bucket 的真实字节数。key 本身 16 字节，再给控制字节、哈希表
+    // 对齐和分配器留 8 字节余量；按 capacity 而不是 len 计，避免低估预留空间。
+    set.capacity()
+        .saturating_mul(std::mem::size_of::<SpanKey>().saturating_add(8))
 }
 
 fn cache_budget() -> usize {
@@ -428,5 +456,67 @@ impl<'a> Cursor<'a> {
 
     fn finished(&self) -> bool {
         self.pos == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posting_cache_hits_keep_a_bounded_clock() {
+        let path = std::env::temp_dir().join(format!(
+            "yt_filter_disk_clock_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_atomic(
+            &path,
+            1,
+            2,
+            [((1, 1), vec![1]), ((2, 1), vec![2])],
+            [
+                Ok(PostingWrite {
+                    field: "project_id".to_string(),
+                    value: "a".to_string(),
+                    disabled: false,
+                    keys: vec![(1, 1)],
+                }),
+                Ok(PostingWrite {
+                    field: "project_id".to_string(),
+                    value: "b".to_string(),
+                    disabled: false,
+                    keys: vec![(2, 1)],
+                }),
+            ],
+        )
+        .unwrap();
+
+        let mut cache = DiskFilterCache::open(&path, 1, 2).unwrap();
+        assert!(matches!(
+            cache.lookup("project_id", "a"),
+            PostingLookup::Resident(_)
+        ));
+        cache.cache_budget = cache.cached.values().next().unwrap().byte_len;
+        for _ in 0..100 {
+            assert!(matches!(
+                cache.lookup("project_id", "a"),
+                PostingLookup::Resident(_)
+            ));
+        }
+        assert_eq!(cache.cached.len(), 1);
+        assert_eq!(cache.lru.len(), 1, "cache hits must not grow the clock");
+
+        assert!(matches!(
+            cache.lookup("project_id", "b"),
+            PostingLookup::Resident(_)
+        ));
+        assert_eq!(cache.cached.len(), 1, "budget must evict one posting");
+        assert_eq!(cache.lru.len(), 1);
+        assert!(cache.cached_bytes <= cache.cache_budget);
+        let _ = std::fs::remove_file(path);
     }
 }

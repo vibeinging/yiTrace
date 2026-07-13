@@ -1,15 +1,15 @@
 impl WriteCoordinator {
     /// 折叠核心。`keys=Some(集合)` 时**只折叠命中这些 (trace,span) 的行**（检索用：先由索引拿到命中 key,
     /// 只折叠它们,不折叠全库）；`None` = 折叠全部（普通读）。`proj` 声明要读哪些可折叠值列——列式段据此
-    /// 跳过不读的列（尤其大文本列），行式/内存源忽略它（无列 I/O 可省）。段扫描仍是全段（行级行指针待真实
-    /// 索引），但折叠/克隆只发生在候选行上。
+    /// 跳过不读的列（尤其大文本列），行式/内存源忽略它（无列 I/O 可省）。文件段有 key 目录时直接点查
+    /// 物理记录；旧段或其他存储不支持时再回退整段扫描。
     fn fold_query(
         &self,
         snap: &Snapshot,
         q: &TraceQuery,
         keys: Option<&std::collections::HashSet<(u64, u64)>>,
         proj: Projection,
-    ) -> (Vec<FoldedSpan>, usize) {
+    ) -> (Vec<FoldedSpan>, FoldQueryStats) {
         // 租户隔离时，强制把 tenant_id 列纳入投影（否则列式段窄投影读不到 tenant，过滤会误删全部）。
         let proj = if q.tenant_id.is_some() {
             Projection::of(proj.bits() | Projection::TENANT_ID)
@@ -17,7 +17,7 @@ impl WriteCoordinator {
             proj
         };
         let mut inputs: Vec<FoldInput> = Vec::new();
-        let mut scanned = 0usize;
+        let mut stats = FoldQueryStats::default();
         let in_keys = |t: u64, s: u64| keys.map_or(true, |ks| ks.contains(&(t, s)));
 
         // 段源：先用段 zone-map(min_ts/max_ts) 做时间窗剪枝 —— 不重叠的段整段跳过、不扫。
@@ -38,12 +38,22 @@ impl WriteCoordinator {
                         .get(&entry.segment_id.get())
                         .map_or(false, |b| !ks.iter().any(|&k| b.maybe_contains(k)));
                     if !bloom_skip {
-                        scanned += 1;
-                        if let Some(rows) = self
+                        stats.scanned_segments += 1;
+                        if let Some(scan) = self
                             .segments
                             .scan_fold_inputs_for_keys(entry.segment_id, ks)
                         {
-                            for (row, fi) in rows {
+                            stats.decoded_segment_rows += scan.decoded_rows;
+                            stats.index_bytes_read =
+                                stats.index_bytes_read.saturating_add(scan.index_bytes_read);
+                            stats.data_bytes_read =
+                                stats.data_bytes_read.saturating_add(scan.data_bytes_read);
+                            stats.indexes_validated += scan.indexes_validated;
+                            stats.indexes_rebuilt += scan.indexes_rebuilt;
+                            if scan.used_point_index {
+                                stats.point_lookup_segments += 1;
+                            }
+                            for (row, fi) in scan.rows {
                                 if entry.deletion_vec.is_deleted(row) {
                                     continue; // 删除位图按行号照查
                                 }
@@ -52,6 +62,7 @@ impl WriteCoordinator {
                         } else {
                             // 内存/测试段的兼容回退：仍使用段折叠缓存，但默认文件段不会走这里。
                             let sf = self.seg_fold(entry.segment_id);
+                            stats.decoded_segment_rows += sf.rows.len();
                             for &(t, s) in ks {
                                 if q.trace_id.map_or(false, |tid| t != tid) {
                                     continue;
@@ -74,7 +85,7 @@ impl WriteCoordinator {
                 //   ② 否则纯投影下推：只裁列、不丢行 → 行号完整，删除位图照行号生效。
                 //   ③ 都不支持 → 回退 `scan_fold_inputs` 读全列。
                 None => {
-                    scanned += 1;
+                    stats.scanned_segments += 1;
                     let time_pushed = if entry.deletion_seq == 0
                         && (q.time_from != i64::MIN || q.time_to != i64::MAX)
                     {
@@ -89,6 +100,7 @@ impl WriteCoordinator {
                     };
                     match time_pushed {
                         Some(folds) => {
+                            stats.decoded_segment_rows += folds.len();
                             for fi in folds {
                                 if q.trace_id.map_or(false, |tid| fi.trace_id != tid) {
                                     continue;
@@ -103,6 +115,7 @@ impl WriteCoordinator {
                                 .unwrap_or_else(|| {
                                     self.segments.scan_fold_inputs(entry.segment_id)
                                 });
+                            stats.decoded_segment_rows += rows.len();
                             for (row, fi) in rows {
                                 if entry.deletion_vec.is_deleted(row) {
                                     continue;
@@ -164,6 +177,6 @@ impl WriteCoordinator {
         if let Some(t) = q.tenant_id {
             spans.retain(|sp| sp.tenant_id == Some(t));
         }
-        (spans, scanned)
+        (spans, stats)
     }
 }

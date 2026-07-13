@@ -1,3 +1,15 @@
+/// 查询期间允许临时物化的过滤 key 上限。按每个 HashSet key 约 48 字节估算，超过预算
+/// 就回到磁盘逐条校验，避免低选择性属性把进程内存顶满。
+const DEFAULT_BM25_FILTER_SET_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const BM25_FILTER_KEY_ESTIMATED_BYTES: usize = 48;
+
+fn bm25_filter_set_budget_bytes() -> usize {
+    std::env::var("YT_BM25_FILTER_SET_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_BM25_FILTER_SET_BUDGET_BYTES)
+}
+
 impl WriteCoordinator {
     /// 装一条 trace 的父子树（树+瀑布视图用）：读出该 trace 的 span，按 parent_span_id 连成树。
     /// 父不在本 trace 内的 span 当根（容错：丢了 root 事件也能渲染）。
@@ -236,13 +248,22 @@ impl WriteCoordinator {
         body(&pred)
     }
 
-    /// BM25 目前按相关性先取 Top-K，再做属性谓词。固定过取会漏掉排在候选窗外的匹配项，
-    /// 所以逐步扩大候选窗：拿够 k 条就停；BM25 返回少于请求量时，说明已经没有更多命中。
+    /// 超过查询期集合预算时的保底路径：按相关性逐步扩大候选窗，再从磁盘点查属性。
+    /// 原生 BM25 在预算内走 `search_filtered`，不会进入这里；外部适配器也可继续复用此回退。
     fn search_bm25_with_filter(
         &self,
         query: &str,
         k: usize,
         filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        self.bm25.search_filtered(query, k, filter)
+    }
+
+    fn search_bm25_post_filter_mut(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Vec<(u64, u64, f32)> {
         if k == 0 {
             return Vec::new();
@@ -262,6 +283,30 @@ impl WriteCoordinator {
             }
             pool = next;
         }
+    }
+
+    fn search_bm25_with_attrs(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Vec<(u64, u64, f32)> {
+        if !filter.needs_attrs() {
+            let predicate = |trace_id: u64, _: u64| {
+                filter.trace_id.is_none_or(|expected| expected == trace_id)
+            };
+            return self.search_bm25_with_filter(query, k, &predicate);
+        }
+        self.ensure_filter_attrs_current();
+        let mut index = self.filter_attrs.lock().unwrap();
+        if index.filter_matches_all(filter) {
+            // 单租户本地库里，tenant posting 覆盖全部 span。后续 BM25 已不需要属性索引，
+            // 先放锁，否则所有同租户全文查询仍会被这把外层锁串行化。
+            drop(index);
+            return self.bm25.search(query, k);
+        }
+        let mut predicate = |trace_id, span_id| index.span_matches((trace_id, span_id), filter);
+        self.search_bm25_post_filter_mut(query, k, &mut predicate)
     }
 
     /// **按产品维度过滤的找相似**：`SearchFilter`（agent/状态/时间/trace）翻成谓词，下推进图搜索。
@@ -286,11 +331,65 @@ impl WriteCoordinator {
         k: usize,
         filter: &SearchFilter,
     ) -> Vec<(FoldedSpan, f32)> {
-        self.ensure_segment_scan_indexes_current();
-        let cands = self.with_filter_pred(filter, |pred| {
-            self.search_bm25_with_filter(query, k, pred)
-        });
+        let cands = self.search_text_attr_candidates(query, k, filter);
         self.join_folded(snap, cands)
+    }
+
+    /// 与 `search_text_attr` 相同，但同时返回 segment 点查证据，供 HTTP readPlan 和性能回归使用。
+    pub fn search_text_attr_with_read_plan(
+        &self,
+        snap: &Snapshot,
+        query: &str,
+        k: usize,
+        filter: &SearchFilter,
+    ) -> (Vec<(FoldedSpan, f32)>, ReadPlanStats) {
+        let cands = self.search_text_attr_candidates(query, k, filter);
+        let candidate_span_keys = cands
+            .iter()
+            .map(|&(trace_id, span_id, _)| (trace_id, span_id))
+            .collect::<HashSet<_>>()
+            .len();
+        let (hits, scan) = self.join_folded_with_stats(snap, cands);
+        (
+            hits,
+            ReadPlanStats {
+                used_filter_index: filter.needs_indexed_filter(),
+                candidate_span_keys: Some(candidate_span_keys),
+                scanned_segments: scan.scanned_segments,
+                point_lookup_segments: scan.point_lookup_segments,
+                decoded_segment_rows: scan.decoded_segment_rows,
+                index_bytes_read: scan.index_bytes_read,
+                data_bytes_read: scan.data_bytes_read,
+                indexes_validated: scan.indexes_validated,
+                indexes_rebuilt: scan.indexes_rebuilt,
+                ..ReadPlanStats::default()
+            },
+        )
+    }
+
+    fn search_text_attr_candidates(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &SearchFilter,
+    ) -> Vec<(u64, u64, f32)> {
+        self.ensure_segment_scan_indexes_current();
+        self.ensure_filter_attrs_current();
+        let exceeds_candidate_budget = self
+            .filter_attrs
+            .lock()
+            .unwrap()
+            .candidate_materialization_key_hint(filter)
+            .is_some_and(|count| {
+                count.saturating_mul(BM25_FILTER_KEY_ESTIMATED_BYTES)
+                    > bm25_filter_set_budget_bytes()
+            });
+        let cands = if filter.has_non_tenant_constraints() && !exceeds_candidate_budget {
+            self.with_filter_pred(filter, |pred| self.search_bm25_with_filter(query, k, pred))
+        } else {
+            self.search_bm25_with_attrs(query, k, filter)
+        };
+        cands
     }
 
     /// 按产品维度过滤的混合检索（向量侧下推进图、关键词侧后置过滤）。
@@ -323,6 +422,14 @@ impl WriteCoordinator {
     /// 把检索候选 (trace, span, 分) join 上「在快照里折叠出的完整 span」，保持检索的排序。
     /// **只折叠命中行**：把候选 key 集喂给 `fold_query`，不折叠全库（大数据下检索不再为几条命中折叠整库）。
     fn join_folded(&self, snap: &Snapshot, cands: Vec<(u64, u64, f32)>) -> Vec<(FoldedSpan, f32)> {
+        self.join_folded_with_stats(snap, cands).0
+    }
+
+    fn join_folded_with_stats(
+        &self,
+        snap: &Snapshot,
+        cands: Vec<(u64, u64, f32)>,
+    ) -> (Vec<(FoldedSpan, f32)>, FoldQueryStats) {
         let mut seen = std::collections::HashSet::new();
         let cands: Vec<(u64, u64, f32)> = cands
             .into_iter()
@@ -331,14 +438,16 @@ impl WriteCoordinator {
         let keys: std::collections::HashSet<(u64, u64)> =
             cands.iter().map(|&(t, s, _)| (t, s)).collect();
         // 检索结果要展示原文（命中片段），读全列。
-        let (hits, _) = self.fold_query(snap, &TraceQuery::all(), Some(&keys), Projection::ALL);
+        let (hits, stats) =
+            self.fold_query(snap, &TraceQuery::all(), Some(&keys), Projection::ALL);
         let map: HashMap<(u64, u64), FoldedSpan> = hits
             .into_iter()
             .map(|s| ((s.trace_id, s.span_id), s))
             .collect();
-        cands
+        let hits = cands
             .into_iter()
             .filter_map(|(t, s, score)| map.get(&(t, s)).cloned().map(|sp| (sp, score)))
-            .collect()
+            .collect();
+        (hits, stats)
     }
 }

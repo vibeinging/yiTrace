@@ -123,7 +123,7 @@ impl WriteCoordinator {
             return;
         };
         let manifest = self.current.manifest();
-        let rollup = self.trace_rollup.lock().unwrap();
+        let mut rollup = self.trace_rollup.lock().unwrap();
         if let Err(err) = rollup.save_cache(
             path,
             manifest.version.get(),
@@ -265,6 +265,17 @@ impl WriteCoordinator {
         self.bm25.clear();
         for span in spans {
             self.index_folded_span_text(&span);
+        }
+        // delete/upgrade 后文本按折叠 span 重建，但幂等键仍来自原始事件。补齐 event_id 表，
+        // 否则一次维护操作后，迟到的 SDK retry 会重新增加词频。
+        for entry in snap.manifest.segments.values() {
+            for record in self.segments.scan_records(entry.segment_id) {
+                self.bm25.mark_event(record.identity.event_id().0);
+            }
+        }
+        let memtable = self.memtable.lock().unwrap();
+        for row in memtable.read_range(snap.retained_watermark, snap.live_lsn) {
+            self.bm25.mark_event(row.identity.event_id().0);
         }
     }
 

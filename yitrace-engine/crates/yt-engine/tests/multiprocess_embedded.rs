@@ -10,12 +10,13 @@ use yt_core::fold::SpanFields;
 use yt_core::ids::SegmentId;
 use yt_wal::WalRecord;
 
-use yt_engine::{NewTraceAnnotation, TraceAnnotationFilter, WriteCoordinator};
+use yt_engine::{EngineJsonApi, NewTraceAnnotation, TraceAnnotationFilter, WriteCoordinator};
 
 const TEST_NAME: &str = "multiple_processes_open_same_data_dir_and_write";
 const READER_TEST_NAME: &str = "reclaim_waits_for_cross_process_reader_pin";
 const STRESS_TEST_NAME: &str = "many_processes_incrementally_refresh_wal_tail";
 const VECTOR_TEST_NAME: &str = "multiple_processes_write_vectors_and_reopen_searches_them";
+const INDEX_REBUILD_TEST_NAME: &str = "multiple_processes_rebuild_one_missing_segment_index";
 
 #[test]
 fn multiple_processes_open_same_data_dir_and_write() {
@@ -201,6 +202,56 @@ fn reclaim_waits_for_cross_process_reader_pin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn multiple_processes_rebuild_one_missing_segment_index() {
+    if let Some(dir) = std::env::var_os("YT_MULTIPROCESS_INDEX_REBUILD_DIR") {
+        let worker = std::env::var("YT_MULTIPROCESS_INDEX_REBUILD_WORKER").unwrap();
+        helper_rebuild_index(Path::new(&dir), &worker);
+        return;
+    }
+
+    let dir = fresh_dir("multiprocess_index_rebuild");
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.ingest(vec![record("index-rebuild")]);
+        coord.flush_memtable();
+    }
+    let segments_dir = dir.join("segments");
+    for entry in std::fs::read_dir(&segments_dir).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".idx") {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let workers = 8usize;
+    let mut children = Vec::new();
+    for worker in 0..workers {
+        children.push((worker, spawn_index_rebuilder(&dir, worker)));
+    }
+    for worker in 0..workers {
+        wait_for_file(&dir.join(format!("index-rebuild-ready-{worker}")));
+    }
+    std::fs::write(dir.join("index-rebuild-go"), b"go").unwrap();
+    for (worker, child) in children {
+        wait_writer(&format!("index-rebuild-{worker}"), child);
+    }
+
+    let indexes = std::fs::read_dir(&segments_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".idx"))
+        .count();
+    assert!(indexes >= 1, "并发查询后应补建 segment 点查索引");
+    assert!(
+        std::fs::read_dir(&segments_dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".idx.tmp")),
+        "多进程重建不能留下临时索引"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn spawn_writer(dir: &Path, trace: &str) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -249,6 +300,19 @@ fn spawn_vector_writer(dir: &Path, trace: &str, x: f32) -> Child {
         .env("YT_MULTIPROCESS_EMBEDDED_VECTOR_DIR", dir)
         .env("YT_MULTIPROCESS_EMBEDDED_VECTOR_TRACE", trace)
         .env("YT_MULTIPROCESS_EMBEDDED_VECTOR_X", x.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn spawn_index_rebuilder(dir: &Path, worker: usize) -> Child {
+    Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(INDEX_REBUILD_TEST_NAME)
+        .arg("--nocapture")
+        .env("YT_MULTIPROCESS_INDEX_REBUILD_DIR", dir)
+        .env("YT_MULTIPROCESS_INDEX_REBUILD_WORKER", worker.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -334,6 +398,23 @@ fn helper_write_vector(dir: &Path, trace: &str, x: f32) {
     coord.ingest(vec![row]);
     coord.index_embedding(trace_id, span_id, vec![x, 0.0, 0.0]);
     coord.flush_memtable();
+}
+
+fn helper_rebuild_index(dir: &Path, worker: &str) {
+    let coord = WriteCoordinator::open_durable(dir).unwrap();
+    coord.recover();
+    let api = EngineJsonApi::new(coord);
+    std::fs::write(dir.join(format!("index-rebuild-ready-{worker}")), b"ready").unwrap();
+    wait_for_file(&dir.join("index-rebuild-go"));
+    let (status, body) = api.route_with_tenant(
+        "POST",
+        "/v1/trace-search",
+        r#"{"text":"index-rebuild","limit":10}"#,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("index-rebuild"), "{body}");
+    assert!(body.contains(r#""pointLookupSegments":1"#), "{body}");
 }
 
 fn record(trace: &str) -> WalRecord {

@@ -55,10 +55,12 @@ impl WriteCoordinator {
             };
             let keys = self.filter_candidate_span_keys(&filter);
             if !keys.is_empty() {
-                return self.fold_query(snap, q, Some(&keys), Projection::ALL);
+                let (spans, stats) = self.fold_query(snap, q, Some(&keys), Projection::ALL);
+                return (spans, stats.scanned_segments);
             }
         }
-        self.fold_query(snap, q, None, Projection::ALL)
+        let (spans, stats) = self.fold_query(snap, q, None, Projection::ALL);
+        (spans, stats.scanned_segments)
     }
 
     /// 结构化读的索引入口：能用派生过滤索引时只折叠候选 span，不能用时回退到普通扫描。
@@ -95,8 +97,10 @@ impl WriteCoordinator {
             if keys.is_empty() {
                 return (Vec::new(), stats);
             }
-            let (spans, scanned) = self.fold_query(snap, q, Some(&keys), proj);
-            stats.scanned_segments = scanned;
+            let (spans, scan) = self.fold_query(snap, q, Some(&keys), proj);
+            stats.scanned_segments = scan.scanned_segments;
+            stats.point_lookup_segments = scan.point_lookup_segments;
+            stats.decoded_segment_rows = scan.decoded_segment_rows;
             stats.matched_spans = spans.len();
             return (spans, stats);
         }
@@ -106,8 +110,10 @@ impl WriteCoordinator {
         } else {
             "unsupported_attr_keys_only".to_string()
         });
-        let (spans, scanned) = self.fold_query(snap, q, None, proj);
-        stats.scanned_segments = scanned;
+        let (spans, scan) = self.fold_query(snap, q, None, proj);
+        stats.scanned_segments = scan.scanned_segments;
+        stats.point_lookup_segments = scan.point_lookup_segments;
+        stats.decoded_segment_rows = scan.decoded_segment_rows;
         stats.matched_spans = spans.len();
         (spans, stats)
     }

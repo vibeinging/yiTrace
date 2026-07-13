@@ -13,6 +13,8 @@ SEED=11400714819323198485
 PROFILE=release
 KEEP_DATA=0
 COLD_QUERIES=0
+VERIFY_SEARCH=0
+VERIFY_SOURCE_INDEX=0
 DATA_DIR=""
 AUTO_DATA_DIR=0
 REPORT_DIR="$ROOT_DIR/docs/reports/scale"
@@ -69,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cold-queries)
       COLD_QUERIES=1
+      shift
+      ;;
+    --verify-search)
+      VERIFY_SEARCH=1
+      shift
+      ;;
+    --verify-source-index)
+      VERIFY_SOURCE_INDEX=1
       shift
       ;;
     --report)
@@ -145,6 +155,12 @@ if [[ "$COLD_QUERIES" -eq 1 ]]; then
     --data-dir "$DATA_DIR"
     --report "$REPORT_PATH"
   )
+  if [[ "$VERIFY_SEARCH" -eq 1 ]]; then
+    query_cmd+=(--verify-search)
+  fi
+  if [[ "$VERIFY_SOURCE_INDEX" -eq 1 ]]; then
+    query_cmd+=(--verify-source-index)
+  fi
 
   echo "==> ${generate_cmd[*]}"
   "${generate_cmd[@]}"
@@ -174,6 +190,12 @@ if [[ -n "$DATA_DIR" ]]; then
 fi
 if [[ "$KEEP_DATA" -eq 1 ]]; then
   cmd+=(--keep-data)
+fi
+if [[ "$VERIFY_SEARCH" -eq 1 ]]; then
+  cmd+=(--verify-search)
+fi
+if [[ "$VERIFY_SOURCE_INDEX" -eq 1 ]]; then
+  cmd+=(--verify-source-index)
 fi
 
 echo "==> ${cmd[*]}"

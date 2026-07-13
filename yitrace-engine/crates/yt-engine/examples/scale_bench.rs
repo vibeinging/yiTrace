@@ -7,17 +7,23 @@
 mod generator;
 #[path = "scale_bench/queries.rs"]
 mod queries;
+#[path = "scale_bench/source_oracle.rs"]
+mod source_oracle;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use generator::{generate_dataset, DatasetStats, GeneratorConfig};
 use queries::{build_queries, Query};
-use yt_engine::{EngineJsonApi, WriteCoordinator};
+use source_oracle::{run_source_index_oracle, SourceOracleReport};
+use yt_engine::{
+    Bm25Index, Bm25TextIndex, ChineseTokenizer, CoordinatorBuilder, EngineJsonApi, WriteCoordinator,
+};
 
 const DEFAULT_SPANS: usize = 10_000;
 const DEFAULT_QUERIES: usize = 200;
@@ -62,7 +68,11 @@ struct Args {
     seed: u64,
     data_dir: PathBuf,
     report: Option<PathBuf>,
+    only_query: Option<String>,
+    concurrency: usize,
     cold_queries: bool,
+    verify_search: bool,
+    verify_source_index: bool,
     keep_data: bool,
 }
 
@@ -86,6 +96,14 @@ struct TimedStats {
     validation_errors: usize,
     expected_read_source: Option<&'static str>,
     read_source_hits: usize,
+    expect_point_lookup: bool,
+    point_lookup_hits: usize,
+    max_point_lookup_segments: u64,
+    max_decoded_segment_rows: u64,
+    max_index_bytes_read: u64,
+    max_data_bytes_read: u64,
+    max_indexes_validated: u64,
+    max_indexes_rebuilt: u64,
     response_bytes: usize,
     first_failure: Option<String>,
 }
@@ -115,6 +133,7 @@ struct Report {
     query_mode: &'static str,
     dataset: DatasetStats,
     queries: usize,
+    query_concurrency: usize,
     data_dir: PathBuf,
     dir: DirStats,
     open_duration: Duration,
@@ -122,6 +141,23 @@ struct Report {
     rss_after_open_kib: Option<u64>,
     rss_after_queries_kib: Option<u64>,
     stats: Vec<TimedStats>,
+    search_oracle: Option<SearchOracleReport>,
+    source_oracle: Option<SourceOracleReport>,
+}
+
+struct SearchOracleReport {
+    duration: Duration,
+    cases: Vec<SearchOracleCaseResult>,
+}
+
+struct SearchOracleCaseResult {
+    name: &'static str,
+    filter: &'static str,
+    k: usize,
+    optimized_count: usize,
+    exact_count: usize,
+    recall_at_k: f64,
+    exact_rank_and_score: bool,
 }
 
 fn main() {
@@ -135,14 +171,22 @@ fn main() {
     let failed = report
         .stats
         .iter()
-        .any(|stat| stat.http_errors > 0 || stat.validation_errors > 0);
+        .any(|stat| stat.http_errors > 0 || stat.validation_errors > 0)
+        || report
+            .search_oracle
+            .as_ref()
+            .is_some_and(|oracle| oracle.cases.iter().any(|case| !case.exact_rank_and_score))
+        || report
+            .source_oracle
+            .as_ref()
+            .is_some_and(|oracle| oracle.cases.iter().any(|case| !case.exact_rank_and_score));
     write_report(&args, &report);
 
     if args.phase == Phase::Full && !args.keep_data {
         let _ = std::fs::remove_dir_all(&args.data_dir);
     }
     if failed {
-        eprintln!("scale_bench: query correctness or read-plan validation failed");
+        eprintln!("scale_bench: query correctness, recall oracle, or read-plan validation failed");
         std::process::exit(1);
     }
 }
@@ -150,8 +194,7 @@ fn main() {
 fn run_open_only(args: &Args) -> Report {
     let dataset = load_dataset_stats(&args.data_dir);
     let open_start = Instant::now();
-    let coord =
-        WriteCoordinator::open_durable(&args.data_dir).expect("open existing durable engine");
+    let (coord, _) = open_bench_engine(&args.data_dir);
     coord.recover();
     let open_duration = open_start.elapsed();
     let rss_after_open_kib = current_rss_kib();
@@ -161,6 +204,7 @@ fn run_open_only(args: &Args) -> Report {
         query_mode: "open-only",
         dataset,
         queries: 0,
+        query_concurrency: args.concurrency,
         dir: dir_stats(&args.data_dir),
         data_dir: args.data_dir.clone(),
         open_duration,
@@ -168,13 +212,15 @@ fn run_open_only(args: &Args) -> Report {
         rss_after_open_kib,
         rss_after_queries_kib: None,
         stats: Vec::new(),
+        search_oracle: None,
+        source_oracle: None,
     }
 }
 
 fn run_generate_only(args: &Args) -> Report {
     prepare_new_data_dir(&args.data_dir);
     let open_start = Instant::now();
-    let coord = WriteCoordinator::open_durable(&args.data_dir).expect("open durable engine");
+    let (coord, _) = open_bench_engine(&args.data_dir);
     coord.recover();
     let open_duration = open_start.elapsed();
     let rss_after_open_kib = current_rss_kib();
@@ -186,6 +232,7 @@ fn run_generate_only(args: &Args) -> Report {
         query_mode: "not-run",
         dataset,
         queries: args.queries,
+        query_concurrency: args.concurrency,
         dir: dir_stats(&args.data_dir),
         data_dir: args.data_dir.clone(),
         open_duration,
@@ -193,38 +240,53 @@ fn run_generate_only(args: &Args) -> Report {
         rss_after_open_kib,
         rss_after_queries_kib: None,
         stats: Vec::new(),
+        search_oracle: None,
+        source_oracle: None,
     }
 }
 
 fn run_query_only(args: &Args) -> Report {
     let dataset = load_dataset_stats(&args.data_dir);
     let open_start = Instant::now();
-    let coord =
-        WriteCoordinator::open_durable(&args.data_dir).expect("open existing durable engine");
+    let (coord, bm25) = open_bench_engine(&args.data_dir);
     coord.recover();
     let open_duration = open_start.elapsed();
     let rss_after_open_kib = current_rss_kib();
-    let stats = run_queries(&coord, args.queries, &dataset);
+    let stats = run_queries(
+        &coord,
+        args.queries,
+        args.concurrency,
+        &dataset,
+        args.only_query.as_deref(),
+    );
+    let rss_after_queries_kib = current_rss_kib();
+    let search_oracle = args.verify_search.then(|| run_search_oracle(bm25.as_ref()));
+    let source_oracle = args
+        .verify_source_index
+        .then(|| run_source_index_oracle(bm25.as_ref(), &dataset, args.batch, TENANT));
 
     Report {
         phase: args.phase,
         query_mode: "separate-process-reopen",
         dataset,
         queries: args.queries,
+        query_concurrency: args.concurrency,
         dir: dir_stats(&args.data_dir),
         data_dir: args.data_dir.clone(),
         open_duration,
         write: None,
         rss_after_open_kib,
-        rss_after_queries_kib: current_rss_kib(),
+        rss_after_queries_kib,
         stats,
+        search_oracle,
+        source_oracle,
     }
 }
 
 fn run_full(args: &Args) -> Report {
     prepare_new_data_dir(&args.data_dir);
     let open_start = Instant::now();
-    let coord = WriteCoordinator::open_durable(&args.data_dir).expect("open durable engine");
+    let (coord, mut bm25) = open_bench_engine(&args.data_dir);
     coord.recover();
     let mut open_duration = open_start.elapsed();
     let (dataset, write) = ingest_dataset(&coord, args);
@@ -233,30 +295,55 @@ fn run_full(args: &Args) -> Report {
     let (coord, query_mode) = if args.cold_queries {
         drop(coord);
         let reopen_start = Instant::now();
-        let reopened =
-            WriteCoordinator::open_durable(&args.data_dir).expect("reopen durable engine");
+        let (reopened, reopened_bm25) = open_bench_engine(&args.data_dir);
         reopened.recover();
+        bm25 = reopened_bm25;
         open_duration = reopen_start.elapsed();
         (reopened, "same-process-reopen")
     } else {
         (coord, "same-process-warm")
     };
     let rss_after_open_kib = current_rss_kib();
-    let stats = run_queries(&coord, args.queries, &dataset);
+    let stats = run_queries(
+        &coord,
+        args.queries,
+        args.concurrency,
+        &dataset,
+        args.only_query.as_deref(),
+    );
+    let rss_after_queries_kib = current_rss_kib();
+    let search_oracle = args.verify_search.then(|| run_search_oracle(bm25.as_ref()));
+    let source_oracle = args
+        .verify_source_index
+        .then(|| run_source_index_oracle(bm25.as_ref(), &dataset, args.batch, TENANT));
 
     Report {
         phase: args.phase,
         query_mode,
         dataset,
         queries: args.queries,
+        query_concurrency: args.concurrency,
         dir: dir_stats(&args.data_dir),
         data_dir: args.data_dir.clone(),
         open_duration,
         write: Some(write),
         rss_after_open_kib,
-        rss_after_queries_kib: current_rss_kib(),
+        rss_after_queries_kib,
         stats,
+        search_oracle,
+        source_oracle,
     }
+}
+
+fn open_bench_engine(path: &Path) -> (Arc<WriteCoordinator>, Arc<Bm25TextIndex>) {
+    let bm25 = Arc::new(Bm25TextIndex::with_tokenizer(Box::new(
+        ChineseTokenizer::full(),
+    )));
+    let coord = CoordinatorBuilder::new()
+        .with_bm25(bm25.clone())
+        .open_durable(path)
+        .expect("open durable engine");
+    (coord, bm25)
 }
 
 fn prepare_new_data_dir(path: &Path) {
@@ -306,39 +393,228 @@ fn ingest_dataset(coord: &Arc<WriteCoordinator>, args: &Args) -> (DatasetStats, 
 fn run_queries(
     coord: &Arc<WriteCoordinator>,
     count: usize,
+    concurrency: usize,
     dataset: &DatasetStats,
+    only_query: Option<&str>,
 ) -> Vec<TimedStats> {
     let api = EngineJsonApi::new(Arc::clone(coord));
-    build_queries(count, dataset)
+    let stats = build_queries(count, dataset)
         .into_iter()
+        .filter(|query| only_query.is_none_or(|name| query.name == name))
+        .map(|mut query| {
+            if only_query.is_some() {
+                query.count = count.max(1);
+            }
+            query
+        })
         .map(|query| {
             eprintln!(
-                "scale_bench: query {} selectivity={} count={}",
-                query.name, query.selectivity, query.count
+                "scale_bench: query {} selectivity={} count={} concurrency={}",
+                query.name, query.selectivity, query.count, concurrency
             );
-            measure_query(&api, query)
+            measure_query(&api, query, concurrency)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if stats.is_empty() {
+        eprintln!(
+            "unknown --only-query: {}",
+            only_query.unwrap_or("<not provided>")
+        );
+        std::process::exit(2);
+    }
+    stats
 }
 
-fn measure_query(api: &EngineJsonApi, query: Query) -> TimedStats {
+#[derive(Clone, Copy)]
+enum OracleFilter {
+    All,
+    ScaleA,
+}
+
+struct SearchOracleCase {
+    name: &'static str,
+    query: &'static str,
+    k: usize,
+    filter: OracleFilter,
+}
+
+fn run_search_oracle(bm25: &Bm25TextIndex) -> SearchOracleReport {
+    let cases = [
+        SearchOracleCase {
+            name: "common-k10",
+            query: "任务执行",
+            k: 10,
+            filter: OracleFilter::All,
+        },
+        SearchOracleCase {
+            name: "common-k50",
+            query: "任务执行",
+            k: 50,
+            filter: OracleFilter::All,
+        },
+        SearchOracleCase {
+            name: "common-project-k10",
+            query: "任务执行",
+            k: 10,
+            filter: OracleFilter::ScaleA,
+        },
+        SearchOracleCase {
+            name: "rare-k10",
+            query: "月蚀校验码",
+            k: 10,
+            filter: OracleFilter::All,
+        },
+        SearchOracleCase {
+            name: "risk-k20",
+            query: "支付风控",
+            k: 20,
+            filter: OracleFilter::All,
+        },
+        SearchOracleCase {
+            name: "multi-term-k20",
+            query: "任务执行 支付风控",
+            k: 20,
+            filter: OracleFilter::All,
+        },
+    ];
+    let started = Instant::now();
+    let results = cases
+        .iter()
+        .map(|case| {
+            eprintln!(
+                "scale_bench: search oracle {} query={:?} k={}",
+                case.name, case.query, case.k
+            );
+            let (optimized, exact, filter) = match case.filter {
+                OracleFilter::All => (
+                    bm25.search(case.query, case.k),
+                    bm25.search_exact_for_eval(case.query, case.k),
+                    "all",
+                ),
+                OracleFilter::ScaleA => {
+                    let scale_a = |trace_id: u64, _: u64| trace_id > 0 && (trace_id - 1) % 4 == 0;
+                    (
+                        bm25.search_filtered(case.query, case.k, &scale_a),
+                        bm25.search_exact_filtered_for_eval(case.query, case.k, &scale_a),
+                        "project_id=scale-a",
+                    )
+                }
+            };
+            let exact_docs = exact
+                .iter()
+                .map(|&(trace_id, span_id, _)| (trace_id, span_id))
+                .collect::<HashSet<_>>();
+            let optimized_docs = optimized
+                .iter()
+                .map(|&(trace_id, span_id, _)| (trace_id, span_id))
+                .collect::<HashSet<_>>();
+            let recall_at_k = if exact_docs.is_empty() {
+                if optimized_docs.is_empty() {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                optimized_docs.intersection(&exact_docs).count() as f64 / exact_docs.len() as f64
+            };
+            SearchOracleCaseResult {
+                name: case.name,
+                filter,
+                k: case.k,
+                optimized_count: optimized.len(),
+                exact_count: exact.len(),
+                recall_at_k,
+                exact_rank_and_score: optimized == exact,
+            }
+        })
+        .collect();
+    SearchOracleReport {
+        duration: started.elapsed(),
+        cases: results,
+    }
+}
+
+struct QueryObservation {
+    index: usize,
+    elapsed: Duration,
+    status: u16,
+    body: String,
+}
+
+fn execute_queries(
+    api: &EngineJsonApi,
+    query: &Query,
+    count: usize,
+    concurrency: usize,
+) -> (Duration, Vec<QueryObservation>) {
+    let total_start = Instant::now();
+    if concurrency <= 1 || count <= 1 {
+        let mut observations = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = Instant::now();
+            let (status, body) =
+                api.route_with_tenant(query.method, &query.path, &query.body, Some(TENANT));
+            observations.push(QueryObservation {
+                index,
+                elapsed: start.elapsed(),
+                status,
+                body,
+            });
+        }
+        return (total_start.elapsed(), observations);
+    }
+
+    let next = AtomicUsize::new(0);
+    let observations = Mutex::new(Vec::with_capacity(count));
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency.min(count) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= count {
+                    break;
+                }
+                let start = Instant::now();
+                let (status, body) =
+                    api.route_with_tenant(query.method, &query.path, &query.body, Some(TENANT));
+                observations.lock().unwrap().push(QueryObservation {
+                    index,
+                    elapsed: start.elapsed(),
+                    status,
+                    body,
+                });
+            });
+        }
+    });
+    let total = total_start.elapsed();
+    let mut observations = observations.into_inner().unwrap();
+    observations.sort_unstable_by_key(|observation| observation.index);
+    (total, observations)
+}
+
+fn measure_query(api: &EngineJsonApi, query: Query, concurrency: usize) -> TimedStats {
     let count = query.count.max(1);
     let mut latencies = Vec::with_capacity(count);
     let mut http_errors = 0usize;
     let mut validation_errors = 0usize;
     let mut read_source_hits = 0usize;
+    let mut point_lookup_hits = 0usize;
+    let mut max_point_lookup_segments = 0u64;
+    let mut max_decoded_segment_rows = 0u64;
+    let mut max_index_bytes_read = 0u64;
+    let mut max_data_bytes_read = 0u64;
+    let mut max_indexes_validated = 0u64;
+    let mut max_indexes_rebuilt = 0u64;
     let mut response_bytes = 0usize;
     let mut first_failure = None;
     let expected_source_fragment = query
         .expected_read_source
         .map(|source| format!(r#""source":"{source}""#));
-    let total_start = Instant::now();
+    let (total, observations) = execute_queries(api, &query, count, concurrency);
 
-    for _ in 0..count {
-        let start = Instant::now();
-        let (status, body) =
-            api.route_with_tenant(query.method, &query.path, &query.body, Some(TENANT));
-        let elapsed = start.elapsed();
+    for observation in observations {
+        let status = observation.status;
+        let body = observation.body;
+        let elapsed = observation.elapsed;
         let missing = query
             .expected_fragments
             .iter()
@@ -346,19 +622,27 @@ fn measure_query(api: &EngineJsonApi, query: Query) -> TimedStats {
         let source_ok = expected_source_fragment
             .as_ref()
             .is_none_or(|fragment| body.contains(fragment));
+        let point_lookup_segments = json_u64_field(&body, "pointLookupSegments").unwrap_or(0);
+        let decoded_segment_rows = json_u64_field(&body, "decodedSegmentRows").unwrap_or(0);
+        let index_bytes_read = json_u64_field(&body, "indexBytesRead").unwrap_or(0);
+        let data_bytes_read = json_u64_field(&body, "dataBytesRead").unwrap_or(0);
+        let indexes_validated = json_u64_field(&body, "indexesValidated").unwrap_or(0);
+        let indexes_rebuilt = json_u64_field(&body, "indexesRebuilt").unwrap_or(0);
+        let point_lookup_ok = !query.expect_point_lookup || point_lookup_segments > 0;
 
         if status != 200 {
             http_errors += 1;
             first_failure
                 .get_or_insert_with(|| format!("status={status} body={}", truncate(&body, 240)));
         }
-        if missing.is_some() || !source_ok {
+        if missing.is_some() || !source_ok || !point_lookup_ok {
             validation_errors += 1;
             first_failure.get_or_insert_with(|| {
                 format!(
-                    "missing={:?} expectedSource={:?} body={}",
+                    "missing={:?} expectedSource={:?} expectPointLookup={} body={}",
                     missing,
                     query.expected_read_source,
+                    query.expect_point_lookup,
                     truncate(&body, 240)
                 )
             });
@@ -366,11 +650,19 @@ fn measure_query(api: &EngineJsonApi, query: Query) -> TimedStats {
         if source_ok && query.expected_read_source.is_some() {
             read_source_hits += 1;
         }
+        if query.expect_point_lookup && point_lookup_ok {
+            point_lookup_hits += 1;
+        }
+        max_point_lookup_segments = max_point_lookup_segments.max(point_lookup_segments);
+        max_decoded_segment_rows = max_decoded_segment_rows.max(decoded_segment_rows);
+        max_index_bytes_read = max_index_bytes_read.max(index_bytes_read);
+        max_data_bytes_read = max_data_bytes_read.max(data_bytes_read);
+        max_indexes_validated = max_indexes_validated.max(indexes_validated);
+        max_indexes_rebuilt = max_indexes_rebuilt.max(indexes_rebuilt);
         response_bytes += body.len();
         latencies.push(elapsed);
     }
 
-    let total = total_start.elapsed();
     let first = latencies.first().copied().unwrap_or_default();
     latencies.sort_unstable();
     TimedStats {
@@ -387,6 +679,14 @@ fn measure_query(api: &EngineJsonApi, query: Query) -> TimedStats {
         validation_errors,
         expected_read_source: query.expected_read_source,
         read_source_hits,
+        expect_point_lookup: query.expect_point_lookup,
+        point_lookup_hits,
+        max_point_lookup_segments,
+        max_decoded_segment_rows,
+        max_index_bytes_read,
+        max_data_bytes_read,
+        max_indexes_validated,
+        max_indexes_rebuilt,
         response_bytes,
         first_failure,
     }
@@ -410,6 +710,16 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         head
     }
+}
+
+fn json_u64_field(body: &str, key: &str) -> Option<u64> {
+    let needle = format!(r#""{key}":"#);
+    let rest = body.split_once(&needle)?.1;
+    let digits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
 fn persist_dataset_stats(path: &Path, stats: &DatasetStats) {
@@ -551,6 +861,7 @@ fn render_report(report: &Report) -> String {
     let _ = writeln!(out, "- generatedAtUnix: {now}");
     let _ = writeln!(out, "- phase: {}", report.phase.label());
     let _ = writeln!(out, "- queryProcessMode: {}", report.query_mode);
+    let _ = writeln!(out, "- pageCacheMode: uncontrolled");
     let _ = writeln!(out, "- seed: {}", report.dataset.seed);
     let _ = writeln!(out, "- foldedSpans: {}", report.dataset.spans);
     let _ = writeln!(out, "- wireEvents: {}", report.dataset.wire_events);
@@ -569,6 +880,37 @@ fn render_report(report: &Report) -> String {
         report.dataset.incomplete_spans
     );
     let _ = writeln!(out, "- requestedQueriesPerEndpoint: {}", report.queries);
+    let _ = writeln!(out, "- queryConcurrency: {}", report.query_concurrency);
+    let _ = writeln!(
+        out,
+        "- searchOracle: {}",
+        report.search_oracle.as_ref().map_or_else(
+            || "not-run".to_string(),
+            |oracle| {
+                let failures = oracle
+                    .cases
+                    .iter()
+                    .filter(|case| !case.exact_rank_and_score)
+                    .count();
+                format!("{} cases, {} failures", oracle.cases.len(), failures)
+            }
+        )
+    );
+    let _ = writeln!(
+        out,
+        "- sourceIndexOracle: {}",
+        report.source_oracle.as_ref().map_or_else(
+            || "not-run".to_string(),
+            |oracle| {
+                let failures = oracle
+                    .cases
+                    .iter()
+                    .filter(|case| !case.exact_rank_and_score)
+                    .count();
+                format!("{} cases, {} failures", oracle.cases.len(), failures)
+            }
+        )
+    );
     let _ = writeln!(out, "- dataDir: {}", report.data_dir.display());
     let _ = writeln!(
         out,
@@ -660,10 +1002,23 @@ fn render_report(report: &Report) -> String {
         );
         for stat in &report.stats {
             let avg_bytes = stat.response_bytes / stat.count.max(1);
-            let plan = stat.expected_read_source.map_or_else(
+            let mut plan = stat.expected_read_source.map_or_else(
                 || "n/a".to_string(),
                 |source| format!("{source} {}/{}", stat.read_source_hits, stat.count),
             );
+            if stat.expect_point_lookup {
+                plan.push_str(&format!(
+                    "; point {}/{} segments<={} rows<={} indexBytes<={} dataBytes<={} validated<={} rebuilt<={}",
+                    stat.point_lookup_hits,
+                    stat.count,
+                    stat.max_point_lookup_segments,
+                    stat.max_decoded_segment_rows,
+                    stat.max_index_bytes_read,
+                    stat.max_data_bytes_read,
+                    stat.max_indexes_validated,
+                    stat.max_indexes_rebuilt
+                ));
+            }
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {:.0} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | {} |",
@@ -700,6 +1055,79 @@ fn render_report(report: &Report) -> String {
             }
         }
     }
+    if let Some(oracle) = &report.search_oracle {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## Search Correctness Oracle");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "完整评分扫描查询词的全部 posting，不使用 WAND、block 跳过、结果缓存或 singleflight。"
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- totalSeconds: {:.3}", oracle.duration.as_secs_f64());
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| Case | Filter | k | Optimized | Exact | Recall@k | Rank and score exact |"
+        );
+        let _ = writeln!(out, "|---|---|---:|---:|---:|---:|---|");
+        for case in &oracle.cases {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {:.3} | {} |",
+                case.name,
+                case.filter,
+                case.k,
+                case.optimized_count,
+                case.exact_count,
+                case.recall_at_k,
+                case.exact_rank_and_score
+            );
+        }
+    }
+    if let Some(oracle) = &report.source_oracle {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## Source-to-Index Correctness Oracle");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "从同一 seed 重新生成 wire event，独立提取可检索字段、分词并计算 BM25；不读取持久倒排。"
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- sourceEvents: {}", oracle.source_events);
+        let _ = writeln!(out, "- uniqueSourceEvents: {}", oracle.unique_source_events);
+        let _ = writeln!(out, "- sourceDocs: {}", oracle.source_docs);
+        let _ = writeln!(
+            out,
+            "- buildSeconds: {:.3}",
+            oracle.build_duration.as_secs_f64()
+        );
+        let _ = writeln!(
+            out,
+            "- compareSeconds: {:.3}",
+            oracle.compare_duration.as_secs_f64()
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| Case | Filter | k | Source | Persisted index | Recall@k | Rank and score exact | Max score delta |"
+        );
+        let _ = writeln!(out, "|---|---|---:|---:|---:|---:|---|---:|");
+        for case in &oracle.cases {
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {:.3} | {} | {:.8} |",
+                case.name,
+                case.filter,
+                case.k,
+                case.source_count,
+                case.index_count,
+                case.recall_at_k,
+                case.exact_rank_and_score,
+                case.max_score_delta
+            );
+        }
+    }
     out
 }
 
@@ -720,7 +1148,11 @@ impl Args {
         let mut seed = DEFAULT_SEED;
         let mut data_dir = None;
         let mut report = None;
+        let mut only_query = None;
+        let mut concurrency = 1usize;
         let mut cold_queries = false;
+        let mut verify_search = false;
+        let mut verify_source_index = false;
         let mut keep_data = false;
 
         let mut args = std::env::args().skip(1);
@@ -739,7 +1171,11 @@ impl Args {
                 "--seed" => seed = parse_next(&mut args, "--seed"),
                 "--data-dir" => data_dir = Some(PathBuf::from(next_value(&mut args, "--data-dir"))),
                 "--report" => report = Some(PathBuf::from(next_value(&mut args, "--report"))),
+                "--only-query" => only_query = Some(next_value(&mut args, "--only-query")),
+                "--concurrency" => concurrency = parse_next(&mut args, "--concurrency"),
                 "--cold-queries" => cold_queries = true,
+                "--verify-search" => verify_search = true,
+                "--verify-source-index" => verify_source_index = true,
                 "--keep-data" => keep_data = true,
                 "--help" | "-h" => {
                     print_help();
@@ -763,6 +1199,10 @@ impl Args {
             );
             std::process::exit(2);
         }
+        if concurrency == 0 {
+            eprintln!("--concurrency must be at least 1");
+            std::process::exit(2);
+        }
 
         Self {
             phase,
@@ -772,7 +1212,11 @@ impl Args {
             seed,
             data_dir,
             report,
+            only_query,
+            concurrency,
             cold_queries,
+            verify_search,
+            verify_source_index,
             keep_data,
         }
     }
@@ -800,11 +1244,16 @@ fn print_help() {
     eprintln!(concat!(
         "usage: scale_bench [--phase full|generate|query|open] [--spans N] [--queries N] ",
         "[--batch N] [--seed N] [--data-dir DIR] [--report PATH] ",
-        "[--cold-queries] [--keep-data]\n",
+        "[--only-query NAME] [--concurrency N] [--cold-queries] [--verify-search] ",
+        "[--verify-source-index] [--keep-data]\n",
         "\n",
         "--phase generate  writes a reusable durable dataset and metadata\n",
         "--phase query     opens an existing dataset and only runs the query matrix\n",
         "--phase open      opens and recovers an existing dataset without running queries\n",
-        "--cold-queries    reopens the engine before queries in full phase\n"
+        "--only-query      runs one named query from the query matrix\n",
+        "--concurrency     runs up to N query calls at the same time\n",
+        "--cold-queries    reopens the engine before queries in full phase\n",
+        "--verify-search   compares optimized BM25 with complete posting scoring\n",
+        "--verify-source-index regenerates wire source and compares independent BM25 scoring\n"
     ));
 }

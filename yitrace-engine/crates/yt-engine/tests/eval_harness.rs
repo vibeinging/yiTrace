@@ -106,6 +106,28 @@ fn ingested_data_is_visible_in_trace_list() {
     );
 }
 
+/// 固定标签检索集给 BM25 分词和排序设质量下限。它不要求每个结果都完美，但明显退步必须失败。
+#[test]
+fn search_quality_metrics_stay_above_regression_floor() {
+    let report = evalkit::run_search_quality_harness();
+    assert_eq!(report.cases.len(), 6);
+    assert!(
+        report.macro_recall_at_k >= 0.95,
+        "macro Recall@k 退步: {:.3}",
+        report.macro_recall_at_k
+    );
+    assert!(
+        report.macro_mrr_at_k >= 0.95,
+        "macro MRR@k 退步: {:.3}",
+        report.macro_mrr_at_k
+    );
+    assert!(
+        report.macro_ndcg_at_k >= 0.90,
+        "macro NDCG@k 退步: {:.3}",
+        report.macro_ndcg_at_k
+    );
+}
+
 // ───────────────────────── 会话级（多轮）评测 ─────────────────────────
 
 /// 会话级评测应把多轮对话准确分成「一次到位 / 绕圈后解决 / 未解决」三类，

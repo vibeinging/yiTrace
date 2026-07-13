@@ -37,9 +37,16 @@ impl WriteCoordinator {
         for l in &r.fields.logs {
             parts.push(l);
         }
-        if !parts.is_empty() {
-            self.bm25
-                .index_text(r.trace_id, r.span_id, &parts.join(" "));
+        let event_id = r.identity.event_id().0;
+        if parts.is_empty() {
+            self.bm25.mark_event(event_id);
+        } else {
+            self.bm25.index_event(
+                event_id,
+                r.trace_id,
+                r.span_id,
+                &parts.join(" "),
+            );
         }
         if update_filter_attrs {
             self.filter_attrs.lock().unwrap().apply_record(r);

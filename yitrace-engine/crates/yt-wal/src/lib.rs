@@ -454,6 +454,54 @@ pub fn encode_records(records: &[WalRecord]) -> Vec<u8> {
     encode_batch(records)
 }
 
+/// 一条记录在 `encode_records` 结果里的字节范围。
+///
+/// Segment 点查目录只保存这些范围，不复制记录内容。`offset` 从 batch payload 开头计算。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodedRecordRange {
+    pub trace_id: u64,
+    pub span_id: u64,
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// 只读取 batch 的结构字段，找出每条记录的位置，不解码字符串和 SpanFields。
+///
+/// 只接受当前 v2 编码；旧 segment 没有点查目录时由上层回退整段扫描。
+pub fn encoded_record_ranges(payload: &[u8]) -> Option<Vec<EncodedRecordRange>> {
+    let mut c = Cur { b: payload, i: 0 };
+    if c.u64()? != BATCH_MAGIC_V2 || c.u64()? != 2 {
+        return None;
+    }
+    let n = usize::try_from(c.u64()?).ok()?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = c.i;
+        let trace_id = c.u64()?;
+        let span_id = c.u64()?;
+        c.u64()?; // ts
+        c.skip_string()?;
+        c.u64()?; // seq
+        c.u8()?; // event_type
+        c.skip_bytes()?; // encoded SpanFields
+        let len = u32::try_from(c.i.checked_sub(start)?).ok()?;
+        out.push(EncodedRecordRange {
+            trace_id,
+            span_id,
+            offset: start as u64,
+            len,
+        });
+    }
+    (c.i == payload.len()).then_some(out)
+}
+
+/// 解码由 `encoded_record_ranges` 返回的一条记录切片。
+pub fn decode_record(bytes: &[u8]) -> Option<WalRecord> {
+    let mut c = Cur { b: bytes, i: 0 };
+    let record = decode_record_v2_from(&mut c)?;
+    (c.i == bytes.len()).then_some(record)
+}
+
 /// `encode_records` 的逆。损坏/截断返回 None。
 pub fn decode_records(payload: &[u8]) -> Option<Vec<WalRecord>> {
     decode_batch(payload)
@@ -665,6 +713,14 @@ impl<'a> Cur<'a> {
         self.i = e;
         Some(s)
     }
+    fn skip_string(&mut self) -> Option<()> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        self.i = self.i.checked_add(n)?;
+        (self.i <= self.b.len()).then_some(())
+    }
+    fn skip_bytes(&mut self) -> Option<()> {
+        self.skip_string()
+    }
     fn opt_u64(&mut self) -> Option<Option<u64>> {
         if self.u8()? == 1 {
             Some(Some(self.u64()?))
@@ -705,26 +761,30 @@ fn decode_batch_v2(c: &mut Cur) -> Option<Vec<WalRecord>> {
     let n = c.u64()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let trace_id = c.u64()?;
-        let span_id = c.u64()?;
-        let ts = c.u64()? as i64;
-        let ext = c.string()?;
-        let seq = c.u64()?;
-        let event_type = EventType::from_tag(c.u8()?);
-        let fields = decode_span_fields(c.bytes()?)?;
-        out.push(WalRecord {
-            trace_id,
-            span_id,
-            ts,
-            identity: EventIdentity {
-                ext_span_id: ext,
-                seq,
-                event_type,
-            },
-            fields,
-        });
+        out.push(decode_record_v2_from(c)?);
     }
     Some(out)
+}
+
+fn decode_record_v2_from(c: &mut Cur) -> Option<WalRecord> {
+    let trace_id = c.u64()?;
+    let span_id = c.u64()?;
+    let ts = c.u64()? as i64;
+    let ext = c.string()?;
+    let seq = c.u64()?;
+    let event_type = EventType::from_tag(c.u8()?);
+    let fields = decode_span_fields(c.bytes()?)?;
+    Some(WalRecord {
+        trace_id,
+        span_id,
+        ts,
+        identity: EventIdentity {
+            ext_span_id: ext,
+            seq,
+            event_type,
+        },
+        fields,
+    })
 }
 
 fn decode_batch_legacy(c: &mut Cur, n: usize) -> Option<Vec<WalRecord>> {
@@ -970,6 +1030,27 @@ mod tests {
         );
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
+    }
+
+    #[test]
+    fn encoded_record_ranges_decode_each_record_without_batch_scan() {
+        let records = vec![rec("first", 1), rec("second", 2), rec("third", 3)];
+        let payload = encode_records(&records);
+        let ranges = encoded_record_ranges(&payload).unwrap();
+        assert_eq!(ranges.len(), records.len());
+
+        for (expected, range) in records.iter().zip(ranges) {
+            let start = range.offset as usize;
+            let end = start + range.len as usize;
+            let decoded = decode_record(&payload[start..end]).unwrap();
+            assert_eq!(decoded.trace_id, expected.trace_id);
+            assert_eq!(decoded.span_id, expected.span_id);
+            assert_eq!(decoded.ts, expected.ts);
+            assert_eq!(decoded.identity, expected.identity);
+            assert_eq!(decoded.fields, expected.fields);
+            assert_eq!(range.trace_id, expected.trace_id);
+            assert_eq!(range.span_id, expected.span_id);
+        }
     }
 
     #[test]

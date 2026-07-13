@@ -217,6 +217,99 @@ impl FilterAttrsIndex {
         out
     }
 
+    /// BM25 已经给出少量候选时，逐条做最终过滤比复制一个低选择性的百万 key postings 更省。
+    /// 磁盘态只读取这一条 attrs row；内存态直接查 HashMap，语义与候选集合路径一致。
+    pub(crate) fn span_matches(&mut self, key: SpanKey, filter: &SearchFilter) -> bool {
+        if filter.trace_id.is_some_and(|trace_id| trace_id != key.0) {
+            return false;
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            let Some(bytes) = disk.load_row(key) else {
+                return false;
+            };
+            let mut cur = CacheCursor {
+                bytes: &bytes,
+                pos: 0,
+            };
+            let Some(row) = FilterAttrs::decode(&mut cur) else {
+                return false;
+            };
+            return cur.pos == bytes.len() && filter.attrs_match(&row);
+        }
+        self.rows
+            .get(&key)
+            .is_some_and(|row| filter.attrs_match(row))
+    }
+
+    pub(crate) fn filter_matches_all(&self, filter: &SearchFilter) -> bool {
+        let Some(tenant_id) = filter.tenant_id else {
+            return false;
+        };
+        if filter.has_non_tenant_constraints() {
+            return false;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            return disk.posting_cardinality("tenant_id", &tenant_id.to_string())
+                == Some(disk.row_count());
+        }
+        self.postings
+            .get(&PostingKey::new("tenant_id", tenant_id.to_string()))
+            .is_some_and(|keys| keys.len() == self.rows.len())
+    }
+
+    pub(crate) fn candidate_count_hint(&self, filter: &SearchFilter) -> Option<usize> {
+        let postings = requested_postings(filter);
+        if postings.is_empty() {
+            return None;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            return postings
+                .iter()
+                .filter_map(|posting| disk.posting_cardinality(&posting.field, &posting.value))
+                .min();
+        }
+        postings
+            .iter()
+            .filter_map(|posting| self.postings.get(posting).map(HashSet::len))
+            .min()
+    }
+
+    /// 估算构造过滤集合需要处理多少个 key。与 `candidate_count_hint` 的“最小结果集”不同，
+    /// 这里累加所有非全量 postings，防止小 project + 超大 tenant 低估查询期内存。
+    pub(crate) fn candidate_materialization_key_hint(
+        &self,
+        filter: &SearchFilter,
+    ) -> Option<usize> {
+        let postings = requested_postings(filter);
+        if postings.is_empty() {
+            return None;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            let row_count = disk.row_count();
+            let mut total = 0usize;
+            for posting in postings {
+                let Some(count) = disk.posting_cardinality(&posting.field, &posting.value) else {
+                    return Some(usize::MAX);
+                };
+                if count != row_count {
+                    total = total.saturating_add(count);
+                }
+            }
+            return Some(if total == 0 { row_count } else { total });
+        }
+
+        let row_count = self.rows.len();
+        let mut total = 0usize;
+        for posting in postings {
+            match self.posting_lookup(&posting) {
+                PostingLookup::Resident(keys) if keys.len() == row_count => {}
+                PostingLookup::Resident(keys) => total = total.saturating_add(keys.len()),
+                PostingLookup::Disabled | PostingLookup::Missing => return Some(usize::MAX),
+            }
+        }
+        Some(if total == 0 { row_count } else { total })
+    }
+
     pub(crate) fn matches_key(&self, trace_id: u64, span_id: u64, filter: &SearchFilter) -> bool {
         self.rows
             .get(&(trace_id, span_id))
@@ -352,6 +445,9 @@ impl FilterAttrsIndex {
         let mut sets = Vec::new();
         let mut needs_row_check = filter.time_from.is_some() || filter.time_to.is_some();
         for posting in postings {
+            if disk.posting_cardinality(&posting.field, &posting.value) == Some(disk.row_count()) {
+                continue;
+            }
             match disk.lookup(&posting.field, &posting.value) {
                 DiskPostingLookup::Resident(set) => sets.push(set),
                 DiskPostingLookup::Disabled => needs_row_check = true,
@@ -767,6 +863,14 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(keys, HashSet::from([(11, 1)]));
+        assert_eq!(
+            index.candidate_materialization_key_hint(&SearchFilter {
+                trace_id: Some(11),
+                ..Default::default()
+            }),
+            Some(usize::MAX),
+            "disabled postings must force the bounded fallback"
+        );
     }
 
     #[test]
@@ -783,9 +887,14 @@ mod tests {
         let path = dir.join("filter_attrs.dat");
 
         let mut index = FilterAttrsIndex::with_posting_budget(1, 1);
-        index.apply_record(&record(1, 10, "alpha", "review"));
-        index.apply_record(&record(2, 20, "alpha", "write"));
-        index.apply_record(&record(3, 30, "beta", "review"));
+        for mut row in [
+            record(1, 10, "alpha", "review"),
+            record(2, 20, "alpha", "write"),
+            record(3, 30, "beta", "review"),
+        ] {
+            row.fields.tenant_id = Some(7);
+            index.apply_record(&row);
+        }
         assert!(index.disabled_posting_count() > 0);
         index.save_cache(&path, 7, 3).unwrap();
 
@@ -796,6 +905,37 @@ mod tests {
             "open must not materialize postings"
         );
         assert_eq!(loaded.len(), 3);
+        assert!(loaded.filter_matches_all(&SearchFilter {
+            tenant_id: Some(7),
+            ..SearchFilter::default()
+        }));
+        assert!(!loaded.filter_matches_all(&SearchFilter {
+            tenant_id: Some(8),
+            ..SearchFilter::default()
+        }));
+        assert_eq!(
+            loaded.candidate_count_hint(&SearchFilter {
+                tenant_id: Some(7),
+                ..attr_filter(&[("project_id", "alpha")])
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            loaded.candidate_materialization_key_hint(&SearchFilter {
+                tenant_id: Some(7),
+                ..attr_filter(&[("project_id", "alpha")])
+            }),
+            Some(2),
+            "covering tenant postings should not count against the query budget"
+        );
+        assert_eq!(
+            loaded.candidate_materialization_key_hint(&attr_filter(&[
+                ("project_id", "alpha"),
+                ("skill", "review")
+            ])),
+            Some(4),
+            "all non-covering postings must count toward the query budget"
+        );
         assert_eq!(
             loaded.candidate_span_keys(&attr_filter(&[
                 ("project_id", "alpha"),
@@ -807,6 +947,14 @@ mod tests {
             loaded.rows.is_empty(),
             "exact lookup should stay disk-backed"
         );
+        assert!(loaded.span_matches(
+            (1, 10),
+            &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
+        ));
+        assert!(!loaded.span_matches(
+            (2, 20),
+            &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
+        ));
 
         let time_filtered = SearchFilter {
             time_from: Some(15),
