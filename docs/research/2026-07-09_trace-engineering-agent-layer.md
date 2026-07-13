@@ -1,29 +1,39 @@
-# Trace Engineering Agent Layer Research
+# yiTrace Trace Agent Research
 
 > 日期：2026-07-09
+> 更新：2026-07-10
 > 分支：trace-engineering
 > 范围：只做调研和产品/架构判断，不写实现代码。
 
 ## 结论
 
-yiTrace 可以在 TraceDB 之上加一层 **Agent Layer**。
+yiTrace 可以在 TraceDB 之上加一层 **Trace Agent**。
 
-这层不是替代底层数据库，也不是再做一个日志 UI。它要解决的是：
+它不是新的通用 Agent 框架，也不是日志 UI。它是一套接入现有 Agent 框架的 Loop Engineering SDK：
 
-> Agent 自己在执行任务时，能搜索历史 run，下钻到相关 span，只取必要上下文，复用成功路径，把失败路径变成 eval。
+> 业务继续用 Pi、LangGraph、OpenAI Agents SDK、Pydantic AI 或自研框架运行 Agent；Trace Agent 负责打点、存储接入、历史检索、按需下钻、eval 和 best path 候选等通用逻辑。
+
+业务框架负责当前任务怎么跑，Trace Agent 负责让每次运行留下证据，并让后续运行能使用这些证据。
 
 如果做对，yiTrace 对外就不只是“本地 TraceDB”，而是：
 
-> TraceDB + agentic engineering layer。
+> TraceDB + 可接入现有 Agent 框架的 Loop Engineering SDK。
 
-别人集成时，不需要自己从 trace 里拼逻辑。SDK/DB 可以直接提供：
+别人接入后，不需要自己从 trace 里重复拼这些逻辑：
 
+- 把框架的 model、tool、step、run 生命周期统一成 yiTrace 事件
 - 查找相似历史 run
 - 下钻相关 span
 - 选择上下文片段
 - 生成 eval case
 - 提取 best path 候选
 - 给 Agent Memory 提供证据
+
+这条闭环可以概括为：
+
+```text
+记录 -> 存储 -> 检索 -> 下钻 -> 评测 -> 复用 -> 再验证
+```
 
 ## 为什么需要这一层
 
@@ -51,6 +61,12 @@ TraceDB 的价值在这里更明显：
 4. 把片段交给 Agent，而不是把整条 trace 都塞进上下文。
 
 ## 外部调研
+
+GitHub 竞品、公开 issue 和线上需求的补充调研见：
+
+- [`2026-07-10_trace-agent-competitor-demand-research.md`](2026-07-10_trace-agent-competitor-demand-research.md)
+
+补充调研后的重要修正是：Agent 查询 trace、trace-to-eval 和 trajectory eval 已经有较强竞品。yiTrace 的差异应放在 embedded、token-first 下钻、task/loop 跨 run 比较和候选路径持续验证，不应只做一组通用 MCP 查询工具。
 
 ### 1. LangSmith / Langfuse：trace 到 eval 是主流方向
 
@@ -83,7 +99,7 @@ OpenTelemetry GenAI 已经定义 agent、conversation、tool call、input/output
 对 yiTrace 的启发：
 
 - 底层 ingest 应继续兼容 OTLP / OpenInference / GenAI semconv。
-- Agent Layer 可以在标准 trace 之上做更高层能力。
+- Trace Agent 可以在标准 trace 之上做更高层能力。
 - `tool_name`、`tool_args`、`tool_result`、`model_input`、`model_output`、`eval_score`、`task_fingerprint` 应该成为一等字段或稳定 attrs。
 
 ### 3. Agent Memory 研究：成功/失败 trajectory 是长期记忆的一类
@@ -105,7 +121,7 @@ Agent Workflow Memory 方向强调从过去经验中归纳 reusable workflows，
 
 - Agent Memory 不能只存自然语言总结。
 - TraceDB 应该保留原始证据。
-- Agent Layer 可以把 trace 变成三种产物：
+- Trace Agent 可以把 trace 变成三种产物：
   - evidence：原始 span 片段
   - lesson：自然语言经验
   - workflow / path：可复用路径
@@ -126,19 +142,35 @@ ExpeL 类方法会从成功和失败 trajectories 中蒸馏经验，在后续任
 
 ## 我们应该做的产品层
 
-建议名字先叫：
+产品能力可以叫：
 
 ```text
-Trace Engineering Layer
+Trace Agent
 ```
 
-或者对外更简单：
+对外包名继续带 yiTrace 品牌：
 
 ```text
-Agent Layer
+@yitrace/agent
+yitrace-agent
 ```
 
-它在 TraceDB 之上，提供给 Agent 用的能力。
+它在业务 Agent 框架和 TraceDB 之间，提供两组能力：
+
+1. 给框架用：统一打点、运行结束处理、eval 生成和路径候选更新。
+2. 给 Agent 用：搜索历史 run、查看 trace 轮廓、下钻 span、比较路径和构造少量上下文。
+
+```text
+业务 Agent 框架
+  |  model/tool/step/run hooks
+  v
+Trace Agent
+  |-- 框架适配器
+  |-- Agent 可调用的 trace 工具
+  |-- context/eval/best-path 通用逻辑
+  v
+yiTrace DB（embedded 或 server）
+```
 
 ## 核心对象
 
@@ -248,7 +280,56 @@ Trace Slice 是上下文预算的基本单位。
 - labels
 - dataset_id
 
-## Agent Layer 的核心 API
+## Trace Agent 的核心 API
+
+### P0：框架生命周期接入
+
+目标：让不同 Agent 框架产出的事件进入同一套 yiTrace 数据模型。
+
+框架适配器至少要能上报：
+
+- run start/end
+- step start/end
+- model input/output
+- tool args/result/error
+- token、cost、status、feedback
+
+公共接入优先兼容 OpenTelemetry GenAI / OpenInference，再映射到现有 yiTrace SpanEvent。Pi、LangGraph 等适配器负责事件翻译，但不能把某个框架的数据格式变成新的公共标准。
+
+接口草案：
+
+```ts
+const traceAgent = createTraceAgent({
+  projectId: "agentic-data",
+  transport: { path: "./data" } // 也可以是 { url: "http://..." }
+})
+
+framework.use(traceAgent.adapter("pi"))
+```
+
+自研框架可以直接调用通用 hooks：
+
+```ts
+traceAgent.onRunStart(...)
+traceAgent.onModelEnd(...)
+traceAgent.onToolEnd(...)
+traceAgent.onRunEnd(...)
+```
+
+### P0：给 Agent 使用的 trace 工具
+
+目标：让业务 Agent 自己查看历史执行，不要求业务方重新封装工具。
+
+建议直接提供：
+
+- `search_runs`
+- `get_trace_outline`
+- `get_span`
+- `compare_runs`
+- `get_best_path_candidates`
+- `create_eval_draft`
+
+这些工具返回结构化结果、证据引用和 token 估算。外部框架只需要把工具注册给自己的 Agent。
 
 ### P0：Agent 上下文检索
 
@@ -377,7 +458,7 @@ agentContext.extractLessons({
 
 ### 1. TraceDB 还是底座
 
-Agent Layer 不应该破坏底层。
+Trace Agent 不应该破坏底层。
 
 底层继续做：
 
@@ -391,7 +472,7 @@ Agent Layer 不应该破坏底层。
 - annotation
 - dataset association
 
-Agent Layer 只消费这些能力，最多要求底层补字段和索引。
+Trace Agent 只通过公开的 DB/client 接口消费这些能力，最多要求底层补字段和索引。它不能直接解析 WAL、manifest 或 segment。
 
 ### 2. 不要一开始做“自动优化 Agent”
 
@@ -428,7 +509,7 @@ best path 应该叫 candidate。
 
 ### 4. 上下文预算是一等约束
 
-Agent Layer 的核心价值就是少塞上下文。
+Trace Agent 的核心价值就是少塞上下文。
 
 所以所有 retrieval / drilldown API 都要返回：
 
@@ -452,7 +533,31 @@ Agent Layer 的核心价值就是少塞上下文。
 - trace/span/log events
 - readPlan
 
-要支撑 Agent Layer，还需要补这些底座能力：
+这些能力可以直接组成 Trace Agent 的底座：
+
+| Trace Agent 需求 | 现有 yiTrace 能力 | 处理方式 |
+|---|---|---|
+| 框架打点和存储 | SDK ingest、SpanEventBuilder、embedded/server | 复用，新增框架事件翻译 |
+| 找相关 run | search、trace-search、task traces | 复用，新增统一查询方法 |
+| 看路径 | trace-trajectories、trajectory-groups | 复用，包装成 Agent 工具 |
+| 比较路径 | traces diff | 复用，补适合 Agent 的结果格式 |
+| 下钻 span | trace/span detail、logEvents | 复用，补 token budget 和 evidence refs |
+| 标记好坏 | annotations | 复用，增加固定 label 约定 |
+| 生成 eval 数据集 | dataset associations | 复用，增加 eval draft 和审核流程 |
+| embedded/server 切换 | 多语言 DB 包、HTTP API | 复用，统一 Trace Agent 连接入口 |
+
+因此 Trace Agent 真正要新增的是：
+
+1. OTel/OpenInference 映射、包内 `NormalizedAgentEvent` 和 hooks。
+2. Pi、LangGraph 等事件适配器。
+3. 可直接注册给业务 Agent 的 trace 工具。
+4. Trace Slice / Context Pack 选择逻辑。
+5. Eval draft、Evaluator 接口和执行结果记录。
+6. Best Path Candidate 的评分、状态变化和持续验证。
+
+不需要新增另一套 WAL、segment、全文检索、向量索引或 trace 存储。
+
+要支撑 Trace Agent，还需要补这些底座能力：
 
 ### P0 底座字段
 
@@ -504,7 +609,23 @@ MVP 可以运行时生成 slice。
 
 ## MVP 建议
 
-### MVP-A：Agent Context Retrieval
+### MVP-A：Framework Adapter + Agent Trace Tools
+
+先完成最薄但完整的闭环：
+
+1. 定义统一的 run/step/model/tool 事件。
+2. 提供不依赖具体框架的 hooks。
+3. 做一个 Pi 适配器验证接入方式。
+4. 提供 `search_runs`、`get_trace_outline`、`get_span` 三个 Agent 工具。
+5. 同时支持 embedded DB 和 yiTrace server。
+
+价值：
+
+- 证明“任意 Agent 框架可以接 yiTrace”不是一句口号。
+- Agent 能自己搜索和下钻历史执行。
+- Pi 只是第一套适配器，不进入 Rust core。
+
+### MVP-B：Agent Context Retrieval
 
 最有差异化，也最符合小红书/X 当前叙事。
 
@@ -521,7 +642,7 @@ MVP 可以运行时生成 slice。
 - 对 AgenticData / 其他 agent 项目可直接用
 - 不需要先解决 best path 治理复杂问题
 
-### MVP-B：Eval From Trace
+### MVP-C：Eval From Trace
 
 做这几个：
 
@@ -534,7 +655,7 @@ MVP 可以运行时生成 slice。
 - 和现有 eval 叙事强相关
 - 产品闭环明确
 
-### MVP-C：Best Path Candidate
+### MVP-D：Best Path Candidate
 
 做候选，不做自动采用。
 
@@ -563,31 +684,71 @@ MVP 可以运行时生成 slice。
 
 ## 推荐路线
 
-1. 先定义 Agent Layer schema 和 API。
-2. 补底座字段：tool args/result、model input/output、task fingerprint。
-3. 做 runtime slice builder，不急着持久化。
-4. 做 agent context retrieval：搜索 run -> 下钻 span -> 构造上下文。
-5. 做 eval draft from trace。
-6. 做 best path candidate store。
-7. 再考虑 lesson extraction 和 memory promotion。
+1. 先定义 Trace Agent 的标准事件、hooks、transport 和工具协议。
+2. 实现不依赖框架的 core，并用 Pi 适配器验证一次完整接入。
+3. 补底座字段：tool args/result、model input/output、task fingerprint。
+4. 做 runtime slice builder，不急着持久化。
+5. 做 agent context retrieval：搜索 run -> 下钻 span -> 构造上下文。
+6. 做 eval draft from trace。
+7. 做 best path candidate store。
+8. 再增加其他框架适配器、lesson extraction 和 memory promotion。
 
 ## `yitrace-agent` 包定义
 
-`yitrace-agent` 不应该定义成通用 agent framework。
+`yitrace-agent` 的准确定位是：
 
-它的定位应该是：
+> 建在 yiTrace 之上、接入现有 Agent 框架的 Loop Engineering SDK。
 
-> 给 Agent 使用 yiTrace 历史执行数据的库。
+它不是一个会替业务执行任务的 Agent，也不要求用户更换 Agent 框架。
 
-更具体一点：
+业务方保留自己的 model、tool、prompt、loop 和状态管理。`yitrace-agent` 提供这些框架普遍需要、但不值得每个项目重复实现的能力：
 
-> `yitrace-agent` 负责把 TraceDB 里的 run/span/log/tool/model/eval 数据，变成 Agent 可以安全放进上下文的小片段、候选路径和 eval 草稿。
+- 接入运行生命周期并统一打点
+- 把数据写入 embedded DB 或 yiTrace server
+- 给 Agent 注册历史检索和 span 下钻工具
+- 从 trace 构造受 token 预算约束的上下文
+- 从失败路径生成 eval 草稿
+- 从成功路径维护 best path 候选
+- 用后续运行继续验证候选是否仍然有效
 
-它不负责通用 agent loop。
+换句话说，业务框架负责 **run loop**，`yitrace-agent` 负责 **improvement loop**。
 
 ### 它负责什么
 
-1. **找历史**
+1. **框架接入与统一打点**
+
+提供通用 hooks 和框架适配器，收集：
+
+- run / step 生命周期
+- model input/output
+- tool args/result/error
+- token、cost、status、feedback
+
+框架适配器只做事件翻译。标准事件、存储和后续逻辑不能依赖 Pi、LangGraph 等框架。
+
+2. **连接 yiTrace**
+
+使用同一套上层 API 支持两种模式：
+
+- embedded：直接连接 `yitrace-db`
+- server：通过 HTTP 连接 yiTrace server
+
+它只走公开 DB/client API，不读取底层数据文件。
+
+3. **给 Agent 注册 trace 工具**
+
+外部框架可以把封装好的工具直接交给自己的 Agent：
+
+- 搜索历史 run
+- 查看 trace 轮廓
+- 下钻具体 span
+- 比较成功和失败路径
+- 获取 best path 候选
+- 创建 eval 草稿
+
+这样“Agent 自己看 trace”不再需要业务方重新写一套工具。
+
+4. **找历史**
 
 根据当前任务，找到相关历史 run：
 
@@ -599,7 +760,7 @@ MVP 可以运行时生成 slice。
 - 相似工具链
 - 相似失败类型
 
-2. **下钻**
+5. **下钻**
 
 从相关 run 下钻到具体 span：
 
@@ -612,7 +773,7 @@ MVP 可以运行时生成 slice。
 - token
 - status
 
-3. **切上下文**
+6. **切上下文**
 
 把长 trace 切成 Agent 能吃的小块：
 
@@ -624,7 +785,7 @@ MVP 可以运行时生成 slice。
 
 核心目标是：不要把整条 trace 塞进上下文。
 
-4. **生成 eval draft**
+7. **生成和运行 eval**
 
 从失败 run 或关键 span 生成 eval 草稿：
 
@@ -634,15 +795,18 @@ MVP 可以运行时生成 slice。
 - source trace/span
 - labels
 
-5. **维护 best path candidate**
+核心层负责样本、证据、数据集和结果记录。需要模型评分时，通过可插拔的 `Evaluator` / `ModelProvider` 调用业务方提供的模型。
+
+8. **维护 best path candidate**
 
 记录同类任务里表现好的路径候选：
 
 - 不是自动采用
 - 不是永久最优
 - 必须带证据、scope、confidence、状态
+- 必须用新的运行结果持续验证或降级
 
-6. **提取 lesson**
+9. **提取 lesson**
 
 从 trace 提取经验，但 lesson 必须带 evidence refs。
 
@@ -650,26 +814,58 @@ MVP 可以运行时生成 slice。
 
 ### 它不负责什么
 
-- 不调 LLM
-- 不管理 tool loop
+- 不接管业务 Agent 的主循环
+- 不选择业务模型和工具
 - 不做多 agent 编排
 - 不决定最终答案
 - 不自动改 prompt
 - 不自动改工具链
 - 不替代 LangGraph / Pi / OpenAI Agents SDK / Pydantic AI
 
-这些属于外部 agent framework。
+这些属于外部 Agent 框架。
 
-`yitrace-agent` 只给它们提供 trace-derived context。
+`yitrace-agent` 可以通过业务方传入的模型做 evaluator、摘要或 lesson 提取，但不能偷偷使用模型，也不能把自己的模型选择强加给业务方。
 
 ### 包边界
 
-建议多语言包保持同一个心智：
+三个包要保持清楚的分工：
 
 ```text
-yitrace-db      = 存、搜、下钻、回放 trace
-yitrace-agent   = 让 Agent 使用历史 trace
+yitrace / @yitrace/trace-sdk = 只负责轻量打点
+yitrace-db / @yitrace/db     = 存、搜、下钻、回放 trace
+yitrace-agent / @yitrace/agent = 把现有 Agent 框架接入完整的 Loop Engineering 闭环
 ```
+
+只要打点的用户继续用 trace SDK。需要搜索、eval、best path 和 Agent 自助下钻的用户使用 `yitrace-agent`。
+
+为了减少用户心智，`yitrace-agent` 应提供统一的连接入口：
+
+```ts
+createTraceAgent({ path: "./data" })
+createTraceAgent({ url: "http://localhost:7878" })
+```
+
+路径模式内部使用 embedded DB，URL 模式内部使用 HTTP client。业务 API 不因部署方式变化。
+
+### Rust core 与框架适配器
+
+可以跨语言复用、结果必须一致的逻辑放进 Rust core：
+
+- OTel/OpenInference 到 yiTrace 的映射
+- 包内归一化事件和对象 schema
+- task fingerprint
+- trace slice 选择和 token budget
+- 候选路径评分与状态变化
+- eval 数据集和结果模型
+
+和具体框架有关的接入留在各语言包：
+
+- Pi / Node adapter
+- LangGraph / Python adapter
+- OpenAI Agents SDK adapter
+- Pydantic AI adapter
+
+因此 Pi 可以作为第一套验证适配器，但不能成为 Rust core 或 `yitrace-agent` 的必选依赖。
 
 Rust:
 
@@ -695,12 +891,22 @@ Node:
 ### 最小 API
 
 ```ts
-agent.searchContext(query)
-agent.drillDown(ref)
+const agent = createTraceAgent({ path: "./data", projectId: "demo" })
+
+agent.hooks()                       // 自研框架接入
+agent.adapter("pi")                // 已支持框架接入
+agent.tools()                       // 注册给业务 Agent 的 trace 工具
+agent.searchRuns(query)
+agent.getTraceOutline(traceRef)
+agent.getSpan(spanRef)
 agent.buildContextPack(options)
-agent.createEvalDraft(ref)
+agent.createEvalDraft(traceRef)
+agent.runEval(datasetRef, evaluator)
 agent.bestPathCandidates(query)
+agent.recordPathOutcome(candidateRef, outcome)
 ```
+
+这里的 `agent` 是 Trace Agent handle，不是另一个负责回答用户问题的业务 Agent。
 
 ### 核心返回对象
 
@@ -738,16 +944,36 @@ EvalDraft
   - labels
 ```
 
+包内仍然需要一个稳定的归一化事件：
+
+```text
+NormalizedAgentEvent
+  - project_id
+  - run_id
+  - parent_run_id
+  - event_type
+  - timestamp
+  - name
+  - input
+  - output
+  - error
+  - token_usage
+  - cost
+  - attrs
+```
+
+`NormalizedAgentEvent` 只是 `yitrace-agent` 内部对象，不是新的 wire protocol。对外继续接受 OTLP/OpenInference 和 yiTrace SpanEvent；所有原始框架字段应尽量无损映射，不能映射的字段保留在 attrs。
+
 ### 一句话对外口径
 
 ```text
-yitrace-agent lets agents search, drill down, and reuse their own execution history without loading full traces into context.
+yitrace-agent adds trace-driven loop engineering to your existing agent framework: capture runs, inspect history, build evals, and reuse better paths.
 ```
 
 中文：
 
 ```text
-yitrace-agent 让 Agent 自己搜索、下钻和复用历史执行过程，而不是把整条 trace 塞进上下文。
+yitrace-agent 给现有 Agent 框架补上基于 trace 的打点、检索、下钻、eval 和路径复用能力。
 ```
 
 ## 参考资料

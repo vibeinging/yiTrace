@@ -39,7 +39,7 @@ yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 No
 3. **应用内需要本地搜索和 trace 详情**：用 `@yitrace/db`、`yitrace-db` Python 包或 Rust crate。
 4. **自己写 UI / 服务**：直接调 `/v1/*`。
 
-alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、持久 BM25 缓存、annotation/dataset/retention 基座。`@yitrace/db` 侧已支持外部 embedding 回调：engine 不调用模型，调用方通过 `embedQuery` / `embedDocuments` 生成 vector 后写入或查询；普通 `search({ text })` 不会触发模型调用。仍在路线图里的上量项包括 attrs postings 磁盘分页、独立 loop/task/trajectory 索引、百万 span 冷/热性能基线、BM25 段内分页 postings。
+alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、持久 BM25 缓存、annotation/dataset/retention 基座。`@yitrace/db` 侧已支持外部 embedding 回调：engine 不调用模型，调用方通过 `embedQuery` / `embedDocuments` 生成 vector 后写入或查询；普通 `search({ text })` 不会触发模型调用。attrs 和 BM25 已支持按目录定位、按命中值或词读取磁盘 postings，并分别使用有上限的缓存。百万 span 冷启动和查询基线已经落盘。仍在路线图里的上量项包括独立 loop/task/trajectory 索引、rollup 分区读取和 BM25 块级跳读。
 
 ---
 
@@ -235,7 +235,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ### GET /v1/metrics  —— Prometheus 指标
 
-返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_filter_attr_postings`、`yt_filter_attr_disabled_postings`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
+返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_read_model_rollup_ready`、`yt_read_model_filter_ready`、`yt_read_model_search_ready`、`yt_filter_attrs`、`yt_filter_attr_postings`、`yt_filter_attr_disabled_postings`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。三个 `yt_read_model_*_ready` 在 clean reopen 后先为 `0`，第一次相关查询加载完成后变成 `1`。
 
 ### GET /v1/healthz / GET /v1/readyz  —— 进程探针
 
@@ -322,7 +322,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ## 单机读模型 API（原始 API，camelCase 响应）
 
-这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`external_trace_id`、`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时会禁用对应 postings，并回退扫描 sidecar 行，保证结果不丢。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`，把全文倒排和段 key bloom 写成 `bm25.dat`、`segment_bloom.dat`；重启时先加载缓存，再叠加 WAL tail。四份缓存命中且没有 delete/upgrade 脏段时，recover 不扫历史 segment，第一次全文检索也不补扫。只有 `bm25.dat` 或 `segment_bloom.dat` 缺失时，全文检索首次使用才补建段扫描索引。缓存不是数据源，删掉、损坏或版本不匹配都会自动扫描 segment 重建。带 `text` 的聚合和路径查询仍会回到正确扫描。把 postings 做成按需分页的磁盘 buffer manager、以及 loop/task 独立磁盘索引仍是后续优化。
+这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`external_trace_id`、`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；内存态 postings 有预算保护，超宽值会回退扫描 sidecar 行，保证结果不丢。持久态 `filter_attrs.dat` v3 把 row、row directory、postings 和 posting directory 分开，查询只读取命中的字段和值；完整 postings 在 flush 时用固定内存外排和多路归并生成，不会因为内存预算而丢失。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`，把全文倒排和段 key bloom 写成 `bm25.dat`、`segment_bloom.dat`。clean reopen 只恢复 manifest、WAL checkpoint 和小型控制状态，四份大缓存保持 deferred：第一次 rollup、过滤或全文查询分别加载自己需要的缓存，第一次写入前则统一补齐，避免历史索引被新事件覆盖。flush 会写入带 CRC 的 `wal.state` checkpoint；checkpoint 有效时只读取已持久化 watermark 后的 WAL，缺失、损坏或越界时自动回退 WAL 正文全量校验。缓存存在且没有 delete/upgrade 脏段时，首次查询不扫历史 segment；缓存缺失、损坏或版本不符时才安全扫描 segment 重建。缓存和 checkpoint 都不是数据源。`bm25.dat` v2 在打开时只读文档长度和词目录，全文查询再按词偏移读取 postings。BM25 与 attrs 的 postings 缓存默认各为 64 MB，可分别通过 `YT_BM25_POSTINGS_CACHE_BYTES` 和 `YT_FILTER_POSTINGS_CACHE_BYTES` 调整。`trace-search` 带 `text` 时走 BM25 top-k，再做精确 contains 和结构化过滤；`trace-aggregate`、trajectory/loop/task 带 `text` 时仍需读取正文并回到正确扫描。当前仍会整块加载的是 `trace_rollup.dat`；rollup 分区读取、loop/task 独立磁盘索引和 BM25 块级跳读仍是后续优化。
 
 ### POST /v1/trace-search  —— 结构化 span 搜索
 
@@ -405,7 +405,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 }
 ```
 
-`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。如果 `source` 是 `scan`，说明本次没有可用索引，例如只有 `text` contains 过滤或只用了未知 attrs key；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；如果某个 postings 被预算禁用，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar，从 `bm25.dat` 恢复全文倒排，从 `segment_bloom.dat` 恢复候选 key 跳段 bloom。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
+`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。`trace-search` 带 `text` 时，`source: "bm25"` 表示先从全文索引取候选，`source: "filter_index"` 表示同时使用 attrs sidecar postings；两条路径都会再做精确 contains 和结构化过滤。文本路径的候选窗口是 `cursor + limit`，当前上限为 500，因此带 text 的 `total` 表示本次物化并通过最终过滤的候选数，不是全库精确计数；需要全量计数时应使用无 text 的结构化过滤或聚合接口。如果 `source` 是 `scan`，说明本次没有可用的专用读模型，例如带正文的聚合/路径查询；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；内存态某个 postings 被预算禁用时，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验；持久态 v3 则按命中值从磁盘读取完整 postings。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar，从 `bm25.dat` 恢复全文倒排，从 `segment_bloom.dat` 恢复候选 key 跳段 bloom。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
 
 ### POST /v1/trace-aggregate  —— 对搜索结果做 groupBy
 
@@ -423,7 +423,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 `filter` 语义与 `/v1/trace-search` 相同。`groupBy` 支持常见字段：`projectId`、`skill`、`mode`、`callSite`、`taskFingerprint`、`validationStatus`、`status`、`agentName`、`toolName`、`model` 等；未知字段按 attrs key 处理。
 
-无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。持久模式会把已进入 segment 的 rollup 写到 `trace_rollup.dat`，文件里带 manifest version 和 memtable watermark；恢复时如果匹配，就直接加载这份 segment-only 缓存，再从 WAL 叠加还没 flush 的尾部事件。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除、segment upgrade 或重启恢复后，rollup 会按当前快照同步重建，删除行不会被算回来，补写字段也会反映到聚合结果里。`trace_rollup.dat` 可以安全删除；损坏或过期只会让下一次启动多扫一次 segment。
+无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。持久模式会把已进入 segment 的 rollup 写到 `trace_rollup.dat`，文件里带 manifest version 和 memtable watermark；clean reopen 不读取正文，第一次 rollup 查询才加载这份 segment-only 缓存。WAL 有未 flush 尾部时，引擎会先补齐历史缓存再叠加尾部事件。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除或 segment upgrade 后，rollup 会按当前快照重建，删除行不会被算回来，补写字段也会反映到聚合结果里。`trace_rollup.dat` 可以安全删除；损坏或过期只会让第一次相关查询扫描 segment 重建，不会拖慢 clean reopen。
 
 **响应**：
 

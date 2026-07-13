@@ -146,6 +146,7 @@ VITE_API=http npm run build                          # 构建对接真实引擎�
 - **测试是承重的**：每个不变量都有"真会失败的测试"（崩溃重放、召回对标、确定性 event_id 跨语言对账）。改逻辑前先看相关测试，改完跑全量。
 - **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 包 `yitrace`，TS 包 `@yitrace/trace-sdk`，嵌入式 DB 包 `@yitrace/db`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
 - **N-API 包隔离**：`yitrace-node/` 可以依赖 NAPI-RS；这些依赖不得进入 `yt-engine`。`@yitrace/db` 只通过 Rust engine API 打开数据目录，不允许 JS 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
+- **恢复路径不能 eager load 大索引**：持久库 clean reopen 只恢复 manifest、WAL checkpoint 和控制状态；`trace_rollup.dat`、`filter_attrs.dat`、`bm25.dat`、`segment_bloom.dat` 按第一次相关查询加载。`filter_attrs.dat` 和 `bm25.dat` 只加载目录，postings 按命中字段/词读取，默认各受 64 MB 缓存预算约束；第一次写入前统一补齐。改恢复逻辑后必须跑 `scale_bench --phase open`，不能让启动重新随 span 数线性增长。
 - **npm 发布**：`@yitrace/db` root 包只放 JS 入口（ESM + CommonJS）和类型声明；native binary 放在 `npm/*` 平台 optional packages。正式发布前必须跑 `npm run release:artifacts` + `npm run release:prepublish` + `npm run pack:check`，并先发布平台包再发布 root 包。
 - **提交信息**：纯净的中文/英文描述，首行简短，body 说清 what + why。不带 AI 工具名。
 
