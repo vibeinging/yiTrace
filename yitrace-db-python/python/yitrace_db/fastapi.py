@@ -1,6 +1,7 @@
 """Optional FastAPI adapter for yitrace-db."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import json
 import re
 from pathlib import Path
@@ -92,10 +93,18 @@ def create_yitrace_app(
     _require_fastapi()
     owns_db = not isinstance(db_or_data_dir, YiTraceDB)
     db = db_or_data_dir if isinstance(db_or_data_dir, YiTraceDB) else YiTraceDB.open(db_or_data_dir, tenant_id=tenant_id)
-    app = FastAPI(title="yiTrace")
-    app.include_router(create_yitrace_router(db, tenant_header=tenant_header, default_tenant_id=tenant_id))
     if owns_db:
-        app.add_event_handler("shutdown", db.close)
+        @asynccontextmanager
+        async def lifespan(_app):
+            try:
+                yield
+            finally:
+                db.close()
+
+        app = FastAPI(title="yiTrace", lifespan=lifespan)
+    else:
+        app = FastAPI(title="yiTrace")
+    app.include_router(create_yitrace_router(db, tenant_header=tenant_header, default_tenant_id=tenant_id))
     return app
 
 

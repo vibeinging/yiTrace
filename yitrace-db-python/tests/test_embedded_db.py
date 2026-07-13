@@ -570,6 +570,22 @@ def test_python_fastapi_router_reuses_embedded_db_route_boundary():
             assert other_tenant.json() == []
 
 
+def test_python_fastapi_app_uses_lifespan_for_owned_db():
+    import asyncio
+
+    pytest.importorskip("fastapi")
+    from yitrace_db.fastapi import create_yitrace_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = create_yitrace_app(tmp, tenant_id=42)
+
+        async def run_lifespan():
+            async with app.router.lifespan_context(app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+
 def test_python_cli_rejects_multi_worker_embedded_serve():
     from yitrace_db.cli import _parse_bind, main
 

@@ -409,6 +409,7 @@ pub(super) fn write_atomic(
     file.flush()?;
     file.get_ref().sync_all()?;
     drop(file);
+    crate::test_failpoints::before_sidecar_rename("trace_rollup", path);
     std::fs::rename(tmp, path)
 }
 

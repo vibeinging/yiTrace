@@ -529,6 +529,7 @@ where
     file.flush()?;
     file.get_ref().sync_all()?;
     drop(file);
+    crate::test_failpoints::before_sidecar_rename("bm25", path);
     std::fs::rename(tmp, path)
 }
 

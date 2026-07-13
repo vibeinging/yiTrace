@@ -74,6 +74,8 @@ copy_dir_files() {
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
+run python "$ROOT_DIR/scripts/check_release_versions.py"
+
 echo "Packaging yiTrace release artifacts into $OUT_DIR"
 echo "Mode: $MODE"
 if [[ -n "$TARGET" ]]; then
@@ -128,6 +130,7 @@ if want python-db; then
   fi
   run python -m maturin build --release "${MATURIN_ARGS[@]}" --out "$OUT_DIR/python-db"
   popd >/dev/null
+  run python "$ROOT_DIR/scripts/verify_python_db_wheel.py" --wheel-dir "$OUT_DIR/python-db"
 fi
 
 if want typescript-sdk; then
@@ -154,13 +157,15 @@ if want rust-sdk; then
   echo
   echo "==> Rust SDK crate"
   run cargo package --manifest-path "$ROOT_DIR/yitrace-sdk/rust/Cargo.toml" --allow-dirty
+  RUST_SDK_VERSION="$(python -c 'import pathlib, sys, tomllib; print(tomllib.loads((pathlib.Path(sys.argv[1]) / "yitrace-sdk/rust/Cargo.toml").read_text())["package"]["version"])' "$ROOT_DIR")"
   mkdir -p "$OUT_DIR/rust-sdk"
-  cp "$ROOT_DIR"/yitrace-sdk/rust/target/package/yitrace-*.crate "$OUT_DIR/rust-sdk"/
+  cp "$ROOT_DIR/yitrace-sdk/rust/target/package/yitrace-${RUST_SDK_VERSION}.crate" "$OUT_DIR/rust-sdk"/
 fi
 
 if want rust-db-source; then
   echo
   echo "==> Rust embedded DB source bundle"
+  RUST_DB_VERSION="$(python -c 'import pathlib, sys, tomllib; print(tomllib.loads((pathlib.Path(sys.argv[1]) / "yitrace-db-rs/Cargo.toml").read_text())["package"]["version"])' "$ROOT_DIR")"
   mkdir -p "$OUT_DIR/rust-db"
   (
     cd "$ROOT_DIR"
@@ -169,7 +174,7 @@ if want rust-db-source; then
       --exclude "*/node_modules" \
       --exclude "*/.pytest_cache" \
       --exclude "*/__pycache__" \
-      -czf "$OUT_DIR/rust-db/yitrace-db-rs-0.1.0-source.tar.gz" \
+      -czf "$OUT_DIR/rust-db/yitrace-db-rs-${RUST_DB_VERSION}-source.tar.gz" \
       yitrace-db-rs \
       yitrace-engine
   )

@@ -486,6 +486,7 @@ fn save_seg_key_bloom_cache(
     std::io::Write::write_all(&mut file, &out)?;
     file.sync_all()?;
     drop(file);
+    crate::test_failpoints::before_sidecar_rename("segment_bloom", path);
     std::fs::rename(tmp, path)
 }
 

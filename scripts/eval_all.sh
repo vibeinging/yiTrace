@@ -10,8 +10,10 @@
 #   --packages       额外跑 package-mode eval 和控制台测试
 #   --pack           额外跑 @yitrace/db 本地打包验证
 #   --crash          额外跑 kill -9 崩溃恢复测试（默认 3 轮，可用 --crash-rounds N）
+#   --sidecar-crash  额外跑派生索引原子替换窗口的 kill -9 测试
+#   --upgrade        额外跑 v0.1.2 数据目录升级测试
 #   --scale          额外跑 10k span 真实数据目录 + 独立进程重启查询
-#   --heavy          等同于 --packages --pack --crash --scale
+#   --heavy          等同于 --packages --pack --crash --sidecar-crash --upgrade --scale
 #   --skip-engine    跳过 Rust 引擎全量离线测试，只跑 eval 测试
 #   --skip-node      在 --packages/--pack 下跳过 Node 嵌入式 DB
 #   --skip-python-db 在 --packages 下跳过 Python 嵌入式 DB
@@ -26,6 +28,8 @@ RUN_ENGINE=1
 RUN_PACKAGES=0
 RUN_PACK=0
 RUN_CRASH=0
+RUN_SIDECAR_CRASH=0
+RUN_UPGRADE=0
 RUN_SCALE=0
 RUN_NODE=1
 RUN_PYTHON_DB=1
@@ -48,6 +52,14 @@ while [[ $# -gt 0 ]]; do
       RUN_CRASH=1
       shift
       ;;
+    --sidecar-crash)
+      RUN_SIDECAR_CRASH=1
+      shift
+      ;;
+    --upgrade)
+      RUN_UPGRADE=1
+      shift
+      ;;
     --scale)
       RUN_SCALE=1
       shift
@@ -56,6 +68,8 @@ while [[ $# -gt 0 ]]; do
       RUN_PACKAGES=1
       RUN_PACK=1
       RUN_CRASH=1
+      RUN_SIDECAR_CRASH=1
+      RUN_UPGRADE=1
       RUN_SCALE=1
       shift
       ;;
@@ -167,6 +181,14 @@ if [[ "$RUN_CRASH" -eq 1 ]]; then
   pushd "$ROOT_DIR" >/dev/null
   run ./tests/crash_recovery_kill9.sh "$CRASH_ROUNDS"
   popd >/dev/null
+fi
+
+if [[ "$RUN_SIDECAR_CRASH" -eq 1 ]]; then
+  run "$ROOT_DIR/tests/sidecar_rebuild_kill9.sh"
+fi
+
+if [[ "$RUN_UPGRADE" -eq 1 ]]; then
+  run "$ROOT_DIR/tests/upgrade_012_to_current.sh"
 fi
 
 if [[ "$RUN_SCALE" -eq 1 ]]; then

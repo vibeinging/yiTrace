@@ -25,6 +25,7 @@ const localPlatform =
     "linux:x64": "linux-x64-gnu",
     "win32:x64": "win32-x64-msvc",
   }[`${process.platform}:${process.arch}`] ?? null;
+const packAllPlatforms = process.env.YITRACE_PACK_ALL_PLATFORMS === "1";
 
 function gitOutput(args) {
   try {
@@ -126,6 +127,7 @@ const artifacts = [
 ];
 
 for (const name of readdirSync(npmDir)) {
+  if (!packAllPlatforms && name !== localPlatform) continue;
   const dir = join(npmDir, name);
   if (!existsSync(join(dir, "package.json"))) continue;
   if (!readdirSync(dir).some((file) => file.endsWith(".node"))) continue;

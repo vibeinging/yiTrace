@@ -195,6 +195,7 @@ impl DiskFilterCache {
         file.write_all(&memtable_watermark.to_le_bytes())?;
         file.sync_all()?;
         drop(file);
+        crate::test_failpoints::before_sidecar_rename("filter_attrs", path);
         std::fs::rename(tmp, path)
     }
 
@@ -407,6 +408,7 @@ where
     }
     file.sync_all()?;
     drop(file);
+    crate::test_failpoints::before_sidecar_rename("filter_attrs", path);
     std::fs::rename(tmp, path)
 }
 

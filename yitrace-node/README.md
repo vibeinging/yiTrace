@@ -13,15 +13,14 @@ optional per-platform packages such as `@yitrace/db-darwin-arm64` and
 `@yitrace/db-linux-x64-gnu`, so users only download the binary for their
 platform.
 
-Supported targets for the first npm release:
+Supported targets:
 
 - macOS x64 / arm64
 - Linux x64 / arm64 with glibc
 - Windows x64 with MSVC
 
-For AgenticData or another internal consumer that needs a stable install source
-before the public npm release, build immutable tarballs and lock those exact
-files in the consumer repo:
+For an internal consumer that needs a stable file-based install source, build
+immutable tarballs and lock those exact files in the consumer repo:
 
 ```bash
 npm ci
@@ -31,8 +30,10 @@ npm run release:prepublish
 npm run pack:verify  # runs pack:local first
 ```
 
-This writes `@yitrace/db` plus any locally available platform packages to
-`yitrace-node/dist/*.tgz`. `pack:local` appends a commit label such as
+This writes `@yitrace/db` plus the current platform package to
+`yitrace-node/dist/*.tgz`. Set `YITRACE_PACK_ALL_PLATFORMS=1` only after a
+release job has deliberately collected fresh binaries for every platform.
+`pack:local` appends a commit label such as
 `g1a2b3c4d5e6f` to each tarball name and writes `dist/pack-manifest.json` with
 the exact files. Set `YITRACE_PACK_LABEL=<release-id>` when the consuming repo
 needs a human-chosen immutable label. Put those tarballs in the consuming repo
@@ -41,8 +42,8 @@ or an internal package registry, then depend on exact `file:` tarballs:
 ```json
 {
   "dependencies": {
-    "@yitrace/db": "file:vendor/yitrace-db-0.0.1-g1a2b3c4d5e6f.tgz",
-    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.0.1-g1a2b3c4d5e6f.tgz"
+    "@yitrace/db": "file:vendor/yitrace-db-0.1.3-g1a2b3c4d5e6f.tgz",
+    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.1.3-g1a2b3c4d5e6f.tgz"
   }
 }
 ```
@@ -67,8 +68,7 @@ Current platform policy:
 - AgenticData local development may still use macOS arm64 artifacts
   (`@yitrace/db` root tarball + `@yitrace/db-darwin-arm64` tarball), but that is
   not the server architecture decision.
-- Local tarballs may also include any other native packages already present on
-  the build machine, such as macOS x64.
+- Local tarballs ignore stale binaries for other platforms by default.
 - Public npm / CI release target set remains macOS x64/arm64, Linux x64/arm64
   glibc, and Windows x64 MSVC. Those platform packages must be produced by CI
   or matching build machines before publishing the root package.
@@ -450,7 +450,8 @@ That eval builds and tests `@yitrace/db` together with the Python, Rust, and
 TypeScript package surfaces, so package drift is caught in one place. For native
 packaging itself, run `npm run pack:verify`; it installs the root tarball and
 the current platform optional package in a clean consumer, then checks ESM,
-CommonJS, and `NAPI_RS_NATIVE_LIBRARY_PATH` loading.
+CommonJS, `NAPI_RS_NATIVE_LIBRARY_PATH` loading, and root/native package version
+agreement.
 
 ## Publishing
 

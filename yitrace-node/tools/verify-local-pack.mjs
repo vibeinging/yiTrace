@@ -36,6 +36,11 @@ if (!rootArtifact) {
 if (!platformArtifact) {
   throw new Error(`Missing platform package artifact for ${platformPackage} in ${manifestPath}`);
 }
+if (rootArtifact.version !== manifest.packageVersion || platformArtifact.version !== manifest.packageVersion) {
+  throw new Error(
+    `Package version mismatch: root=${rootArtifact.version}, platform=${platformArtifact.version}, expected=${manifest.packageVersion}`,
+  );
+}
 
 const rootTarball = join(root, "dist", rootArtifact.file);
 const platformTarball = join(root, "dist", platformArtifact.file);
@@ -184,9 +189,10 @@ const { YiTraceDB, createSpanEventBuilder } = require("@yitrace/db");
 `,
   );
 
-  execFileSync("node", ["verify-esm.mjs"], { cwd: consumer, stdio: "inherit" });
-  execFileSync("node", ["verify-cjs.cjs"], { cwd: consumer, stdio: "inherit" });
-  execFileSync("node", ["verify-native-path.cjs"], { cwd: consumer, stdio: "inherit" });
+  const verifyEnv = { ...process.env, NAPI_RS_ENFORCE_VERSION_CHECK: "1" };
+  execFileSync("node", ["verify-esm.mjs"], { cwd: consumer, stdio: "inherit", env: verifyEnv });
+  execFileSync("node", ["verify-cjs.cjs"], { cwd: consumer, stdio: "inherit", env: verifyEnv });
+  execFileSync("node", ["verify-native-path.cjs"], { cwd: consumer, stdio: "inherit", env: verifyEnv });
   console.log(`Verified @yitrace/db local tarballs in clean consumer: ${consumer}`);
 } finally {
   rmSync(consumer, { recursive: true, force: true });

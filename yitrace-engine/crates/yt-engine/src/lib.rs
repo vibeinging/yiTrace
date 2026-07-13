@@ -40,6 +40,8 @@ pub use bm25::{Bm25TextIndex, CjkBigramTokenizer, Tokenizer};
 mod tokenizer_cn;
 pub use tokenizer_cn::{ChineseTokenizer, Dict};
 
+mod test_failpoints;
+
 mod segstore;
 pub use segstore::FileSegmentStore;
 

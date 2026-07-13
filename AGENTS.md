@@ -99,6 +99,9 @@ cd yitrace-db-python && python -m pytest      # Python embedded DB + FastAPI/CLI
 cd yitrace-db-rs && cargo test --offline      # Rust embedded DB crate
 ./scripts/package_mode_eval.sh                # 跨 Python/TS/Node/Rust 包形态回归，含 Python SDK clean consumer
 ./scripts/package_release_artifacts.sh        # 创建 v* tag 前先本地打包；GitHub Action 只在 tag push 时重复这条路径
+python scripts/check_release_versions.py                 # 检查所有公开包和 lockfile 版本一致
+./tests/upgrade_012_to_current.sh              # 用真实 0.1.2 数据目录验证升级、去重和索引重建
+./tests/sidecar_rebuild_kill9.sh               # 在派生索引原子替换前 kill -9，再验证恢复
 ```
 
 **Node / Electron 嵌入式 DB（`@yitrace/db`）：**
@@ -149,6 +152,7 @@ VITE_API=http npm run build                          # 构建对接真实引擎�
 - **N-API 包隔离**：`yitrace-node/` 可以依赖 NAPI-RS；这些依赖不得进入 `yt-engine`。`@yitrace/db` 只通过 Rust engine API 打开数据目录，不允许 JS 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
 - **恢复路径不能 eager load 大索引**：持久库 clean reopen 只恢复 manifest、WAL checkpoint 和控制状态；`trace_rollup.dat`、`filter_attrs.dat`、`bm25.dat`、`segment_bloom.dat` 按第一次相关查询加载。`trace_rollup.dat` v2 只加载页目录，按 tenant/project/trace 范围读页；`filter_attrs.dat` v3 只加载行和 posting 目录；`bm25.dat` v4 只加载文档长度、确定性 event_id 表和词/块目录，按 block-max 上界决定是否读 128 条 postings。同一 event_id 在重试、WAL 重放和重开后只能索引一次；修改这条路径必须跑 `--verify-source-index`。默认 segment 的 `seg-*.idx` 保存 `(trace_id, span_id) -> byte offset`，启动时不加载；首次点查会校验索引并重算整个 segment CRC，损坏段在点查和顺序读下都必须拒绝。索引缺失或损坏会从对应 `seg-*.dat` 重建；它不是数据源。BM25 与 attrs 缓存默认各受 64 MB 预算约束，按内存容器 capacity 计费；无过滤 BM25 结果缓存默认 16 MB，由 `YT_BM25_QUERY_CACHE_BYTES` 控制，写入后必须失效；查询候选集合另由 `YT_BM25_FILTER_SET_BUDGET_BYTES` 控制。`readPlan.indexBytesRead/dataBytesRead/indexesValidated/indexesRebuilt` 必须保留，不能只报解码行数。改恢复逻辑后必须跑 `scale_bench --phase open`，不能让启动重新随 span 数线性增长。
 - **npm 发布**：`@yitrace/db` root 包只放 JS 入口（ESM + CommonJS）和类型声明；native binary 放在 `npm/*` 平台 optional packages。正式发布前必须跑 `npm run release:artifacts` + `npm run release:prepublish` + `npm run pack:check`，并先发布平台包再发布 root 包。
+- **版本与产物验证**：tag、Node root/平台包、Python、TypeScript、Rust 包和 lockfile 必须通过 `scripts/check_release_versions.py`。`pack:local` 默认只打 root + 当前平台，避免误带本机残留的旧平台二进制；只有确认所有平台二进制都是本次构建时才设置 `YITRACE_PACK_ALL_PLATFORMS=1`。Python DB wheel 必须用 `scripts/verify_python_db_wheel.py` 在干净环境验证 embedded、reopen、FastAPI 和 CLI server。
 - **提交信息**：纯净的中文/英文描述，首行简短，body 说清 what + why。不带 AI 工具名。
 
 ---

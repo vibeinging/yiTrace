@@ -12,8 +12,8 @@ execution history back into Agent Memory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![npm](https://img.shields.io/badge/npm-%40yitrace%2Fdb%200.1.2-cb3837?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
-[![PyPI](https://img.shields.io/badge/PyPI-yitrace--db%200.1.2-3775a9?logo=pypi)](https://pypi.org/project/yitrace-db/)
+[![npm](https://img.shields.io/npm/v/%40yitrace%2Fdb?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
+[![PyPI](https://img.shields.io/pypi/v/yitrace-db?logo=pypi)](https://pypi.org/project/yitrace-db/)
 
 ![yiTrace console](docs/images/console-overview.png)
 
@@ -182,10 +182,10 @@ The full HTTP contract is in [API Reference](docs/API_REFERENCE.md).
 | Existing OTel/OpenInference app | Send `POST /v1/traces` | OTLP/OpenInference compatible ingest |
 | Rust app | Source dependency | Rust SDK and embedded wrapper live in this repo |
 
-Current public versions:
+Published packages:
 
-- npm: `@yitrace/db@0.1.2`, `@yitrace/trace-sdk@0.1.2`
-- PyPI: `yitrace==0.1.2`, `yitrace-db==0.1.2`
+- npm: [`@yitrace/db`](https://www.npmjs.com/package/@yitrace/db), [`@yitrace/trace-sdk`](https://www.npmjs.com/package/@yitrace/trace-sdk)
+- PyPI: [`yitrace`](https://pypi.org/project/yitrace/), [`yitrace-db`](https://pypi.org/project/yitrace-db/)
 
 ## Embedded Mode vs Server Mode
 
@@ -276,12 +276,16 @@ python -m pytest
 Release artifact build:
 
 ```bash
+python scripts/check_release_versions.py
 ./scripts/package_release_artifacts.sh
+./tests/upgrade_012_to_current.sh
+./tests/sidecar_rebuild_kill9.sh
 ```
 
 The GitHub Actions package workflow runs only on `v*` tag pushes. Use
 `vX.Y.Z-only-python-sdk` style tags to test one package target; use `vX.Y.Z`
-tags for the full package matrix.
+tags for the full package matrix. Every native job installs its final wheel or
+tarballs in a clean consumer before uploading the artifact.
 
 ## How It Works
 

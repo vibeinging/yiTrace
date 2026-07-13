@@ -11,8 +11,8 @@ yiTrace 把这些路径存进本地 TraceDB，让你可以搜索、回放、沉�
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
-[![npm](https://img.shields.io/badge/npm-%40yitrace%2Fdb%200.1.1-cb3837?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
-[![PyPI](https://img.shields.io/badge/PyPI-yitrace--db%200.1.0-3775a9?logo=pypi)](https://pypi.org/project/yitrace-db/)
+[![npm](https://img.shields.io/npm/v/%40yitrace%2Fdb?logo=npm)](https://www.npmjs.com/package/@yitrace/db)
+[![PyPI](https://img.shields.io/pypi/v/yitrace-db?logo=pypi)](https://pypi.org/project/yitrace-db/)
 
 ![yiTrace 控制台](docs/images/console-overview.png)
 
@@ -175,10 +175,10 @@ curl -XPOST http://127.0.0.1:7878/v1/search \
 | 已经有 OTel/OpenInference | 发 `POST /v1/traces` | 兼容 OTLP/OpenInference 摄入 |
 | Rust 应用 | 源码依赖 | Rust SDK 和 embedded wrapper 都在本仓库 |
 
-当前公开版本：
+已经发布的包：
 
-- npm：`@yitrace/db@0.1.1`、`@yitrace/trace-sdk@0.1.1`
-- PyPI：`yitrace==0.1.0`、`yitrace-db==0.1.0`
+- npm：[`@yitrace/db`](https://www.npmjs.com/package/@yitrace/db)、[`@yitrace/trace-sdk`](https://www.npmjs.com/package/@yitrace/trace-sdk)
+- PyPI：[`yitrace`](https://pypi.org/project/yitrace/)、[`yitrace-db`](https://pypi.org/project/yitrace-db/)
 
 ## embedded 模式和 server 模式
 
@@ -265,11 +265,15 @@ python -m pytest
 构建发版产物：
 
 ```bash
+python scripts/check_release_versions.py
 ./scripts/package_release_artifacts.sh
+./tests/upgrade_012_to_current.sh
+./tests/sidecar_rebuild_kill9.sh
 ```
 
 GitHub Actions 只在推送 `v*` tag 时打包。可以用 `vX.Y.Z-only-python-sdk`
-这类 tag 先跑单个包；用 `vX.Y.Z` 跑完整打包矩阵。
+这类 tag 先跑单个包；用 `vX.Y.Z` 跑完整打包矩阵。每个 native job 都会先在
+干净 consumer 中安装最终 wheel 或 tarball，验证通过后才上传产物。
 
 ## 它怎么工作
 

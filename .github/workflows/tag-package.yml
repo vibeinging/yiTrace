@@ -94,6 +94,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check release versions
+        run: python scripts/check_release_versions.py --tag "${{ github.ref_name }}"
+
       - name: Setup Node
         if: ${{ matrix.target == 'typescript-sdk' }}
         uses: actions/setup-node@v4
@@ -144,6 +147,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check release versions
+        run: python scripts/check_release_versions.py --tag "${{ github.ref_name }}"
 
       - name: Setup Node
         if: ${{ matrix.target == 'node-db' }}
@@ -201,6 +207,10 @@ jobs:
         env:
           MATURIN_BUILD_ARGS: ${{ matrix.maturin_args }}
         run: ./scripts/package_release_artifacts.sh --target "${{ matrix.target }}"
+
+      - name: Verify Python DB wheel in a clean consumer
+        if: ${{ matrix.target == 'python-db' && startsWith(matrix.platform, 'linux-') }}
+        run: python scripts/verify_python_db_wheel.py --wheel-dir dist/tag-package/python-db
 
       - name: Upload package
         uses: actions/upload-artifact@v4
