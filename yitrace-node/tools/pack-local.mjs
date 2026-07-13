@@ -75,6 +75,11 @@ function cleanLabel(value) {
 
 const gitCommit = gitOutput(["rev-parse", "HEAD"]);
 const gitShortCommit = gitOutput(["rev-parse", "--short=12", "HEAD"]);
+if (gitCommit) {
+  // A build may rewrite tracked generated files with identical contents. Refresh
+  // cached stat data so diff-index reports content changes, not stale mtimes.
+  gitSucceeds(["update-index", "-q", "--refresh"]);
+}
 const gitDirty = gitCommit ? !gitSucceeds(["diff-index", "--quiet", "HEAD", "--"]) : false;
 const packLabel = cleanLabel(
   process.env.YITRACE_PACK_LABEL ??
