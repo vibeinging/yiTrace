@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use yt_core::event::{EventIdentity, EventType};
@@ -21,6 +21,9 @@ use yt_core::ids::WalLsn;
 
 const BATCH_MAGIC_V2: u64 = 0x3254_4259_5741_4C59; // Versioned batch sentinel, distinct from realistic record counts.
 const SPAN_FIELDS_MAGIC_V2: u64 = 0x3244_4C46_5459_5954; // Versioned SpanFields sentinel for standalone upgrade payloads.
+const WAL_STATE_MAGIC: u64 = 0x3154_5357_5459_5954; // "TYYTWST1"
+const WAL_STATE_VERSION: u32 = 1;
+const WAL_STATE_LEN: usize = 40;
 
 /// 一条 WAL 记录 = 一个事件。
 #[derive(Clone)]
@@ -56,7 +59,10 @@ enum Backing {
     File {
         file: File,
         path: PathBuf,
+        state_path: PathBuf,
         scanned_len: usize,
+        checkpoint_len: usize,
+        checkpoint_lsn: u64,
     },
 }
 
@@ -83,13 +89,21 @@ impl Wal {
     /// 文件模式：真落盘。打开已有文件并扫描出 next_lsn（恢复用），之后 append+fsync。
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let existing = std::fs::read(&path).unwrap_or_default();
-        let (frames, scanned_len) = parse_frames_with_consumed(&existing);
-        // next_lsn = 最后一帧的 first_lsn + 其记录数（与 append 的 n.max(1) 递增一致）
+        let state_path = path.with_extension("state");
+        let file_len = std::fs::metadata(&path)
+            .map(|meta| meta.len() as usize)
+            .unwrap_or(0);
+        let checkpoint = load_wal_state(&state_path)
+            .filter(|state| state.scanned_len <= file_len)
+            .unwrap_or_default();
+        let existing = read_file_from(&path, checkpoint.scanned_len).unwrap_or_default();
+        let (frames, consumed) = parse_frames_with_consumed(&existing);
+        let scanned_len = checkpoint.scanned_len.saturating_add(consumed);
+        // checkpoint 之前的帧已经随 manifest flush 持久化；这里只解码 checkpoint 后的尾部。
         let next_lsn = frames
             .last()
             .map(|(first, recs)| first + (recs.len() as u64).max(1))
-            .unwrap_or(1);
+            .unwrap_or(checkpoint.next_lsn.max(1));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -100,7 +114,10 @@ impl Wal {
             backing: Backing::File {
                 file,
                 path,
+                state_path,
                 scanned_len,
+                checkpoint_len: checkpoint.scanned_len,
+                checkpoint_lsn: checkpoint.checkpoint_lsn,
             },
         })
     }
@@ -143,6 +160,9 @@ impl Wal {
     /// 文件模式重新读盘解析；撕裂尾被丢弃。返回 owned（文件模式无法借用）。
     pub fn replay_after(&self, from: WalLsn) -> Vec<(u64, WalRecord)> {
         let from = from.get();
+        if from >= self.committed_tail().get() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut push = |first: u64, recs: &[WalRecord]| {
             for (i, r) in recs.iter().enumerate() {
@@ -160,8 +180,18 @@ impl Wal {
                     }
                 }
             }
-            Backing::File { path, .. } => {
-                let bytes = std::fs::read(path).unwrap_or_default();
+            Backing::File {
+                path,
+                checkpoint_len,
+                checkpoint_lsn,
+                ..
+            } => {
+                let offset = if from >= *checkpoint_lsn {
+                    *checkpoint_len
+                } else {
+                    0
+                };
+                let bytes = read_file_from(path, offset).unwrap_or_default();
                 for (first, recs) in parse_frames(&bytes) {
                     push(first, &recs);
                 }
@@ -172,6 +202,37 @@ impl Wal {
 
     pub fn committed_tail(&self) -> WalLsn {
         WalLsn::new(self.next_lsn - 1)
+    }
+
+    /// manifest 已把 `through` 之前的 WAL 吸收到 segment 后，记录对应文件偏移。
+    /// 状态文件只是恢复加速器；缺失、损坏或落后时会从 WAL 正文回退校验。
+    pub fn checkpoint(&mut self, through: WalLsn) -> std::io::Result<()> {
+        let next_lsn = self.next_lsn;
+        let Backing::File {
+            state_path,
+            scanned_len,
+            checkpoint_len,
+            checkpoint_lsn,
+            ..
+        } = &mut self.backing
+        else {
+            return Ok(());
+        };
+        if through.get() != next_lsn.saturating_sub(1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WAL checkpoint must match committed tail",
+            ));
+        }
+        let state = WalState {
+            scanned_len: *scanned_len,
+            checkpoint_lsn: through.get(),
+            next_lsn,
+        };
+        save_wal_state(state_path, state)?;
+        *checkpoint_len = *scanned_len;
+        *checkpoint_lsn = through.get();
+        Ok(())
     }
 
     /// 文件模式下重新扫描 WAL，吸收其它进程已经提交的帧，更新本进程的 next_lsn。
@@ -196,8 +257,8 @@ impl Wal {
                 return (self.committed_tail(), changed);
             }
 
-            let existing = std::fs::read(&*path).unwrap_or_default();
-            if file_len < *scanned_len || existing.len() < *scanned_len {
+            if file_len < *scanned_len {
+                let existing = std::fs::read(&*path).unwrap_or_default();
                 let (frames, consumed) = parse_frames_with_consumed(&existing);
                 *scanned_len = consumed;
                 self.next_lsn = update_next_lsn_from_frames(&frames);
@@ -205,7 +266,8 @@ impl Wal {
                 return (self.committed_tail(), changed);
             }
 
-            let (frames, consumed) = parse_frames_with_consumed(&existing[*scanned_len..]);
+            let existing = read_file_from(path, *scanned_len).unwrap_or_default();
+            let (frames, consumed) = parse_frames_with_consumed(&existing);
             *scanned_len = (*scanned_len).saturating_add(consumed);
             if let Some(next) = frames
                 .last()
@@ -217,6 +279,70 @@ impl Wal {
         }
         (self.committed_tail(), changed)
     }
+}
+
+#[derive(Clone, Copy)]
+struct WalState {
+    scanned_len: usize,
+    checkpoint_lsn: u64,
+    next_lsn: u64,
+}
+
+impl Default for WalState {
+    fn default() -> Self {
+        Self {
+            scanned_len: 0,
+            checkpoint_lsn: 0,
+            next_lsn: 1,
+        }
+    }
+}
+
+fn read_file_from(path: &Path, offset: usize) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset as u64))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn load_wal_state(path: &Path) -> Option<WalState> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() != WAL_STATE_LEN {
+        return None;
+    }
+    let payload = &bytes[..WAL_STATE_LEN - 4];
+    let expected = u32::from_le_bytes(bytes[WAL_STATE_LEN - 4..].try_into().ok()?);
+    if crc32_bytes(payload) != expected {
+        return None;
+    }
+    let magic = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let version = u32::from_le_bytes(payload[8..12].try_into().ok()?);
+    if magic != WAL_STATE_MAGIC || version != WAL_STATE_VERSION {
+        return None;
+    }
+    Some(WalState {
+        scanned_len: u64::from_le_bytes(payload[12..20].try_into().ok()?) as usize,
+        checkpoint_lsn: u64::from_le_bytes(payload[20..28].try_into().ok()?),
+        next_lsn: u64::from_le_bytes(payload[28..36].try_into().ok()?),
+    })
+}
+
+fn save_wal_state(path: &Path, state: WalState) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(WAL_STATE_LEN);
+    bytes.extend_from_slice(&WAL_STATE_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&WAL_STATE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(state.scanned_len as u64).to_le_bytes());
+    bytes.extend_from_slice(&state.checkpoint_lsn.to_le_bytes());
+    bytes.extend_from_slice(&state.next_lsn.to_le_bytes());
+    let crc = crc32_bytes(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    let tmp = path.with_extension("state.tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(tmp, path)
 }
 
 // ───────────────────────── 帧解析 ─────────────────────────
@@ -326,6 +452,54 @@ fn put_bytes(b: &mut Vec<u8>, bytes: &[u8]) {
 /// （`FileSegmentStore`），避免两处各写一份记录序列化。
 pub fn encode_records(records: &[WalRecord]) -> Vec<u8> {
     encode_batch(records)
+}
+
+/// 一条记录在 `encode_records` 结果里的字节范围。
+///
+/// Segment 点查目录只保存这些范围，不复制记录内容。`offset` 从 batch payload 开头计算。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodedRecordRange {
+    pub trace_id: u64,
+    pub span_id: u64,
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// 只读取 batch 的结构字段，找出每条记录的位置，不解码字符串和 SpanFields。
+///
+/// 只接受当前 v2 编码；旧 segment 没有点查目录时由上层回退整段扫描。
+pub fn encoded_record_ranges(payload: &[u8]) -> Option<Vec<EncodedRecordRange>> {
+    let mut c = Cur { b: payload, i: 0 };
+    if c.u64()? != BATCH_MAGIC_V2 || c.u64()? != 2 {
+        return None;
+    }
+    let n = usize::try_from(c.u64()?).ok()?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let start = c.i;
+        let trace_id = c.u64()?;
+        let span_id = c.u64()?;
+        c.u64()?; // ts
+        c.skip_string()?;
+        c.u64()?; // seq
+        c.u8()?; // event_type
+        c.skip_bytes()?; // encoded SpanFields
+        let len = u32::try_from(c.i.checked_sub(start)?).ok()?;
+        out.push(EncodedRecordRange {
+            trace_id,
+            span_id,
+            offset: start as u64,
+            len,
+        });
+    }
+    (c.i == payload.len()).then_some(out)
+}
+
+/// 解码由 `encoded_record_ranges` 返回的一条记录切片。
+pub fn decode_record(bytes: &[u8]) -> Option<WalRecord> {
+    let mut c = Cur { b: bytes, i: 0 };
+    let record = decode_record_v2_from(&mut c)?;
+    (c.i == bytes.len()).then_some(record)
 }
 
 /// `encode_records` 的逆。损坏/截断返回 None。
@@ -539,6 +713,14 @@ impl<'a> Cur<'a> {
         self.i = e;
         Some(s)
     }
+    fn skip_string(&mut self) -> Option<()> {
+        let n = usize::try_from(self.u64()?).ok()?;
+        self.i = self.i.checked_add(n)?;
+        (self.i <= self.b.len()).then_some(())
+    }
+    fn skip_bytes(&mut self) -> Option<()> {
+        self.skip_string()
+    }
     fn opt_u64(&mut self) -> Option<Option<u64>> {
         if self.u8()? == 1 {
             Some(Some(self.u64()?))
@@ -579,26 +761,30 @@ fn decode_batch_v2(c: &mut Cur) -> Option<Vec<WalRecord>> {
     let n = c.u64()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let trace_id = c.u64()?;
-        let span_id = c.u64()?;
-        let ts = c.u64()? as i64;
-        let ext = c.string()?;
-        let seq = c.u64()?;
-        let event_type = EventType::from_tag(c.u8()?);
-        let fields = decode_span_fields(c.bytes()?)?;
-        out.push(WalRecord {
-            trace_id,
-            span_id,
-            ts,
-            identity: EventIdentity {
-                ext_span_id: ext,
-                seq,
-                event_type,
-            },
-            fields,
-        });
+        out.push(decode_record_v2_from(c)?);
     }
     Some(out)
+}
+
+fn decode_record_v2_from(c: &mut Cur) -> Option<WalRecord> {
+    let trace_id = c.u64()?;
+    let span_id = c.u64()?;
+    let ts = c.u64()? as i64;
+    let ext = c.string()?;
+    let seq = c.u64()?;
+    let event_type = EventType::from_tag(c.u8()?);
+    let fields = decode_span_fields(c.bytes()?)?;
+    Some(WalRecord {
+        trace_id,
+        span_id,
+        ts,
+        identity: EventIdentity {
+            ext_span_id: ext,
+            seq,
+            event_type,
+        },
+        fields,
+    })
 }
 
 fn decode_batch_legacy(c: &mut Cur, n: usize) -> Option<Vec<WalRecord>> {
@@ -750,6 +936,48 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_reopens_from_tail_and_preserves_unflushed_records() {
+        let path = temp_path();
+        let state_path = path.with_extension("state");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            let flushed = wal.append_committed(vec![rec("flushed", 1), rec("flushed-2", 2)]);
+            wal.checkpoint(flushed).unwrap();
+            wal.append_committed(vec![rec("tail", 3)]);
+        }
+
+        let wal = Wal::open(&path).unwrap();
+        assert_eq!(wal.committed_tail(), WalLsn::new(3));
+        let tail = wal.replay_after(WalLsn::new(2));
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].0, 3);
+        assert_eq!(tail[0].1.identity.ext_span_id, "tail");
+        assert!(wal.replay_after(WalLsn::new(3)).is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn corrupt_checkpoint_falls_back_to_full_wal_scan() {
+        let path = temp_path();
+        let state_path = path.with_extension("state");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            let tail = wal.append_committed(vec![rec("a", 1), rec("b", 2)]);
+            wal.checkpoint(tail).unwrap();
+        }
+        std::fs::write(&state_path, b"broken").unwrap();
+
+        let wal = Wal::open(&path).unwrap();
+        assert_eq!(wal.committed_tail(), WalLsn::new(2));
+        assert_eq!(wal.replay_after(WalLsn::new(0)).len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
     fn file_wal_incremental_refresh_sees_only_new_frames() {
         let path = temp_path();
         let mut wal_a = Wal::open(&path).unwrap();
@@ -802,6 +1030,27 @@ mod tests {
         );
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
+    }
+
+    #[test]
+    fn encoded_record_ranges_decode_each_record_without_batch_scan() {
+        let records = vec![rec("first", 1), rec("second", 2), rec("third", 3)];
+        let payload = encode_records(&records);
+        let ranges = encoded_record_ranges(&payload).unwrap();
+        assert_eq!(ranges.len(), records.len());
+
+        for (expected, range) in records.iter().zip(ranges) {
+            let start = range.offset as usize;
+            let end = start + range.len as usize;
+            let decoded = decode_record(&payload[start..end]).unwrap();
+            assert_eq!(decoded.trace_id, expected.trace_id);
+            assert_eq!(decoded.span_id, expected.span_id);
+            assert_eq!(decoded.ts, expected.ts);
+            assert_eq!(decoded.identity, expected.identity);
+            assert_eq!(decoded.fields, expected.fields);
+            assert_eq!(range.trace_id, expected.trace_id);
+            assert_eq!(range.span_id, expected.span_id);
+        }
     }
 
     #[test]

@@ -125,31 +125,40 @@ impl Default for Dict {
 /// 纯 Rust 中文词级分词器，实现引擎的 `Tokenizer`。
 /// 默认装满 jieba 全量词典：`with_tokenizer(Box::new(ChineseTokenizer::default()))`。
 pub struct ChineseTokenizer {
-    dict: Arc<Dict>,
+    /// `None` 表示使用进程共享的内置全量词典，并在第一次真正分词时初始化。
+    /// 启动只构造分词器句柄，不为尚未发生的全文检索解析 34.9 万词。
+    dict: Option<Arc<Dict>>,
 }
 
 impl ChineseTokenizer {
     /// 用 jieba 全量词典（+ 领域词），开箱即生产级。
     pub fn full() -> Self {
-        Self { dict: Dict::full() }
+        Self { dict: None }
     }
 
     /// 在全量词典上**叠加自有词典**（jieba 格式文本：每行 `词 频 [词性]`）。用户词覆盖词频、可加生词。
     pub fn with_user_dict(text: &str) -> Self {
         let mut d = (*Dict::full()).clone();
         d.extend_str(text);
-        Self { dict: Arc::new(d) }
+        Self {
+            dict: Some(Arc::new(d)),
+        }
     }
 
     /// 用完全自定义词典（不含 jieba 全量；多用于测试或特殊场景）。
     pub fn with_dict(dict: Dict) -> Self {
         Self {
-            dict: Arc::new(dict),
+            dict: Some(Arc::new(dict)),
         }
+    }
+
+    fn resolved_dict(&self) -> Arc<Dict> {
+        self.dict.clone().unwrap_or_else(Dict::full)
     }
 
     /// 对一段**纯中文**做词典 DAG + 最大概率路径切分。
     fn cut(&self, sentence: &str) -> Vec<String> {
+        let dict = self.resolved_dict();
         let chars: Vec<char> = sentence.chars().collect();
         let n = chars.len();
         if n == 0 {
@@ -168,9 +177,9 @@ impl ChineseTokenizer {
         let dag: Vec<Vec<usize>> = (0..n)
             .map(|i| {
                 let mut ends = Vec::new();
-                let jmax = (i + self.dict.max_word_len.max(1)).min(n);
+                let jmax = (i + dict.max_word_len.max(1)).min(n);
                 for j in (i + 1)..=jmax {
-                    if j == i + 1 || self.dict.contains(&sentence[byte_at[i]..byte_at[j]]) {
+                    if j == i + 1 || dict.contains(&sentence[byte_at[i]..byte_at[j]]) {
                         ends.push(j);
                     }
                 }
@@ -186,7 +195,7 @@ impl ChineseTokenizer {
         for i in (0..n).rev() {
             let mut best = (f64::NEG_INFINITY, i + 1);
             for &j in &dag[i] {
-                let lp = self.dict.logprob(&sentence[byte_at[i]..byte_at[j]]) + route[j].0;
+                let lp = dict.logprob(&sentence[byte_at[i]..byte_at[j]]) + route[j].0;
                 if lp > best.0 {
                     best = (lp, j);
                 }

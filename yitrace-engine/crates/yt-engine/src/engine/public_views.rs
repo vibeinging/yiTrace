@@ -4,12 +4,20 @@ pub struct ReadPlanStats {
     pub used_filter_index: bool,
     pub candidate_span_keys: Option<usize>,
     pub scanned_segments: usize,
+    pub point_lookup_segments: usize,
+    pub decoded_segment_rows: usize,
+    pub index_bytes_read: u64,
+    pub data_bytes_read: u64,
+    pub indexes_validated: usize,
+    pub indexes_rebuilt: usize,
     pub matched_spans: usize,
     pub fallback_reason: Option<String>,
     pub unsupported_attr_keys: Vec<String>,
     pub trace_fetch_source: Option<String>,
     pub trace_fetch_span_count: Option<usize>,
     pub trace_fetch_fallback_reason: Option<String>,
+    pub rollup_pages_read: Option<usize>,
+    pub rollup_pages_total: Option<usize>,
 }
 
 /// 一条 trace 的摘要（web 控制台列表视图用）。

@@ -39,7 +39,7 @@ yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 No
 3. **应用内需要本地搜索和 trace 详情**：用 `@yitrace/db`、`yitrace-db` Python 包或 Rust crate。
 4. **自己写 UI / 服务**：直接调 `/v1/*`。
 
-alpha 阶段适合早期用户接入和 dogfood。已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、持久 BM25 缓存、annotation/dataset/retention 基座。`@yitrace/db` 侧已支持外部 embedding 回调：engine 不调用模型，调用方通过 `embedQuery` / `embedDocuments` 生成 vector 后写入或查询；普通 `search({ text })` 不会触发模型调用。仍在路线图里的上量项包括 attrs postings 磁盘分页、独立 loop/task/trajectory 索引、百万 span 冷/热性能基线、BM25 段内分页 postings。
+已稳定的能力包括摄入、重启恢复、search、trace/span detail、attrs 过滤、read-model rollup、持久 BM25 缓存、annotation/dataset/retention 基座。`@yitrace/db` 侧已支持外部 embedding 回调：engine 不调用模型，调用方通过 `embedQuery` / `embedDocuments` 生成 vector 后写入或查询；普通 `search({ text })` 不会触发模型调用。attrs postings、rollup 页、BM25 block-max 和默认 segment 点查都已支持按目录定位、按需磁盘读取和固定预算缓存，并完成百万 span 冷启动与查询基线。仍在路线图里的上量项包括独立 loop/task/trajectory 索引和大结果聚合的流式执行。
 
 ---
 
@@ -235,7 +235,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ### GET /v1/metrics  —— Prometheus 指标
 
-返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_filter_attrs`、`yt_filter_attr_postings`、`yt_filter_attr_disabled_postings`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。
+返回 Prometheus 文本格式（`# HELP` / `# TYPE` / 值），可直接被 Prometheus 抓、Grafana 出看板。指标：`yt_manifest_version`、`yt_segments_live`、`yt_memtable_rows`、`yt_segments_dead`、`yt_readers_active`、`yt_wal_committed_tail`、`yt_flush_threshold`、`yt_read_model_rollup_ready`、`yt_read_model_filter_ready`、`yt_read_model_search_ready`、`yt_filter_attrs`、`yt_filter_attr_postings`、`yt_filter_attr_disabled_postings`、`yt_fold_cache_entries`、`yt_seg_bloom_count`、`yt_datasets`。三个 `yt_read_model_*_ready` 在 clean reopen 后先为 `0`，第一次相关查询加载完成后变成 `1`。
 
 ### GET /v1/healthz / GET /v1/readyz  —— 进程探针
 
@@ -322,7 +322,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ## 单机读模型 API（原始 API，camelCase 响应）
 
-这组端点用于把 trace 数据进一步筛选、聚合和估算空间。当前实现是**单机基础版**：结果语义已经稳定；`external_trace_id`、`project_id`、`skill`、`mode`、`call_site`、`task_fingerprint`、`loop_id`、`validation_status`、`review_status`、`eval_status`、`tool_name`、`model` 等常用过滤会先走 attrs sidecar 缩小候选 span，再折叠候选数据。attrs sidecar 在内存里有 postings，会选最小 postings 起步并做最终校验，避免每次过滤扫全量 span；postings 有内存预算，单个值太宽或总条目太多时会禁用对应 postings，并回退扫描 sidecar 行，保证结果不丢。没有可用索引时会回退扫描，响应里的 `readPlan` 会说明这次读到底走了哪条路径。`trace-aggregate` 的无文本聚合有 rollup 快路径；trajectory/loop/task 的无文本路径也复用同一份 span 小字段 rollup。路径类接口拿到候选 trace 后，会按 trace_id 从 rollup 只取这些 trace 的完整 span；`readPlan.traceFetchSource` 会说明这一步是否也命中 rollup。持久模式会把已 flush 的 segment 小字段写成 `trace_rollup.dat`，把过滤 sidecar 写成 `filter_attrs.dat`，把全文倒排和段 key bloom 写成 `bm25.dat`、`segment_bloom.dat`；重启时先加载缓存，再叠加 WAL tail。四份缓存命中且没有 delete/upgrade 脏段时，recover 不扫历史 segment，第一次全文检索也不补扫。只有 `bm25.dat` 或 `segment_bloom.dat` 缺失时，全文检索首次使用才补建段扫描索引。缓存不是数据源，删掉、损坏或版本不匹配都会自动扫描 segment 重建。带 `text` 的聚合和路径查询仍会回到正确扫描。把 postings 做成按需分页的磁盘 buffer manager、以及 loop/task 独立磁盘索引仍是后续优化。
+这组端点用于把 trace 数据进一步筛选、聚合和估算空间。常用过滤先走 attrs sidecar。`filter_attrs.dat` v3 把 row、row directory、postings 和 posting directory 分开，查询只读取命中的字段和值。`trace_rollup.dat` v2 按 tenant、`project_id` 和 trace 范围切成最多 4096 行的页，打开只读页目录，查询只读可能命中的页；页缓存默认 64 MB，可用 `YT_ROLLUP_PAGE_CACHE_BYTES` 调整。`bm25.dat` v3 把每个词切成 128 条一块，目录保存块的文档范围和真实最大 BM25 norm；block-max 先判断上界，再决定是否读取块。块快路和整词 WAND 回退共享 `YT_BM25_POSTINGS_CACHE_BYTES` 预算，整词回退使用连续读。无过滤 BM25 查询结果另有 16 MB 有界 CLOCK 缓存，可用 `YT_BM25_QUERY_CACHE_BYTES` 调整；索引写入、重建或重新加载后失效，相同冷查询并发进入时只执行一次评分。BM25 支持把结构化过滤下推到打分阶段；候选 postings 集合按 64 MB 临时预算决定是否物化，超过预算才回到小批候选逐条校验。默认 segment 的 `seg-*.idx` 保存 key 到物理字节范围，top-k 回填只读取目标行；候选 key 超过 4096 时回退顺序扫描，避免大量随机读。clean reopen 仍只恢复 manifest、WAL checkpoint 和控制状态；旧版本、缺失、损坏或版本不匹配时按需扫描 segment 重建派生索引。aggregate/trajectory/loop/task 带 `text` 时仍需读取正文并回到正确扫描。
 
 ### POST /v1/trace-search  —— 结构化 span 搜索
 
@@ -395,6 +395,12 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "usedFilterIndex": true,
     "candidateSpanKeys": 12,
     "scannedSegments": 4,
+    "pointLookupSegments": 2,
+    "decodedSegmentRows": 20,
+    "indexBytesRead": 8640,
+    "dataBytesRead": 28416,
+    "indexesValidated": 2,
+    "indexesRebuilt": 0,
     "matchedSpans": 1,
     "fallbackReason": null,
     "unsupportedAttrKeys": [],
@@ -405,7 +411,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 }
 ```
 
-`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan.scannedSegments` 和 `readPlan.matchedSpans`。如果 `source` 是 `scan`，说明本次没有可用索引，例如只有 `text` contains 过滤或只用了未知 attrs key；这时 `fallbackReason` 会给出原因。`source: "filter_index"` 表示本次先用了 attrs sidecar postings 拿候选 span key；如果某个 postings 被预算禁用，查询会用其他可用 postings 或扫描 sidecar 行后再做最终校验。持久库重启后可从 `filter_attrs.dat` 恢复 segment sidecar，从 `bm25.dat` 恢复全文倒排，从 `segment_bloom.dat` 恢复候选 key 跳段 bloom。聚合接口还可能返回 `source: "aggregate_rollup"`，表示本次没有折叠 trace 大字段，直接用了 rollup 聚合行；持久库重启后可从 `trace_rollup.dat` 恢复这部分 segment rollup。路径类接口还可能返回 `source: "trajectory_rollup"`，表示本次用同一份 rollup 小字段生成 trajectory/loop/task 摘要，没有读取 input/output/logs。路径类接口还会返回 `traceFetchSource` 和 `traceFetchSpanCount`：它说明拿到候选 trace 后，完整 trace 的 span 是继续从 rollup 按 trace_id 精确取，还是回退扫描。
+`scannedSpans` 是兼容旧响应的字段，当前值等同于扫描段数；新代码应读取 `readPlan`。`pointLookupSegments` 表示有多少个 segment 走了 key 索引，`decodedSegmentRows` 表示真正解码了多少条物理记录。`indexBytesRead` / `dataBytesRead` 统计代码请求读取的逻辑字节，还会把索引目录读取和首次整段 CRC 校验算进去；它不是操作系统页缓存或磁盘设备层的物理读量。不能只用解码行数代替查询 I/O；`indexesValidated` / `indexesRebuilt` 用来判断本次是否付出了首次校验或补建索引的成本。`trace-search` 带 `text` 时，`source: "bm25"` 表示先从全文索引取候选，`source: "filter_index"` 表示同时使用 attrs sidecar；结构化过滤会尽量下推到 BM25 打分。文本路径的候选窗口是 `cursor + limit`，当前上限为 500，因此带 text 的 `total` 不是全库精确计数。`source: "aggregate_rollup"` 或 `"trajectory_rollup"` 表示没有读取大字段；`rollupPagesRead` / `rollupPagesTotal` 说明本次实际读取了多少 rollup 页。路径类接口的 `traceFetchSource` 和 `traceFetchSpanCount` 则说明候选 trace 的完整 span 是继续从 rollup 精确取，还是回退扫描。
 
 ### POST /v1/trace-aggregate  —— 对搜索结果做 groupBy
 
@@ -423,7 +429,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 `filter` 语义与 `/v1/trace-search` 相同。`groupBy` 支持常见字段：`projectId`、`skill`、`mode`、`callSite`、`taskFingerprint`、`validationStatus`、`status`、`agentName`、`toolName`、`model` 等；未知字段按 attrs key 处理。
 
-无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。持久模式会把已进入 segment 的 rollup 写到 `trace_rollup.dat`，文件里带 manifest version 和 memtable watermark；恢复时如果匹配，就直接加载这份 segment-only 缓存，再从 WAL 叠加还没 flush 的尾部事件。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除、segment upgrade 或重启恢复后，rollup 会按当前快照同步重建，删除行不会被算回来，补写字段也会反映到聚合结果里。`trace_rollup.dat` 可以安全删除；损坏或过期只会让下一次启动多扫一次 segment。
+无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。`trace_rollup.dat` v2 带 manifest version、memtable watermark 和页目录；clean reopen 不读取页内容，第一次查询按 tenant、`project_id`、trace 和时间范围选择页。WAL 有未 flush 尾部时，引擎会叠加内存增量。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除或 segment upgrade 后，rollup 会按当前快照重建。`trace_rollup.dat` 可以安全删除；损坏或过期只会让第一次相关查询扫描 segment 重建，不会拖慢 clean reopen。
 
 **响应**：
 
@@ -457,7 +463,11 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "unsupportedAttrKeys": [],
     "traceFetchSource": null,
     "traceFetchSpanCount": null,
-    "traceFetchFallbackReason": null
+    "traceFetchFallbackReason": null,
+    "rollupPagesRead": 2,
+    "rollupPagesTotal": 5,
+    "pointLookupSegments": 0,
+    "decodedSegmentRows": 0
   }
 }
 ```

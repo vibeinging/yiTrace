@@ -10,7 +10,8 @@
 #   --packages       额外跑 package-mode eval 和控制台测试
 #   --pack           额外跑 @yitrace/db 本地打包验证
 #   --crash          额外跑 kill -9 崩溃恢复测试（默认 3 轮，可用 --crash-rounds N）
-#   --heavy          等同于 --packages --pack --crash
+#   --scale          额外跑 10k span 真实数据目录 + 独立进程重启查询
+#   --heavy          等同于 --packages --pack --crash --scale
 #   --skip-engine    跳过 Rust 引擎全量离线测试，只跑 eval 测试
 #   --skip-node      在 --packages/--pack 下跳过 Node 嵌入式 DB
 #   --skip-python-db 在 --packages 下跳过 Python 嵌入式 DB
@@ -25,6 +26,7 @@ RUN_ENGINE=1
 RUN_PACKAGES=0
 RUN_PACK=0
 RUN_CRASH=0
+RUN_SCALE=0
 RUN_NODE=1
 RUN_PYTHON_DB=1
 RUN_RUST_DB=1
@@ -46,10 +48,15 @@ while [[ $# -gt 0 ]]; do
       RUN_CRASH=1
       shift
       ;;
+    --scale)
+      RUN_SCALE=1
+      shift
+      ;;
     --heavy)
       RUN_PACKAGES=1
       RUN_PACK=1
       RUN_CRASH=1
+      RUN_SCALE=1
       shift
       ;;
     --crash-rounds)
@@ -111,25 +118,34 @@ if [[ "$RUN_ENGINE" -eq 1 ]]; then
 fi
 
 if [[ "$RUN_PACKAGES" -eq 1 ]]; then
-  PACKAGE_ARGS=()
-  if [[ "$RUN_SDK" -eq 0 ]]; then
-    PACKAGE_ARGS+=("--skip-sdk")
+  if [[ "$RUN_SDK" -eq 1 && "$RUN_PYTHON_DB" -eq 1 && "$RUN_RUST_DB" -eq 1 && "$RUN_NODE" -eq 1 ]]; then
+    # macOS Bash 3.2 + `set -u` treats an expanded empty array as unbound.
+    run "$ROOT_DIR/scripts/package_mode_eval.sh"
+  else
+    PACKAGE_ARGS=()
+    if [[ "$RUN_SDK" -eq 0 ]]; then
+      PACKAGE_ARGS+=("--skip-sdk")
+    fi
+    if [[ "$RUN_PYTHON_DB" -eq 0 ]]; then
+      PACKAGE_ARGS+=("--skip-python-db")
+    fi
+    if [[ "$RUN_RUST_DB" -eq 0 ]]; then
+      PACKAGE_ARGS+=("--skip-rust-db")
+    fi
+    if [[ "$RUN_NODE" -eq 0 ]]; then
+      PACKAGE_ARGS+=("--skip-node")
+    fi
+    run "$ROOT_DIR/scripts/package_mode_eval.sh" "${PACKAGE_ARGS[@]}"
   fi
-  if [[ "$RUN_PYTHON_DB" -eq 0 ]]; then
-    PACKAGE_ARGS+=("--skip-python-db")
-  fi
-  if [[ "$RUN_RUST_DB" -eq 0 ]]; then
-    PACKAGE_ARGS+=("--skip-rust-db")
-  fi
-  if [[ "$RUN_NODE" -eq 0 ]]; then
-    PACKAGE_ARGS+=("--skip-node")
-  fi
-  run "$ROOT_DIR/scripts/package_mode_eval.sh" "${PACKAGE_ARGS[@]}"
 
   if [[ "$RUN_UI" -eq 1 ]]; then
     if need_dir "$ROOT_DIR/yitrace-console"; then
       pushd "$ROOT_DIR/yitrace-console" >/dev/null
-      run npm test
+      if node -e 'const p = require("./package.json"); process.exit(p.scripts && p.scripts.test ? 0 : 1)'; then
+        run npm test
+      else
+        echo "跳过控制台测试：package.json 未定义 test 脚本"
+      fi
       run npm run build
       popd >/dev/null
     fi
@@ -151,6 +167,23 @@ if [[ "$RUN_CRASH" -eq 1 ]]; then
   pushd "$ROOT_DIR" >/dev/null
   run ./tests/crash_recovery_kill9.sh "$CRASH_ROUNDS"
   popd >/dev/null
+fi
+
+if [[ "$RUN_SCALE" -eq 1 ]]; then
+  SCALE_REPORT="${TMPDIR:-/tmp}/yitrace-scale-eval-$$.md"
+  run "$ROOT_DIR/scripts/bench_scale.sh" --smoke --cold-queries --report "$SCALE_REPORT"
+  OPEN_MS="$(awk '/^- openAndRecoverMillis:/ { print $3; exit }' "$SCALE_REPORT")"
+  OPEN_MAX_MS="${YT_SCALE_OPEN_MAX_MS:-100}"
+  if [[ -z "$OPEN_MS" ]]; then
+    echo "启动性能回归: 报告缺少 openAndRecoverMillis" >&2
+    exit 1
+  fi
+  if ! awk -v actual="$OPEN_MS" -v limit="$OPEN_MAX_MS" 'BEGIN { exit !(actual <= limit) }'; then
+    echo "启动性能回归: ${OPEN_MS}ms > ${OPEN_MAX_MS}ms" >&2
+    exit 1
+  fi
+  echo "启动性能通过: ${OPEN_MS}ms <= ${OPEN_MAX_MS}ms"
+  rm -f "$SCALE_REPORT" "${SCALE_REPORT%.md}_generate.md"
 fi
 
 echo

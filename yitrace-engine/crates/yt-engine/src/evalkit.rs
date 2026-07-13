@@ -26,3 +26,4 @@ use crate::{
 
 include!("evalkit/trace_harness.rs");
 include!("evalkit/session_harness.rs");
+include!("evalkit/search_quality.rs");

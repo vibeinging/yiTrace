@@ -34,6 +34,7 @@ mod graph;
 pub use graph::GraphAnnIndex;
 
 mod bm25;
+mod bm25_disk;
 pub use bm25::{Bm25TextIndex, CjkBigramTokenizer, Tokenizer};
 
 mod tokenizer_cn;
@@ -51,6 +52,8 @@ mod gc_log;
 
 pub mod olog;
 
+mod filter_disk;
+mod filter_external_sort;
 mod filter_sidecar;
 use filter_sidecar::FilterAttrsIndex;
 

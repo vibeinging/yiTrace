@@ -128,7 +128,7 @@ fn json_read_plan(plan: &ReadPlanStats) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"source":"{}","usedFilterIndex":{},"candidateSpanKeys":{},"scannedSegments":{},"matchedSpans":{},"fallbackReason":{},"unsupportedAttrKeys":[{}],"traceFetchSource":{},"traceFetchSpanCount":{},"traceFetchFallbackReason":{}}}"#,
+        r#"{{"source":"{}","usedFilterIndex":{},"candidateSpanKeys":{},"scannedSegments":{},"pointLookupSegments":{},"decodedSegmentRows":{},"indexBytesRead":{},"dataBytesRead":{},"indexesValidated":{},"indexesRebuilt":{},"matchedSpans":{},"fallbackReason":{},"unsupportedAttrKeys":[{}],"traceFetchSource":{},"traceFetchSpanCount":{},"traceFetchFallbackReason":{},"rollupPagesRead":{},"rollupPagesTotal":{}}}"#,
         plan.source.as_deref().unwrap_or(if plan.used_filter_index {
             "filter_index"
         } else {
@@ -138,6 +138,12 @@ fn json_read_plan(plan: &ReadPlanStats) -> String {
         plan.candidate_span_keys
             .map_or("null".to_string(), |value| value.to_string()),
         plan.scanned_segments,
+        plan.point_lookup_segments,
+        plan.decoded_segment_rows,
+        plan.index_bytes_read,
+        plan.data_bytes_read,
+        plan.indexes_validated,
+        plan.indexes_rebuilt,
         plan.matched_spans,
         json_opt_str(plan.fallback_reason.as_deref()),
         unsupported,
@@ -145,6 +151,10 @@ fn json_read_plan(plan: &ReadPlanStats) -> String {
         plan.trace_fetch_span_count
             .map_or("null".to_string(), |value| value.to_string()),
         json_opt_str(plan.trace_fetch_fallback_reason.as_deref()),
+        plan.rollup_pages_read
+            .map_or("null".to_string(), |value| value.to_string()),
+        plan.rollup_pages_total
+            .map_or("null".to_string(), |value| value.to_string()),
     )
 }
 

@@ -58,6 +58,8 @@ pub struct WriteCoordinator {
     filter_attrs: Mutex<FilterAttrsIndex>,
     /// trace aggregate 物化 rollup：span 级小字段汇总，不存大文本/logs。
     trace_rollup: Mutex<TraceAggregateRollupIndex>,
+    /// rollup / attrs 是否已经装进当前进程。持久重启只恢复控制面，两个大索引按读路径惰性加载。
+    read_model_load_state: Mutex<ReadModelLoadState>,
     /// 控制台会话边车索引：摄入时**增量差量**维护（O(1)/事件），delete/upgrade 标脏、下次读重建。
     session_idx: Mutex<SessionIndex>,
     /// **段折叠缓存**：不可变段首次解码后缓存（行 + (trace,span)→行号 索引），检索路径只取候选行、

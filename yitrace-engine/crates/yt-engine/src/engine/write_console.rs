@@ -162,7 +162,16 @@ impl WriteCoordinator {
         let Some(t) = tenant else {
             return self.console_sessions(snap);
         };
-        let (spans, _) = self.read_spans_query(snap, &TraceQuery::all().for_tenant(t));
+        let query = TraceQuery::all().for_tenant(t);
+        let filter = SearchFilter {
+            tenant_id: Some(t),
+            ..Default::default()
+        };
+        self.ensure_trace_rollup_current();
+        if let Some(rows) = self.trace_rollup.lock().unwrap().query_sessions(&query, &filter) {
+            return rows;
+        }
+        let (spans, _) = self.read_spans_query(snap, &query);
         let mut idx = SessionIndex::default();
         idx.rebuild(&spans);
         idx.rows()
@@ -170,8 +179,9 @@ impl WriteCoordinator {
 
     /// 控制台用：按租户和 attrs 过滤会话。
     ///
-    /// 语义是“会话内至少一个 span 命中所有 attrs 条件”，返回该会话的完整聚合行。它不走
-    /// session_idx 快路径，因为 attrs 是 span 级属性；初版只给控制台/AgenticData 的精确筛选使用。
+    /// 语义是“会话内至少一个 span 命中所有 attrs 条件”，返回该会话的完整聚合行。
+    /// 先用 rollup 找出命中的 session，再聚合这些 session 的全部小字段；rollup 不可用时才回退
+    /// 到原始 segment 扫描，保证 span 级 attrs 语义不被 session 级索引误判。
     pub fn console_sessions_for_tenant_and_attrs(
         &self,
         snap: &Snapshot,
@@ -185,6 +195,15 @@ impl WriteCoordinator {
             Some(t) => TraceQuery::all().for_tenant(t),
             None => TraceQuery::all(),
         };
+        let mut filter = SearchFilter {
+            tenant_id: tenant,
+            ..Default::default()
+        };
+        filter.attrs = attrs.clone();
+        self.ensure_trace_rollup_current();
+        if let Some(rows) = self.trace_rollup.lock().unwrap().query_sessions(&q, &filter) {
+            return rows;
+        }
         let (spans, _) = self.read_spans_query(snap, &q);
         let mut matching_sessions = std::collections::HashSet::new();
         for s in &spans {
@@ -275,6 +294,15 @@ impl WriteCoordinator {
         let mut by_event: BTreeMap<u64, (u64, SpanLogEvent)> = BTreeMap::new();
 
         for entry in snap.manifest.segments.values() {
+            let bloom_skip = self
+                .seg_key_bloom
+                .lock()
+                .unwrap()
+                .get(&entry.segment_id.get())
+                .map_or(false, |b| !keys.iter().any(|&key| b.maybe_contains(key)));
+            if bloom_skip {
+                continue;
+            }
             let recs = self.segments.scan_records(entry.segment_id);
             for (row, rec) in recs.iter().enumerate() {
                 if entry.deletion_vec.is_deleted(row as u32) {

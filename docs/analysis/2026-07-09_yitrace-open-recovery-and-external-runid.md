@@ -2,6 +2,8 @@
 
 日期：2026-07-09
 
+> 2026-07-11 更新：本文最初的 fast-ready 会在 recover 中解码四份 sidecar。当前实现已进一步改成 clean reopen 不加载大型 sidecar，rollup、attrs、BM25/bloom 在第一次相关查询时按组加载；attrs v3 和 BM25 v2 又把完整加载改为“目录常驻、命中 postings 按偏移读取、固定预算缓存”。100 万 span、5.92 GB 数据实测 `open + recover` 约 1–2 ms；10 万 span 上 attrs 首次加载从约 690 ms 降到 14 ms。本文关于 external runId 的结论不变，旧恢复日志仅保留为演进背景。
+
 ## 结论
 
 客户反馈的问题成立，本次已按 P0 修复三条主路径：
@@ -30,24 +32,20 @@ recover_done segs_scanned=422
 - 修复前：即使两份缓存命中，open 流程仍会逐段扫 segment，重建 BM25、session index、segment bloom 等易失索引。
 - 这个开销发生在 `YiTraceDB.open()` / recovery 阶段，不是前端接口查询本身。
 
-修复后，四份缓存命中且 manifest 中没有 delete / upgrade 脏段时，recover 只加载缓存和 WAL tail：
+当前实现中，四份缓存命中且 manifest 中没有 delete / upgrade 脏段时，recover 不加载大缓存，只恢复控制状态和 WAL tail：
 
 ```text
-trace_rollup_cache_load ...
-filter_attrs_cache_load ...
-bm25_cache_load ...
-segment_bloom_cache_load ...
-recover_fast_ready segments_deferred=422
+recover_lazy_ready segments_deferred=422 derived_dirty=false
 recover_done segs_scanned=0 ...
 ```
 
-如果 `bm25.dat` 或 `segment_bloom.dat` 缺失，则 open 仍然先快速可用，首次全文检索再扫描历史 segment，并输出：
+第一次 rollup、attrs 或全文查询才加载对应缓存。如果 `bm25.dat` 或 `segment_bloom.dat` 缺失，首次全文检索扫描历史 segment，并输出：
 
 ```text
-segment_scan_indexes_rebuild_done segs_scanned=422
+segment_scan_indexes_ready segs_scanned=422 cache_loaded=false
 ```
 
-如果四份缓存都命中，`segment_scan_indexes_stale=false`，首次全文检索直接使用持久 BM25 和 bloom，不会补扫。
+如果四份缓存都命中，第一次查询只反序列化缓存，不补扫 segment。`yt_read_model_rollup_ready`、`yt_read_model_filter_ready`、`yt_read_model_search_ready` 可观察当前进程已经加载了哪一组。
 
 ## 已处理项
 
@@ -55,11 +53,10 @@ segment_scan_indexes_rebuild_done segs_scanned=422
 
 代码行为：
 
-- `rebuild_volatile_from_current_locked()` 先尝试加载 `trace_rollup.dat`、`filter_attrs.dat`、`bm25.dat`、`segment_bloom.dat`。
-- `trace_rollup.dat` 和 `filter_attrs.dat` 命中，且 segment 没有 delete / upgrade 派生脏状态时，直接进入 fast-ready。
-- fast-ready 阶段只重放 WAL tail，保证最近未 flush 的数据仍可见。
-- BM25 / bloom 缓存也命中时，`segment_scan_indexes_stale=false`，全文检索直接可用。
-- 只有 BM25 / bloom 缓存缺失时，段扫描派生索引通过 `segment_scan_indexes_stale` 延后：
+- `rebuild_volatile_from_current_locked()` 只恢复 manifest、WAL checkpoint 和控制状态，不解码四份大 sidecar。
+- rollup、attrs、BM25/bloom 有独立 ready 状态，第一次相关查询只加载自己需要的组。
+- WAL tail 非空或第一次写入时，先补齐历史读模型再叠加增量，保证最近未 flush 的数据仍可见。
+- BM25 / bloom 通过 `segment_scan_indexes_stale` 延后：
   - `search_text` / hybrid 搜索首次使用时调用 `ensure_segment_scan_indexes_current()` 补建 BM25 / segment bloom。
   - 纯 external id / attrs 的 trace-search 走 rollup，不触发补建。
 

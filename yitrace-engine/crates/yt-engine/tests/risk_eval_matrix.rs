@@ -240,6 +240,7 @@ fn trace_search_aggregate_and_storage_stats_are_tenant_scoped() {
     let (status, text_only) =
         api.route_with_tenant("POST", "/v1/trace-search", text_only_body, None);
     assert_eq!(status, 200, "{text_only}");
+    assert_contains(&text_only, r#""source":"bm25""#);
     assert_contains(&text_only, r#""usedFilterIndex":false"#);
     assert_contains(&text_only, r#""fallbackReason":"no_indexed_filter""#);
 
@@ -400,6 +401,10 @@ fn durable_reopen_preserves_searchable_trace() {
             dir.join("filter_attrs.dat").exists(),
             "flush 后应写出 segment-only attrs filter sidecar cache"
         );
+        assert!(
+            dir.join("wal.state").exists(),
+            "flush 后应写出 WAL checkpoint，恢复只扫描 watermark 后的尾部"
+        );
     }
     {
         let reopened = WriteCoordinator::open_durable(&dir).unwrap();
@@ -410,6 +415,21 @@ fn durable_reopen_preserves_searchable_trace() {
         assert_eq!(status, 200, "{body}");
         assert_contains(&body, r#""trace_id":88001"#);
         assert_contains(&body, r#""project_id":"reopen-risk""#);
+
+        let (status, point_read) = api.route_with_tenant(
+            "POST",
+            "/v1/trace-search",
+            r#"{"text":"盗刷","filter":{"projectId":"reopen-risk"},"limit":10}"#,
+            Some(880),
+        );
+        assert_eq!(status, 200, "{point_read}");
+        assert_contains(&point_read, r#""pointLookupSegments":1"#);
+        assert_contains(&point_read, r#""decodedSegmentRows":1"#);
+        assert_contains(&point_read, r#""indexBytesRead":"#);
+        assert_contains(&point_read, r#""dataBytesRead":"#);
+        assert_contains(&point_read, r#""indexesValidated":"#);
+        assert_contains(&point_read, r#""indexesRebuilt":"#);
+        assert_contains(&point_read, r#""total":1"#);
 
         let aggregate_body =
             r#"{"filter":{"projectId":"reopen-risk"},"groupBy":["skill"],"limit":10}"#;
@@ -460,6 +480,8 @@ fn durable_reopen_preserves_searchable_trace() {
     }
     std::fs::write(dir.join("trace_rollup.dat"), b"bad-cache").unwrap();
     std::fs::write(dir.join("filter_attrs.dat"), b"bad-cache").unwrap();
+    std::fs::write(dir.join("bm25.dat"), b"bad-cache").unwrap();
+    std::fs::write(dir.join("segment_bloom.dat"), b"bad-cache").unwrap();
     {
         let reopened = WriteCoordinator::open_durable(&dir).unwrap();
         reopened.recover();
@@ -489,6 +511,11 @@ fn durable_reopen_preserves_searchable_trace() {
             r#""readPlan":{"source":"trajectory_rollup""#,
         );
         assert_contains(&indexed_search, r#""total":1"#);
+
+        let (status, text_search) =
+            api.route_with_tenant("POST", "/v1/search", r#"{"text":"盗刷","k":10}"#, Some(880));
+        assert_eq!(status, 200, "{text_search}");
+        assert_contains(&text_search, r#""trace_id":88001"#);
     }
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -785,4 +812,58 @@ fn http_auth_body_limit_and_tenant_header_work_together() {
     assert_contains(&t1, r#""trace_id":99001"#);
     let (_, t2) = api.route_with_tenant("GET", "/v1/traces", "", Some(2));
     assert_not_contains(&t2, r#""trace_id":99001"#);
+}
+
+#[test]
+fn automatic_flush_defers_full_sidecar_save_until_explicit_flush() {
+    let dir = durable_dir("deferred-sidecar-save");
+    {
+        let coord = WriteCoordinator::open_durable(&dir).unwrap();
+        coord.recover();
+        let rollup_path = dir.join("trace_rollup.dat");
+        let attrs_path = dir.join("filter_attrs.dat");
+        assert!(!rollup_path.exists());
+        assert!(!attrs_path.exists());
+        let api = EngineJsonApi::new(Arc::clone(&coord));
+        coord.set_flush_threshold(100);
+        let first = r#"[{"trace_id":99011,"span_id":1,"ts":10,"seq":1,"event_type":2,"ext_span_id":"99011-1","status":0,"output_text":"自动刷盘检索一","attrs":{"project_id":"deferred-save"}}]"#;
+        assert_eq!(
+            api.route_with_tenant("POST", "/v1/ingest", first, Some(990))
+                .0,
+            200
+        );
+        let rollup_before = std::fs::read(&rollup_path).unwrap();
+        let attrs_before = std::fs::read(&attrs_path).unwrap();
+
+        coord.set_flush_threshold(1);
+        let second = r#"[{"trace_id":99012,"span_id":1,"ts":20,"seq":1,"event_type":2,"ext_span_id":"99012-1","status":0,"output_text":"自动刷盘检索二","attrs":{"project_id":"deferred-save"}}]"#;
+        assert_eq!(
+            api.route_with_tenant("POST", "/v1/ingest", second, Some(990))
+                .0,
+            200
+        );
+        assert_eq!(std::fs::read(&rollup_path).unwrap(), rollup_before);
+        assert_eq!(std::fs::read(&attrs_path).unwrap(), attrs_before);
+
+        coord.flush_memtable();
+        assert!(rollup_path.exists(), "显式 flush 应写 rollup");
+        assert!(attrs_path.exists(), "显式 flush 应写 attrs");
+        assert_ne!(std::fs::read(rollup_path).unwrap(), rollup_before);
+        assert_ne!(std::fs::read(attrs_path).unwrap(), attrs_before);
+        assert!(dir.join("bm25.dat").exists());
+    }
+    {
+        let reopened = WriteCoordinator::open_durable(&dir).unwrap();
+        reopened.recover();
+        let api = EngineJsonApi::new(reopened);
+        let (status, body) = api.route_with_tenant(
+            "POST",
+            "/v1/search",
+            r#"{"text":"自动刷盘","k":10,"filter":{"attrs":{"project_id":"deferred-save"}}}"#,
+            Some(990),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_contains(&body, r#""trace_id":99011"#);
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }

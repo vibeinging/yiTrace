@@ -343,8 +343,8 @@ fn search_indexes_rebuilt_after_restart() {
 
 #[test]
 fn durable_recover_defers_segment_scan_when_read_model_caches_hit() {
-    // P0: open/recover 命中 rollup/filter 缓存时不能再全量扫 segment。
-    // BM25 + segment bloom 也命中时，全文检索不再触发段扫描补建。
+    // P0: clean recover 只恢复控制面，四份大索引保持 deferred；第一次相关查询按组加载缓存，
+    // 不能扫描历史 segment，也不能提前把未使用的索引装进内存。
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -365,14 +365,16 @@ fn durable_recover_defers_segment_scan_when_read_model_caches_hit() {
     let wc2 = WriteCoordinator::open_durable(&dir).unwrap();
     wc2.recover();
     assert!(
-        !*wc2.segment_scan_indexes_stale.lock().unwrap(),
-        "BM25/bloom 缓存命中后全文检索索引应直接可用"
+        *wc2.segment_scan_indexes_stale.lock().unwrap(),
+        "recover 返回时 BM25/bloom 应保持 deferred"
     );
     assert_eq!(
         wc2.seg_key_bloom.lock().unwrap().len(),
-        1,
-        "recover 应从 segment_bloom.dat 加载 bloom，不预扫历史 segment"
+        0,
+        "recover 不应提前加载 bloom"
     );
+    let state = *wc2.read_model_load_state.lock().unwrap();
+    assert!(!state.rollup_ready && !state.filter_attrs_ready);
 
     let filter = SearchFilter {
         external_trace_id: Some("run-fast".into()),
@@ -386,9 +388,12 @@ fn durable_recover_defers_segment_scan_when_read_model_caches_hit() {
     assert_eq!(spans[0].external_trace_id.as_deref(), Some("run-fast"));
     assert_eq!(
         wc2.seg_key_bloom.lock().unwrap().len(),
-        1,
-        "纯外部 ID 查询走 rollup，不改变已加载 bloom"
+        0,
+        "纯 rollup 查询不应顺带加载 bloom"
     );
+    let state = *wc2.read_model_load_state.lock().unwrap();
+    assert!(state.rollup_ready);
+    assert!(!state.filter_attrs_ready);
 
     let snap = wc2.pin_snapshot();
     let hits = wc2.search_text(&snap, "盗刷", 10);
@@ -396,10 +401,78 @@ fn durable_recover_defers_segment_scan_when_read_model_caches_hit() {
     assert_eq!((hits[0].0.trace_id, hits[0].0.span_id), (7, 70));
     assert!(
         !*wc2.segment_scan_indexes_stale.lock().unwrap(),
-        "全文检索应直接使用持久 BM25/bloom"
+        "第一次全文检索后 BM25/bloom 应进入 ready"
     );
     assert_eq!(wc2.seg_key_bloom.lock().unwrap().len(), 1);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_first_queries_load_deferred_read_models_safely() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_lazy_concurrent_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        wc.recover();
+        let mut event = ev(9, 90, 1, Some(0), Some(20), &["并发惰性加载盗刷"]);
+        event.fields.external_trace_id = Some("lazy-run".into());
+        event.fields.agent_name = Some("lazy-agent".into());
+        wc.ingest(vec![event]);
+        wc.flush_memtable();
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let barrier = Arc::new(Barrier::new(12));
+    let mut workers = Vec::new();
+    for worker in 0..12 {
+        let wc = Arc::clone(&wc);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let snap = wc.pin_snapshot();
+            match worker % 3 {
+                0 => {
+                    let filter = SearchFilter {
+                        external_trace_id: Some("lazy-run".into()),
+                        ..Default::default()
+                    };
+                    let (spans, _) = wc
+                        .trace_aggregate_rollup_spans(&TraceQuery::all(), &filter)
+                        .expect("rollup should load once and answer");
+                    assert_eq!(spans.len(), 1);
+                }
+                1 => {
+                    let hits = wc.search_text(&snap, "盗刷", 10);
+                    assert_eq!(hits.len(), 1);
+                }
+                _ => {
+                    let filter = SearchFilter {
+                        agent_name: Some("lazy-agent".into()),
+                        ..Default::default()
+                    };
+                    let hits = wc.search_text_attr(&snap, "盗刷", 10, &filter);
+                    assert_eq!(hits.len(), 1);
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let state = *wc.read_model_load_state.lock().unwrap();
+    assert!(state.rollup_ready && state.filter_attrs_ready);
+    assert!(!*wc.segment_scan_indexes_stale.lock().unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -603,6 +676,50 @@ fn console_sessions_cache_serves_then_invalidates_on_write() {
     let snap2 = wc.pin_snapshot();
     let c = wc.console_sessions(&snap2);
     assert_eq!(c.len(), 2, "写入后缓存失效、能看到新会话");
+}
+
+#[test]
+fn console_sessions_attrs_rollup_keeps_full_session_and_invalidates() {
+    let wc = WriteCoordinator::new(Arc::new(CapturingStore::default()));
+    let mut hit = ev(1, 1, 1, Some(0), Some(10), &[]);
+    hit.fields.tenant_id = Some(7);
+    hit.fields.session_id = Some(700);
+    hit.fields.input_tokens = Some(10);
+    hit.fields.attrs.insert("project_id".into(), "alpha".into());
+
+    let mut sibling = ev(2, 1, 1, Some(0), Some(20), &[]);
+    sibling.fields.tenant_id = Some(7);
+    sibling.fields.session_id = Some(700);
+    sibling.fields.input_tokens = Some(20);
+    sibling
+        .fields
+        .attrs
+        .insert("project_id".into(), "other".into());
+    wc.ingest(vec![hit, sibling]);
+
+    let mut attrs = std::collections::BTreeMap::new();
+    attrs.insert("project_id".to_string(), "alpha".to_string());
+    let snap = wc.pin_snapshot();
+    let first = wc.console_sessions_for_tenant_and_attrs(&snap, Some(7), &attrs);
+    assert_eq!(first.len(), 1, "命中一条 span 也应返回整个 session");
+    assert_eq!(first[0].session_id, 700);
+    assert_eq!(first[0].turn_count, 2, "session 聚合要包含未命中 attrs 的另一轮");
+    assert_eq!(first[0].input_tokens, 30);
+
+    let cached = wc.console_sessions_for_tenant_and_attrs(&snap, Some(7), &attrs);
+    assert_eq!(cached, first, "重复查询应命中 rollup session cache");
+
+    let mut new_session = ev(3, 1, 1, Some(0), Some(30), &[]);
+    new_session.fields.tenant_id = Some(7);
+    new_session.fields.session_id = Some(701);
+    new_session
+        .fields
+        .attrs
+        .insert("project_id".into(), "alpha".into());
+    wc.ingest(vec![new_session]);
+    let snap2 = wc.pin_snapshot();
+    let after_write = wc.console_sessions_for_tenant_and_attrs(&snap2, Some(7), &attrs);
+    assert_eq!(after_write.len(), 2, "新写入应让 attrs session cache 失效");
 }
 
 #[test]

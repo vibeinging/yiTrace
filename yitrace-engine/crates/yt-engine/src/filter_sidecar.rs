@@ -1,16 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
 use std::path::Path;
 
+use crate::filter_disk::{self, DiskFilterCache, PostingLookup as DiskPostingLookup};
+use crate::filter_external_sort::PostingRunBuilder;
 use crate::{is_filter_attr_key, FilterAttrs, SearchFilter};
 use yt_core::fold::SpanFields;
 use yt_wal::WalRecord;
 
 type SpanKey = (u64, u64);
 
-const CACHE_MAGIC: u32 = 0x5954_4641; // "YTFA"
-const CACHE_VERSION: u32 = 2;
 const DEFAULT_POSTING_ENTRY_BUDGET: usize = 2_000_000;
 const DEFAULT_POSTING_SET_BUDGET: usize = 200_000;
 
@@ -21,6 +20,7 @@ pub(crate) struct FilterAttrsIndex {
     posting_entries: usize,
     posting_entry_budget: usize,
     posting_set_budget: usize,
+    disk: Option<DiskFilterCache>,
 }
 
 impl Default for FilterAttrsIndex {
@@ -75,22 +75,32 @@ impl FilterAttrsIndex {
             posting_entries: 0,
             posting_entry_budget,
             posting_set_budget,
+            disk: None,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.rows.len()
+        self.disk
+            .as_ref()
+            .map_or(self.rows.len(), DiskFilterCache::row_count)
     }
 
     pub(crate) fn posting_count(&self) -> usize {
-        self.posting_entries
+        self.disk
+            .as_ref()
+            .map_or(self.posting_entries, DiskFilterCache::posting_count)
     }
 
     pub(crate) fn disabled_posting_count(&self) -> usize {
-        self.disabled_postings.len()
+        self.disk
+            .as_ref()
+            .map_or(self.disabled_postings.len(), |disk| {
+                disk.disabled_posting_count()
+            })
     }
 
     pub(crate) fn apply_record(&mut self, record: &WalRecord) {
+        self.materialize_disk();
         let key = (record.trace_id, record.span_id);
         if let Some(old) = self.rows.get(&key).cloned() {
             self.remove_postings(key, &old);
@@ -127,7 +137,10 @@ impl FilterAttrsIndex {
         *self = Self::from_records(records, patches);
     }
 
-    pub(crate) fn candidate_span_keys(&self, filter: &SearchFilter) -> HashSet<SpanKey> {
+    pub(crate) fn candidate_span_keys(&mut self, filter: &SearchFilter) -> HashSet<SpanKey> {
+        if self.disk.is_some() {
+            return self.disk_candidate_span_keys(filter);
+        }
         let mut sets: Vec<&HashSet<SpanKey>> = Vec::new();
         if let Some(trace_id) = filter.trace_id {
             match self.posting_lookup(&PostingKey::new("trace_id", trace_id.to_string())) {
@@ -204,6 +217,99 @@ impl FilterAttrsIndex {
         out
     }
 
+    /// BM25 已经给出少量候选时，逐条做最终过滤比复制一个低选择性的百万 key postings 更省。
+    /// 磁盘态只读取这一条 attrs row；内存态直接查 HashMap，语义与候选集合路径一致。
+    pub(crate) fn span_matches(&mut self, key: SpanKey, filter: &SearchFilter) -> bool {
+        if filter.trace_id.is_some_and(|trace_id| trace_id != key.0) {
+            return false;
+        }
+        if let Some(disk) = self.disk.as_mut() {
+            let Some(bytes) = disk.load_row(key) else {
+                return false;
+            };
+            let mut cur = CacheCursor {
+                bytes: &bytes,
+                pos: 0,
+            };
+            let Some(row) = FilterAttrs::decode(&mut cur) else {
+                return false;
+            };
+            return cur.pos == bytes.len() && filter.attrs_match(&row);
+        }
+        self.rows
+            .get(&key)
+            .is_some_and(|row| filter.attrs_match(row))
+    }
+
+    pub(crate) fn filter_matches_all(&self, filter: &SearchFilter) -> bool {
+        let Some(tenant_id) = filter.tenant_id else {
+            return false;
+        };
+        if filter.has_non_tenant_constraints() {
+            return false;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            return disk.posting_cardinality("tenant_id", &tenant_id.to_string())
+                == Some(disk.row_count());
+        }
+        self.postings
+            .get(&PostingKey::new("tenant_id", tenant_id.to_string()))
+            .is_some_and(|keys| keys.len() == self.rows.len())
+    }
+
+    pub(crate) fn candidate_count_hint(&self, filter: &SearchFilter) -> Option<usize> {
+        let postings = requested_postings(filter);
+        if postings.is_empty() {
+            return None;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            return postings
+                .iter()
+                .filter_map(|posting| disk.posting_cardinality(&posting.field, &posting.value))
+                .min();
+        }
+        postings
+            .iter()
+            .filter_map(|posting| self.postings.get(posting).map(HashSet::len))
+            .min()
+    }
+
+    /// 估算构造过滤集合需要处理多少个 key。与 `candidate_count_hint` 的“最小结果集”不同，
+    /// 这里累加所有非全量 postings，防止小 project + 超大 tenant 低估查询期内存。
+    pub(crate) fn candidate_materialization_key_hint(
+        &self,
+        filter: &SearchFilter,
+    ) -> Option<usize> {
+        let postings = requested_postings(filter);
+        if postings.is_empty() {
+            return None;
+        }
+        if let Some(disk) = self.disk.as_ref() {
+            let row_count = disk.row_count();
+            let mut total = 0usize;
+            for posting in postings {
+                let Some(count) = disk.posting_cardinality(&posting.field, &posting.value) else {
+                    return Some(usize::MAX);
+                };
+                if count != row_count {
+                    total = total.saturating_add(count);
+                }
+            }
+            return Some(if total == 0 { row_count } else { total });
+        }
+
+        let row_count = self.rows.len();
+        let mut total = 0usize;
+        for posting in postings {
+            match self.posting_lookup(&posting) {
+                PostingLookup::Resident(keys) if keys.len() == row_count => {}
+                PostingLookup::Resident(keys) => total = total.saturating_add(keys.len()),
+                PostingLookup::Disabled | PostingLookup::Missing => return Some(usize::MAX),
+            }
+        }
+        Some(if total == 0 { row_count } else { total })
+    }
+
     pub(crate) fn matches_key(&self, trace_id: u64, span_id: u64, filter: &SearchFilter) -> bool {
         self.rows
             .get(&(trace_id, span_id))
@@ -217,16 +323,27 @@ impl FilterAttrsIndex {
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> std::io::Result<()> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(parent)?;
-        let tmp = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&self.encode_cache(manifest_version, memtable_watermark))?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(tmp, path)
+        if let Some(disk) = self.disk.as_ref() {
+            return disk.persist_with_metadata(path, manifest_version, memtable_watermark);
+        }
+        // 内存 postings 受预算保护，宽字段可能被禁用。落盘走固定内存 run + 多路归并，
+        // 生成完整 postings，避免百万级 tenant/project 查询退回全行扫描或 flush OOM。
+        let mut posting_runs = PostingRunBuilder::new(path);
+        for (&key, row) in &self.rows {
+            for posting in posting_keys_for_row(key, row) {
+                posting_runs.push(posting.field, posting.value, key)?;
+            }
+        }
+        let postings = posting_runs.finish()?;
+
+        let mut rows: Vec<_> = self.rows.iter().collect();
+        rows.sort_unstable_by_key(|(&key, _)| key);
+        let rows = rows.into_iter().map(|(&key, row)| {
+            let mut bytes = Vec::new();
+            row.encode(&mut bytes);
+            (key, bytes)
+        });
+        filter_disk::write_atomic(path, manifest_version, memtable_watermark, rows, postings)
     }
 
     pub(crate) fn load_cache(
@@ -234,11 +351,15 @@ impl FilterAttrsIndex {
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
-        Self::decode_cache(&bytes, manifest_version, memtable_watermark)
+        let disk = DiskFilterCache::open(path, manifest_version, memtable_watermark)?;
+        Some(Self {
+            disk: Some(disk),
+            ..Self::default()
+        })
     }
 
     fn apply_fields(&mut self, key: SpanKey, fields: &SpanFields) {
+        self.materialize_disk();
         let Some(mut row) = self.rows.remove(&key) else {
             return;
         };
@@ -249,58 +370,14 @@ impl FilterAttrsIndex {
     }
 
     fn add_postings(&mut self, key: SpanKey, row: &FilterAttrs) {
-        self.add_posting(PostingKey::new("trace_id", key.0.to_string()), key);
-        if let Some(external_trace_id) = &row.external_trace_id {
-            self.add_posting(
-                PostingKey::new("external_trace_id", external_trace_id.as_str()),
-                key,
-            );
-        }
-        if let Some(tenant_id) = row.tenant_id {
-            self.add_posting(PostingKey::new("tenant_id", tenant_id.to_string()), key);
-        }
-        if let Some(status) = row.status {
-            self.add_posting(PostingKey::new("status", status.to_string()), key);
-        }
-        for (field, value) in [
-            ("agent_name", row.agent_name.as_deref()),
-            ("tool_name", row.tool_name.as_deref()),
-            ("model", row.model.as_deref()),
-        ] {
-            if let Some(value) = value {
-                self.add_posting(PostingKey::new(field, value), key);
-            }
-        }
-        for (attr_key, value) in &row.attrs {
-            self.add_posting(PostingKey::new(attr_field(attr_key), value), key);
+        for posting in posting_keys_for_row(key, row) {
+            self.add_posting(posting, key);
         }
     }
 
     fn remove_postings(&mut self, key: SpanKey, row: &FilterAttrs) {
-        self.remove_posting(&PostingKey::new("trace_id", key.0.to_string()), key);
-        if let Some(external_trace_id) = &row.external_trace_id {
-            self.remove_posting(
-                &PostingKey::new("external_trace_id", external_trace_id.as_str()),
-                key,
-            );
-        }
-        if let Some(tenant_id) = row.tenant_id {
-            self.remove_posting(&PostingKey::new("tenant_id", tenant_id.to_string()), key);
-        }
-        if let Some(status) = row.status {
-            self.remove_posting(&PostingKey::new("status", status.to_string()), key);
-        }
-        for (field, value) in [
-            ("agent_name", row.agent_name.as_deref()),
-            ("tool_name", row.tool_name.as_deref()),
-            ("model", row.model.as_deref()),
-        ] {
-            if let Some(value) = value {
-                self.remove_posting(&PostingKey::new(field, value), key);
-            }
-        }
-        for (attr_key, value) in &row.attrs {
-            self.remove_posting(&PostingKey::new(attr_field(attr_key), value), key);
+        for posting in posting_keys_for_row(key, row) {
+            self.remove_posting(&posting, key);
         }
     }
 
@@ -362,63 +439,146 @@ impl FilterAttrsIndex {
         }
     }
 
-    fn encode_cache(&self, manifest_version: u64, memtable_watermark: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        put_u32(&mut out, CACHE_MAGIC);
-        put_u32(&mut out, CACHE_VERSION);
-        put_u64(&mut out, manifest_version);
-        put_u64(&mut out, memtable_watermark);
-        let mut rows: Vec<_> = self.rows.iter().collect();
-        rows.sort_by_key(|(&(trace_id, span_id), _)| (trace_id, span_id));
-        put_u64(&mut out, rows.len() as u64);
-        for (&(trace_id, span_id), row) in rows {
-            put_u64(&mut out, trace_id);
-            put_u64(&mut out, span_id);
-            row.encode(&mut out);
+    fn disk_candidate_span_keys(&mut self, filter: &SearchFilter) -> HashSet<SpanKey> {
+        let postings = requested_postings(filter);
+        let disk = self.disk.as_mut().expect("disk filter cache");
+        let mut sets = Vec::new();
+        let mut needs_row_check = filter.time_from.is_some() || filter.time_to.is_some();
+        for posting in postings {
+            if disk.posting_cardinality(&posting.field, &posting.value) == Some(disk.row_count()) {
+                continue;
+            }
+            match disk.lookup(&posting.field, &posting.value) {
+                DiskPostingLookup::Resident(set) => sets.push(set),
+                DiskPostingLookup::Disabled => needs_row_check = true,
+                DiskPostingLookup::Missing => return HashSet::new(),
+            }
+        }
+
+        sets.sort_unstable_by_key(|set| set.len());
+        let mut out = if let Some(first) = sets.first() {
+            let mut out = (**first).clone();
+            for set in sets.iter().skip(1) {
+                out.retain(|key| set.contains(key));
+            }
+            out
+        } else {
+            disk.row_keys().collect()
+        };
+
+        if let Some(trace_id) = filter.trace_id {
+            out.retain(|key| key.0 == trace_id);
+        }
+        if needs_row_check {
+            out.retain(|&key| {
+                let Some(bytes) = disk.load_row(key) else {
+                    return false;
+                };
+                let mut cur = CacheCursor {
+                    bytes: &bytes,
+                    pos: 0,
+                };
+                let Some(row) = FilterAttrs::decode(&mut cur) else {
+                    return false;
+                };
+                cur.pos == bytes.len() && filter.attrs_match(&row)
+            });
         }
         out
     }
 
-    fn decode_cache(bytes: &[u8], manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
-        let mut cur = CacheCursor { bytes, pos: 0 };
-        if cur.u32()? != CACHE_MAGIC || cur.u32()? != CACHE_VERSION {
-            return None;
-        }
-        if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
-            return None;
-        }
-        let count = cur.u64()? as usize;
-        let mut rows = HashMap::new();
-        for _ in 0..count {
-            let trace_id = cur.u64()?;
-            let span_id = cur.u64()?;
-            let row = FilterAttrs::decode(&mut cur)?;
-            rows.insert((trace_id, span_id), row);
-        }
-        if cur.pos != bytes.len() {
-            return None;
-        }
-        let mut out = Self {
-            rows,
-            ..Default::default()
+    fn materialize_disk(&mut self) {
+        let Some(mut disk) = self.disk.take() else {
+            return;
         };
-        out.rebuild_postings();
-        Some(out)
+        let keys: Vec<_> = disk.row_keys().collect();
+        self.rows.reserve(keys.len());
+        for key in keys {
+            let bytes = disk
+                .load_row(key)
+                .expect("filter cache row referenced by directory must be readable");
+            let mut cur = CacheCursor {
+                bytes: &bytes,
+                pos: 0,
+            };
+            let row = FilterAttrs::decode(&mut cur)
+                .expect("filter cache row referenced by directory must decode");
+            assert_eq!(cur.pos, bytes.len(), "filter cache row has trailing bytes");
+            self.rows.insert(key, row);
+        }
+        self.rebuild_postings();
     }
 
     fn rebuild_postings(&mut self) {
         self.postings.clear();
         self.disabled_postings.clear();
         self.posting_entries = 0;
-        let rows: Vec<_> = self
-            .rows
-            .iter()
-            .map(|(&key, row)| (key, row.clone()))
-            .collect();
-        for (key, row) in rows {
-            self.add_postings(key, &row);
+        let rows = std::mem::take(&mut self.rows);
+        for (&key, row) in &rows {
+            self.add_postings(key, row);
+        }
+        self.rows = rows;
+    }
+}
+
+fn requested_postings(filter: &SearchFilter) -> Vec<PostingKey> {
+    let mut out = Vec::new();
+    if let Some(trace_id) = filter.trace_id {
+        out.push(PostingKey::new("trace_id", trace_id.to_string()));
+    }
+    if let Some(value) = &filter.external_trace_id {
+        out.push(PostingKey::new("external_trace_id", value));
+    }
+    if let Some(tenant_id) = filter.tenant_id {
+        out.push(PostingKey::new("tenant_id", tenant_id.to_string()));
+    }
+    if let Some(status) = filter.status {
+        out.push(PostingKey::new("status", status.to_string()));
+    }
+    for (field, value) in [
+        ("agent_name", filter.agent_name.as_deref()),
+        ("tool_name", filter.tool_name.as_deref()),
+        ("model", filter.model.as_deref()),
+    ] {
+        if let Some(value) = value {
+            out.push(PostingKey::new(field, value));
         }
     }
+    out.extend(
+        filter
+            .attrs
+            .iter()
+            .map(|(key, value)| PostingKey::new(attr_field(key), value)),
+    );
+    out
+}
+
+fn posting_keys_for_row(key: SpanKey, row: &FilterAttrs) -> Vec<PostingKey> {
+    let mut out = vec![PostingKey::new("trace_id", key.0.to_string())];
+    if let Some(value) = &row.external_trace_id {
+        out.push(PostingKey::new("external_trace_id", value));
+    }
+    if let Some(value) = row.tenant_id {
+        out.push(PostingKey::new("tenant_id", value.to_string()));
+    }
+    if let Some(value) = row.status {
+        out.push(PostingKey::new("status", value.to_string()));
+    }
+    for (field, value) in [
+        ("agent_name", row.agent_name.as_deref()),
+        ("tool_name", row.tool_name.as_deref()),
+        ("model", row.model.as_deref()),
+    ] {
+        if let Some(value) = value {
+            out.push(PostingKey::new(field, value));
+        }
+    }
+    out.extend(
+        row.attrs
+            .iter()
+            .map(|(key, value)| PostingKey::new(attr_field(key), value)),
+    );
+    out
 }
 
 impl FilterAttrs {
@@ -512,10 +672,6 @@ fn smallest_first<'a>(
 
 fn attr_field(key: &str) -> String {
     format!("attr:{key}")
-}
-
-fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
@@ -707,5 +863,126 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(keys, HashSet::from([(11, 1)]));
+        assert_eq!(
+            index.candidate_materialization_key_hint(&SearchFilter {
+                trace_id: Some(11),
+                ..Default::default()
+            }),
+            Some(usize::MAX),
+            "disabled postings must force the bounded fallback"
+        );
+    }
+
+    #[test]
+    fn disk_cache_pages_exact_postings_and_materializes_on_first_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "yt_filter_disk_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("filter_attrs.dat");
+
+        let mut index = FilterAttrsIndex::with_posting_budget(1, 1);
+        for mut row in [
+            record(1, 10, "alpha", "review"),
+            record(2, 20, "alpha", "write"),
+            record(3, 30, "beta", "review"),
+        ] {
+            row.fields.tenant_id = Some(7);
+            index.apply_record(&row);
+        }
+        assert!(index.disabled_posting_count() > 0);
+        index.save_cache(&path, 7, 3).unwrap();
+
+        let mut loaded = FilterAttrsIndex::load_cache(&path, 7, 3).unwrap();
+        assert!(loaded.rows.is_empty(), "open must not materialize all rows");
+        assert!(
+            loaded.postings.is_empty(),
+            "open must not materialize postings"
+        );
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.filter_matches_all(&SearchFilter {
+            tenant_id: Some(7),
+            ..SearchFilter::default()
+        }));
+        assert!(!loaded.filter_matches_all(&SearchFilter {
+            tenant_id: Some(8),
+            ..SearchFilter::default()
+        }));
+        assert_eq!(
+            loaded.candidate_count_hint(&SearchFilter {
+                tenant_id: Some(7),
+                ..attr_filter(&[("project_id", "alpha")])
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            loaded.candidate_materialization_key_hint(&SearchFilter {
+                tenant_id: Some(7),
+                ..attr_filter(&[("project_id", "alpha")])
+            }),
+            Some(2),
+            "covering tenant postings should not count against the query budget"
+        );
+        assert_eq!(
+            loaded.candidate_materialization_key_hint(&attr_filter(&[
+                ("project_id", "alpha"),
+                ("skill", "review")
+            ])),
+            Some(4),
+            "all non-covering postings must count toward the query budget"
+        );
+        assert_eq!(
+            loaded.candidate_span_keys(&attr_filter(&[
+                ("project_id", "alpha"),
+                ("skill", "review")
+            ])),
+            HashSet::from([(1, 10)])
+        );
+        assert!(
+            loaded.rows.is_empty(),
+            "exact lookup should stay disk-backed"
+        );
+        assert!(loaded.span_matches(
+            (1, 10),
+            &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
+        ));
+        assert!(!loaded.span_matches(
+            (2, 20),
+            &attr_filter(&[("project_id", "alpha"), ("skill", "review")])
+        ));
+
+        let time_filtered = SearchFilter {
+            time_from: Some(15),
+            time_to: Some(25),
+            ..attr_filter(&[("project_id", "alpha")])
+        };
+        assert_eq!(
+            loaded.candidate_span_keys(&time_filtered),
+            HashSet::from([(2, 20)])
+        );
+
+        // compaction 只推进 manifest 时，不应重建整份侧车，但必须原子更新版本头。
+        loaded.save_cache(&path, 8, 3).unwrap();
+        assert!(FilterAttrsIndex::load_cache(&path, 8, 3).is_some());
+
+        loaded.apply_record(&record(4, 40, "alpha", "review"));
+        assert!(
+            loaded.disk.is_none(),
+            "first write materializes the immutable base"
+        );
+        assert_eq!(
+            loaded.candidate_span_keys(&attr_filter(&[
+                ("project_id", "alpha"),
+                ("skill", "review")
+            ])),
+            HashSet::from([(1, 10), (4, 40)])
+        );
+        assert!(FilterAttrsIndex::load_cache(&path, 9, 3).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -37,9 +37,16 @@ impl WriteCoordinator {
         for l in &r.fields.logs {
             parts.push(l);
         }
-        if !parts.is_empty() {
-            self.bm25
-                .index_text(r.trace_id, r.span_id, &parts.join(" "));
+        let event_id = r.identity.event_id().0;
+        if parts.is_empty() {
+            self.bm25.mark_event(event_id);
+        } else {
+            self.bm25.index_event(
+                event_id,
+                r.trace_id,
+                r.span_id,
+                &parts.join(" "),
+            );
         }
         if update_filter_attrs {
             self.filter_attrs.lock().unwrap().apply_record(r);
@@ -84,6 +91,8 @@ impl WriteCoordinator {
         let _process = self.acquire_process_lock("write");
         let _w = self.write_lock.lock().unwrap();
         self.refresh_from_disk_locked();
+        // clean reopen 不预载派生索引；第一次写入前补齐，保证历史索引和新事件在同一状态上增量更新。
+        self.ensure_all_read_models_current_locked();
         let mut wal = self.wal.lock().unwrap();
         // 这批的起始 LSN（在 append 之前确定），逐条分配 commit_lsn。
         let first = wal.committed_tail().get() + 1;
@@ -181,6 +190,9 @@ impl WriteCoordinator {
         let before = self.memtable.lock().unwrap().len();
         let v_before = self.current.version();
         self.flush_memtable_locked();
+        // 显式 flush 是派生缓存的持久化点。自动 flush 只保证主数据落盘，避免每个小段都重写
+        // 全量 BM25/attrs/rollup sidecar；崩溃时旧 cache 会因 manifest 版本不符而重建。
+        self.persist_read_model_sidecars();
         let seg = v_before;
         olog::log(
             olog::Level::Info,
@@ -241,9 +253,20 @@ impl WriteCoordinator {
             },
         );
         self.commit_and_persist(draft);
+        if let Err(err) = self
+            .wal
+            .lock()
+            .unwrap()
+            .checkpoint(WalLsn::new(max_lsn))
+        {
+            olog::log(
+                olog::Level::Warn,
+                "wal_checkpoint_save_failed",
+                &[("error", &err.to_string())],
+            );
+        }
         let gate = WalLsn::new(self.current.min_retained_watermark());
         self.memtable.lock().unwrap().evict_up_to(gate);
-        self.persist_read_model_sidecars();
     }
 
     /// 读 MemTable 源：某快照可见的半开区间 `(retained_watermark, live_lsn]`（测试/折叠用）。

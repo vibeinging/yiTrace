@@ -50,6 +50,18 @@ impl SearchFilter {
             || self.tenant_id.is_some()
     }
 
+    pub(crate) fn has_non_tenant_constraints(&self) -> bool {
+        self.trace_id.is_some()
+            || self.external_trace_id.is_some()
+            || self.agent_name.is_some()
+            || self.tool_name.is_some()
+            || self.model.is_some()
+            || self.status.is_some()
+            || self.time_from.is_some()
+            || self.time_to.is_some()
+            || !self.attrs.is_empty()
+    }
+
     /// 属性是否匹配（不含 trace_id，那个在 key 上单独判）。
     fn attrs_match(&self, a: &FilterAttrs) -> bool {
         // 租户隔离：tenant 不符直接出局（最先判，隔离优先）。

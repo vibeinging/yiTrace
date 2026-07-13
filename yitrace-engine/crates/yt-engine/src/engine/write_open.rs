@@ -41,27 +41,35 @@ impl WriteCoordinator {
         graph: Option<Arc<dyn GraphIndex>>,
         vec_cfg: Option<DiskGraphConfig>,
     ) -> std::io::Result<Arc<Self>> {
+        let open_started = std::time::Instant::now();
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let process_lock = Arc::new(process_lock::ProcessLockManager::new(dir));
+        let lock_started = std::time::Instant::now();
         let _open_guard = process_lock
             .acquire("open")
             .map_err(|e| std::io::Error::new(e.kind(), format!("open durable lock failed: {e}")))?;
         let _write_guard = process_lock
             .acquire("write")
             .map_err(|e| std::io::Error::new(e.kind(), format!("open durable write lock failed: {e}")))?;
+        let lock_us = lock_started.elapsed().as_micros() as u64;
+        let storage_started = std::time::Instant::now();
         let segments = Arc::new(FileSegmentStore::open(dir.join("segments"))?);
         let wal = Wal::open(dir.join("wal.log"))?;
+        let storage_us = storage_started.elapsed().as_micros() as u64;
         let manifest_path = dir.join("manifest.dat");
         let metadata_path = dir.join("metadata.dat");
         let gc_log_path = dir.join("gc.log");
         // 有持久 manifest 就从它恢复段集合与 id 计数器；否则从空开始。
+        let manifest_started = std::time::Instant::now();
         let (manifest, next_seg, next_chunk) = match persist::load(&manifest_path) {
             Some(s) => (s.manifest, s.next_segment_id, s.next_chunk_id),
             None => (Manifest::empty(), 1, 1),
         };
+        let manifest_us = manifest_started.elapsed().as_micros() as u64;
         // 默认向量索引 = **磁盘图索引**（向量+图都落盘、重启不 rebuild、append 友好），不用 vecstore。
         // 注入了自定义 graph（可能内存型）则保留 vecstore 重建路径（向后兼容）。
+        let graph_started = std::time::Instant::now();
         let (graph, vector_path): (Option<Arc<dyn GraphIndex>>, Option<std::path::PathBuf>) =
             match graph {
                 Some(g) => (Some(g), Some(dir.join("vectors.dat"))),
@@ -71,6 +79,8 @@ impl WriteCoordinator {
                     (Some(Arc::new(disk) as Arc<dyn GraphIndex>), None)
                 }
             };
+        let graph_us = graph_started.elapsed().as_micros() as u64;
+        let build_started = std::time::Instant::now();
         let coord = Self::build_full(
             segments,
             wal,
@@ -86,7 +96,9 @@ impl WriteCoordinator {
             Some(dir.to_path_buf()),
             Some(process_lock),
         );
+        let build_us = build_started.elapsed().as_micros() as u64;
         // 打开 GC 日志，先补删上次崩溃残留的"MARK 没 DONE"段（崩溃安全），再装上。
+        let gc_started = std::time::Instant::now();
         let entries = gc_log::GcLog::scan(&gc_log_path).unwrap_or_default();
         for seg in gc_log::pending_deletions(&entries) {
             // 段文件可能已删了一半（崩溃在 unlink 中）；补删幂等（不存在就跳过）。
@@ -100,6 +112,21 @@ impl WriteCoordinator {
         // 不能静默降级成"无 GC 日志、reclaim 直接删"（那样崩溃恢复失效且无人知晓）。
         let log = gc_log::GcLog::open(&gc_log_path)?;
         *coord.gc_log.lock().unwrap() = Some(log);
+        let gc_us = gc_started.elapsed().as_micros() as u64;
+        let total_us = open_started.elapsed().as_micros() as u64;
+        olog::log(
+            olog::Level::Info,
+            "open_durable_done",
+            &[
+                ("total_us", &total_us),
+                ("lock_us", &lock_us),
+                ("storage_us", &storage_us),
+                ("manifest_us", &manifest_us),
+                ("graph_us", &graph_us),
+                ("build_us", &build_us),
+                ("gc_us", &gc_us),
+            ],
+        );
         Ok(coord)
     }
 
@@ -186,6 +213,11 @@ impl WriteCoordinator {
             trace_rollup_path,
             filter_attrs: Mutex::new(FilterAttrsIndex::default()),
             trace_rollup: Mutex::new(TraceAggregateRollupIndex::default()),
+            read_model_load_state: Mutex::new(if dir.is_some() {
+                ReadModelLoadState::deferred()
+            } else {
+                ReadModelLoadState::ready()
+            }),
             session_idx: Mutex::new(SessionIndex::default()),
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
             seg_key_bloom: Mutex::new(HashMap::new()),
@@ -290,6 +322,10 @@ impl WriteCoordinator {
         self.refresh_metadata_from_disk_locked();
         if !manifest_changed {
             if tail.get() != old_tail {
+                if !tail_records.is_empty() {
+                    // 另一个进程只追加了 WAL、尚未 flush。先补齐历史派生索引，再叠加这段增量。
+                    self.ensure_all_read_models_current_locked();
+                }
                 self.apply_wal_tail_records_locked(tail_records);
                 self.current.advance_committed_tail(tail);
             }
@@ -346,11 +382,17 @@ impl WriteCoordinator {
     fn clear_volatile_indexes_locked(&self) {
         *self.memtable.lock().unwrap() = MemTable::new();
         self.clear_segment_scan_indexes_locked();
-        *self.segment_scan_indexes_stale.lock().unwrap() = false;
+        let durable = self.manifest_path.is_some();
+        *self.segment_scan_indexes_stale.lock().unwrap() = durable;
         self.graph.clear();
         self.graph.reload();
         *self.filter_attrs.lock().unwrap() = FilterAttrsIndex::default();
         *self.trace_rollup.lock().unwrap() = TraceAggregateRollupIndex::default();
+        *self.read_model_load_state.lock().unwrap() = if durable {
+            ReadModelLoadState::deferred()
+        } else {
+            ReadModelLoadState::ready()
+        };
     }
 
     fn clear_segment_scan_indexes_locked(&self) {
@@ -363,81 +405,27 @@ impl WriteCoordinator {
     fn rebuild_volatile_from_current_locked(&self) -> usize {
         self.clear_volatile_indexes_locked();
         let m = self.current.manifest();
-        let loaded_rollup = self.load_trace_rollup_segments(&m);
-        let loaded_filter_attrs = self.load_filter_attrs_segments(&m);
-        let loaded_bm25 = self.load_bm25_segments(&m);
-        let loaded_seg_key_bloom = self.load_seg_key_bloom_segments(&m);
         let segment_derived_dirty = m
             .segments
             .values()
             .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
-
-        if loaded_rollup && loaded_filter_attrs && !segment_derived_dirty {
-            let seg_count = m.segments.len();
-            drop(m);
-            *self.segment_scan_indexes_stale.lock().unwrap() =
-                !(loaded_bm25 && loaded_seg_key_bloom);
-            self.session_idx.lock().unwrap().dirty = true;
-            self.reload_legacy_vectors_locked();
-            self.replay_wal_tail_into_memtable_locked();
-            olog::log(
-                olog::Level::Info,
-                "recover_fast_ready",
-                &[("segments_deferred", &seg_count)],
-            );
-            return 0;
-        }
-
-        if loaded_bm25 {
-            self.bm25.clear();
-        }
-        if loaded_seg_key_bloom {
-            self.seg_key_bloom.lock().unwrap().clear();
-        }
-
-        let mut scanned = 0usize;
-        for entry in m.segments.values() {
-            let recs = self.segments.scan_records(entry.segment_id);
-            scanned += 1;
-            let bloom = KeyBloom::build(recs.iter().map(|r| (r.trace_id, r.span_id)), recs.len());
-            self.seg_key_bloom
-                .lock()
-                .unwrap()
-                .insert(entry.segment_id.get(), Arc::new(bloom));
-            for r in &recs {
-                match (loaded_rollup, loaded_filter_attrs) {
-                    (true, true) => self.index_record_without_rollup_and_filter_attrs(r),
-                    (true, false) => self.index_record_without_rollup(r),
-                    (false, true) => self.index_record_without_filter_attrs(r),
-                    (false, false) => self.index_record(r),
-                }
-            }
-        }
+        let seg_count = m.segments.len();
         drop(m);
-
+        // 正常重启只恢复控制面。四份大型派生索引由第一次相关查询加载；第一次写入前会全部补齐。
+        // delete/upgrade 只会让缓存失效，不影响主数据正确性，惰性加载时会自动走段重建。
+        *self.segment_scan_indexes_stale.lock().unwrap() = self.manifest_path.is_some();
+        self.session_idx.lock().unwrap().dirty = true;
         self.reload_legacy_vectors_locked();
         self.replay_wal_tail_into_memtable_locked();
-
-        if segment_derived_dirty {
-            self.rebuild_trace_rollup_current();
-        }
-        if segment_derived_dirty {
-            self.rebuild_filter_attrs_current();
-        }
-        if !loaded_rollup || segment_derived_dirty {
-            self.persist_trace_rollup_segments();
-        }
-        if !loaded_filter_attrs || segment_derived_dirty {
-            self.persist_filter_attrs_segments();
-        }
-        *self.segment_scan_indexes_stale.lock().unwrap() = false;
-        if !loaded_bm25 || segment_derived_dirty {
-            self.persist_bm25_segments();
-        }
-        if !loaded_seg_key_bloom || segment_derived_dirty {
-            self.persist_seg_key_bloom_segments();
-        }
-        scanned
+        olog::log(
+            olog::Level::Info,
+            "recover_lazy_ready",
+            &[
+                ("segments_deferred", &seg_count),
+                ("derived_dirty", &segment_derived_dirty),
+            ],
+        );
+        0
     }
 
     fn reload_legacy_vectors_locked(&self) {
@@ -449,9 +437,19 @@ impl WriteCoordinator {
     }
 
     fn replay_wal_tail_into_memtable_locked(&self) {
-        let wal = self.wal.lock().unwrap();
+        let (records, tail) = {
+            let wal = self.wal.lock().unwrap();
+            (
+                wal.replay_after(WalLsn::new(self.current.memtable_watermark())),
+                wal.committed_tail(),
+            )
+        };
+        if !records.is_empty() {
+            // WAL tail 必须叠加到完整派生索引上，不能先写空索引再被持久 cache 覆盖。
+            self.ensure_all_read_models_current_locked();
+        }
         let mut mt = self.memtable.lock().unwrap();
-        for (lsn, r) in wal.replay_after(WalLsn::new(self.current.memtable_watermark())) {
+        for (lsn, r) in records {
             self.index_record(&r);
             mt.append(MemRow {
                 commit_lsn: lsn,
@@ -462,7 +460,6 @@ impl WriteCoordinator {
                 fields: r.fields.clone(),
             });
         }
-        let tail = wal.committed_tail();
         self.current.advance_committed_tail(tail);
     }
 
@@ -476,15 +473,43 @@ impl WriteCoordinator {
         if !*self.segment_scan_indexes_stale.lock().unwrap() {
             return;
         }
-        let scanned = self.rebuild_segment_scan_indexes_locked();
+        self.ensure_segment_scan_indexes_current_locked();
+    }
+
+    fn ensure_segment_scan_indexes_current_locked(&self) {
+        if !*self.segment_scan_indexes_stale.lock().unwrap() {
+            return;
+        }
+        let manifest = self.current.manifest();
+        let derived_dirty = manifest
+            .segments
+            .values()
+            .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
+        let loaded = !derived_dirty
+            && self.load_bm25_segments(&manifest)
+            && self.load_seg_key_bloom_segments(&manifest);
+        drop(manifest);
+        let scanned = if loaded {
+            0
+        } else {
+            self.rebuild_segment_scan_indexes_locked()
+        };
         *self.segment_scan_indexes_stale.lock().unwrap() = false;
-        self.persist_bm25_segments();
-        self.persist_seg_key_bloom_segments();
+        if !loaded {
+            self.persist_bm25_segments();
+            self.persist_seg_key_bloom_segments();
+        }
         olog::log(
             olog::Level::Info,
-            "segment_scan_indexes_rebuild_done",
-            &[("segs_scanned", &scanned)],
+            "segment_scan_indexes_ready",
+            &[("segs_scanned", &scanned), ("cache_loaded", &loaded)],
         );
+    }
+
+    fn ensure_all_read_models_current_locked(&self) {
+        self.ensure_trace_rollup_current_locked();
+        self.ensure_filter_attrs_current_locked();
+        self.ensure_segment_scan_indexes_current_locked();
     }
 
     fn rebuild_segment_scan_indexes_locked(&self) -> usize {

@@ -104,14 +104,29 @@ if want python-db; then
   echo "==> Python embedded DB wheel"
   pushd "$ROOT_DIR/yitrace-db-python" >/dev/null
   # MATURIN_BUILD_ARGS is used by CI to request manylinux wheels on Linux.
-  MATURIN_ARGS=()
+  MATURIN_ARGS=("--interpreter" "$(command -v python)")
   if [[ -n "${MATURIN_BUILD_ARGS:-}" ]]; then
     # shellcheck disable=SC2206
-    MATURIN_ARGS=(${MATURIN_BUILD_ARGS})
-    run python -m maturin build --release "${MATURIN_ARGS[@]}" --out "$OUT_DIR/python-db"
-  else
-    run python -m maturin build --release --out "$OUT_DIR/python-db"
+    EXTRA_MATURIN_ARGS=(${MATURIN_BUILD_ARGS})
+    MATURIN_ARGS+=("${EXTRA_MATURIN_ARGS[@]}")
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    PYTHON_MACHINE="$(python -c 'import platform; print(platform.machine())')"
+    RUST_HOST="$(rustc -vV | awk '/^host:/ { print $2 }')"
+    PYTHON_TARGET=""
+    case "$PYTHON_MACHINE" in
+      arm64|aarch64)
+        PYTHON_TARGET="aarch64-apple-darwin"
+        ;;
+      x86_64|amd64)
+        PYTHON_TARGET="x86_64-apple-darwin"
+        ;;
+    esac
+    if [[ -n "$PYTHON_TARGET" && "$PYTHON_TARGET" != "$RUST_HOST" ]]; then
+      echo "Python 架构 $PYTHON_MACHINE 与 Rust host $RUST_HOST 不同，使用 target $PYTHON_TARGET"
+      MATURIN_ARGS+=("--target" "$PYTHON_TARGET")
+    fi
   fi
+  run python -m maturin build --release "${MATURIN_ARGS[@]}" --out "$OUT_DIR/python-db"
   popd >/dev/null
 fi
 

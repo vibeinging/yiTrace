@@ -1,17 +1,19 @@
 impl WriteCoordinator {
-    /// 崩溃恢复：从 WAL 重放重建 MemTable（§M.6）+ **重建派生检索索引**。
+    /// 崩溃恢复：从 WAL checkpoint 后重放 MemTable（§M.6），派生读模型按需加载。
     /// 重放点 = 当前 manifest 的 memtable_watermark（已吸收进段的最大 LSN）。
     /// 重放只取 watermark 之后的记录；即便段与重放有重叠（崩溃窗口里段已落、水位未推进），
     /// 读时的确定性 event_id 去重也保证不重复折叠 —— 这正是「seq 原样持久化、不重补」的意义。
     ///
-    /// 检索索引(BM25/属性边车/向量)是派生态。重启时优先加载已持久化的缓存：
-    /// - rollup/filter/BM25/bloom 都命中时先快速可用，不扫历史 segment。
-    /// - 只有 BM25 或 bloom 缓存缺失时，首次全文检索才补扫历史 segment。
-    /// - 缓存缺失或段有删除/补写时，再扫持久段(水位之前)+ 重放 WAL 尾(水位之后)重建。
+    /// 检索索引(BM25/属性边车/向量)是派生态：
+    /// - clean reopen 不解码 rollup/filter/BM25/bloom，数据库先进入可用状态。
+    /// - 第一次相关查询加载对应缓存；第一次写入前全部补齐。
+    /// - 缓存缺失、损坏或段有删除/补写时，第一次使用才扫持久段重建。
+    /// - WAL 有未 flush 尾部时，恢复会先补齐历史读模型再叠加尾部，保证增量不被后加载缓存覆盖。
     /// - 向量**段里推不出来**：从独立向量文件重载,喂回图索引(后写覆盖先写)。
     pub fn recover(&self) {
         let _process = self.acquire_process_lock("write");
         let _local = self.write_lock.lock().unwrap();
+        let started = std::time::Instant::now();
         olog::log(
             olog::Level::Info,
             "recover_start",
@@ -27,6 +29,8 @@ impl WriteCoordinator {
         let seg_count = self.rebuild_volatile_from_current_locked();
         let wal_count = self.memtable.lock().unwrap().len() as u64;
         let tail = self.current.committed_tail();
+        let duration_us = started.elapsed().as_micros() as u64;
+        let duration_ms = started.elapsed().as_millis() as u64;
         olog::log(
             olog::Level::Info,
             "recover_done",
@@ -35,6 +39,8 @@ impl WriteCoordinator {
                 ("vectors_reloaded", &0u64),
                 ("wal_replayed", &wal_count),
                 ("committed_tail", &tail),
+                ("duration_us", &duration_us),
+                ("duration_ms", &duration_ms),
             ],
         );
     }
@@ -92,6 +98,14 @@ impl WriteCoordinator {
             },
         );
         self.commit_and_persist(draft); // 原子换指针：sealed→live + watermark 同时生效;并落盘 manifest
+        if let Err(err) = self.wal.lock().unwrap().checkpoint(up_to_lsn) {
+            // checkpoint 只是恢复加速器；写失败不影响 WAL/manifest 正确性，下次启动回退全量校验。
+            olog::log(
+                olog::Level::Warn,
+                "wal_checkpoint_save_failed",
+                &[("error", &err.to_string())],
+            );
+        }
 
         // 提交后按 gate 回收 MemTable 被吸收前缀。gate 必须取「所有活跃读者下界的最小值」，
         // 绝不能直接用 up_to_lsn —— 否则就是 flush-evict 漏行 bug。仍有旧读者时此值更小、不删其行。
@@ -408,6 +422,8 @@ impl WriteCoordinator {
         let active_readers = self.current.active_reader_count();
         let committed_tail = self.current.committed_tail();
         let flush_threshold = self.flush_threshold.load(Ordering::Relaxed);
+        let read_model_state = *self.read_model_load_state.lock().unwrap();
+        let search_read_model_ready = !*self.segment_scan_indexes_stale.lock().unwrap();
         let filter_attrs_guard = self.filter_attrs.lock().unwrap();
         let filter_attrs = filter_attrs_guard.len();
         let filter_attr_postings = filter_attrs_guard.posting_count();
@@ -454,6 +470,25 @@ impl WriteCoordinator {
         out.push_str("# HELP yt_flush_threshold 内存表自动刷盘阈值（行数）。\n");
         out.push_str("# TYPE yt_flush_threshold gauge\n");
         out.push_str(&format!("yt_flush_threshold {flush_threshold}\n\n"));
+
+        out.push_str("# HELP yt_read_model_rollup_ready rollup 是否已加载到当前进程。\n");
+        out.push_str("# TYPE yt_read_model_rollup_ready gauge\n");
+        out.push_str(&format!(
+            "yt_read_model_rollup_ready {}\n\n",
+            u8::from(read_model_state.rollup_ready)
+        ));
+        out.push_str("# HELP yt_read_model_filter_ready attrs 过滤索引是否已加载到当前进程。\n");
+        out.push_str("# TYPE yt_read_model_filter_ready gauge\n");
+        out.push_str(&format!(
+            "yt_read_model_filter_ready {}\n\n",
+            u8::from(read_model_state.filter_attrs_ready)
+        ));
+        out.push_str("# HELP yt_read_model_search_ready BM25 和 bloom 是否已加载到当前进程。\n");
+        out.push_str("# TYPE yt_read_model_search_ready gauge\n");
+        out.push_str(&format!(
+            "yt_read_model_search_ready {}\n\n",
+            u8::from(search_read_model_ready)
+        ));
 
         out.push_str("# HELP yt_filter_attrs 检索过滤属性边车条目数。\n");
         out.push_str("# TYPE yt_filter_attrs gauge\n");
