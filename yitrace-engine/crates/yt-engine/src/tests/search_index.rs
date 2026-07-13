@@ -190,6 +190,45 @@ fn tenant_filter_isolates_search_across_tenants() {
 }
 
 #[test]
+fn text_filter_expands_beyond_initial_bm25_window() {
+    let store = Arc::new(CapturingStore::default());
+    let wc = WriteCoordinator::new(store);
+    let mut rows = Vec::new();
+    for trace_id in 1..=120 {
+        let mut row = ev(
+            trace_id,
+            1,
+            1,
+            Some(0),
+            Some(100),
+            &["任务执行 固定文本"],
+        );
+        row.fields.tenant_id = Some(1);
+        if trace_id == 120 {
+            row.fields
+                .attrs
+                .insert("project_id".to_string(), "\"target-project\"".to_string());
+        }
+        rows.push(row);
+    }
+    wc.ingest(rows.clone());
+    wc.commit_flush(&rows, WalLsn::new(rows.len() as u64));
+    let snap = wc.pin_snapshot();
+    let mut filter = SearchFilter {
+        tenant_id: Some(1),
+        ..Default::default()
+    };
+    filter.attrs.insert(
+        "project_id".to_string(),
+        "\"target-project\"".to_string(),
+    );
+
+    let hits = wc.search_text_attr(&snap, "任务执行", 1, &filter);
+    assert_eq!(hits.len(), 1, "匹配项在初始 Top 50 外也不能漏召回");
+    assert_eq!(hits[0].0.trace_id, 120);
+}
+
+#[test]
 fn builder_injects_custom_graph_index_end_to_end() {
     // 注入口验证：用 CoordinatorBuilder 换 GraphIndex 后，search_similar 走的是注入的实现，不是默认 ANN。
     // 这条是「外部或自定义 GraphIndex 只换向量索引层」在引擎层的契约（与分词那条对称）。

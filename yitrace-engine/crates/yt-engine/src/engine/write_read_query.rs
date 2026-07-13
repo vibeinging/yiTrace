@@ -45,6 +45,19 @@ impl WriteCoordinator {
     /// 返回 (折叠出的 span, 实际扫描的段数)。所有判定只用快照里钉死的版本。
     pub fn read_spans_query(&self, snap: &Snapshot, q: &TraceQuery) -> (Vec<FoldedSpan>, usize) {
         // 普通读 / trace 详情要原文,读全列。
+        // trace_id 是点查，不应退化成逐段解码。filter sidecar 已经保存了该 trace 的 span key，
+        // 交给候选 key 快路后，段级 bloom 会把无关 segment 直接跳过。
+        if let Some(trace_id) = q.trace_id {
+            let filter = SearchFilter {
+                trace_id: Some(trace_id),
+                tenant_id: q.tenant_id,
+                ..Default::default()
+            };
+            let keys = self.filter_candidate_span_keys(&filter);
+            if !keys.is_empty() {
+                return self.fold_query(snap, q, Some(&keys), Projection::ALL);
+            }
+        }
         self.fold_query(snap, q, None, Projection::ALL)
     }
 

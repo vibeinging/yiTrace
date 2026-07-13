@@ -76,7 +76,10 @@ impl ProcessLockManager {
                     if let Some(wait_started) = wait_started {
                         self.finish_wait(wait_started);
                     }
-                    write_owner(&lock_dir, &self.dir)?;
+                    if let Err(err) = write_owner(&lock_dir, &self.dir) {
+                        let _ = fs::remove_dir_all(&lock_dir);
+                        return Err(err);
+                    }
                     return Ok(ProcessLockGuard { lock_dir });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -128,7 +131,10 @@ impl ProcessLockManager {
         loop {
             match fs::create_dir(&lock_dir) {
                 Ok(()) => {
-                    write_owner(&lock_dir, &self.dir)?;
+                    if let Err(err) = write_owner(&lock_dir, &self.dir) {
+                        let _ = fs::remove_dir_all(&lock_dir);
+                        return Err(err);
+                    }
                     return Ok(Some(ProcessLockGuard { lock_dir }));
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -160,7 +166,8 @@ impl ProcessLockManager {
             {
                 Ok(mut f) => {
                     f.write_all(owner_json(&self.dir).as_bytes())?;
-                    f.sync_all()?;
+                    // reader pin 只保护仍活着的进程。掉电会同时终止读者，没必要把诊断文件 fsync
+                    // 到介质；文件关闭后已经对同机其他进程可见。这里 fsync 会给每次查询增加几十毫秒。
                     self.metrics
                         .reader_pin_count
                         .fetch_add(1, Ordering::Relaxed);
@@ -270,8 +277,9 @@ fn write_owner(lock_dir: &Path, data_dir: &Path) -> io::Result<()> {
         .write(true)
         .truncate(true)
         .open(lock_dir.join("owner.json"))?;
-    f.write_all(owner.as_bytes())?;
-    f.sync_all()
+    // owner 仅用于判断持锁进程是否仍存活，不是数据库数据。进程存活时页缓存对其他进程立即可见；
+    // 掉电时锁也不再有效，所以不做 fsync。WAL/manifest/segment 的持久化规则完全不受影响。
+    f.write_all(owner.as_bytes())
 }
 
 fn owner_json(data_dir: &Path) -> String {

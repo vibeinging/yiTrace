@@ -353,6 +353,9 @@ impl EngineJsonApi {
     ) -> Result<TraceSearchRead, String> {
         let v = crate::wire::parse(body)?;
         let parsed = self.parse_trace_search_value(&v, tenant);
+        if let Some(text) = parsed.spec.text.clone() {
+            return Ok(self.trace_search_text_spans(parsed, &text));
+        }
         if parsed.spec.text.is_none() {
             if let Some((spans, mut read_plan)) = self
                 .coord
@@ -392,6 +395,48 @@ impl EngineJsonApi {
             limit: parsed.limit,
             sort_by: parsed.sort_by,
         })
+    }
+
+    /// 文本查询走 BM25 top-k，再按结构化条件做最终校验。
+    /// 旧路径会先把 tenant/attrs 候选全部折叠成完整 span，再做 contains；百万级数据下会把
+    /// input/output/log 大字段一次性拉进内存。BM25 只物化当前页所需的候选，显著降低查询峰值。
+    fn trace_search_text_spans(
+        &self,
+        parsed: TraceSearchParsed,
+        text: &str,
+    ) -> TraceSearchRead {
+        let k = parsed
+            .cursor
+            .saturating_add(parsed.limit)
+            .clamp(1, 500);
+        let snap = self.coord.pin_snapshot();
+        let spans = self
+            .coord
+            .search_text_attr(&snap, text, k, &parsed.index_filter)
+            .into_iter()
+            .map(|(span, _score)| span)
+            .filter(|span| trace_search_matches(span, &parsed.spec))
+            .collect::<Vec<_>>();
+        let indexed = parsed.index_filter.needs_indexed_filter();
+        let read_plan = ReadPlanStats {
+            source: Some(if indexed {
+                "filter_index".to_string()
+            } else {
+                "bm25".to_string()
+            }),
+            used_filter_index: indexed,
+            candidate_span_keys: Some(spans.len()),
+            matched_spans: spans.len(),
+            fallback_reason: (!indexed).then(|| "no_indexed_filter".to_string()),
+            ..Default::default()
+        };
+        TraceSearchRead {
+            spans,
+            read_plan,
+            cursor: parsed.cursor,
+            limit: parsed.limit,
+            sort_by: parsed.sort_by,
+        }
     }
 
     fn trace_read_model_spans(

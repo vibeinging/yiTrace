@@ -27,37 +27,45 @@ impl WriteCoordinator {
             if entry.max_ts < q.time_from || entry.min_ts > q.time_to {
                 continue; // 时间窗外，整段剪掉
             }
-            scanned += 1;
             match keys {
-                // ★ 检索快路：已知候选 key → 段折叠缓存 + 段内 key→行号 索引，**只取候选行**、不扫全段。
-                //   首次解码该段后缓存，之后所有查询命中缓存（这是把检索 QPS 从"每查全段扫"解放出来的关键）。
+                // ★ 检索快路：已知候选 key → 段级 bloom 跳段，只解码命中 key 的行。
                 Some(ks) => {
-                    // 段级 bloom：这个段肯定没有任何候选 key → 整段跳过折叠定位（upgrade 仍在下面照常处理）。
+                    // 这个段肯定没有任何候选 key → 整段跳过折叠定位（upgrade 仍在下面照常处理）。
                     let bloom_skip = self
                         .seg_key_bloom
                         .lock()
                         .unwrap()
                         .get(&entry.segment_id.get())
                         .map_or(false, |b| !ks.iter().any(|&k| b.maybe_contains(k)));
-                    let sf = if bloom_skip {
-                        None
-                    } else {
-                        Some(self.seg_fold(entry.segment_id))
-                    };
-                    for &(t, s) in ks {
-                        let Some(sf) = &sf else { break };
-                        if q.trace_id.map_or(false, |tid| t != tid) {
-                            continue;
-                        }
-                        let Some(rowlist) = sf.by_key.get(&(t, s)) else {
-                            continue;
-                        };
-                        for &row in rowlist {
-                            if entry.deletion_vec.is_deleted(row) {
-                                continue; // 删除位图按行号照查
+                    if !bloom_skip {
+                        scanned += 1;
+                        if let Some(rows) = self
+                            .segments
+                            .scan_fold_inputs_for_keys(entry.segment_id, ks)
+                        {
+                            for (row, fi) in rows {
+                                if entry.deletion_vec.is_deleted(row) {
+                                    continue; // 删除位图按行号照查
+                                }
+                                inputs.push(fi);
                             }
-                            // 时间窗已由段 zone-map 整段剪枝（FoldInput 不带行级 ts，与投影路一致）。
-                            inputs.push(sf.rows[row as usize].clone()); // 只克隆候选行（极少）
+                        } else {
+                            // 内存/测试段的兼容回退：仍使用段折叠缓存，但默认文件段不会走这里。
+                            let sf = self.seg_fold(entry.segment_id);
+                            for &(t, s) in ks {
+                                if q.trace_id.map_or(false, |tid| t != tid) {
+                                    continue;
+                                }
+                                let Some(rowlist) = sf.by_key.get(&(t, s)) else {
+                                    continue;
+                                };
+                                for &row in rowlist {
+                                    if entry.deletion_vec.is_deleted(row) {
+                                        continue;
+                                    }
+                                    inputs.push(sf.rows[row as usize].clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -66,6 +74,7 @@ impl WriteCoordinator {
                 //   ② 否则纯投影下推：只裁列、不丢行 → 行号完整，删除位图照行号生效。
                 //   ③ 都不支持 → 回退 `scan_fold_inputs` 读全列。
                 None => {
+                    scanned += 1;
                     let time_pushed = if entry.deletion_seq == 0
                         && (q.time_from != i64::MIN || q.time_to != i64::MAX)
                     {

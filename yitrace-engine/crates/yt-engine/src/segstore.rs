@@ -13,6 +13,7 @@
 //! —— 段文件在盘上，但"有哪些段、各段的删除/补写"靠 manifest，那块单独一单元。
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -90,6 +91,21 @@ impl SegmentStore for FileSegmentStore {
         yt_wal::decode_records(payload).unwrap_or_default()
     }
 
+    fn scan_fold_inputs_for_keys(
+        &self,
+        seg: SegmentId,
+        keys: &HashSet<(u64, u64)>,
+    ) -> Option<Vec<(u32, FoldInput)>> {
+        Some(
+            self.scan_records(seg)
+                .into_iter()
+                .enumerate()
+                .filter(|(_, record)| keys.contains(&(record.trace_id, record.span_id)))
+                .map(|(row, record)| (row as u32, record.to_fold_input()))
+                .collect(),
+        )
+    }
+
     fn unlink_segment(&self, seg: SegmentId) {
         let _ = fs::remove_file(self.seg_path(seg));
     }
@@ -158,6 +174,28 @@ mod tests {
         assert_eq!(folds.len(), 2);
         assert_eq!(folds[0].0, 0);
         assert_eq!(folds[1].0, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyed_fold_scan_returns_only_requested_rows() {
+        let dir = temp_dir();
+        let seg = SegmentId::new(8);
+        let store = FileSegmentStore::open(&dir).unwrap();
+        store.flush_to_segment(
+            seg,
+            &[
+                rec("a", 1, "first"),
+                rec("b", 2, "second"),
+                rec("c", 3, "third"),
+            ],
+        );
+
+        let keys = HashSet::from([(1, 2), (99, 99)]);
+        let rows = store.scan_fold_inputs_for_keys(seg, &keys).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1.span_id, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

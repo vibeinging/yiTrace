@@ -158,6 +158,12 @@ fn route_metrics_reports_prometheus_format() {
     assert!(body.contains("yt_segments_live"), "缺活跃段数:\n{body}");
     assert!(body.contains("yt_readers_active"), "缺活跃读者:\n{body}");
     assert!(
+        body.contains("yt_read_model_rollup_ready")
+            && body.contains("yt_read_model_filter_ready")
+            && body.contains("yt_read_model_search_ready"),
+        "缺惰性读模型就绪指标:\n{body}"
+    );
+    assert!(
         body.contains("yt_filter_attr_disabled_postings"),
         "缺过滤 postings 预算指标:\n{body}"
     );

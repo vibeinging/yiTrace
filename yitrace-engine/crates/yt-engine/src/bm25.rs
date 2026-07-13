@@ -14,18 +14,16 @@
 //! BM25 按 bigram 把它拆成 盗刷/刷风/风控，命中"盗刷"和"风控"两概念的文档排第一，按 tf-idf 给出相关性序。
 #![allow(dead_code)]
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-use std::io::Write;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::bm25_disk::{self, CacheMetadata, DiskBm25Cache};
 use crate::Bm25Index;
 
 const K1: f32 = 1.5;
 const B: f32 = 0.75;
-const CACHE_MAGIC: u32 = 0x5954_424d; // "YTBM"
-const CACHE_VERSION: u32 = 1;
 
 /// f32 全序包装（NaN 也定序），WAND 的 top-k 阈值堆用。
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +37,41 @@ impl PartialOrd for OrdF32 {
 impl Ord for OrdF32 {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&o.0)
+    }
+}
+
+/// Top-k 堆的根保存最差结果，避免高频词把所有命中文档先堆进内存再排序。
+#[derive(Clone, Copy, PartialEq)]
+struct RankedScore {
+    doc: (u64, u64),
+    score: OrdF32,
+}
+impl Eq for RankedScore {}
+impl PartialOrd for RankedScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RankedScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // 分数低、或同分但 doc 较大的结果更差，因此在 BinaryHeap 根部优先淘汰。
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| self.doc.cmp(&other.doc))
+    }
+}
+
+fn push_topk(heap: &mut BinaryHeap<RankedScore>, k: usize, doc: (u64, u64), score: f32) {
+    let item = RankedScore {
+        doc,
+        score: OrdF32(score),
+    };
+    if heap.len() < k {
+        heap.push(item);
+    } else if heap.peek().is_some_and(|worst| item < *worst) {
+        heap.pop();
+        heap.push(item);
     }
 }
 
@@ -110,7 +143,6 @@ pub fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-#[derive(Default)]
 struct Bm25State {
     /// token → (文档 → 词频)。增量建图用（HashMap 插入快）。
     postings: HashMap<String, HashMap<(u64, u64), u32>>,
@@ -121,6 +153,21 @@ struct Bm25State {
     /// WAND 用：token → 分块的有序 postings（脏时从 `postings` 重建、查询期缓存，build-then-query 摊销）。
     sorted: HashMap<String, Postings>,
     dirty: bool,
+    /// 已提交的倒排基线。打开时只保留文档长度和词目录，postings 按查询词读取。
+    disk: Option<DiskBm25Cache>,
+}
+
+impl Default for Bm25State {
+    fn default() -> Self {
+        Self {
+            postings: HashMap::new(),
+            doc_len: HashMap::new(),
+            total_len: 0,
+            sorted: HashMap::new(),
+            dirty: false,
+            disk: None,
+        }
+    }
 }
 
 /// 每块 128 篇文档，存 max_tf/min_dl 算块上界（block-max-WAND：块上界 < 阈值 → 整块跳）。
@@ -128,7 +175,14 @@ const BLOCK_SIZE: usize = 128;
 
 /// 一个 token 的分块有序 postings。
 struct Postings {
-    docs: Vec<((u64, u64), u32)>, // 按 doc 升序
+    docs: Arc<Vec<((u64, u64), u32)>>, // 按 doc 升序
+    blocks: Vec<BlockMeta>,
+}
+
+/// 一次查询命中的 postings。文档长度与 docs 对齐，避免逐文档二分查找磁盘 doc table。
+struct QueryPostings {
+    docs: Arc<Vec<((u64, u64), u32)>>,
+    doc_lens: Vec<u32>,
     blocks: Vec<BlockMeta>,
 }
 struct BlockMeta {
@@ -138,36 +192,145 @@ struct BlockMeta {
 }
 
 impl Bm25State {
-    /// 脏了就重建分块有序 postings（DAAT 要求 cursor 按 doc 推进；block-max 要每块的 max_tf/min_dl）。
+    /// 把增量 postings 合并进有序主索引。主索引与增量只保留一份 doc/tf，避免持久缓存加载后
+    /// 同时常驻 HashMap postings 和排序 Vec postings 两份百万级数据。
     fn ensure_sorted(&mut self) {
         if !self.dirty {
             return;
         }
-        self.sorted.clear();
-        for (tok, plist) in &self.postings {
-            let mut docs: Vec<((u64, u64), u32)> = plist.iter().map(|(&d, &tf)| (d, tf)).collect();
-            docs.sort_unstable_by_key(|&(d, _)| d);
-            let mut blocks = Vec::new();
-            let mut i = 0;
-            while i < docs.len() {
-                let end = (i + BLOCK_SIZE).min(docs.len());
-                let mut max_tf = 0u32;
-                let mut min_dl = u32::MAX;
-                for &(d, tf) in &docs[i..end] {
-                    max_tf = max_tf.max(tf);
-                    min_dl = min_dl.min(self.doc_len[&d]);
-                }
-                blocks.push(BlockMeta {
-                    end,
-                    max_tf,
-                    min_dl,
-                });
-                i = end;
-            }
-            self.sorted.insert(tok.clone(), Postings { docs, blocks });
+        for (tok, delta_map) in std::mem::take(&mut self.postings) {
+            let mut delta: Vec<((u64, u64), u32)> = delta_map.into_iter().collect();
+            delta.sort_unstable_by_key(|&(doc, _)| doc);
+            let base = self
+                .sorted
+                .remove(&tok)
+                .map(|postings| {
+                    Arc::try_unwrap(postings.docs).unwrap_or_else(|docs| (*docs).clone())
+                })
+                .unwrap_or_default();
+            let docs = merge_sorted_postings(base, delta);
+            let blocks = build_blocks(&docs, &self.doc_len)
+                .expect("BM25 postings doc must have a document length");
+            self.sorted.insert(
+                tok,
+                Postings {
+                    docs: Arc::new(docs),
+                    blocks,
+                },
+            );
         }
         self.dirty = false;
     }
+
+    fn doc_count(&self) -> usize {
+        let disk_count = self.disk.as_ref().map_or(0, DiskBm25Cache::doc_count);
+        disk_count
+            + self
+                .doc_len
+                .keys()
+                .filter(|&&doc| {
+                    self.disk
+                        .as_ref()
+                        .and_then(|disk| disk.doc_len(doc))
+                        .is_none()
+                })
+                .count()
+    }
+
+    fn doc_len(&self, doc: (u64, u64)) -> Option<u32> {
+        let base = self
+            .disk
+            .as_ref()
+            .and_then(|disk| disk.doc_len(doc))
+            .unwrap_or(0);
+        let delta = self.doc_len.get(&doc).copied().unwrap_or(0);
+        let len = base.saturating_add(delta);
+        (len > 0).then_some(len)
+    }
+
+    fn postings_for(&mut self, token: &str) -> Option<Arc<Vec<((u64, u64), u32)>>> {
+        self.ensure_sorted();
+        let delta = self
+            .sorted
+            .get(token)
+            .map(|postings| Arc::clone(&postings.docs));
+        let base = self
+            .disk
+            .as_mut()
+            .and_then(|disk| disk.load_postings(token));
+        match (base, delta) {
+            (Some(base), Some(delta)) => Some(Arc::new(merge_sorted_postings(
+                Arc::unwrap_or_clone(base),
+                Arc::unwrap_or_clone(delta),
+            ))),
+            (Some(base), None) => Some(base),
+            (None, Some(delta)) => Some(delta),
+            (None, None) => None,
+        }
+    }
+
+    fn doc_lens_for_sorted(&self, docs: &[((u64, u64), u32)]) -> Option<Vec<u32>> {
+        let Some(disk) = self.disk.as_ref() else {
+            return docs
+                .iter()
+                .map(|&(doc, _)| self.doc_len.get(&doc).copied())
+                .collect();
+        };
+        let base = disk.docs();
+        let mut base_index = 0usize;
+        let mut out = Vec::with_capacity(docs.len());
+        for &(doc, _) in docs {
+            while base_index < base.len() && base[base_index].0 < doc {
+                base_index += 1;
+            }
+            let base_len = if base_index < base.len() && base[base_index].0 == doc {
+                base[base_index].1
+            } else {
+                0
+            };
+            let delta_len = self.doc_len.get(&doc).copied().unwrap_or(0);
+            let len = base_len.saturating_add(delta_len);
+            if len == 0 {
+                return None;
+            }
+            out.push(len);
+        }
+        Some(out)
+    }
+}
+
+fn merge_sorted_postings(
+    base: Vec<((u64, u64), u32)>,
+    delta: Vec<((u64, u64), u32)>,
+) -> Vec<((u64, u64), u32)> {
+    let mut out = Vec::with_capacity(base.len().saturating_add(delta.len()));
+    let mut base = base.into_iter().peekable();
+    let mut delta = delta.into_iter().peekable();
+    loop {
+        match (base.peek(), delta.peek()) {
+            (Some(&(base_doc, _)), Some(&(delta_doc, _))) if base_doc < delta_doc => {
+                out.push(base.next().unwrap());
+            }
+            (Some(&(base_doc, _)), Some(&(delta_doc, _))) if base_doc > delta_doc => {
+                out.push(delta.next().unwrap());
+            }
+            (Some(_), Some(_)) => {
+                let (doc, base_tf) = base.next().unwrap();
+                let (_, delta_tf) = delta.next().unwrap();
+                out.push((doc, base_tf.saturating_add(delta_tf)));
+            }
+            (Some(_), None) => {
+                out.extend(base.by_ref());
+                break;
+            }
+            (None, Some(_)) => {
+                out.extend(delta.by_ref());
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    out
 }
 
 /// BM25 词频长度归一（tf·(k1+1) / (tf + k1·(1-b+b·dl/avgdl))）。上确界 = k1+1（tf→∞）。
@@ -225,11 +388,10 @@ impl Bm25Index for Bm25TextIndex {
     /// 单词查询走块跳过（块上界 = idf·norm(max_tf,min_dl) < θ → 整块跳）；多词查询走 term 级 WAND（剪掉只命中弱词的文档）。
     fn search(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
         let mut st = self.state.lock().unwrap();
-        let n = st.doc_len.len();
+        let n = st.doc_count();
         if n == 0 || k == 0 {
             return Vec::new();
         }
-        st.ensure_sorted();
         let avgdl = st.total_len as f32 / n as f32;
 
         // 查询词去重 + 排序（确定性求和顺序：按 token 序加各词贡献，与暴力一致）。
@@ -237,24 +399,34 @@ impl Bm25Index for Bm25TextIndex {
         toks.sort_unstable();
         toks.dedup();
 
-        // 命中词：(idf, &分块postings)。
-        let mut hits: Vec<(f32, &Postings)> = Vec::new();
+        // 只读取查询命中的词。持久基线 postings 从磁盘按偏移分页，WAL tail 从内存增量合并。
+        let mut hits: Vec<(f32, QueryPostings)> = Vec::new();
         for tok in &toks {
-            if let Some(pp) = st.sorted.get(tok) {
-                let df = pp.docs.len() as f32;
+            if let Some(docs) = st.postings_for(tok) {
+                let df = docs.len() as f32;
                 let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
-                hits.push((idf, pp));
+                let Some(doc_lens) = st.doc_lens_for_sorted(&docs) else {
+                    return Vec::new();
+                };
+                let blocks = build_blocks_from_lens(&docs, &doc_lens);
+                hits.push((
+                    idf,
+                    QueryPostings {
+                        docs,
+                        doc_lens,
+                        blocks,
+                    },
+                ));
             }
         }
         if hits.is_empty() {
             return Vec::new();
         }
 
-        let mut topk: BinaryHeap<Reverse<OrdF32>> = BinaryHeap::new();
-        let mut scored: Vec<(u64, u64, f32)> = Vec::new();
-        let theta = |h: &BinaryHeap<Reverse<OrdF32>>| {
+        let mut topk: BinaryHeap<RankedScore> = BinaryHeap::new();
+        let theta = |h: &BinaryHeap<RankedScore>| {
             if h.len() >= k {
-                h.peek().unwrap().0 .0
+                h.peek().unwrap().score.0
             } else {
                 f32::NEG_INFINITY
             }
@@ -262,22 +434,18 @@ impl Bm25Index for Bm25TextIndex {
 
         if hits.len() == 1 {
             // 单词：block-max 块跳过。块上界 < θ → 整块不打分。
-            let (idf, pp) = hits[0];
+            let (idf, pp) = &hits[0];
             let mut i = 0usize;
             for blk in &pp.blocks {
-                let bmax = idf * bm25_norm(blk.max_tf as f32, blk.min_dl as f32, avgdl);
+                let bmax = *idf * bm25_norm(blk.max_tf as f32, blk.min_dl as f32, avgdl);
                 if bmax < theta(&topk) {
                     i = blk.end;
                     continue; // 整块跳
                 }
-                for &(doc, tf) in &pp.docs[i..blk.end] {
-                    let dl = st.doc_len[&doc] as f32;
-                    let sc = idf * bm25_norm(tf as f32, dl, avgdl);
-                    scored.push((doc.0, doc.1, sc));
-                    topk.push(Reverse(OrdF32(sc)));
-                    if topk.len() > k {
-                        topk.pop();
-                    }
+                for (offset, &(doc, tf)) in pp.docs[i..blk.end].iter().enumerate() {
+                    let dl = pp.doc_lens[i + offset] as f32;
+                    let sc = *idf * bm25_norm(tf as f32, dl, avgdl);
+                    push_topk(&mut topk, k, doc, sc);
                 }
                 i = blk.end;
             }
@@ -285,16 +453,18 @@ impl Bm25Index for Bm25TextIndex {
             // 多词：term 级 WAND（DAAT，上界 = idf·(k1+1)，按 doc 序选 pivot、剪枝）。
             struct Cur<'a> {
                 docs: &'a [((u64, u64), u32)],
+                doc_lens: &'a [u32],
                 idf: f32,
                 maxi: f32,
                 pos: usize,
             }
             let mut curs: Vec<Cur> = hits
                 .iter()
-                .map(|&(idf, pp)| Cur {
+                .map(|(idf, pp)| Cur {
                     docs: &pp.docs,
-                    idf,
-                    maxi: idf * (K1 + 1.0),
+                    doc_lens: &pp.doc_lens,
+                    idf: *idf,
+                    maxi: *idf * (K1 + 1.0),
                     pos: 0,
                 })
                 .collect();
@@ -320,17 +490,17 @@ impl Bm25Index for Bm25TextIndex {
                 let first_doc = curs[order[0]].docs[curs[order[0]].pos].0;
                 if first_doc == pivot_doc {
                     let mut sc = 0.0f32;
-                    let dl = st.doc_len[&pivot_doc] as f32;
+                    let dl = curs
+                        .iter()
+                        .find(|c| c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc)
+                        .map(|c| c.doc_lens[c.pos] as f32)
+                        .unwrap();
                     for c in curs.iter() {
                         if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
                             sc += c.idf * bm25_norm(c.docs[c.pos].1 as f32, dl, avgdl);
                         }
                     }
-                    scored.push((pivot_doc.0, pivot_doc.1, sc));
-                    topk.push(Reverse(OrdF32(sc)));
-                    if topk.len() > k {
-                        topk.pop();
-                    }
+                    push_topk(&mut topk, k, pivot_doc, sc);
                     for c in curs.iter_mut() {
                         if c.pos < c.docs.len() && c.docs[c.pos].0 == pivot_doc {
                             c.pos += 1;
@@ -350,7 +520,11 @@ impl Bm25Index for Bm25TextIndex {
             }
         }
 
-        // 候选全量打分完 → 终排取 top-k（与暴力一致）。
+        // 候选打分过程中只保留 top-k，最后做稳定终排。
+        let mut scored: Vec<(u64, u64, f32)> = topk
+            .into_iter()
+            .map(|item| (item.doc.0, item.doc.1, item.score.0))
+            .collect();
         scored.sort_by(|a, b| {
             b.2.partial_cmp(&a.2)
                 .unwrap()
@@ -365,10 +539,15 @@ impl Bm25Index for Bm25TextIndex {
     }
 
     fn load_cache(&self, path: &Path, manifest_version: u64, memtable_watermark: u64) -> bool {
-        let Some(state) = Bm25State::load_cache(path, manifest_version, memtable_watermark) else {
+        let Some(disk) = DiskBm25Cache::open(path, manifest_version, memtable_watermark) else {
             return false;
         };
-        *self.state.lock().unwrap() = state;
+        let total_len = disk.total_len();
+        *self.state.lock().unwrap() = Bm25State {
+            total_len,
+            disk: Some(disk),
+            ..Bm25State::default()
+        };
         true
     }
 
@@ -378,21 +557,10 @@ impl Bm25Index for Bm25TextIndex {
         manifest_version: u64,
         memtable_watermark: u64,
     ) -> std::io::Result<bool> {
-        let Some(parent) = path.parent() else {
-            return Ok(true);
-        };
-        std::fs::create_dir_all(parent)?;
-        let bytes = self
-            .state
+        self.state
             .lock()
             .unwrap()
-            .encode_cache(manifest_version, memtable_watermark);
-        let tmp = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(tmp, path)?;
+            .save_cache(path, manifest_version, memtable_watermark)?;
         Ok(true)
     }
 }
@@ -403,23 +571,23 @@ impl Bm25TextIndex {
     #[cfg(test)]
     fn search_exhaustive(&self, query: &str, k: usize) -> Vec<(u64, u64, f32)> {
         let mut st = self.state.lock().unwrap();
-        let n = st.doc_len.len();
+        let n = st.doc_count();
         if n == 0 || k == 0 {
             return Vec::new();
         }
-        st.ensure_sorted();
         let avgdl = st.total_len as f32 / n as f32;
         let mut toks: Vec<String> = self.tokenizer.tokenize(query);
         toks.sort_unstable();
         toks.dedup();
         let mut scores: HashMap<(u64, u64), f32> = HashMap::new();
         for tok in &toks {
-            if let Some(pp) = st.sorted.get(tok) {
-                let df = pp.docs.len() as f32;
+            if let Some(docs) = st.postings_for(tok) {
+                let df = docs.len() as f32;
                 let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
-                for &(doc, tf) in &pp.docs {
-                    let dl = st.doc_len[&doc] as f32;
-                    *scores.entry(doc).or_insert(0.0) += idf * bm25_norm(tf as f32, dl, avgdl);
+                let doc_lens = st.doc_lens_for_sorted(&docs).unwrap();
+                for (&(doc, tf), &dl) in docs.iter().zip(&doc_lens) {
+                    *scores.entry(doc).or_insert(0.0) +=
+                        idf * bm25_norm(tf as f32, dl as f32, avgdl);
                 }
             }
         }
@@ -436,109 +604,107 @@ impl Bm25TextIndex {
 }
 
 impl Bm25State {
-    fn encode_cache(&mut self, manifest_version: u64, memtable_watermark: u64) -> Vec<u8> {
+    fn save_cache(
+        &mut self,
+        path: &Path,
+        manifest_version: u64,
+        memtable_watermark: u64,
+    ) -> std::io::Result<()> {
         self.ensure_sorted();
-        let mut out = Vec::new();
-        put_u32(&mut out, CACHE_MAGIC);
-        put_u32(&mut out, CACHE_VERSION);
-        put_u64(&mut out, manifest_version);
-        put_u64(&mut out, memtable_watermark);
-        put_u64(&mut out, self.total_len);
+        let mut docs = self
+            .disk
+            .as_ref()
+            .map(|disk| disk.docs().to_vec())
+            .unwrap_or_default();
+        let mut delta_docs: Vec<_> = self.doc_len.iter().map(|(&doc, &len)| (doc, len)).collect();
+        delta_docs.sort_unstable_by_key(|&(doc, _)| doc);
+        docs = merge_sorted_doc_lengths(docs, delta_docs);
 
-        let mut docs: Vec<((u64, u64), u32)> =
-            self.doc_len.iter().map(|(&doc, &len)| (doc, len)).collect();
-        docs.sort_unstable_by_key(|&(doc, _)| doc);
-        put_u64(&mut out, docs.len() as u64);
-        for ((trace_id, span_id), len) in docs {
-            put_u64(&mut out, trace_id);
-            put_u64(&mut out, span_id);
-            put_u32(&mut out, len);
+        let mut token_set = BTreeSet::new();
+        if let Some(disk) = self.disk.as_ref() {
+            token_set.extend(disk.token_names().cloned());
         }
+        token_set.extend(self.sorted.keys().cloned());
+        let tokens: Vec<String> = token_set.into_iter().collect();
+        let doc_count = docs.len() as u64;
 
-        let mut tokens: Vec<&String> = self.postings.keys().collect();
-        tokens.sort_unstable();
-        put_u64(&mut out, tokens.len() as u64);
-        for token in tokens {
-            put_string(&mut out, token);
-            let mut postings: Vec<((u64, u64), u32)> = self.postings[token]
-                .iter()
-                .map(|(&doc, &tf)| (doc, tf))
-                .collect();
-            postings.sort_unstable_by_key(|&(doc, _)| doc);
-            put_u64(&mut out, postings.len() as u64);
-            for ((trace_id, span_id), tf) in postings {
-                put_u64(&mut out, trace_id);
-                put_u64(&mut out, span_id);
-                put_u32(&mut out, tf);
+        bm25_disk::write_atomic(
+            path,
+            CacheMetadata {
+                manifest_version,
+                memtable_watermark,
+                total_len: self.total_len,
+            },
+            docs,
+            doc_count,
+            &tokens,
+            |token| {
+                let delta = self
+                    .sorted
+                    .get(token)
+                    .map(|postings| Arc::clone(&postings.docs));
+                let base = self
+                    .disk
+                    .as_mut()
+                    .and_then(|disk| disk.load_postings(token));
+                Ok(match (base, delta) {
+                    (Some(base), Some(delta)) => merge_sorted_postings(
+                        Arc::unwrap_or_clone(base),
+                        Arc::unwrap_or_clone(delta),
+                    ),
+                    (Some(base), None) => Arc::unwrap_or_clone(base),
+                    (None, Some(delta)) => Arc::unwrap_or_clone(delta),
+                    (None, None) => Vec::new(),
+                })
+            },
+        )
+    }
+}
+
+fn merge_sorted_doc_lengths(
+    base: Vec<((u64, u64), u32)>,
+    delta: Vec<((u64, u64), u32)>,
+) -> Vec<((u64, u64), u32)> {
+    let mut out = Vec::with_capacity(base.len().saturating_add(delta.len()));
+    let mut base = base.into_iter().peekable();
+    let mut delta = delta.into_iter().peekable();
+    loop {
+        match (base.peek(), delta.peek()) {
+            (Some(&(base_doc, _)), Some(&(delta_doc, _))) if base_doc < delta_doc => {
+                out.push(base.next().unwrap());
             }
-        }
-        out
-    }
-
-    fn load_cache(path: &Path, manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
-        Self::decode_cache(&bytes, manifest_version, memtable_watermark)
-    }
-
-    fn decode_cache(bytes: &[u8], manifest_version: u64, memtable_watermark: u64) -> Option<Self> {
-        let mut cur = CacheCursor { bytes, pos: 0 };
-        if cur.u32()? != CACHE_MAGIC || cur.u32()? != CACHE_VERSION {
-            return None;
-        }
-        if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
-            return None;
-        }
-        let total_len = cur.u64()?;
-        let doc_count = cur.u64()? as usize;
-        let mut doc_len = HashMap::with_capacity(doc_count);
-        for _ in 0..doc_count {
-            let trace_id = cur.u64()?;
-            let span_id = cur.u64()?;
-            let len = cur.u32()?;
-            doc_len.insert((trace_id, span_id), len);
-        }
-
-        let token_count = cur.u64()? as usize;
-        let mut postings: HashMap<String, HashMap<(u64, u64), u32>> =
-            HashMap::with_capacity(token_count);
-        let mut sorted: HashMap<String, Postings> = HashMap::with_capacity(token_count);
-        for _ in 0..token_count {
-            let token = cur.string()?;
-            let posting_count = cur.u64()? as usize;
-            let mut map = HashMap::with_capacity(posting_count);
-            let mut docs = Vec::with_capacity(posting_count);
-            for _ in 0..posting_count {
-                let trace_id = cur.u64()?;
-                let span_id = cur.u64()?;
-                let tf = cur.u32()?;
-                let doc = (trace_id, span_id);
-                if !doc_len.contains_key(&doc) {
-                    return None;
-                }
-                map.insert(doc, tf);
-                docs.push((doc, tf));
+            (Some(&(base_doc, _)), Some(&(delta_doc, _))) if base_doc > delta_doc => {
+                out.push(delta.next().unwrap());
             }
-            docs.sort_unstable_by_key(|&(doc, _)| doc);
-            let blocks = build_blocks(&docs, &doc_len)?;
-            sorted.insert(token.clone(), Postings { docs, blocks });
-            postings.insert(token, map);
+            (Some(_), Some(_)) => {
+                let (doc, base_len) = base.next().unwrap();
+                let (_, delta_len) = delta.next().unwrap();
+                out.push((doc, base_len.saturating_add(delta_len)));
+            }
+            (Some(_), None) => {
+                out.extend(base.by_ref());
+                break;
+            }
+            (None, Some(_)) => {
+                out.extend(delta.by_ref());
+                break;
+            }
+            (None, None) => break,
         }
-        if cur.pos != bytes.len() {
-            return None;
-        }
-        Some(Self {
-            postings,
-            doc_len,
-            total_len,
-            sorted,
-            dirty: false,
-        })
     }
+    out
 }
 
 fn build_blocks(
     docs: &[((u64, u64), u32)],
     doc_len: &HashMap<(u64, u64), u32>,
+) -> Option<Vec<BlockMeta>> {
+    build_blocks_with(docs, |doc| doc_len.get(&doc).copied())
+}
+
+fn build_blocks_with(
+    docs: &[((u64, u64), u32)],
+    mut doc_len: impl FnMut((u64, u64)) -> Option<u32>,
 ) -> Option<Vec<BlockMeta>> {
     let mut blocks = Vec::new();
     let mut i = 0;
@@ -548,7 +714,7 @@ fn build_blocks(
         let mut min_dl = u32::MAX;
         for &(doc, tf) in &docs[i..end] {
             max_tf = max_tf.max(tf);
-            min_dl = min_dl.min(*doc_len.get(&doc)?);
+            min_dl = min_dl.min(doc_len(doc)?);
         }
         blocks.push(BlockMeta {
             end,
@@ -560,51 +726,26 @@ fn build_blocks(
     Some(blocks)
 }
 
-fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_string(out: &mut Vec<u8>, value: &str) {
-    put_u64(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-
-struct CacheCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> CacheCursor<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        let out = &self.bytes[self.pos..end];
-        self.pos = end;
-        Some(out)
+fn build_blocks_from_lens(docs: &[((u64, u64), u32)], doc_lens: &[u32]) -> Vec<BlockMeta> {
+    debug_assert_eq!(docs.len(), doc_lens.len());
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    while start < docs.len() {
+        let end = (start + BLOCK_SIZE).min(docs.len());
+        let max_tf = docs[start..end]
+            .iter()
+            .map(|&(_, tf)| tf)
+            .max()
+            .unwrap_or(0);
+        let min_dl = doc_lens[start..end].iter().copied().min().unwrap_or(0);
+        blocks.push(BlockMeta {
+            end,
+            max_tf,
+            min_dl,
+        });
+        start = end;
     }
-
-    fn u32(&mut self) -> Option<u32> {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(self.take(4)?);
-        Some(u32::from_le_bytes(b))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(self.take(8)?);
-        Some(u64::from_le_bytes(b))
-    }
-
-    fn string(&mut self) -> Option<String> {
-        let len = self.u64()? as usize;
-        String::from_utf8(self.take(len)?.to_vec()).ok()
-    }
+    blocks
 }
 
 #[cfg(test)]
@@ -756,6 +897,20 @@ mod tests {
         let loaded = Bm25TextIndex::new();
         assert!(loaded.load_cache(&path, 7, 3));
         assert_eq!(loaded.search("盗刷 风控", 10), before);
+
+        // 持久主索引只保留排序 postings；WAL tail 增量要能合并回主索引，不能覆盖历史文档。
+        loaded.index_text(1, 10, "补充风控证据");
+        loaded.index_text(4, 40, "新发现盗刷风险");
+        let fresh = Bm25TextIndex::new();
+        fresh.index_text(1, 10, "风控系统拦截疑似盗刷");
+        fresh.index_text(2, 20, "正常登录完成转账");
+        fresh.index_text(3, 30, "疑似盗刷需要人工复核");
+        fresh.index_text(1, 10, "补充风控证据");
+        fresh.index_text(4, 40, "新发现盗刷风险");
+        assert_eq!(
+            loaded.search("盗刷 风控", 10),
+            fresh.search("盗刷 风控", 10)
+        );
         assert!(
             !loaded.load_cache(&path, 8, 3),
             "manifest version mismatch must reject stale cache"

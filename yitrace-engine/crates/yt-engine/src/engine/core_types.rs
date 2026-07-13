@@ -10,6 +10,32 @@ pub enum SegLifecycle {
     Dead,
 }
 
+/// 持久读模型的进程内加载状态。
+///
+/// 数据本体仍由 segment + WAL + manifest 保证；这些索引只是可重建的加速层。持久模式重启时先把
+/// 三组状态标成未就绪，数据库立即可用，真正需要某条读路径或第一次写入时再加载对应缓存。
+#[derive(Debug, Clone, Copy)]
+struct ReadModelLoadState {
+    rollup_ready: bool,
+    filter_attrs_ready: bool,
+}
+
+impl ReadModelLoadState {
+    fn ready() -> Self {
+        Self {
+            rollup_ready: true,
+            filter_attrs_ready: true,
+        }
+    }
+
+    fn deferred() -> Self {
+        Self {
+            rollup_ready: false,
+            filter_attrs_ready: false,
+        }
+    }
+}
+
 // ───────────────────────── 外部件接口边界 ─────────────────────────
 
 /// **折叠列投影**：聚合/列表类查询声明它要读哪些**可折叠值列**。
@@ -80,6 +106,16 @@ pub trait SegmentStore: Send + Sync {
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord>;
     /// 物理删除一个 dead 段文件（仅在 §D1.4 三条水位放行后调用）。
     fn unlink_segment(&self, seg: SegmentId);
+
+    /// 可选：只解码命中 key 的折叠输入，并保留段内行号供 deletion vector 校验。
+    /// 默认回退到引擎的段折叠缓存；文件段可用它避免把整段大字段常驻内存。
+    fn scan_fold_inputs_for_keys(
+        &self,
+        _seg: SegmentId,
+        _keys: &HashSet<(u64, u64)>,
+    ) -> Option<Vec<(u32, FoldInput)>> {
+        None
+    }
 
     /// 可选：**投影扫描**，只解码 `proj` 选中的可折叠值列（身份/分组列恒读），返回**带物理行号**的
     /// `FoldInput`。投影只裁列、不丢行，故行号完整、与删除位图共存安全——**任何查询都能用**。

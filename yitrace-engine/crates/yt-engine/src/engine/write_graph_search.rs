@@ -144,9 +144,7 @@ impl WriteCoordinator {
         filter: &dyn Fn(u64, u64) -> bool,
     ) -> Vec<(FoldedSpan, f32)> {
         self.ensure_segment_scan_indexes_current();
-        let mut cands = self.bm25.search(query, k.max(50));
-        cands.retain(|&(t, s, _)| filter(t, s));
-        cands.truncate(k);
+        let cands = self.search_bm25_with_filter(query, k, filter);
         self.join_folded(snap, cands)
     }
 
@@ -198,8 +196,7 @@ impl WriteCoordinator {
     ) -> Vec<(FoldedSpan, f32)> {
         self.ensure_segment_scan_indexes_current();
         let pool = k.max(10);
-        let mut bm = self.bm25.search(text, pool);
-        bm.retain(|&(t, s, _)| filter(t, s)); // 关键词侧：后置过滤
+        let bm = self.search_bm25_with_filter(text, pool, filter);
         let vec = self.graph.search(query_vec, pool, filter); // 向量侧：下推进图过滤
         let r1: Vec<(u64, u64)> = bm.iter().map(|&(t, s, _)| (t, s)).collect();
         let r2: Vec<(u64, u64)> = vec.iter().map(|&(t, s, _)| (t, s)).collect();
@@ -219,20 +216,52 @@ impl WriteCoordinator {
         f: &SearchFilter,
         body: impl FnOnce(&dyn Fn(u64, u64) -> bool) -> R,
     ) -> R {
-        let attrs = self.filter_attrs.lock().unwrap();
         let need_attrs = f.needs_attrs();
+        if !need_attrs {
+            let pred = |trace_id: u64, _: u64| f.trace_id.map_or(true, |id| id == trace_id);
+            return body(&pred);
+        }
+
+        // 精确字段先通过磁盘 postings 求出候选集合。后续 BM25/ANN 只做 HashSet contains，
+        // 不再为每一个候选 span 随机读取属性行。
+        let candidates = self.filter_candidate_span_keys(f);
         let pred = move |t: u64, s: u64| -> bool {
             if let Some(tid) = f.trace_id {
                 if t != tid {
                     return false;
                 }
             }
-            if !need_attrs {
-                return true; // 仅 trace_id 约束（或无约束），不必查边车
-            }
-            attrs.matches_key(t, s, f)
+            candidates.contains(&(t, s))
         };
         body(&pred)
+    }
+
+    /// BM25 目前按相关性先取 Top-K，再做属性谓词。固定过取会漏掉排在候选窗外的匹配项，
+    /// 所以逐步扩大候选窗：拿够 k 条就停；BM25 返回少于请求量时，说明已经没有更多命中。
+    fn search_bm25_with_filter(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &dyn Fn(u64, u64) -> bool,
+    ) -> Vec<(u64, u64, f32)> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut pool = k.max(50);
+        loop {
+            let mut candidates = self.bm25.search(query, pool);
+            let exhausted = candidates.len() < pool;
+            candidates.retain(|&(trace_id, span_id, _)| filter(trace_id, span_id));
+            if candidates.len() >= k || exhausted {
+                candidates.truncate(k);
+                return candidates;
+            }
+            let next = pool.saturating_mul(4);
+            if next == pool {
+                return candidates;
+            }
+            pool = next;
+        }
     }
 
     /// **按产品维度过滤的找相似**：`SearchFilter`（agent/状态/时间/trace）翻成谓词，下推进图搜索。
@@ -259,10 +288,7 @@ impl WriteCoordinator {
     ) -> Vec<(FoldedSpan, f32)> {
         self.ensure_segment_scan_indexes_current();
         let cands = self.with_filter_pred(filter, |pred| {
-            let mut c = self.bm25.search(query, k.max(50));
-            c.retain(|&(t, s, _)| pred(t, s));
-            c.truncate(k);
-            c
+            self.search_bm25_with_filter(query, k, pred)
         });
         self.join_folded(snap, cands)
     }
@@ -279,8 +305,7 @@ impl WriteCoordinator {
         self.ensure_segment_scan_indexes_current();
         let pool = k.max(10);
         let (bm, vec) = self.with_filter_pred(filter, |pred| {
-            let mut bm = self.bm25.search(text, pool);
-            bm.retain(|&(t, s, _)| pred(t, s));
+            let bm = self.search_bm25_with_filter(text, pool, pred);
             let vec = self.graph.search(query_vec, pool, pred);
             (bm, vec)
         });

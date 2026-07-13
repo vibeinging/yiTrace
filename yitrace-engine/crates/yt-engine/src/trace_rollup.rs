@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use crate::{ReadPlanStats, SearchFilter, TraceQuery};
+use crate::{ConsoleSession, ReadPlanStats, SearchFilter, TraceQuery};
 use yt_core::fold::{FoldedSpan, SpanFields};
 use yt_wal::WalRecord;
 
@@ -14,10 +14,14 @@ pub(crate) struct TraceAggregateRollupIndex {
     rows: HashMap<(u64, u64), TraceAggregateRollupRow>,
     by_trace: BTreeMap<u64, Vec<u64>>,
     dirty: bool,
+    session_cache: std::sync::Mutex<
+        HashMap<(Option<u64>, i64, i64, Vec<(String, String)>), Vec<ConsoleSession>>,
+    >,
 }
 
 impl TraceAggregateRollupIndex {
     pub(crate) fn apply_record(&mut self, record: &WalRecord) {
+        self.session_cache.get_mut().unwrap().clear();
         if self.dirty {
             return;
         }
@@ -37,6 +41,7 @@ impl TraceAggregateRollupIndex {
 
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.session_cache.get_mut().unwrap().clear();
     }
 
     pub(crate) fn from_records(
@@ -173,6 +178,111 @@ impl TraceAggregateRollupIndex {
         Some((out, stats))
     }
 
+    /// 从小字段 rollup 直接聚合会话列表，避免 tenant 视图为每个请求重新扫描原始 segment。
+    pub(crate) fn query_sessions(
+        &self,
+        query: &TraceQuery,
+        filter: &SearchFilter,
+    ) -> Option<Vec<ConsoleSession>> {
+        if self.dirty {
+            return None;
+        }
+        let cache_key = (
+            filter.tenant_id,
+            query.time_from,
+            query.time_to,
+            filter
+                .attrs
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>(),
+        );
+        if let Some(rows) = self.session_cache.lock().unwrap().get(&cache_key) {
+            return Some(rows.clone());
+        }
+        #[derive(Default)]
+        struct Acc {
+            traces: HashSet<u64>,
+            external_session: Option<String>,
+            input_tokens: u64,
+            output_tokens: u64,
+            error_count: usize,
+            title: String,
+            first_trace: u64,
+        }
+
+        let matching_sessions = if filter.attrs.is_empty() {
+            None
+        } else {
+            let mut ids = HashSet::new();
+            for row in self.rows.values() {
+                if row.matches_query(query) && row.matches_filter(filter) {
+                    if let Some(session_id) = row.session_id {
+                        ids.insert(session_id);
+                    }
+                }
+            }
+            Some(ids)
+        };
+        let mut aggregate_filter = filter.clone();
+        aggregate_filter.attrs.clear();
+        let mut sessions: BTreeMap<u64, Acc> = BTreeMap::new();
+        for row in self.rows.values() {
+            if !row.matches_query(query) || !row.matches_filter(&aggregate_filter) {
+                continue;
+            }
+            let Some(session_id) = row.session_id else {
+                continue;
+            };
+            if matching_sessions
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&session_id))
+            {
+                continue;
+            }
+            let acc = sessions.entry(session_id).or_default();
+            acc.traces.insert(row.trace_id);
+            acc.input_tokens += row.input_tokens.unwrap_or(0);
+            acc.output_tokens += row.output_tokens.unwrap_or(0);
+            acc.error_count += usize::from(row.status.unwrap_or(0) != 0);
+            if acc.external_session.is_none() {
+                acc.external_session = row.external_session_id.clone();
+            }
+            if acc.title.is_empty() {
+                if let Some(agent) = &row.agent_name {
+                    acc.title = agent.clone();
+                }
+            }
+            if acc.first_trace == 0 || row.trace_id < acc.first_trace {
+                acc.first_trace = row.trace_id;
+            }
+        }
+
+        let mut rows: Vec<ConsoleSession> = sessions
+            .into_iter()
+            .map(|(session_id, acc)| ConsoleSession {
+                session_id,
+                external_session_id: acc.external_session,
+                title: if acc.title.is_empty() {
+                    format!("会话 {session_id}")
+                } else {
+                    acc.title
+                },
+                turn_count: acc.traces.len(),
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                has_error: acc.error_count > 0,
+                first_trace_id: acc.first_trace,
+            })
+            .collect();
+        rows.sort_by(|a, b| b.session_id.cmp(&a.session_id));
+        self.session_cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, rows.clone());
+        Some(rows)
+    }
+
     fn encode_cache(&self, manifest_version: u64, memtable_watermark: u64) -> Vec<u8> {
         let mut out = Vec::new();
         put_u32(&mut out, CACHE_MAGIC);
@@ -197,25 +307,22 @@ impl TraceAggregateRollupIndex {
             return None;
         }
         let count = cur.u64()? as usize;
-        let mut rows = HashMap::new();
+        let mut rows = HashMap::with_capacity(count);
+        let mut by_trace: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         for _ in 0..count {
             let row = TraceAggregateRollupRow::decode(&mut cur)?;
+            // cache 按 (trace, span) 排序写出；解码时顺手建 trace 目录，不再二次遍历和排序。
+            by_trace.entry(row.trace_id).or_default().push(row.span_id);
             rows.insert((row.trace_id, row.span_id), row);
         }
         if cur.pos != bytes.len() {
             return None;
         }
-        let mut by_trace: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-        for &(trace_id, span_id) in rows.keys() {
-            by_trace.entry(trace_id).or_default().push(span_id);
-        }
-        for span_ids in by_trace.values_mut() {
-            span_ids.sort_unstable();
-        }
         Some(Self {
             rows,
             by_trace,
             dirty: false,
+            session_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 }

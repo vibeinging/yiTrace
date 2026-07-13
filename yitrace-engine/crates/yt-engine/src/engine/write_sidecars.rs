@@ -7,6 +7,7 @@ impl WriteCoordinator {
         q: &TraceQuery,
         filter: &SearchFilter,
     ) -> Option<(Vec<FoldedSpan>, ReadPlanStats)> {
+        self.ensure_trace_rollup_current();
         let result = self.trace_rollup.lock().unwrap().query(q, filter)?;
         if result
             .1
@@ -24,6 +25,7 @@ impl WriteCoordinator {
         trace_ids: &[u64],
         tenant: Option<u64>,
     ) -> Option<(BTreeMap<u64, Vec<FoldedSpan>>, ReadPlanStats)> {
+        self.ensure_trace_rollup_current();
         let result = self
             .trace_rollup
             .lock()
@@ -114,12 +116,14 @@ impl WriteCoordinator {
     }
 
     fn persist_trace_rollup_segments(&self) {
+        if !self.read_model_load_state.lock().unwrap().rollup_ready {
+            return;
+        }
         let Some(path) = &self.trace_rollup_path else {
             return;
         };
         let manifest = self.current.manifest();
-        let (records, patches) = self.collect_segment_rollup_parts(&manifest);
-        let rollup = TraceAggregateRollupIndex::from_records(records, patches);
+        let rollup = self.trace_rollup.lock().unwrap();
         if let Err(err) = rollup.save_cache(
             path,
             manifest.version.get(),
@@ -136,6 +140,38 @@ impl WriteCoordinator {
     fn rebuild_trace_rollup_current(&self) {
         let snap = self.pin_snapshot();
         self.rebuild_trace_rollup_from_snapshot(&snap);
+        self.read_model_load_state.lock().unwrap().rollup_ready = true;
+    }
+
+    fn ensure_trace_rollup_current(&self) {
+        if self.read_model_load_state.lock().unwrap().rollup_ready {
+            return;
+        }
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
+        self.ensure_trace_rollup_current_locked();
+    }
+
+    fn ensure_trace_rollup_current_locked(&self) {
+        if self.read_model_load_state.lock().unwrap().rollup_ready {
+            return;
+        }
+        let manifest = self.current.manifest();
+        let derived_dirty = manifest
+            .segments
+            .values()
+            .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
+        let loaded = !derived_dirty && self.load_trace_rollup_segments(&manifest);
+        drop(manifest);
+        if !loaded {
+            let snap = self.current.pin_snapshot();
+            self.rebuild_trace_rollup_from_snapshot(&snap);
+        }
+        self.read_model_load_state.lock().unwrap().rollup_ready = true;
+        if !loaded {
+            self.persist_trace_rollup_segments();
+        }
     }
 
     fn rebuild_filter_attrs_from_snapshot(&self, snap: &Snapshot) {
@@ -310,12 +346,19 @@ impl WriteCoordinator {
     }
 
     fn persist_filter_attrs_segments(&self) {
+        if !self
+            .read_model_load_state
+            .lock()
+            .unwrap()
+            .filter_attrs_ready
+        {
+            return;
+        }
         let Some(path) = &self.filter_attrs_path else {
             return;
         };
         let manifest = self.current.manifest();
-        let (records, patches) = self.collect_segment_rollup_parts(&manifest);
-        let index = FilterAttrsIndex::from_records(records, patches);
+        let index = self.filter_attrs.lock().unwrap();
         if let Err(err) = index.save_cache(
             path,
             manifest.version.get(),
@@ -332,6 +375,54 @@ impl WriteCoordinator {
     fn rebuild_filter_attrs_current(&self) {
         let snap = self.pin_snapshot();
         self.rebuild_filter_attrs_from_snapshot(&snap);
+        self.read_model_load_state
+            .lock()
+            .unwrap()
+            .filter_attrs_ready = true;
+    }
+
+    fn ensure_filter_attrs_current(&self) {
+        if self
+            .read_model_load_state
+            .lock()
+            .unwrap()
+            .filter_attrs_ready
+        {
+            return;
+        }
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
+        self.ensure_filter_attrs_current_locked();
+    }
+
+    fn ensure_filter_attrs_current_locked(&self) {
+        if self
+            .read_model_load_state
+            .lock()
+            .unwrap()
+            .filter_attrs_ready
+        {
+            return;
+        }
+        let manifest = self.current.manifest();
+        let derived_dirty = manifest
+            .segments
+            .values()
+            .any(|entry| entry.deletion_seq > 0 || entry.upgrade_ref.is_some());
+        let loaded = !derived_dirty && self.load_filter_attrs_segments(&manifest);
+        drop(manifest);
+        if !loaded {
+            let snap = self.current.pin_snapshot();
+            self.rebuild_filter_attrs_from_snapshot(&snap);
+        }
+        self.read_model_load_state
+            .lock()
+            .unwrap()
+            .filter_attrs_ready = true;
+        if !loaded {
+            self.persist_filter_attrs_segments();
+        }
     }
 
     fn persist_read_model_sidecars(&self) {
@@ -342,10 +433,9 @@ impl WriteCoordinator {
     }
 
     fn filter_candidate_span_keys(&self, filter: &SearchFilter) -> HashSet<(u64, u64)> {
-        self.filter_attrs
-            .lock()
-            .unwrap()
-            .candidate_span_keys(filter)
+        self.ensure_filter_attrs_current();
+        let mut index = self.filter_attrs.lock().unwrap();
+        index.candidate_span_keys(filter)
     }
 }
 
