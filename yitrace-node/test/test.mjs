@@ -227,12 +227,13 @@ try {
   const builder = createSpanEventBuilder({
     traceId: "builder-run",
     sessionId: "builder-session",
+    agentName: "builder-agent",
     attrs: { project_id: "agentic-data", skill: "builder", mode: "auto", call_site: "builder.ts:1" },
   });
   builder.startSpan({
     spanId: "builder-span",
     name: "builder span",
-    agentName: "builder-agent",
+    displayName: "  Builder 展示名  ",
     toolName: "builder-tool",
     model: "qwen",
     inputText: "builder 输入",
@@ -251,6 +252,11 @@ try {
   assert.equal(builtEvents[0].external_trace_id, "builder-run");
   assert.equal(builtEvents[0].external_span_id, "builder-span");
   assert.equal(builtEvents[0].external_session_id, "builder-session");
+  assert.equal(builtEvents[0].span_name, "builder span");
+  assert.equal(builtEvents[0].display_name, "Builder 展示名");
+  assert.equal(builtEvents[0].agent_name, "builder-agent");
+  assert.equal(builtEvents[0].logs, undefined, "name 不再混进 logs");
+  assert.equal(builtEvents[1].span_name, undefined, "名字只在 start 上报");
   await builder.ingest(db);
 
   const attrHits = await db.search({
@@ -275,6 +281,8 @@ try {
   assert.equal(traceSearch.total, 1);
   assert.equal(traceSearch.items[0].externalTraceId, "builder-run");
   assert.equal(traceSearch.items[0].externalSpanId, "builder-span");
+  assert.equal(traceSearch.items[0].spanName, "builder span");
+  assert.equal(traceSearch.items[0].displayName, "Builder 展示名");
   assert.equal(traceSearch.readPlan.source, "filter_index");
   assert.equal(traceSearch.readPlan.usedFilterIndex, true);
   assert.equal(traceSearch.readPlan.candidateSpanKeys, 1);
@@ -285,8 +293,16 @@ try {
   });
   assert.equal(externalRunExists.total, 1);
   assert.equal(externalRunExists.items[0].externalTraceId, "builder-run");
+  assert.equal(externalRunExists.items[0].spanName, "builder span");
+  assert.equal(externalRunExists.items[0].displayName, "Builder 展示名");
   assert.equal(externalRunExists.readPlan.usedFilterIndex, true);
   assert.equal(externalRunExists.readPlan.candidateSpanKeys, 1);
+
+  const builderTrace = await db.trace("builder-run");
+  assert.equal(builderTrace.summary.name, "Builder 展示名");
+  assert.equal(builderTrace.spans[0].spanName, "builder span");
+  assert.equal(builderTrace.spans[0].displayName, "Builder 展示名");
+  assert.equal(builderTrace.spans[0].actorId, "tool:builder-tool");
 
   const externalRunMiss = await db.traceSearch({
     filter: { externalTraceId: "builder-run-missing" },

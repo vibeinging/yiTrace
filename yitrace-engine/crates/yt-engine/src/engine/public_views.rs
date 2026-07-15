@@ -101,9 +101,9 @@ impl TraceTree {
 /// agent 执行图里一个节点的角色类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
-    /// 有 agent_name 的 span。
+    /// 无 tool_name、但有 agent_name 的 span。
     Agent,
-    /// 无 agent_name 但有 tool_name 的 span。
+    /// 有 tool_name 的 span。agent_name 作为上下文继承时，工具身份仍优先。
     Tool,
     /// 两者都无（用 span:<id> 占位）。
     Other,
@@ -193,7 +193,16 @@ pub struct ConsoleSpan {
     pub external_parent_span_id: Option<String>,
     pub external_session_id: Option<String>,
     pub kind: &'static str,
+    /// 兼容字段：当前角色/工具/模型名。新前端展示优先用 display_name/span_name。
     pub name: String,
+    /// SDK/OTLP 上报的具体操作名。
+    pub span_name: Option<String>,
+    /// 给最终用户看的可选名字。
+    pub display_name: Option<String>,
+    /// Agent 图内部聚合 id。只用于 Map/连边，不展示、不由 SDK 用户填写。
+    pub actor_id: String,
+    pub agent_name: Option<String>,
+    pub tool_name: Option<String>,
     pub start_ns: u64,
     pub duration_ns: u64,
     pub has_error: bool,

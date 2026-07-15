@@ -292,6 +292,9 @@ impl WriteCoordinator {
         if let Some(text) = span.output_text.as_deref() {
             parts.push(text);
         }
+        if let Some(text) = span.span_name.as_deref() {
+            parts.push(text);
+        }
         for field in [&span.agent_name, &span.tool_name, &span.model] {
             if let Some(text) = field.as_deref() {
                 parts.push(text);

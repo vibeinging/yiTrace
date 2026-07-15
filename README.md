@@ -62,6 +62,13 @@ with connect(path="./yitrace-data", tenant_id=1) as db:
     print(hits)
 ```
 
+The `with connect(...)` form above is for scripts and small examples. A
+long-running FastAPI, ARQ, or Celery service should initialize yiTrace once per
+process, reuse the process runtime, and shut it down once when that process
+exits. Do not open the DB for every request, task, or query. See the
+[Python service integration guide (Chinese)](docs/design/2026-07-14_python-service-integration.md)
+for lifecycle hooks and the buffered/spool/HTTP choice.
+
 If you only want to send traces to a running yiTrace server, install just the
 SDK:
 
@@ -151,8 +158,9 @@ await tracer.close();
 
 ### Run a local yiTrace server
 
-Use server mode when multiple app processes or machines should write to one
-TraceDB.
+Use server mode for multiple machines, containers on different hosts, or cases
+where one machine cannot own the data directory. Multiple worker processes on
+the same machine may use embedded mode with the same local data directory.
 
 ```bash
 python -m pip install "yitrace-db[server]"

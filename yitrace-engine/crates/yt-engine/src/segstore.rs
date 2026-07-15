@@ -573,7 +573,10 @@ mod tests {
         let seg = SegmentId::new(7);
         {
             let store = FileSegmentStore::open(&dir).unwrap();
-            store.flush_to_segment(seg, &[rec("反洗钱", 1, "日志1"), rec("盗刷", 2, "日志2")]);
+            let mut named = rec("反洗钱", 1, "日志1");
+            named.fields.span_name = Some("risk.review".into());
+            named.fields.display_name = Some("风险审核".into());
+            store.flush_to_segment(seg, &[named, rec("盗刷", 2, "日志2")]);
         }
         // 重开（相当于重启进程）
         let store2 = FileSegmentStore::open(&dir).unwrap();
@@ -581,6 +584,8 @@ mod tests {
         assert_eq!(recs.len(), 2, "段从磁盘读回来");
         assert_eq!(recs[0].identity.ext_span_id, "反洗钱");
         assert_eq!(recs[0].fields.logs, vec!["日志1"]);
+        assert_eq!(recs[0].fields.span_name.as_deref(), Some("risk.review"));
+        assert_eq!(recs[0].fields.display_name.as_deref(), Some("风险审核"));
         assert_eq!(recs[1].identity.ext_span_id, "盗刷");
         // 行号映射
         let folds = store2.scan_fold_inputs(seg);

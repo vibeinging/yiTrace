@@ -87,6 +87,8 @@ export interface SpanEvent {
   session_id?: TenantId | null;
   external_session_id?: string | null;
   turn_id?: TenantId | null;
+  span_name?: string | null;
+  display_name?: string | null;
   agent_name?: string | null;
   tool_name?: string | null;
   model?: string | null;
@@ -501,6 +503,11 @@ export interface TraceSpan {
   externalSessionId?: string | null;
   kind?: string;
   name?: string;
+  spanName?: string | null;
+  displayName?: string | null;
+  actorId?: string;
+  agentName?: string | null;
+  toolName?: string | null;
   attrs?: Record<string, unknown>;
   logEvents?: SpanLogEvent[];
   [key: string]: unknown;
@@ -537,6 +544,12 @@ export interface SpanDetail {
   externalSpanId?: string | null;
   externalParentSpanId?: string | null;
   externalSessionId?: string | null;
+  name?: string;
+  spanName?: string | null;
+  displayName?: string | null;
+  actorId?: string;
+  agentName?: string | null;
+  toolName?: string | null;
   attrs?: Record<string, unknown>;
   logEvents?: SpanLogEvent[];
   [key: string]: unknown;
@@ -549,6 +562,8 @@ export interface SpanBuilderDefaults {
   session_id?: TenantId;
   tenantId?: TenantId;
   tenant_id?: TenantId;
+  agentName?: string | null;
+  agent_name?: string | null;
   attrs?: Record<string, unknown>;
 }
 
@@ -570,6 +585,8 @@ export interface SpanBuilderEventOptions extends SpanBuilderDefaults {
   ts?: WireNumber;
   seq?: number;
   name?: string;
+  displayName?: string | null;
+  display_name?: string | null;
   message?: string;
   log?: string;
   logs?: string[];

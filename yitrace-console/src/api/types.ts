@@ -1,6 +1,6 @@
 // 控制台数据模型。字段对齐引擎已有的输出（SessionSummary / TraceSummary / FoldedSpan）。
 
-export type SpanKind = 'llm' | 'tool' | 'chain' | 'retriever' | 'agent'
+export type SpanKind = 'llm' | 'tool' | 'chain' | 'retriever' | 'agent' | 'other'
 export type Status = 'ok' | 'error' | 'run'
 
 /** 会话摘要 = 引擎 list_sessions 的一行（多轮串起的一组 trace）。 */
@@ -34,6 +34,11 @@ export interface Span {
   parentId: string | null
   kind: SpanKind
   name: string
+  spanName?: string
+  displayName?: string
+  actorId?: string
+  agentName?: string
+  toolName?: string
   startMs: number
   durMs: number
   status: Status
@@ -47,6 +52,12 @@ export interface Span {
 /** span 详情：大字段晚物化（选中才拉）。 */
 export interface SpanDetail {
   id: string
+  name?: string
+  spanName?: string
+  displayName?: string
+  actorId?: string
+  agentName?: string
+  toolName?: string
   input?: string
   output?: string
   error?: string
@@ -67,6 +78,11 @@ export interface Step {
   id: string
   kind: SpanKind
   name: string
+  spanName?: string
+  displayName?: string
+  actorId?: string
+  agentName?: string
+  toolName?: string
   status: Status
   durMs: number
   inTok: number
@@ -74,6 +90,11 @@ export interface Step {
   model?: string
   input?: string
   output?: string
+}
+
+/** 给最终用户看的名字；内部技术名只在没有展示名时回退。 */
+export function spanDisplayName(span: { id: string; name: string; spanName?: string; displayName?: string }): string {
+  return span.displayName?.trim() || span.spanName?.trim() || span.name || `span ${span.id}`
 }
 
 /** 游标分页页。 */

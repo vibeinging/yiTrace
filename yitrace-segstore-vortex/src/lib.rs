@@ -99,6 +99,8 @@ fn projected_field_names(proj: Projection) -> Option<Vec<&'static str>> {
         (Projection::OUTPUT_TOKENS, "output_tokens"),
         (Projection::SESSION_ID, "session_id"),
         (Projection::TENANT_ID, "tenant_id"),
+        (Projection::SPAN_NAME, "span_name"),
+        (Projection::DISPLAY_NAME, "display_name"),
         (Projection::AGENT_NAME, "agent_name"),
         (Projection::TOOL_NAME, "tool_name"),
         (Projection::MODEL, "model"),
@@ -166,6 +168,8 @@ impl VortexSegmentStore {
         let strcol = |f: &dyn Fn(&WalRecord) -> Option<String>| {
             VarBinViewArray::from_iter_nullable_str(records.iter().map(f)).into_array()
         };
+        let span_name = strcol(&|r| r.fields.span_name.clone());
+        let display_name = strcol(&|r| r.fields.display_name.clone());
         let agent_name = strcol(&|r| r.fields.agent_name.clone());
         let tool_name = strcol(&|r| r.fields.tool_name.clone());
         let model = strcol(&|r| r.fields.model.clone());
@@ -189,6 +193,8 @@ impl VortexSegmentStore {
             ("session_id", session_id),
             ("tenant_id", tenant_id),
             ("eval_score", eval_score),
+            ("span_name", span_name),
+            ("display_name", display_name),
             ("agent_name", agent_name),
             ("tool_name", tool_name),
             ("model", model),
@@ -225,6 +231,8 @@ impl VortexSegmentStore {
         let status = st.column_by_name("status").map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
         let eval_score = st.column_by_name("eval_score").map(|c| c.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
         let optsv = |name: &str| st.column_by_name(name).map(|c| c.as_string_view().clone());
+        let span_name = optsv("span_name");
+        let display_name = optsv("display_name");
         let agent_name = optsv("agent_name");
         let tool_name = optsv("tool_name");
         let model = optsv("model");
@@ -258,6 +266,8 @@ impl VortexSegmentStore {
                     session_id: gu64(&session_id, i),
                     tenant_id: gu64(&tenant_id, i),
                     eval_score: gu32(&eval_score, i),
+                    span_name: gstr(&span_name, i),
+                    display_name: gstr(&display_name, i),
                     agent_name: gstr(&agent_name, i),
                     tool_name: gstr(&tool_name, i),
                     model: gstr(&model, i),
@@ -268,6 +278,7 @@ impl VortexSegmentStore {
                         None => Vec::new(),
                         Some(s) => decode_logs(&s),
                     },
+                    ..Default::default()
                 },
             })
             .collect()
@@ -282,6 +293,7 @@ impl VortexSegmentStore {
         if bytes.is_empty() {
             return Vec::new();
         }
+        let fallback_filter = filter.clone();
         let arr: VortexResult<ArrayRef> = self.rt.block_on(async {
             let buf = ByteBuffer::copy_from(bytes.as_slice());
             let scan = self.session.open_options().open_buffer(buf)?.scan()?;
@@ -298,6 +310,11 @@ impl VortexSegmentStore {
         let arr = match arr {
             Ok(a) => a,
             Err(e) => {
+                if !proj.is_all() {
+                    // 旧 Vortex 段没有后来新增的可选列时，窄投影会报列不存在。
+                    // 回退全列读取后，rows_from_arrow 会把缺列还原成 None，保证旧段可读。
+                    return self.read_filtered(seg, fallback_filter, Projection::ALL);
+                }
                 eprintln!("[vortex-segstore] scan seg {} 失败: {e}", seg.get());
                 return Vec::new();
             }
@@ -410,6 +427,8 @@ mod tests {
         let mut a = rec(1, 10, 1);
         a.fields.status = Some(0);
         a.fields.input_tokens = Some(1200);
+        a.fields.span_name = Some("risk.review".into());
+        a.fields.display_name = Some("风险审核".into());
         a.fields.agent_name = Some("风控".into());
         a.fields.output_text = Some("疑似盗刷".into());
         a.fields.logs = vec!["开始".into(), "研判".into()];
@@ -428,6 +447,8 @@ mod tests {
         assert_eq!(back[0].identity.ext_span_id, "1-10");
         assert_eq!(back[0].fields.status, Some(0));
         assert_eq!(back[0].fields.input_tokens, Some(1200));
+        assert_eq!(back[0].fields.span_name.as_deref(), Some("risk.review"));
+        assert_eq!(back[0].fields.display_name.as_deref(), Some("风险审核"));
         assert_eq!(back[0].fields.agent_name.as_deref(), Some("风控"));
         assert_eq!(back[0].fields.output_text.as_deref(), Some("疑似盗刷"));
         assert_eq!(back[0].fields.logs, vec!["开始", "研判"]);
@@ -553,6 +574,8 @@ mod tests {
         let seg = SegmentId::new(7);
 
         let mut a = rec(1, 10, 1);
+        a.fields.span_name = Some("risk.review".into());
+        a.fields.display_name = Some("风险审核".into());
         a.fields.agent_name = Some("风控".into());
         a.fields.input_tokens = Some(100);
         a.fields.output_tokens = Some(20);
@@ -578,6 +601,14 @@ mod tests {
         assert_eq!(f.fields.input_text, None, "投影外的大文本列不读 → None");
         assert_eq!(f.fields.output_text, None, "投影外的大文本列不读 → None");
         assert!(f.fields.logs.is_empty(), "投影外的 logs 列不读 → 空");
+        assert_eq!(f.fields.span_name, None, "投影外的名称列不读 → None");
+        assert_eq!(f.fields.display_name, None, "投影外的展示名列不读 → None");
+
+        let name_proj = Projection::of(Projection::SPAN_NAME | Projection::DISPLAY_NAME);
+        let names = store.scan_fold_inputs_projected(seg, name_proj).unwrap();
+        assert_eq!(names[0].1.fields.span_name.as_deref(), Some("risk.review"));
+        assert_eq!(names[0].1.fields.display_name.as_deref(), Some("风险审核"));
+        assert_eq!(names[0].1.fields.agent_name, None, "名称投影不应读取 agent 列");
 
         // 对照:全列读回原文都在。
         let all = store.scan_records(seg);

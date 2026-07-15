@@ -38,7 +38,8 @@ test("span 产出 start/log/end", () => {
   check(evs.map((e) => e.eventType).join(",") === [EventType.SpanStart, EventType.Log, EventType.SpanEnd].join(","), "三类事件");
   check(evs.map((e) => e.seq).join(",") === "1,2,3", "seq 单调递增");
   check(evs.every((e) => e.extSpanId === evs[0].extSpanId), "同一 span 身份");
-  check(evs[0].logs[0] === "调用LLM研判", "start 带名");
+  check(evs[0].spanName === "调用LLM研判" && evs[0].logs.length === 0, "start 用独立字段带名");
+  check(evs.slice(1).every((e) => e.spanName === null), "名字只在 start 上报");
   check(evs[2].status === 0 && evs[2].durationNs !== null && evs[2].durationNs >= 0n, "end 带状态+耗时");
   check(new Set(evs.map((e) => eventId(e.extSpanId, e.seq, e.eventType))).size === 3, "event_id 互不相同");
 });
@@ -52,10 +53,26 @@ test("嵌套 span 自动建父子", () => {
     });
   });
   const starts = exp.events.filter((e) => e.eventType === EventType.SpanStart);
-  const rootStart = starts.find((e) => e.logs[0] === "root")!;
-  const childStart = starts.find((e) => e.logs[0] === "child")!;
+  const rootStart = starts.find((e) => e.spanName === "root")!;
+  const childStart = starts.find((e) => e.spanName === "child")!;
   check(rootStart.parentSpanId === null, "根 span 无父");
   check(childStart.parentSpanId === rootStart.spanId, "子 span 的父是 root");
+});
+
+test("displayName 可选，agent 上下文自动继承", () => {
+  const exp = new CollectingExporter();
+  const tr = new Tracer(exp, 1, "planner_agent");
+  tr.trace("x", (t) => {
+    t.span("planner.route", { displayName: "  规划下一步  " }, () => {});
+    t.span("普通名字", () => {});
+  });
+  const starts = exp.events.filter((e) => e.eventType === EventType.SpanStart);
+  const advanced = starts.find((e) => e.spanName === "planner.route")!;
+  const simple = starts.find((e) => e.spanName === "普通名字")!;
+  check(advanced.displayName === "规划下一步", "展示名 trim 后上报");
+  check(simple.displayName === null, "简单用法无需 displayName");
+  check(exp.events.every((e) => e.agentName === "planner_agent"), "agent 上下文继承");
+  check(toWire(advanced).display_name === "规划下一步", "展示名进入 wire");
 });
 
 test("setTokens 上报并进线格式", () => {
@@ -90,7 +107,7 @@ test("会话/agent/eval 文本字段透传并进线格式", () => {
   );
   // 会话 id 透传到本 trace 全部事件（含嵌套子 span）
   check(exp.events.every((e) => e.sessionId === 9000n), "会话 id 透传到全部事件");
-  const end = exp.events.find((e) => e.eventType === EventType.SpanEnd && e.agentName === "规划")!;
+  const end = exp.events.find((e) => e.eventType === EventType.SpanEnd && e.model === "qwen3")!;
   check(end.model === "qwen3", "model 记上");
   check(end.inputText === "请研判这笔交易" && end.outputText === "判定为疑似盗刷", "eval 输入输出文本记上");
   const w = toWire(end);
@@ -120,7 +137,8 @@ async function asyncTests(): Promise<void> {
   const ev: SpanEvent = {
     traceId: 1n, spanId: 1n, ts: 1n, seq: 1n, eventType: EventType.SpanEnd, extSpanId: "s1",
     parentSpanId: null, status: 0, durationNs: null, inputTokens: null, outputTokens: null,
-    sessionId: null, tenantId: null, agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
+    sessionId: null, tenantId: null, spanName: null, displayName: null,
+    agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
   };
   const origFetch = globalThis.fetch;
   try {

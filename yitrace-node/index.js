@@ -128,7 +128,7 @@ function normalizeEmbedder(value) {
 function searchableTextFromEvent(event) {
   if (!plainObject(event)) return "";
   const parts = [];
-  for (const key of ["input_text", "inputText", "output_text", "outputText", "agent_name", "agentName", "tool_name", "toolName", "model"]) {
+  for (const key of ["input_text", "inputText", "output_text", "outputText", "span_name", "spanName", "agent_name", "agentName", "tool_name", "toolName", "model"]) {
     const value = event[key];
     if (value !== undefined && value !== null && String(value).trim() !== "") parts.push(String(value));
   }
@@ -251,8 +251,12 @@ export class SpanEventBuilder {
     const event = this.#baseEvent(options, 1);
     this.#copyCommonFields(event, options);
     const name = optionValue(options, "name");
+    setIfDefined(event, "span_name", name === undefined || name === null ? undefined : String(name));
+    const displayName = optionValue(options, "display_name", "displayName");
+    if (displayName !== undefined && displayName !== null && String(displayName).trim() !== "") {
+      event.display_name = String(displayName).trim();
+    }
     const logs = [...(Array.isArray(options.logs) ? options.logs : [])];
-    if (name !== undefined && name !== null) logs.unshift(String(name));
     if (logs.length > 0) event.logs = logs;
     this.#events.push(event);
     return event;
@@ -331,7 +335,11 @@ export class SpanEventBuilder {
   }
 
   #copyCommonFields(event, options) {
-    setIfDefined(event, "agent_name", optionValue(options, "agent_name", "agentName"));
+    setIfDefined(
+      event,
+      "agent_name",
+      optionValue(options, "agent_name", "agentName") ?? optionValue(this.#defaults, "agent_name", "agentName"),
+    );
     setIfDefined(event, "tool_name", optionValue(options, "tool_name", "toolName"));
     setIfDefined(event, "model", optionValue(options, "model"));
     setIfDefined(event, "input_text", optionValue(options, "input_text", "inputText"));

@@ -348,6 +348,8 @@ struct TraceAggregateRollupRow {
     external_span_id: Option<String>,
     external_parent_span_id: Option<String>,
     external_session_id: Option<String>,
+    span_name: Option<String>,
+    display_name: Option<String>,
     status: Option<u8>,
     duration_ns: Option<u64>,
     input_tokens: Option<u64>,
@@ -378,6 +380,8 @@ impl TraceAggregateRollupRow {
             external_span_id: None,
             external_parent_span_id: None,
             external_session_id: None,
+            span_name: None,
+            display_name: None,
             status: None,
             duration_ns: None,
             input_tokens: None,
@@ -417,6 +421,12 @@ impl TraceAggregateRollupRow {
         }
         if fields.external_session_id.is_some() {
             self.external_session_id = fields.external_session_id.clone();
+        }
+        if fields.span_name.is_some() {
+            self.span_name = fields.span_name.clone();
+        }
+        if fields.display_name.is_some() {
+            self.display_name = fields.display_name.clone();
         }
         if fields.status.is_some() {
             self.status = fields.status;
@@ -532,6 +542,8 @@ impl TraceAggregateRollupRow {
             external_span_id: self.external_span_id.clone(),
             external_parent_span_id: self.external_parent_span_id.clone(),
             external_session_id: self.external_session_id.clone(),
+            span_name: self.span_name.clone(),
+            display_name: self.display_name.clone(),
             agent_name: self.agent_name.clone(),
             tool_name: self.tool_name.clone(),
             model: self.model.clone(),
@@ -545,7 +557,7 @@ impl TraceAggregateRollupRow {
         }
     }
 
-    fn encode(&self, out: &mut Vec<u8>) {
+    fn encode(&self, out: &mut Vec<u8>, version: u32) {
         put_u64(out, self.trace_id);
         put_u64(out, self.span_id);
         put_opt_u64(out, self.parent_span_id);
@@ -570,9 +582,14 @@ impl TraceAggregateRollupRow {
             put_string(out, key);
             put_string(out, value);
         }
+        if version >= 3 {
+            // v3 只在行尾追加字段，v2 页仍可用原布局读取。
+            put_opt_string(out, self.span_name.as_deref());
+            put_opt_string(out, self.display_name.as_deref());
+        }
     }
 
-    fn decode(cur: &mut CacheCursor<'_>) -> Option<Self> {
+    fn decode(cur: &mut CacheCursor<'_>, version: u32) -> Option<Self> {
         let trace_id = cur.u64()?;
         let span_id = cur.u64()?;
         let parent_span_id = cur.opt_u64()?;
@@ -597,6 +614,11 @@ impl TraceAggregateRollupRow {
         for _ in 0..attr_count {
             attrs.insert(cur.string()?, cur.string()?);
         }
+        let (span_name, display_name) = if version >= 3 {
+            (cur.opt_string()?, cur.opt_string()?)
+        } else {
+            (None, None)
+        };
         Some(Self {
             trace_id,
             span_id,
@@ -607,6 +629,8 @@ impl TraceAggregateRollupRow {
             external_span_id,
             external_parent_span_id,
             external_session_id,
+            span_name,
+            display_name,
             status,
             duration_ns,
             input_tokens,

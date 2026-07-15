@@ -3,8 +3,8 @@ use std::net::TcpListener;
 use std::thread;
 
 use yitrace::{
-    event_id, CollectingExporter, EventType, Exporter, HttpExporter, SpanEvent, TraceOptions,
-    Tracer, YiTraceError,
+    event_id, CollectingExporter, EventType, Exporter, HttpExporter, SpanEvent, SpanOptions,
+    TraceOptions, Tracer, YiTraceError,
 };
 
 #[test]
@@ -60,11 +60,17 @@ fn tracer_emits_start_log_end_and_parent_child() {
 
     let root_start = events
         .iter()
-        .find(|event| event.event_type == EventType::SpanStart && event.logs == ["root"])
+        .find(|event| {
+            event.event_type == EventType::SpanStart
+                && event.span_name.as_deref() == Some("root")
+        })
         .unwrap();
     let child_start = events
         .iter()
-        .find(|event| event.event_type == EventType::SpanStart && event.logs == ["child"])
+        .find(|event| {
+            event.event_type == EventType::SpanStart
+                && event.span_name.as_deref() == Some("child")
+        })
         .unwrap();
     assert_eq!(root_start.parent_span_id, None);
     assert_eq!(child_start.parent_span_id, Some(root_start.span_id));
@@ -79,6 +85,39 @@ fn tracer_emits_start_log_end_and_parent_child() {
     assert_eq!(root_end.agent_name.as_deref(), Some("规划"));
     assert_eq!(root_end.model.as_deref(), Some("qwen3"));
     assert_eq!(root_end.output_text.as_deref(), Some("判定为疑似盗刷"));
+}
+
+#[test]
+fn display_name_is_optional_and_agent_context_is_inherited() {
+    let exporter = CollectingExporter::default();
+    let mut tracer = Tracer::with_exporter(exporter, 1);
+    tracer
+        .trace_with_result(
+            "x",
+            TraceOptions::default().agent_name("planner_agent"),
+            |trace| {
+                trace.span_with_result(
+                    "planner.route",
+                    SpanOptions::default().display_name("  规划下一步  "),
+                    |_| Ok(()),
+                )
+            },
+        )
+        .unwrap();
+    let events = tracer.into_exporter().into_events();
+    let start = events
+        .iter()
+        .find(|event| event.event_type == EventType::SpanStart)
+        .unwrap();
+    assert_eq!(start.span_name.as_deref(), Some("planner.route"));
+    assert_eq!(start.display_name.as_deref(), Some("规划下一步"));
+    assert!(events
+        .iter()
+        .all(|event| event.agent_name.as_deref() == Some("planner_agent")));
+    assert!(events
+        .iter()
+        .filter(|event| event.event_type != EventType::SpanStart)
+        .all(|event| event.span_name.is_none() && event.display_name.is_none()));
 }
 
 #[test]
@@ -119,6 +158,8 @@ fn event_json_escapes_and_uses_wire_field_names() {
         output_tokens: None,
         session_id: None,
         tenant_id: Some(9),
+        span_name: None,
+        display_name: None,
         agent_name: Some("agent".to_string()),
         tool_name: None,
         model: None,
@@ -194,6 +235,8 @@ fn sample_event() -> SpanEvent {
         output_tokens: None,
         session_id: None,
         tenant_id: None,
+        span_name: None,
+        display_name: None,
         agent_name: None,
         tool_name: None,
         model: None,

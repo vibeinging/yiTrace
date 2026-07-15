@@ -494,6 +494,8 @@ mod tests {
             external_span_id: None,
             external_parent_span_id: None,
             external_session_id: None,
+            span_name: None,
+            display_name: None,
             agent_name: None,
             tool_name: None,
             model: None,

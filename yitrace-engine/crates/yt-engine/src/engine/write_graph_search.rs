@@ -47,7 +47,7 @@ impl WriteCoordinator {
     }
 
     /// 一条 trace 的 **agent 执行图（DAG）**：把 span 父子树按 agent/工具维度收拢成"谁调用了谁"。
-    /// 角色判定:有 agent_name → Agent;否则有 tool_name → Tool;都没有 → `span:<id>`(Other)。
+    /// 角色判定:有 tool_name → Tool;否则有 agent_name → Agent;都没有 → `span:<id>`(Other)。
     /// 边 = 父 span 的角色 → 子 span 的角色(同角色自环剔除,只留跨角色调用/移交),按出现次数聚合。
     /// 节点带聚合统计(span 数、token)。节点/边都确定排序,可复算。
     pub fn agent_graph(&self, snap: &Snapshot, trace_id: u64) -> AgentGraph {
@@ -68,10 +68,10 @@ impl WriteCoordinator {
 
         // 角色判定（返回 (名字, 类型)）。
         let actor_of = |s: &FoldedSpan| -> (String, ActorKind) {
-            if let Some(a) = &s.agent_name {
-                (a.clone(), ActorKind::Agent)
-            } else if let Some(t) = &s.tool_name {
+            if let Some(t) = &s.tool_name {
                 (t.clone(), ActorKind::Tool)
+            } else if let Some(a) = &s.agent_name {
+                (a.clone(), ActorKind::Agent)
             } else {
                 (format!("span:{}", s.span_id), ActorKind::Other)
             }

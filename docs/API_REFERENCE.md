@@ -31,6 +31,7 @@ yiTrace 有两类运行方式：独立服务和嵌入式。嵌入式目前有 No
 嵌入式包不是直接读文件。它们都把 Rust engine 加载到当前进程，再调用同一套 `EngineJsonApi`。
 所以本文里的请求体、响应字段、`readPlan`、attrs 过滤、trace/span 详情等契约，也适用于嵌入式包的高级方法或 `route_json` 风格方法。
 嵌入式支持同机多个进程打开同一个本地 data dir；引擎内部会串行化 open/write，并用 reader pin 保护跨进程快照回收。多台机器、网络文件系统或跨主机容器共享同一个 data dir 时，应改为一个 yiTrace server 进程，其他 worker 走 HTTP。
+Python/FastAPI/ARQ 服务端如何管理进程生命周期、选择 buffered/spool/http 模式，见 [Python 服务端接入指南](design/2026-07-14_python-service-integration.md)。
 
 对外推荐顺序：
 
@@ -143,6 +144,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "output_tokens": null,
     "session_id": "session-uuid",
     "tenant_id": null,
+    "span_name": "risk.review",
+    "display_name": "风险审核",
     "agent_name": "风控",
     "tool_name": null,
     "model": null,
@@ -174,6 +177,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `input_tokens`/`output_tokens` | u64? | token 计数 |
 | `session_id` | u64 或 string? | 会话归属；字符串原文保存在 `external_session_id` |
 | `tenant_id` | u64? | 租户归属；HTTP 服务会被 `X-Tenant-Id` 覆盖 |
+| `span_name` | string? | 技术操作名；SDK 的 `span(name)` 自动写入，进入 BM25 |
+| `display_name` | string? | 给用户看的可选名称；只展示，不参与检索、过滤、聚合或节点身份；全空格按未设置处理 |
 | `agent_name`/`tool_name`/`model` | string? | 标注 |
 | `input_text`/`output_text` | string? | 大文本（晚物化） |
 | `logs` | string[] | 日志行 |
@@ -204,6 +209,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens` / `llm.token_count.completion` | `output_tokens` |
 | `gen_ai.agent.name` / `agent.name` | `agent_name` |
 | `gen_ai.tool.name` / `tool.name` | `tool_name` |
+| OTLP span 的 `name` | `span_name` |
+| `yitrace.display_name` | `display_name` |
 | `input.value` / `gen_ai.prompt` | `input_text` |
 | `output.value` / `gen_ai.completion` | `output_text` |
 | `yitrace.session_id` / `session.id` / `gen_ai.conversation.id` / `session_id` | `session_id` |
@@ -322,7 +329,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 ## 单机读模型 API（原始 API，camelCase 响应）
 
-这组端点用于把 trace 数据进一步筛选、聚合和估算空间。常用过滤先走 attrs sidecar。`filter_attrs.dat` v3 把 row、row directory、postings 和 posting directory 分开，查询只读取命中的字段和值。`trace_rollup.dat` v2 按 tenant、`project_id` 和 trace 范围切成最多 4096 行的页，打开只读页目录，查询只读可能命中的页；页缓存默认 64 MB，可用 `YT_ROLLUP_PAGE_CACHE_BYTES` 调整。`bm25.dat` v3 把每个词切成 128 条一块，目录保存块的文档范围和真实最大 BM25 norm；block-max 先判断上界，再决定是否读取块。块快路和整词 WAND 回退共享 `YT_BM25_POSTINGS_CACHE_BYTES` 预算，整词回退使用连续读。无过滤 BM25 查询结果另有 16 MB 有界 CLOCK 缓存，可用 `YT_BM25_QUERY_CACHE_BYTES` 调整；索引写入、重建或重新加载后失效，相同冷查询并发进入时只执行一次评分。BM25 支持把结构化过滤下推到打分阶段；候选 postings 集合按 64 MB 临时预算决定是否物化，超过预算才回到小批候选逐条校验。默认 segment 的 `seg-*.idx` 保存 key 到物理字节范围，top-k 回填只读取目标行；候选 key 超过 4096 时回退顺序扫描，避免大量随机读。clean reopen 仍只恢复 manifest、WAL checkpoint 和控制状态；旧版本、缺失、损坏或版本不匹配时按需扫描 segment 重建派生索引。aggregate/trajectory/loop/task 带 `text` 时仍需读取正文并回到正确扫描。
+这组端点用于把 trace 数据进一步筛选、聚合和估算空间。常用过滤先走 attrs sidecar。`filter_attrs.dat` v3 把 row、row directory、postings 和 posting directory 分开，查询只读取命中的字段和值。`trace_rollup.dat` v3 按 tenant、`project_id` 和 trace 范围切成最多 4096 行的页，打开只读页目录，查询只读可能命中的页；它会保存 `span_name/display_name`，并兼容读取 v2。页缓存默认 64 MB，可用 `YT_ROLLUP_PAGE_CACHE_BYTES` 调整。`bm25.dat` v3 把每个词切成 128 条一块，目录保存块的文档范围和真实最大 BM25 norm；block-max 先判断上界，再决定是否读取块。块快路和整词 WAND 回退共享 `YT_BM25_POSTINGS_CACHE_BYTES` 预算，整词回退使用连续读。无过滤 BM25 查询结果另有 16 MB 有界 CLOCK 缓存，可用 `YT_BM25_QUERY_CACHE_BYTES` 调整；索引写入、重建或重新加载后失效，相同冷查询并发进入时只执行一次评分。BM25 支持把结构化过滤下推到打分阶段；候选 postings 集合按 64 MB 临时预算决定是否物化，超过预算才回到小批候选逐条校验。默认 segment 的 `seg-*.idx` 保存 key 到物理字节范围，top-k 回填只读取目标行；候选 key 超过 4096 时回退顺序扫描，避免大量随机读。clean reopen 仍只恢复 manifest、WAL checkpoint 和控制状态；旧版本、缺失、损坏或版本不匹配时按需扫描 segment 重建派生索引。aggregate/trajectory/loop/task 带 `text` 时仍需读取正文并回到正确扫描。
 
 ### POST /v1/trace-search  —— 结构化 span 搜索
 
@@ -373,6 +380,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
       "spanId": "1",
       "externalTraceId": "run-uuid",
       "externalSpanId": "span-uuid",
+      "spanName": "planner.route",
+      "displayName": "规划下一步",
       "status": 0,
       "durationNs": 12000000,
       "inputTokens": 900,
@@ -429,7 +438,7 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 
 `filter` 语义与 `/v1/trace-search` 相同。`groupBy` 支持常见字段：`projectId`、`skill`、`mode`、`callSite`、`taskFingerprint`、`validationStatus`、`status`、`agentName`、`toolName`、`model` 等；未知字段按 attrs key 处理。
 
-无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、token、duration、status 和 attrs，不读取 input/output/logs。`trace_rollup.dat` v2 带 manifest version、memtable watermark 和页目录；clean reopen 不读取页内容，第一次查询按 tenant、`project_id`、trace 和时间范围选择页。WAL 有未 flush 尾部时，引擎会叠加内存增量。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除或 segment upgrade 后，rollup 会按当前快照重建。`trace_rollup.dat` 可以安全删除；损坏或过期只会让第一次相关查询扫描 segment 重建，不会拖慢 clean reopen。
+无 `text` 的聚合会优先走 `aggregate_rollup`，只读取小字段、名称、token、duration、status 和 attrs，不读取 input/output/logs。`trace_rollup.dat` v3 带 manifest version、memtable watermark 和页目录；clean reopen 不读取页内容，第一次查询按 tenant、`project_id`、trace 和时间范围选择页。WAL 有未 flush 尾部时，引擎会叠加内存增量。请求里带 `text` 时必须检查大字段内容，所以会回到 `filter_index` 或 `scan` 路径。执行 retention 删除或 segment upgrade 后，rollup 会按当前快照重建。`trace_rollup.dat` 可以安全删除；损坏或过期只会让第一次相关查询扫描 segment 重建，不会拖慢 clean reopen。
 
 **响应**：
 
@@ -964,7 +973,12 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
       "id": "400035-s0",
       "parentId": null,
       "kind": "agent",
-      "name": "agent.workflow",
+      "name": "planner-agent",
+      "spanName": "agent.workflow",
+      "displayName": "规划下一步",
+      "actorId": "agent:planner-agent",
+      "agentName": "planner-agent",
+      "toolName": null,
       "startMs": 0,
       "durMs": 6,
       "status": "ok",
@@ -996,8 +1010,12 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 |---|---|---|
 | `id` | string | span id |
 | `parentId` | string? | 父 span id（null=root） |
-| `kind` | string | `llm`/`tool`/`chain`/`retriever`/`agent` |
-| `name` | string | span 名 |
+| `kind` | string | `llm`/`tool`/`chain`/`retriever`/`agent`/`other` |
+| `name` | string | 兼容字段；无友好名称时回退到 agent/tool/model/span id |
+| `spanName` | string? | SDK `span(name)` 对应的技术操作名 |
+| `displayName` | string? | 给用户看的可选名称；前端优先显示它 |
+| `actorId` | string | 后端生成的稳定图节点 id；SDK 不传，普通页面不展示 |
+| `agentName`/`toolName` | string? | “谁在做”与工具身份；不等同于 span 名 |
 | `startMs` | i64 | 起点（瀑布定位用） |
 | `durMs` | i64 | 耗时 |
 | `status` | string | `"ok"`/`error`/`run` |
@@ -1031,7 +1049,12 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
   {
     "id": "400035-s0",
     "kind": "agent",
-    "name": "agent.workflow",
+    "name": "planner-agent",
+    "spanName": "agent.workflow",
+    "displayName": "规划下一步",
+    "actorId": "agent:planner-agent",
+    "agentName": "planner-agent",
+    "toolName": null,
     "status": "ok",
     "durMs": 6,
     "inTok": 0,
@@ -1050,6 +1073,12 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 ```json
 {
   "id": "400035-s0",
+  "name": "planner-agent",
+  "spanName": "agent.workflow",
+  "displayName": "规划下一步",
+  "actorId": "agent:planner-agent",
+  "agentName": "planner-agent",
+  "toolName": null,
   "input": "...",
   "output": "...",
   "logEvents": [
@@ -1070,6 +1099,11 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | string | span id |
+| `name` | string | 兼容名称字段 |
+| `spanName` | string? | 技术操作名 |
+| `displayName` | string? | 用户友好名称 |
+| `actorId` | string | 稳定图节点 id，不是用户参数 |
+| `agentName`/`toolName` | string? | agent 与工具身份 |
 | `input` | string? | 输入文本（null=无） |
 | `output` | string? | 输出文本（null=无） |
 | `logEvents` | object[] | span 内携带 `logs` 的原始事件，字段同 `GET /v1/traces/:id` |

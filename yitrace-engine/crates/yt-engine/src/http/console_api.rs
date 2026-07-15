@@ -140,7 +140,21 @@ impl EngineJsonApi {
             (i + s.input_tokens, o + s.output_tokens)
         });
         let any_err = spans.iter().any(|s| s.has_error);
-        let name = spans.first().map(|s| s.name.clone()).unwrap_or_default();
+        let name = spans
+            .first()
+            .map(|s| {
+                s.display_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        s.span_name
+                            .as_deref()
+                            .filter(|value| !value.trim().is_empty())
+                    })
+                    .unwrap_or(&s.name)
+                    .to_string()
+            })
+            .unwrap_or_default();
         let visible_keys: std::collections::HashSet<(u64, u64)> =
             spans.iter().map(|s| (tid, s.span_id)).collect();
         let log_events_by_span = self
@@ -154,7 +168,7 @@ impl EngineJsonApi {
                     .map(|events| json_log_events(events))
                     .unwrap_or_else(|| "[]".to_string());
                 format!(
-                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{},"logEvents":{}}}"#,
+                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{},"logEvents":{}}}"#,
                     s.span_id,
                     s.parent_span_id.map_or("null".to_string(), |p| format!("\"{p}\"")),
                     json_opt_str(s.external_trace_id.as_deref()),
@@ -163,6 +177,11 @@ impl EngineJsonApi {
                     json_opt_str(s.external_session_id.as_deref()),
                     s.kind,
                     json_escape(&s.name),
+                    json_opt_str(s.span_name.as_deref()),
+                    json_opt_str(s.display_name.as_deref()),
+                    json_escape(&s.actor_id),
+                    json_opt_str(s.agent_name.as_deref()),
+                    json_opt_str(s.tool_name.as_deref()),
                     s.start_ns / 1_000_000,
                     s.duration_ns / 1_000_000,
                     if s.has_error { "error" } else { "ok" },
@@ -213,12 +232,17 @@ impl EngineJsonApi {
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"kind":"{}","name":"{}","status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{},"attrs":{}}}"#,
+                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{},"attrs":{}}}"#,
                     s.span_id,
                     json_opt_str(s.external_trace_id.as_deref()),
                     json_opt_str(s.external_span_id.as_deref()),
                     s.kind,
                     json_escape(&s.name),
+                    json_opt_str(s.span_name.as_deref()),
+                    json_opt_str(s.display_name.as_deref()),
+                    json_escape(&s.actor_id),
+                    json_opt_str(s.agent_name.as_deref()),
+                    json_opt_str(s.tool_name.as_deref()),
                     if s.has_error { "error" } else { "ok" },
                     s.duration_ns / 1_000_000,
                     s.input_tokens,
@@ -254,12 +278,18 @@ impl EngineJsonApi {
                 (
                     200,
                     format!(
-                        r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"input":{},"output":{},"attrs":{},"logEvents":{}}}"#,
+                        r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"input":{},"output":{},"attrs":{},"logEvents":{}}}"#,
                         sid,
                         json_opt_str(s.external_trace_id.as_deref()),
                         json_opt_str(s.external_span_id.as_deref()),
                         json_opt_str(s.external_parent_span_id.as_deref()),
                         json_opt_str(s.external_session_id.as_deref()),
+                        json_escape(&s.name),
+                        json_opt_str(s.span_name.as_deref()),
+                        json_opt_str(s.display_name.as_deref()),
+                        json_escape(&s.actor_id),
+                        json_opt_str(s.agent_name.as_deref()),
+                        json_opt_str(s.tool_name.as_deref()),
                         s.input_text
                             .as_ref()
                             .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),

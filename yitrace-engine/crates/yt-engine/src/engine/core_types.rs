@@ -66,8 +66,10 @@ impl Projection {
     pub const TENANT_ID: u32 = 1 << 14;
     pub const EXTERNAL_IDS: u32 = 1 << 15;
     pub const ATTRS: u32 = 1 << 16;
+    pub const SPAN_NAME: u32 = 1 << 17;
+    pub const DISPLAY_NAME: u32 = 1 << 18;
 
-    const MASK: u32 = (1 << 17) - 1;
+    const MASK: u32 = (1 << 19) - 1;
 
     /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
     pub const ALL: Projection = Projection(Self::MASK);

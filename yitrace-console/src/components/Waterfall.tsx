@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useTrace } from '../hooks/queries'
-import type { Span } from '../api'
+import { spanDisplayName, type Span } from '../api'
 import { AgentGraph } from './AgentGraph'
 import { StepStream } from './StepStream'
 import { TurnTimeline } from './TurnTimeline'
@@ -9,7 +9,7 @@ import { TurnTimeline } from './TurnTimeline'
 type View = 'wf' | 'steps' | 'graph'
 
 const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms')
-const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT' }
+const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT', other: 'SPAN' }
 
 export function Waterfall({
   sessionId,
@@ -117,9 +117,9 @@ function Insight({ spans, onSelect }: { spans: Span[]; onSelect: (id: string) =>
   const maxDur = Math.max(1, ...byDur.map((s) => s.durMs))
   const maxCost = Math.max(1e-6, ...byCost.map((s) => s.cost))
   const row = (s: Span, i: number, frac: number, val: string, color: string) => (
-    <div className="irow" key={s.id} onClick={() => onSelect(s.id)} title={s.name}>
+    <div className="irow" key={s.id} onClick={() => onSelect(s.id)} title={spanDisplayName(s)}>
       <span className="irank">{i + 1}</span>
-      <span className="iname">{s.name}</span>
+      <span className="iname">{spanDisplayName(s)}</span>
       <span className="imeter"><i style={{ width: Math.max(frac * 100, 5) + '%', background: color }} /></span>
       <span className="ival">{val}</span>
     </div>
@@ -147,7 +147,7 @@ function SpanRow({ s, maxEnd, sel, onClick }: { s: Span; maxEnd: number; sel: bo
     <div className={'srow' + (sel ? ' sel' : '')} onClick={() => onClick(s.id)}>
       <div className="sname" style={{ paddingLeft: 14 + s.depth * 12 }}>
         <span className={'kind k-' + s.kind}>{KIND_LABEL[s.kind]}</span>
-        <span className="slabel">{s.name}{s.status === 'error' && <span className="errchip"> ERR</span>}</span>
+        <span className="slabel">{spanDisplayName(s)}{s.status === 'error' && <span className="errchip"> ERR</span>}</span>
       </div>
       <div className="wf"><div className={'bar ' + barcls} style={{ left: left + '%', width: w + '%' }} /></div>
       <div className="scost">{tot ? (tot / 1000 >= 1 ? (tot / 1000).toFixed(1) + 'k' : tot) : '·'}</div>

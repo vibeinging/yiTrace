@@ -23,7 +23,7 @@ batches with your HTTP stack.
 ## Usage
 
 ```rust
-use yitrace::{HttpExporter, TraceOptions, Tracer};
+use yitrace::{HttpExporter, SpanOptions, TraceOptions, Tracer};
 
 fn main() -> yitrace::Result<()> {
     let exporter = HttpExporter::new("http://127.0.0.1:7878/v1/ingest")?
@@ -32,23 +32,33 @@ fn main() -> yitrace::Result<()> {
 
     tracer.trace_with_result(
         "risk review",
-        TraceOptions::default().session_id(9000).tenant_id(1),
+        TraceOptions::default()
+            .session_id(9000)
+            .tenant_id(1)
+            .agent_name("risk-agent"),
         |trace| {
-            trace.span_result("LLM check", |span| {
-                span.set_agent("risk-agent");
-                span.set_model("gpt-5");
-                span.set_io(Some("疑似盗刷订单".to_string()), None);
-                span.log("疑似盗刷")?;
-                span.set_tokens(Some(900), Some(120));
-                span.set_io(None, Some("建议人工复核".to_string()));
-                Ok(())
-            })
+            trace.span_with_result(
+                "llm.check",
+                SpanOptions::default().display_name("LLM 风险检查"),
+                |span| {
+                    span.set_model("gpt-5");
+                    span.set_io(Some("疑似盗刷订单".to_string()), None);
+                    span.log("疑似盗刷")?;
+                    span.set_tokens(Some(900), Some(120));
+                    span.set_io(None, Some("建议人工复核".to_string()));
+                    Ok(())
+                },
+            )
         },
     )?;
 
     tracer.close()
 }
 ```
+
+普通用法只需要 `span_result(name, ...)`。只有技术名不适合直接展示时才使用
+`SpanOptions::display_name(...)`；`TraceOptions::agent_name(...)` 作为 trace 上下文，
+会由其中的子 span 自动继承。展示名不参与检索、过滤或节点合并。
 
 ## What It Guarantees
 

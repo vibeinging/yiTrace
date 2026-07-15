@@ -19,13 +19,16 @@ impl WriteCoordinator {
 
     fn index_record_inner(&self, r: &WalRecord, update_rollup: bool, update_filter_attrs: bool) {
         // 中文倒排：把该 span 的**可检索文本**喂进 BM25。检索的主对象是 LLM 的输入/输出原文
-        // （input_text/output_text），logs（含 span name）作补充。三者拼起来索引——真实 SDK 灌进来的
+        // （input_text/output_text），span_name / logs 作补充。它们拼起来索引——真实 SDK 灌进来的
         // input/output 文本会被索引，而不是只索引 logs（否则真实数据上"中文检索"会突然失效）。
         let mut parts: Vec<&str> = Vec::new();
         if let Some(t) = r.fields.input_text.as_deref() {
             parts.push(t);
         }
         if let Some(t) = r.fields.output_text.as_deref() {
+            parts.push(t);
+        }
+        if let Some(t) = r.fields.span_name.as_deref() {
             parts.push(t);
         }
         // agent/tool/model 名也索引——用户会按"搜某个 agent/tool 的 trace"（如"搜风控 agent 的报错"）。

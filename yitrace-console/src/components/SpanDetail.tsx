@@ -1,4 +1,5 @@
 import { useTrace, useSpanDetail } from '../hooks/queries'
+import { spanDisplayName } from '../api'
 
 const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms')
 
@@ -16,7 +17,10 @@ export function SpanDetail({ traceId, spanId }: { traceId: string | null; spanId
         ) : (
           <>
             <div className="dsec">
-              <div className="kv"><span className="k">名称</span><span className="v">{span.name}</span></div>
+              <div className="kv"><span className="k">名称</span><span className="v">{spanDisplayName(span)}</span></div>
+              {spanDisplayName(span) !== (span.spanName ?? span.name) && (
+                <div className="kv"><span className="k">内部名称</span><span className="v">{span.spanName ?? span.name}</span></div>
+              )}
               <div className="kv"><span className="k">类型</span><span className="v">{span.kind}</span></div>
               <div className="kv"><span className="k">状态</span><span className="v">{span.status}</span></div>
               <div className="kv"><span className="k">耗时</span><span className="v">{fmtDur(span.durMs)}</span></div>

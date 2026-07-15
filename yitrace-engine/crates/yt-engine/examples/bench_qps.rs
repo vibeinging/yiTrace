@@ -83,6 +83,8 @@ fn main() {
                 external_span_id: None,
                 external_parent_span_id: None,
                 external_session_id: None,
+                span_name: None,
+                display_name: None,
                 agent_name: Some("风控".into()),
                 tool_name: None,
                 model: None,

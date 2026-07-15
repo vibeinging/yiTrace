@@ -150,10 +150,102 @@ VITE_API=http npm run build                          # 构建对接真实引擎�
 - **测试是承重的**：每个不变量都有"真会失败的测试"（崩溃重放、召回对标、确定性 event_id 跨语言对账）。改逻辑前先看相关测试，改完跑全量。
 - **命名**：crate `yt-*`，Rust 标识符 `yt_`，Prometheus 指标 `yt_*`，环境变量 `YT_*`，Python 包 `yitrace`，TS 包 `@yitrace/trace-sdk`，嵌入式 DB 包 `@yitrace/db`。顶层目录 `yitrace-*`。**不要引入旧前缀。**
 - **N-API 包隔离**：`yitrace-node/` 可以依赖 NAPI-RS；这些依赖不得进入 `yt-engine`。`@yitrace/db` 只通过 Rust engine API 打开数据目录，不允许 JS 直接解析 WAL/manifest/segment 文件。嵌入式查询走 `EngineJsonApi` 进程内调用，不启动本地 HTTP server、不走 TCP socket。
-- **恢复路径不能 eager load 大索引**：持久库 clean reopen 只恢复 manifest、WAL checkpoint 和控制状态；`trace_rollup.dat`、`filter_attrs.dat`、`bm25.dat`、`segment_bloom.dat` 按第一次相关查询加载。`trace_rollup.dat` v2 只加载页目录，按 tenant/project/trace 范围读页；`filter_attrs.dat` v3 只加载行和 posting 目录；`bm25.dat` v4 只加载文档长度、确定性 event_id 表和词/块目录，按 block-max 上界决定是否读 128 条 postings。同一 event_id 在重试、WAL 重放和重开后只能索引一次；修改这条路径必须跑 `--verify-source-index`。默认 segment 的 `seg-*.idx` 保存 `(trace_id, span_id) -> byte offset`，启动时不加载；首次点查会校验索引并重算整个 segment CRC，损坏段在点查和顺序读下都必须拒绝。索引缺失或损坏会从对应 `seg-*.dat` 重建；它不是数据源。BM25 与 attrs 缓存默认各受 64 MB 预算约束，按内存容器 capacity 计费；无过滤 BM25 结果缓存默认 16 MB，由 `YT_BM25_QUERY_CACHE_BYTES` 控制，写入后必须失效；查询候选集合另由 `YT_BM25_FILTER_SET_BUDGET_BYTES` 控制。`readPlan.indexBytesRead/dataBytesRead/indexesValidated/indexesRebuilt` 必须保留，不能只报解码行数。改恢复逻辑后必须跑 `scale_bench --phase open`，不能让启动重新随 span 数线性增长。
+- **恢复路径不能 eager load 大索引**：持久库 clean reopen 只恢复 manifest、WAL checkpoint 和控制状态；`trace_rollup.dat`、`filter_attrs.dat`、`bm25.dat`、`segment_bloom.dat` 按第一次相关查询加载。`trace_rollup.dat` v3 只加载页目录，按 tenant/project/trace 范围读页，并保留 v2 读取兼容；`filter_attrs.dat` v3 只加载行和 posting 目录；`bm25.dat` v4 只加载文档长度、确定性 event_id 表和词/块目录，按 block-max 上界决定是否读 128 条 postings。同一 event_id 在重试、WAL 重放和重开后只能索引一次；修改这条路径必须跑 `--verify-source-index`。默认 segment 的 `seg-*.idx` 保存 `(trace_id, span_id) -> byte offset`，启动时不加载；首次点查会校验索引并重算整个 segment CRC，损坏段在点查和顺序读下都必须拒绝。索引缺失或损坏会从对应 `seg-*.dat` 重建；它不是数据源。BM25 与 attrs 缓存默认各受 64 MB 预算约束，按内存容器 capacity 计费；无过滤 BM25 结果缓存默认 16 MB，由 `YT_BM25_QUERY_CACHE_BYTES` 控制，写入后必须失效；查询候选集合另由 `YT_BM25_FILTER_SET_BUDGET_BYTES` 控制。`readPlan.indexBytesRead/dataBytesRead/indexesValidated/indexesRebuilt` 必须保留，不能只报解码行数。改恢复逻辑后必须跑 `scale_bench --phase open`，不能让启动重新随 span 数线性增长。
 - **npm 发布**：`@yitrace/db` root 包只放 JS 入口（ESM + CommonJS）和类型声明；native binary 放在 `npm/*` 平台 optional packages。正式发布前必须跑 `npm run release:artifacts` + `npm run release:prepublish` + `npm run pack:check`，并先发布平台包再发布 root 包。
 - **版本与产物验证**：tag、Node root/平台包、Python、TypeScript、Rust 包和 lockfile 必须通过 `scripts/check_release_versions.py`。`pack:local` 默认只打 root + 当前平台，避免误带本机残留的旧平台二进制；只有确认所有平台二进制都是本次构建时才设置 `YITRACE_PACK_ALL_PLATFORMS=1`。Python DB wheel 必须用 `scripts/verify_python_db_wheel.py` 在干净环境验证 embedded、reopen、FastAPI 和 CLI server。
 - **提交信息**：纯净的中文/英文描述，首行简短，body 说清 what + why。不带 AI 工具名。
+
+### 4.1 Span 名称参数（`display_name` 契约）
+
+> **状态说明**：`span_name` / `display_name` 已贯穿 SDK、wire、持久化、查询和控制台。新增接入和后续改动必须继续遵守本节契约。
+
+#### 用户端只保留简单用法
+
+普通用户创建 span 时只需要传一个 `name`：
+
+```python
+with trace.span("规划下一步"):
+    ...
+```
+
+此时 `name` 既是 span 的名字，也是前端默认显示的名字。只有内部技术名不适合给人看时，才额外传可选的 `display_name`：
+
+```python
+with trace.span("planner.route", display_name="规划下一步"):
+    ...
+```
+
+TypeScript 的目标接口同理：
+
+```typescript
+trace.span("规划下一步", () => { /* ... */ })
+trace.span("planner.route", { displayName: "规划下一步" }, () => { /* ... */ })
+```
+
+不要要求普通用户同时填写 `agent_name`、`span_name` 和 `display_name`。SDK 负责把用户传入的 `name` 转成内部 `span_name`。
+
+#### 参数定义
+
+| 用户概念 | 是否必填 | 作用 | 谁来填写 |
+|---|---:|---|---|
+| `name` | 是 | 一次具体操作的名字，也是默认展示名，例如“规划下一步”或 `planner.route` | 用户创建 span 时填写 |
+| `display_name` / `displayName` | 否 | 覆盖前端展示名，例如把 `planner.route` 显示成“规划下一步” | 只有需要区分技术名和展示名时由用户填写 |
+| `agent_name` / `agentName` | 否 | 标识 span 属于哪个 agent，用于按 agent 聚合、成本统计和执行图 | 优先在 tracer/agent 上下文配置并由子 span 自动继承；高级用户才按 span 覆盖 |
+| `span_name` / `spanName` | 内部字段 | `name` 落到 wire、存储和查询结果后的字段名 | SDK 自动生成，普通用户不直接填写 |
+
+展示顺序固定为：
+
+```text
+display_name → span_name → tool_name → agent_name → model → span id
+```
+
+空字符串或全空格的 `display_name` 按“未设置”处理，继续使用后面的回退值。前端可以省略过长文字，但不能修改存储的原值。
+
+#### `agent_name` 和 `name` 的区别
+
+`agent_name` 是“谁在做”，`name` 是“正在做什么”。例如同一个 `planner_agent` 可以产生多个 span：
+
+```text
+agent_name = planner_agent, name = 分析用户问题
+agent_name = planner_agent, name = 选择执行工具
+agent_name = planner_agent, name = 汇总执行结果
+```
+
+前端瀑布按 span 展示 `display_name/name`；按 agent 做成本统计和执行图聚合时使用 `agent_name`，不能使用 `display_name`。
+
+#### 执行图内部 key
+
+执行图需要一个不随展示文案变化的内部 id，避免两个都叫“查询数据”的节点被错误合并。它由后端自动计算，例如：
+
+```text
+有 tool_name → tool:<tool_name>
+否则有 agent_name → agent:<agent_name>
+否则有 model → model:<model>
+否则 → span:<span_id>
+```
+
+控制台响应把这个内部值命名为 `actorId`。它不是用户参数：SDK 用户不传，页面不展示，也不要把 `actorKey` 之类的内部叫法写进普通接入文档。
+
+#### 各层字段命名
+
+| 层 | 技术名 | 展示名 | Agent 名 |
+|---|---|---|---|
+| Python SDK | `name` | `display_name` | `agent_name` |
+| TypeScript / Node SDK | `name` | `displayName` | `agentName` |
+| 原始 HTTP wire | `span_name` | `display_name` | `agent_name` |
+| 控制台 JSON | `spanName` | `displayName` | `agentName`（同时返回内部 `actorId`） |
+| Rust 内部 | `span_name` | `display_name` | `agent_name` |
+
+#### 实现不变量
+
+- `span_name` 和 `display_name` 是执行时快照；历史 trace 不随后来的节点改名而变化。
+- 普通 SDK 只在 `SPAN_START` 写入 `span_name/display_name`。`LOG` 和 `SPAN_END` 不应重复携带或覆盖它们；需要事后修正时走明确的 upgrade/patch 路径。
+- `display_name` 只用于展示，不参与节点身份、Agent 图聚合、过滤和 `event_id` 计算。
+- `event_id` 仍只由 `ext_span_id + seq + event_type` 决定，增加或修改展示名不能破坏去重。
+- 第一版 `display_name` 不进入 BM25。页面能看到某个展示名，不代表搜索该展示名一定能命中；如果以后要支持，单独修改搜索契约和测试。
+- 旧数据没有 `span_name/display_name` 时必须保持当前展示结果，不得因为升级变成空名字。
+- 新字段必须完整经过 wire、`SpanFields`、折叠、WAL/segment/manifest、Projection、Vortex、OTLP、各语言 SDK、embedded DB 和控制台 API；不能只改前端。
+- 执行图聚合和连边使用后端生成的稳定内部 id，标签才使用 `displayName/spanName` 回退链。
 
 ---
 

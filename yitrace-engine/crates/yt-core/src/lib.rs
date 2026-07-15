@@ -415,6 +415,10 @@ pub mod fold {
         pub external_parent_span_id: Option<String>,
         /// 外部 session id 原文。AgenticData 等系统使用 UUID 时不会只剩 hash。
         pub external_session_id: Option<String>,
+        /// span 技术名。SDK 的 `span(name)` 和 OTLP span name 落到这里，不再混进 logs。
+        pub span_name: Option<String>,
+        /// 给前端用户看的名字。只负责展示，不参与身份、聚合或 event_id。
+        pub display_name: Option<String>,
         /// agent 名（成本/可观测按 agent 下钻）。last-non-null。
         pub agent_name: Option<String>,
         /// 工具名（tool/function call span）。last-non-null。
@@ -474,6 +478,12 @@ pub mod fold {
             if other.external_session_id.is_some() {
                 self.external_session_id = other.external_session_id.clone();
             }
+            if other.span_name.is_some() {
+                self.span_name = other.span_name.clone();
+            }
+            if other.display_name.is_some() {
+                self.display_name = other.display_name.clone();
+            }
             if other.agent_name.is_some() {
                 self.agent_name = other.agent_name.clone();
             }
@@ -532,6 +542,8 @@ pub mod fold {
         pub external_span_id: Option<String>,
         pub external_parent_span_id: Option<String>,
         pub external_session_id: Option<String>,
+        pub span_name: Option<String>,
+        pub display_name: Option<String>,
         pub agent_name: Option<String>,
         pub tool_name: Option<String>,
         pub model: Option<String>,
@@ -581,6 +593,12 @@ pub mod fold {
             }
             if p.external_session_id.is_some() {
                 self.external_session_id = p.external_session_id.clone();
+            }
+            if p.span_name.is_some() {
+                self.span_name = p.span_name.clone();
+            }
+            if p.display_name.is_some() {
+                self.display_name = p.display_name.clone();
             }
             if p.agent_name.is_some() {
                 self.agent_name = p.agent_name.clone();
@@ -644,6 +662,8 @@ pub mod fold {
             let mut external_span_id: Option<String> = None;
             let mut external_parent_span_id: Option<String> = None;
             let mut external_session_id: Option<String> = None;
+            let mut span_name: Option<String> = None;
+            let mut display_name: Option<String> = None;
             let mut agent_name: Option<String> = None;
             let mut tool_name: Option<String> = None;
             let mut model: Option<String> = None;
@@ -687,6 +707,12 @@ pub mod fold {
                 }
                 if e.fields.external_session_id.is_some() {
                     external_session_id = e.fields.external_session_id.clone();
+                }
+                if e.fields.span_name.is_some() {
+                    span_name = e.fields.span_name.clone();
+                }
+                if e.fields.display_name.is_some() {
+                    display_name = e.fields.display_name.clone();
                 }
                 if e.fields.agent_name.is_some() {
                     agent_name = e.fields.agent_name.clone();
@@ -732,6 +758,8 @@ pub mod fold {
                 external_span_id,
                 external_parent_span_id,
                 external_session_id,
+                span_name,
+                display_name,
                 agent_name,
                 tool_name,
                 model,
@@ -803,6 +831,20 @@ pub mod fold {
                 Some(2),
                 "seq 大的（后发生的）非空值应胜出"
             );
+        }
+
+        #[test]
+        fn span_and_display_names_fold_independently() {
+            let mut start = ev(1, 10, 1, None, None, &[]);
+            start.fields.span_name = Some("risk.review".into());
+            start.fields.display_name = Some("风险审核".into());
+            let mut patch = ev(1, 10, 2, None, None, &[]);
+            patch.fields.display_name = Some("人工风险审核".into());
+
+            let folded = fold_events([patch, start]);
+            assert_eq!(folded[0].span_name.as_deref(), Some("risk.review"));
+            assert_eq!(folded[0].display_name.as_deref(), Some("人工风险审核"));
+            assert!(folded[0].logs.is_empty(), "名称不能再混入日志");
         }
 
         #[test]

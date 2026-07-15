@@ -34,6 +34,17 @@ with tracer.trace("反洗钱筛查") as t:
 
 嵌套 `span` 自动建父子（`parent_span_id` 进线格式 + 引擎），trace 还原成树。
 
+普通用户只传 `name`。内部技术名不适合直接展示时，再传可选的 `display_name`；`agent_name` 建议在 tracer 上配置，子 span 会自动继承：
+
+```python
+tracer = Tracer(exporter=ConsoleExporter(), node_id=1, agent_name="planner-agent")
+with tracer.trace("处理请求") as t:
+    with t.span("planner.route", display_name="规划下一步"):
+        pass
+```
+
+这里 `planner.route` 会写入内部 `span_name`，控制台优先显示“规划下一步”。`display_name` 只负责展示，不参与检索、过滤或节点合并；全空格按未设置处理。
+
 每个 span 产出三类事件：`SPAN_START`（带 span 名）+ 若干 `LOG` + `SPAN_END`（带状态+耗时）。
 `seq` 在 span 内单调递增、由客户端给定，原样进引擎、引擎绝不重补 —— 进引擎后按 `(trace, span)`
 折叠成一条完整 span。
@@ -91,7 +102,7 @@ db.close()
 ```python
 from yitrace import init_yitrace, shutdown_yitrace
 
-runtime = init_yitrace(path="./data/yitrace", tenant_id=1, node_id=1)
+runtime = init_yitrace(path="./data/yitrace", tenant_id=1)
 tr = runtime.tracer
 
 # 请求线程只入队；后台线程批量写 embedded DB。
@@ -101,6 +112,10 @@ with tr.trace("tuner-run", tenant_id=1) as t:
 
 shutdown_yitrace()  # 等待队列 flush，并关闭 embedded DB
 ```
+
+这里的生命周期是**每个进程一次**：进程启动时初始化，所有请求和任务复用 `runtime.tracer`，进程退出时关闭。不要在每个请求、Agent run 或查询里调用 `init_yitrace()`；也不要在单个请求结束时调用 `tr.close()`，否则会关闭整个进程共用的 exporter。
+
+FastAPI、ARQ 的完整启动钩子和模式选择见 [Python 服务端接入指南](../../docs/design/2026-07-14_python-service-integration.md)。
 
 默认 `fail_open=True`。如果 native 包缺失、data dir 被锁、恢复失败，`init_yitrace(...)` 会返回 no-op tracer，主服务继续启动；`runtime.enabled == False`，`runtime.error` 里保留原因。
 
@@ -112,9 +127,23 @@ shutdown_yitrace()  # 等待队列 flush，并关闭 embedded DB
 from yitrace import init_yitrace
 
 # 每个本机 worker 进程都可以这样初始化。
-runtime = init_yitrace(path="./data/yitrace", tenant_id=1, node_id=1)
+runtime = init_yitrace(path="./data/yitrace", tenant_id=1)
 tr = runtime.tracer
 ```
+
+同机多进程没有特殊要求时省略 `node_id`。如果显式配置，必须保证并行运行的进程使用不同的值，不能让所有 worker 都写 `node_id=1`。
+
+查询也复用当前进程已经打开的 `runtime.db`，不要查询一次 open 一次：
+
+```python
+result = runtime.db.trace_search({
+    "filter": {"externalTraceId": run_id},
+    "limit": 1,
+})
+print(result["readPlan"])
+```
+
+`externalTraceId` 会走过滤索引，适合按业务 runId 查存在性或下钻。新代码看 `readPlan`，不要只看兼容字段 `scannedSpans`。buffered 写入是异步的；同一条业务路径刚写完就必须查到时，先调用 `runtime.exporter.flush(timeout=2.0)`，不要重新 open DB。
 
 不要让多台机器、网络文件系统或跨主机容器共享同一个 embedded data dir；这些场景用 yiTrace server 或外部队列。
 
@@ -124,7 +153,7 @@ tr = runtime.tracer
 from yitrace import SpoolConsumer, SpoolDbExporter, Tracer, connect
 
 # worker 进程：只写 spool 文件，不打开 YiTraceDB。
-tr = Tracer(exporter=SpoolDbExporter("./data/yitrace-spool", tenant_id=1), node_id=1)
+tr = Tracer(exporter=SpoolDbExporter("./data/yitrace-spool", tenant_id=1))
 with tr.trace("worker-task", tenant_id=1) as t:
     with t.span("tool-call") as s:
         s.log("ok")

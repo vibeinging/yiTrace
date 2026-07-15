@@ -32,11 +32,15 @@ class Span:
         parent_span_id: int | None = None,
         session_id: int | None = None,
         tenant_id: int | None = None,
+        display_name: str | None = None,
+        agent_name: str | None = None,
     ) -> None:
         self.tracer = tracer
         self.trace_id = trace_id
         self.span_id = span_id
         self.name = name
+        normalized_display_name = display_name.strip() if display_name is not None else ""
+        self.display_name = normalized_display_name or None
         self.parent_span_id = parent_span_id
         self.ext_span_id = f"{trace_id}-{span_id}"  # 跨进程稳定身份，与引擎 demo 一致
         self._seq = 0
@@ -45,7 +49,7 @@ class Span:
         self._output_tokens: int | None = None
         self._session_id = session_id  # 会话 id：从 trace 透传下来
         self._tenant_id = tenant_id  # 租户 id：从 trace 透传下来（隔离维度）
-        self._agent_name: str | None = None
+        self._agent_name: str | None = agent_name
         self._tool_name: str | None = None
         self._model: str | None = None
         self._input_text: str | None = None
@@ -72,6 +76,8 @@ class Span:
                 output_tokens=self._output_tokens,
                 session_id=self._session_id,
                 tenant_id=self._tenant_id,
+                span_name=self.name if event_type is EventType.SPAN_START else None,
+                display_name=self.display_name if event_type is EventType.SPAN_START else None,
                 agent_name=self._agent_name,
                 tool_name=self._tool_name,
                 model=self._model,
@@ -115,14 +121,23 @@ class Span:
         if output_text is not None:
             self._output_text = output_text
 
-    def span(self, name: str):
+    def span(self, name: str, *, display_name: str | None = None, agent_name: str | None = None):
         """嵌套子 span：自动以当前 span 为父，并继承会话 id / 租户 id。"""
-        return _scoped_span(self.tracer, self.trace_id, name, self.span_id, self._session_id, self._tenant_id)
+        return _scoped_span(
+            self.tracer,
+            self.trace_id,
+            name,
+            self.span_id,
+            self._session_id,
+            self._tenant_id,
+            display_name,
+            agent_name if agent_name is not None else self._agent_name,
+        )
 
     # —— 上下文管理 ——
     def _start(self) -> None:
         self._start_ns = time.time_ns()
-        self._emit(EventType.SPAN_START, logs=[self.name])
+        self._emit(EventType.SPAN_START)
 
     def _end(self) -> None:
         end = time.time_ns()
@@ -132,10 +147,27 @@ class Span:
 
 @contextmanager
 def _scoped_span(
-    tracer: "Tracer", trace_id: int, name: str, parent_span_id: int | None, session_id: int | None = None, tenant_id: int | None = None
+    tracer: "Tracer",
+    trace_id: int,
+    name: str,
+    parent_span_id: int | None,
+    session_id: int | None = None,
+    tenant_id: int | None = None,
+    display_name: str | None = None,
+    agent_name: str | None = None,
 ) -> Iterator[Span]:
     span_id = tracer._sf.next()
-    sp = Span(tracer, trace_id, span_id, name, parent_span_id, session_id, tenant_id)
+    sp = Span(
+        tracer,
+        trace_id,
+        span_id,
+        name,
+        parent_span_id,
+        session_id,
+        tenant_id,
+        display_name,
+        agent_name,
+    )
     sp._start()
     try:
         yield sp
@@ -147,28 +179,65 @@ def _scoped_span(
 
 
 class Trace:
-    def __init__(self, tracer: "Tracer", trace_id: int, name: str, session_id: int | None = None, tenant_id: int | None = None) -> None:
+    def __init__(
+        self,
+        tracer: "Tracer",
+        trace_id: int,
+        name: str,
+        session_id: int | None = None,
+        tenant_id: int | None = None,
+        agent_name: str | None = None,
+    ) -> None:
         self.tracer = tracer
         self.trace_id = trace_id
         self.name = name
         self.session_id = session_id  # 会话 id：多轮对话/agent 会话，串起多条 trace
         self.tenant_id = tenant_id  # 租户 id：逻辑隔离维度，本 trace 的所有 span 都带它
+        self.agent_name = agent_name
 
-    def span(self, name: str):
+    def span(self, name: str, *, display_name: str | None = None, agent_name: str | None = None):
         """根 span（无父），继承本 trace 的会话 id / 租户 id。"""
-        return _scoped_span(self.tracer, self.trace_id, name, None, self.session_id, self.tenant_id)
+        return _scoped_span(
+            self.tracer,
+            self.trace_id,
+            name,
+            None,
+            self.session_id,
+            self.tenant_id,
+            display_name,
+            agent_name if agent_name is not None else self.agent_name,
+        )
 
 
 class Tracer:
-    def __init__(self, exporter: Exporter | None = None, node_id: int | None = None) -> None:
+    def __init__(
+        self,
+        exporter: Exporter | None = None,
+        node_id: int | None = None,
+        agent_name: str | None = None,
+    ) -> None:
         self.exporter: Exporter = exporter or ConsoleExporter()
         self._sf = Snowflake(node_id)
+        self.agent_name = agent_name
 
     @contextmanager
-    def trace(self, name: str, session_id: int | None = None, tenant_id: int | None = None) -> Iterator[Trace]:
+    def trace(
+        self,
+        name: str,
+        session_id: int | None = None,
+        tenant_id: int | None = None,
+        agent_name: str | None = None,
+    ) -> Iterator[Trace]:
         """开一条 trace。session_id 归会话；tenant_id 标租户（隔离维度，该 trace 全部 span 都带）。"""
         trace_id = self._sf.next()
-        yield Trace(self, trace_id, name, session_id, tenant_id)
+        yield Trace(
+            self,
+            trace_id,
+            name,
+            session_id,
+            tenant_id,
+            agent_name if agent_name is not None else self.agent_name,
+        )
 
     def _emit(self, event: SpanEvent) -> None:
         self.exporter.export(event)

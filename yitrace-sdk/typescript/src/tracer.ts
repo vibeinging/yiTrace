@@ -18,11 +18,17 @@ function nowNs(): bigint {
   return BigInt(Date.now()) * 1_000_000n;
 }
 
+export interface SpanOptions {
+  displayName?: string;
+  agentName?: string;
+}
+
 export class Span {
   tracer: Tracer;
   traceId: bigint;
   spanId: bigint;
   name: string;
+  private displayNameV: string | null;
   parentSpanId: bigint | null;
   extSpanId: string;
   private seqN = 0n;
@@ -46,20 +52,37 @@ export class Span {
     parentSpanId: bigint | null = null,
     sessionId: bigint | null = null,
     tenantId: bigint | null = null,
+    options: SpanOptions = {},
   ) {
     this.tracer = tracer;
     this.traceId = traceId;
     this.spanId = spanId;
     this.name = name;
+    this.displayNameV = options.displayName?.trim() || null;
     this.parentSpanId = parentSpanId;
     this.sessionIdV = sessionId;
     this.tenantIdV = tenantId;
+    this.agentNameV = options.agentName ?? null;
     this.extSpanId = `${traceId}-${spanId}`; // 跨进程稳定身份,与引擎一致
   }
 
   // 嵌套子 span：自动以当前 span 为父，并继承会话 id / 租户 id。
-  span<T>(name: string, fn: (s: Span) => T): T {
-    return runSpan(this.tracer, this.traceId, name, this.spanId, fn, this.sessionIdV, this.tenantIdV);
+  span<T>(name: string, fn: (s: Span) => T): T;
+  span<T>(name: string, options: SpanOptions, fn: (s: Span) => T): T;
+  span<T>(name: string, optionsOrFn: SpanOptions | ((s: Span) => T), maybeFn?: (s: Span) => T): T {
+    const options = typeof optionsOrFn === "function" ? {} : optionsOrFn;
+    const fn = typeof optionsOrFn === "function" ? optionsOrFn : maybeFn;
+    if (!fn) throw new TypeError("span callback is required");
+    return runSpan(
+      this.tracer,
+      this.traceId,
+      name,
+      this.spanId,
+      fn,
+      this.sessionIdV,
+      this.tenantIdV,
+      { ...options, agentName: options.agentName ?? this.agentNameV ?? undefined },
+    );
   }
 
   private nextSeq(): bigint {
@@ -85,6 +108,8 @@ export class Span {
       outputTokens: this.outputTokensV,
       sessionId: this.sessionIdV,
       tenantId: this.tenantIdV,
+      spanName: eventType === EventType.SpanStart ? this.name : null,
+      displayName: eventType === EventType.SpanStart ? this.displayNameV : null,
       agentName: this.agentNameV,
       toolName: this.toolNameV,
       model: this.modelV,
@@ -131,7 +156,7 @@ export class Span {
 
   start(): void {
     this.startNs = nowNs();
-    this.emit(EventType.SpanStart, { logs: [this.name] });
+    this.emit(EventType.SpanStart);
   }
 
   end(): void {
@@ -150,9 +175,10 @@ function runSpan<T>(
   fn: (s: Span) => T,
   sessionId: bigint | null = null,
   tenantId: bigint | null = null,
+  options: SpanOptions = {},
 ): T {
   const spanId = tracer.sf.next();
-  const sp = new Span(tracer, traceId, spanId, name, parentSpanId, sessionId, tenantId);
+  const sp = new Span(tracer, traceId, spanId, name, parentSpanId, sessionId, tenantId, options);
   sp.start();
   try {
     return fn(sp);
@@ -170,28 +196,53 @@ export class Trace {
   name: string;
   sessionId: bigint | null; // 会话 id：多轮对话/agent 会话，串起多条 trace
   tenantId: bigint | null; // 租户 id：逻辑隔离维度，本 trace 全部 span 都带它
+  agentName: string | null;
 
-  constructor(tracer: Tracer, traceId: bigint, name: string, sessionId: bigint | null = null, tenantId: bigint | null = null) {
+  constructor(
+    tracer: Tracer,
+    traceId: bigint,
+    name: string,
+    sessionId: bigint | null = null,
+    tenantId: bigint | null = null,
+    agentName: string | null = null,
+  ) {
     this.tracer = tracer;
     this.traceId = traceId;
     this.name = name;
     this.sessionId = sessionId;
     this.tenantId = tenantId;
+    this.agentName = agentName;
   }
 
   // 根 span（无父），继承本 trace 的会话 id / 租户 id。
-  span<T>(name: string, fn: (s: Span) => T): T {
-    return runSpan(this.tracer, this.traceId, name, null, fn, this.sessionId, this.tenantId);
+  span<T>(name: string, fn: (s: Span) => T): T;
+  span<T>(name: string, options: SpanOptions, fn: (s: Span) => T): T;
+  span<T>(name: string, optionsOrFn: SpanOptions | ((s: Span) => T), maybeFn?: (s: Span) => T): T {
+    const options = typeof optionsOrFn === "function" ? {} : optionsOrFn;
+    const fn = typeof optionsOrFn === "function" ? optionsOrFn : maybeFn;
+    if (!fn) throw new TypeError("span callback is required");
+    return runSpan(
+      this.tracer,
+      this.traceId,
+      name,
+      null,
+      fn,
+      this.sessionId,
+      this.tenantId,
+      { ...options, agentName: options.agentName ?? this.agentName ?? undefined },
+    );
   }
 }
 
 export class Tracer {
   exporter: Exporter;
   sf: Snowflake;
+  agentName: string | null;
 
-  constructor(exporter?: Exporter, nodeId?: number) {
+  constructor(exporter?: Exporter, nodeId?: number, agentName?: string) {
     this.exporter = exporter ?? new ConsoleExporter();
     this.sf = new Snowflake(nodeId);
+    this.agentName = agentName ?? null;
   }
 
   // 开一条 trace。sessionId 归会话；tenantId 标租户（隔离维度，该 trace 全部 span 都带）。
@@ -199,7 +250,7 @@ export class Tracer {
     const traceId = this.sf.next();
     const sid = sessionId === undefined ? null : BigInt(sessionId);
     const tid = tenantId === undefined ? null : BigInt(tenantId);
-    return fn(new Trace(this, traceId, name, sid, tid));
+    return fn(new Trace(this, traceId, name, sid, tid, this.agentName));
   }
 
   emitEvent(e: SpanEvent): void {

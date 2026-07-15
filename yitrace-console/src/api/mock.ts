@@ -88,7 +88,11 @@ function spansOf(traceId: string): { summary: TraceSummary; spans: Span[] } {
   const spans: Span[] = []
   // 一棵随时间推进的调用树：root(agent) → 若干子步。
   let clock = 0
-  const root: Span = { id: `${traceId}-s0`, parentId: null, kind: 'agent', name: 'agent.workflow', startMs: 0, durMs: summary.durMs, status: summary.status, cost: summary.cost, depth: 0 }
+  const root: Span = {
+    id: `${traceId}-s0`, parentId: null, kind: 'agent', name: 'agent.workflow',
+    spanName: 'agent.workflow', displayName: '工作流 Agent', actorId: 'agent:workflow',
+    startMs: 0, durMs: summary.durMs, status: summary.status, cost: summary.cost, depth: 0,
+  }
   spans.push(root)
   const stack: { id: string; depth: number; end: number }[] = [{ id: root.id, depth: 0, end: summary.durMs }]
   for (let k = 1; k < n; k++) {
@@ -162,6 +166,11 @@ export const mockApi: TraceApi = {
       id: s.id,
       kind: s.kind,
       name: s.name,
+      spanName: s.spanName,
+      displayName: s.displayName,
+      actorId: s.actorId,
+      agentName: s.agentName,
+      toolName: s.toolName,
       status: s.status,
       durMs: s.durMs,
       inTok: s.inTok ?? 0,

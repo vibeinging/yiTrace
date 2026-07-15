@@ -134,11 +134,13 @@ button{font:inherit}
 .k-llm{color:var(--llm);background:rgba(107,127,209,.14)}.k-tool{color:var(--tool);background:rgba(75,127,209,.14)}
 .k-chain{color:var(--chain);background:rgba(201,154,62,.14)}.k-retriever{color:var(--retr);background:rgba(74,157,111,.14)}
 .k-agent{color:var(--agent);background:rgba(176,126,192,.14)}
+.k-other{color:#7180a0;background:rgba(113,128,160,.14)}
 .slabel{overflow:hidden;text-overflow:ellipsis}
 .wf{flex:1;position:relative;height:100%;margin:0 12px}
 .bar{position:absolute;top:9px;height:12px;border-radius:3px;min-width:3px}
 .bar.b-llm{background:var(--llm)}.bar.b-tool{background:var(--tool)}.bar.b-chain{background:var(--chain)}
 .bar.b-retriever{background:var(--retr)}.bar.b-agent{background:var(--agent)}
+.bar.b-other{background:#7180a0}
 .bar.b-err{background:var(--err)!important}
 .scost{width:60px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .sdur{width:60px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}

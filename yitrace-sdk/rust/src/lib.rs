@@ -85,6 +85,8 @@ pub struct SpanEvent {
     pub output_tokens: Option<u64>,
     pub session_id: Option<u64>,
     pub tenant_id: Option<u64>,
+    pub span_name: Option<String>,
+    pub display_name: Option<String>,
     pub agent_name: Option<String>,
     pub tool_name: Option<String>,
     pub model: Option<String>,
@@ -115,6 +117,8 @@ impl SpanEvent {
         push_opt_num(&mut fields, "output_tokens", self.output_tokens);
         push_opt_num(&mut fields, "session_id", self.session_id);
         push_opt_num(&mut fields, "tenant_id", self.tenant_id);
+        push_opt_str(&mut fields, "span_name", self.span_name.as_deref());
+        push_opt_str(&mut fields, "display_name", self.display_name.as_deref());
         push_opt_str(&mut fields, "agent_name", self.agent_name.as_deref());
         push_opt_str(&mut fields, "tool_name", self.tool_name.as_deref());
         push_opt_str(&mut fields, "model", self.model.as_deref());
@@ -432,6 +436,7 @@ impl<E: Exporter> Tracer<E> {
             name: name.into(),
             session_id: options.session_id,
             tenant_id: options.tenant_id,
+            agent_name: options.agent_name,
         };
         Ok(run(&mut trace))
     }
@@ -457,6 +462,7 @@ impl<E: Exporter> Tracer<E> {
             name: name.into(),
             session_id: options.session_id,
             tenant_id: options.tenant_id,
+            agent_name: options.agent_name,
         };
         run(&mut trace)
     }
@@ -474,10 +480,11 @@ impl<E: Exporter> Tracer<E> {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Debug)]
 pub struct TraceOptions {
     session_id: Option<u64>,
     tenant_id: Option<u64>,
+    agent_name: Option<String>,
 }
 
 impl TraceOptions {
@@ -490,6 +497,11 @@ impl TraceOptions {
         self.tenant_id = Some(tenant_id);
         self
     }
+
+    pub fn agent_name(mut self, agent_name: impl Into<String>) -> Self {
+        self.agent_name = Some(agent_name.into());
+        self
+    }
 }
 
 pub struct Trace<'a, E> {
@@ -498,6 +510,7 @@ pub struct Trace<'a, E> {
     name: String,
     session_id: Option<u64>,
     tenant_id: Option<u64>,
+    agent_name: Option<String>,
 }
 
 impl<E: Exporter> Trace<'_, E> {
@@ -524,8 +537,12 @@ impl<E: Exporter> Trace<'_, E> {
             options.parent_span_id,
             self.session_id,
             self.tenant_id,
+            options
+                .agent_name
+                .clone()
+                .or_else(|| self.agent_name.clone()),
+            options.display_name.clone(),
         );
-        span.agent_name = options.agent_name;
         span.tool_name = options.tool_name;
         span.model = options.model;
         span.input_text = options.input_text;
@@ -570,8 +587,12 @@ impl<E: Exporter> Trace<'_, E> {
             options.parent_span_id,
             self.session_id,
             self.tenant_id,
+            options
+                .agent_name
+                .clone()
+                .or_else(|| self.agent_name.clone()),
+            options.display_name.clone(),
         );
-        span.agent_name = options.agent_name;
         span.tool_name = options.tool_name;
         span.model = options.model;
         span.input_text = options.input_text;
@@ -617,6 +638,7 @@ pub struct Span<'a, E> {
     output_tokens: Option<u64>,
     session_id: Option<u64>,
     tenant_id: Option<u64>,
+    display_name: Option<String>,
     agent_name: Option<String>,
     tool_name: Option<String>,
     model: Option<String>,
@@ -634,6 +656,8 @@ impl<'a, E: Exporter> Span<'a, E> {
         parent_span_id: Option<u64>,
         session_id: Option<u64>,
         tenant_id: Option<u64>,
+        agent_name: Option<String>,
+        display_name: Option<String>,
     ) -> Self {
         Self {
             tracer,
@@ -648,7 +672,10 @@ impl<'a, E: Exporter> Span<'a, E> {
             output_tokens: None,
             session_id,
             tenant_id,
-            agent_name: None,
+            display_name: display_name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            agent_name,
             tool_name: None,
             model: None,
             input_text: None,
@@ -680,8 +707,12 @@ impl<'a, E: Exporter> Span<'a, E> {
             Some(self.span_id),
             self.session_id,
             self.tenant_id,
+            options
+                .agent_name
+                .clone()
+                .or_else(|| self.agent_name.clone()),
+            options.display_name.clone(),
         );
-        child.agent_name = options.agent_name;
         child.tool_name = options.tool_name;
         child.model = options.model;
         child.input_text = options.input_text;
@@ -726,8 +757,12 @@ impl<'a, E: Exporter> Span<'a, E> {
             Some(self.span_id),
             self.session_id,
             self.tenant_id,
+            options
+                .agent_name
+                .clone()
+                .or_else(|| self.agent_name.clone()),
+            options.display_name.clone(),
         );
-        child.agent_name = options.agent_name;
         child.tool_name = options.tool_name;
         child.model = options.model;
         child.input_text = options.input_text;
@@ -796,7 +831,7 @@ impl<'a, E: Exporter> Span<'a, E> {
     fn start(&mut self) -> Result<()> {
         let started = now_ns();
         self.start_ns = Some(started);
-        self.emit(EventType::SpanStart, None, None, vec![self.name.clone()])
+        self.emit(EventType::SpanStart, None, None, Vec::new())
     }
 
     fn end(&mut self) -> Result<()> {
@@ -836,6 +871,10 @@ impl<'a, E: Exporter> Span<'a, E> {
             output_tokens: self.output_tokens,
             session_id: self.session_id,
             tenant_id: self.tenant_id,
+            span_name: (event_type == EventType::SpanStart).then(|| self.name.clone()),
+            display_name: (event_type == EventType::SpanStart)
+                .then(|| self.display_name.clone())
+                .flatten(),
             agent_name: self.agent_name.clone(),
             tool_name: self.tool_name.clone(),
             model: self.model.clone(),
@@ -850,6 +889,7 @@ impl<'a, E: Exporter> Span<'a, E> {
 #[derive(Default, Clone, Debug)]
 pub struct SpanOptions {
     parent_span_id: Option<u64>,
+    display_name: Option<String>,
     agent_name: Option<String>,
     tool_name: Option<String>,
     model: Option<String>,
@@ -859,6 +899,11 @@ pub struct SpanOptions {
 impl SpanOptions {
     pub fn parent_span_id(mut self, value: u64) -> Self {
         self.parent_span_id = Some(value);
+        self
+    }
+
+    pub fn display_name(mut self, value: impl Into<String>) -> Self {
+        self.display_name = Some(value.into());
         self
     }
 

@@ -14,7 +14,8 @@ use crate::{SearchFilter, TraceQuery};
 use super::{CacheCursor, TraceAggregateRollupRow};
 
 const MAGIC: u32 = 0x5954_524f; // "YTRO"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
+const MIN_READ_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 64;
 const PAGE_ROWS: usize = 4096;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -34,6 +35,7 @@ struct PageRef {
 
 pub(super) struct DiskTraceRollup {
     file: File,
+    version: u32,
     row_count: usize,
     pages: Vec<PageRef>,
     cached: HashMap<usize, Arc<Vec<TraceAggregateRollupRow>>>,
@@ -74,7 +76,11 @@ impl DiskTraceRollup {
             bytes: &header,
             pos: 0,
         };
-        if cur.u32()? != MAGIC || cur.u32()? != VERSION {
+        if cur.u32()? != MAGIC {
+            return None;
+        }
+        let version = cur.u32()?;
+        if !(MIN_READ_VERSION..=VERSION).contains(&version) {
             return None;
         }
         if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
@@ -141,6 +147,7 @@ impl DiskTraceRollup {
 
         Some(Self {
             file,
+            version,
             row_count,
             pages,
             cached: HashMap::new(),
@@ -289,7 +296,7 @@ impl DiskTraceRollup {
         };
         let mut rows = Vec::with_capacity(page.row_count as usize);
         for _ in 0..page.row_count {
-            rows.push(TraceAggregateRollupRow::decode(&mut cur)?);
+            rows.push(TraceAggregateRollupRow::decode(&mut cur, self.version)?);
         }
         if cur.pos != bytes.len() {
             return None;
@@ -332,6 +339,16 @@ pub(super) fn write_atomic(
     memtable_watermark: u64,
     rows: &mut [TraceAggregateRollupRow],
 ) -> std::io::Result<()> {
+    write_atomic_version(path, manifest_version, memtable_watermark, rows, VERSION)
+}
+
+fn write_atomic_version(
+    path: &Path,
+    manifest_version: u64,
+    memtable_watermark: u64,
+    rows: &mut [TraceAggregateRollupRow],
+    version: u32,
+) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -362,7 +379,7 @@ pub(super) fn write_atomic(
             min_ts = min_ts.min(row.min_ts);
             max_ts = max_ts.max(row.max_ts);
             let mut encoded = Vec::new();
-            row.encode(&mut encoded);
+            row.encode(&mut encoded, version);
             file.write_all(&encoded)?;
         }
         let page_end = file.stream_position()?;
@@ -398,7 +415,7 @@ pub(super) fn write_atomic(
 
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&MAGIC.to_le_bytes())?;
-    file.write_all(&VERSION.to_le_bytes())?;
+    file.write_all(&version.to_le_bytes())?;
     file.write_all(&manifest_version.to_le_bytes())?;
     file.write_all(&memtable_watermark.to_le_bytes())?;
     file.write_all(&(rows.len() as u64).to_le_bytes())?;
@@ -514,5 +531,37 @@ mod tests {
         assert_eq!(disk.last_read_stats(), (1, 3));
         assert!(DiskTraceRollup::open(&path, 5, 9).is_none());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v3_persists_names_and_v2_remains_readable() {
+        let base = std::env::temp_dir().join(format!(
+            "yt_rollup_names_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let v3_path = base.with_extension("v3");
+        let v2_path = base.with_extension("v2");
+        let mut named = row(11, 7, "names");
+        named.span_name = Some("risk.review".into());
+        named.display_name = Some("风险审核".into());
+
+        write_atomic(&v3_path, 4, 9, &mut [named.clone()]).unwrap();
+        let mut v3 = DiskTraceRollup::open(&v3_path, 4, 9).unwrap();
+        let v3_rows = v3.all_rows().unwrap();
+        assert_eq!(v3_rows[0].span_name.as_deref(), Some("risk.review"));
+        assert_eq!(v3_rows[0].display_name.as_deref(), Some("风险审核"));
+
+        write_atomic_version(&v2_path, 4, 9, &mut [named], 2).unwrap();
+        let mut v2 = DiskTraceRollup::open(&v2_path, 4, 9).unwrap();
+        let v2_rows = v2.all_rows().unwrap();
+        assert_eq!(v2_rows[0].span_name, None);
+        assert_eq!(v2_rows[0].display_name, None);
+
+        let _ = std::fs::remove_file(v3_path);
+        let _ = std::fs::remove_file(v2_path);
     }
 }

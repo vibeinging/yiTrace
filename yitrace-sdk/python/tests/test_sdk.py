@@ -58,7 +58,8 @@ def test_span_produces_start_log_end():
     assert [e.event_type for e in evs] == [EventType.SPAN_START, EventType.LOG, EventType.SPAN_END]
     assert [e.seq for e in evs] == [1, 2, 3], "seq 在 span 内单调递增"
     assert all(e.ext_span_id == evs[0].ext_span_id for e in evs), "同一 span 身份一致"
-    assert evs[0].logs == ["调用LLM研判"], "start 带 span 名"
+    assert evs[0].span_name == "调用LLM研判" and evs[0].logs == [], "start 用独立字段带 span 名"
+    assert all(e.span_name is None for e in evs[1:]), "名字只在 start 上报"
     assert evs[1].logs == ["研判结论 需人工复核"]
     assert evs[2].status == 0 and evs[2].duration_ns is not None and evs[2].duration_ns >= 0
     assert len({e.event_id() for e in evs}) == 3, "三个事件 event_id 互不相同"
@@ -73,8 +74,8 @@ def test_nested_spans_set_parent():
                 pass
 
     starts = [e for e in exp.events if e.event_type == EventType.SPAN_START]
-    root_start = next(e for e in starts if e.logs == ["root"])
-    child_start = next(e for e in starts if e.logs == ["child"])
+    root_start = next(e for e in starts if e.span_name == "root")
+    child_start = next(e for e in starts if e.span_name == "child")
     assert root_start.parent_span_id is None, "根 span 无父"
     assert child_start.parent_span_id == root_start.span_id, "子 span 的父是 root"
     assert "parent_span_id" in child_start.to_wire(), "线格式带 parent_span_id"
@@ -106,7 +107,7 @@ def test_session_agent_and_eval_io_fields_wire_through():
     starts = [e for e in exp.events if e.event_type == EventType.SPAN_START]
     # 会话 id 透传到嵌套 span
     assert all(e.session_id == 9000 for e in exp.events), "会话 id 透传到本 trace 全部事件（含嵌套）"
-    end = next(e for e in exp.events if e.event_type == EventType.SPAN_END and e.agent_name == "规划")
+    end = next(e for e in exp.events if e.event_type == EventType.SPAN_END and e.model == "qwen3")
     assert end.model == "qwen3"
     assert end.input_text == "请研判这笔交易"
     assert end.output_text == "判定为疑似盗刷"
@@ -115,6 +116,24 @@ def test_session_agent_and_eval_io_fields_wire_through():
     # 子 span 带 tool_name
     tool_end = next(e for e in exp.events if e.event_type == EventType.SPAN_END and e.tool_name == "kb_lookup")
     assert tool_end.session_id == 9000, "子 span 也继承会话 id"
+
+
+def test_display_name_is_optional_and_agent_context_is_inherited():
+    exp = CollectingExporter()
+    tr = Tracer(exporter=exp, node_id=1, agent_name="planner_agent")
+    with tr.trace("x") as t:
+        with t.span("planner.route", display_name="  规划下一步  "):
+            pass
+        with t.span("普通名字"):
+            pass
+
+    starts = [e for e in exp.events if e.event_type == EventType.SPAN_START]
+    advanced = next(e for e in starts if e.span_name == "planner.route")
+    simple = next(e for e in starts if e.span_name == "普通名字")
+    assert advanced.display_name == "规划下一步"
+    assert simple.display_name is None
+    assert all(e.agent_name == "planner_agent" for e in exp.events)
+    assert advanced.to_wire()["display_name"] == "规划下一步"
 
 
 def test_exception_marks_error_status():

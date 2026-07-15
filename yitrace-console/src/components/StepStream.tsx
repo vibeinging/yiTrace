@@ -1,7 +1,8 @@
 import { useSteps } from '../hooks/queries'
+import { spanDisplayName } from '../api'
 
 const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms')
-const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT', other: '·' }
+const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT', other: 'SPAN' }
 
 // 步骤流：每一步「输入 → 输出」并排卡片。切到此视图才拉文本（与瀑布的晚物化分开）。
 export function StepStream({ traceId, active }: { traceId: string | null; active: boolean }) {
@@ -18,7 +19,7 @@ export function StepStream({ traceId, active }: { traceId: string | null; active
               <span className={'sdot k-' + s.kind} />
               <div className="shd">
                 <span className={'kind k-' + s.kind}>{KIND_LABEL[s.kind] ?? s.kind}</span>
-                <span className="snm">{s.name}</span>
+                <span className="snm">{spanDisplayName(s)}</span>
                 <span className="smeta">{fmtDur(s.durMs)}{tot ? ` · ${tot} tok` : ''}{s.model ? ` · ${s.model}` : ''}{s.status === 'error' ? ' · 出错' : ''}</span>
               </div>
               <div className="iorow">

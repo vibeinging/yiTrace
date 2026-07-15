@@ -97,13 +97,15 @@ fn sort_trace_search_spans(spans: &mut [FoldedSpan], sort_by: &str) {
 
 fn trace_search_item_json(s: &FoldedSpan) -> String {
     format!(
-        r#"{{"traceId":"{}","spanId":"{}","externalTraceId":{},"externalSpanId":{},"externalSessionId":{},"sessionId":{},"status":{},"durationNs":{},"inputTokens":{},"outputTokens":{},"agentName":{},"toolName":{},"model":{},"inputText":{},"outputText":{},"logs":[{}],"attrs":{}}}"#,
+        r#"{{"traceId":"{}","spanId":"{}","externalTraceId":{},"externalSpanId":{},"externalSessionId":{},"sessionId":{},"spanName":{},"displayName":{},"status":{},"durationNs":{},"inputTokens":{},"outputTokens":{},"agentName":{},"toolName":{},"model":{},"inputText":{},"outputText":{},"logs":[{}],"attrs":{}}}"#,
         s.trace_id,
         s.span_id,
         json_opt_str(s.external_trace_id.as_deref()),
         json_opt_str(s.external_span_id.as_deref()),
         json_opt_str(s.external_session_id.as_deref()),
         s.session_id.map_or("null".to_string(), |v| v.to_string()),
+        json_opt_str(s.span_name.as_deref()),
+        json_opt_str(s.display_name.as_deref()),
         s.status.map_or("null".to_string(), |v| v.to_string()),
         s.duration_ns.map_or("null".to_string(), |v| v.to_string()),
         s.input_tokens.map_or("null".to_string(), |v| v.to_string()),

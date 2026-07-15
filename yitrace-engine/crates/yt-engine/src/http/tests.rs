@@ -26,6 +26,87 @@ fn route_ingest_then_query() {
 }
 
 #[test]
+fn names_are_exposed_without_changing_search_or_actor_identity() {
+    let s = server();
+    let batch = r#"[
+      {"trace_id":501,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"501-1","span_name":"内部检索名甲","display_name":"  用户看到的根节点乙  ","agent_name":"risk-agent"},
+      {"trace_id":501,"span_id":2,"parent_span_id":1,"ts":2,"seq":1,"event_type":1,"ext_span_id":"501-2","span_name":"内部工具检索名丙","display_name":"用户看到的工具丁","agent_name":"risk-agent","tool_name":"customer_lookup"},
+      {"trace_id":501,"span_id":1,"ts":3,"seq":2,"event_type":2,"ext_span_id":"501-1","duration_ns":10},
+      {"trace_id":501,"span_id":2,"parent_span_id":1,"ts":4,"seq":2,"event_type":2,"ext_span_id":"501-2","duration_ns":5}
+    ]"#;
+    let (status, body) = s.route("POST", "/v1/ingest", batch);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, trace) = s.route("GET", "/v1/traces/501", "");
+    assert_eq!(status, 200, "{trace}");
+    assert!(trace.contains(r#""name":"用户看到的根节点乙""#), "{trace}");
+    assert!(trace.contains(r#""spanName":"内部检索名甲""#), "{trace}");
+    assert!(
+        trace.contains(r#""displayName":"用户看到的根节点乙""#),
+        "{trace}"
+    );
+    assert!(trace.contains(r#""actorId":"agent:risk-agent""#), "{trace}");
+    assert!(
+        trace.contains(r#""actorId":"tool:customer_lookup""#),
+        "{trace}"
+    );
+    assert!(
+        trace.contains(r#""kind":"tool""#),
+        "继承 agent 的工具 span 仍应是工具: {trace}"
+    );
+
+    let (status, steps) = s.route("GET", "/v1/traces/501/steps", "");
+    assert_eq!(status, 200, "{steps}");
+    assert!(
+        steps.contains(r#""displayName":"用户看到的工具丁""#),
+        "{steps}"
+    );
+
+    let (status, detail) = s.route("GET", "/v1/traces/501/spans/2", "");
+    assert_eq!(status, 200, "{detail}");
+    assert!(
+        detail.contains(r#""spanName":"内部工具检索名丙""#),
+        "{detail}"
+    );
+    assert!(detail.contains(r#""agentName":"risk-agent""#), "{detail}");
+    assert!(
+        detail.contains(r#""toolName":"customer_lookup""#),
+        "{detail}"
+    );
+
+    let (status, internal_search) =
+        s.route("POST", "/v1/search", r#"{"text":"内部检索名甲","k":10}"#);
+    assert_eq!(status, 200, "{internal_search}");
+    assert!(
+        internal_search.contains(r#""trace_id":501"#),
+        "span_name 应可检索: {internal_search}"
+    );
+
+    let (status, display_search) = s.route(
+        "POST",
+        "/v1/search",
+        r#"{"text":"用户看到的根节点乙","k":10}"#,
+    );
+    assert_eq!(status, 200, "{display_search}");
+    assert_eq!(display_search, "[]", "display_name 只展示，不进入检索");
+
+    let (status, read_model) = s.route(
+        "POST",
+        "/v1/trace-search",
+        r#"{"filter":{"traceId":501},"limit":10}"#,
+    );
+    assert_eq!(status, 200, "{read_model}");
+    assert!(
+        read_model.contains(r#""spanName":"内部检索名甲""#),
+        "{read_model}"
+    );
+    assert!(
+        read_model.contains(r#""displayName":"用户看到的根节点乙""#),
+        "{read_model}"
+    );
+}
+
+#[test]
 fn route_ingest_accepts_external_ids_and_attrs() {
     let s = server();
     let batch = r#"[

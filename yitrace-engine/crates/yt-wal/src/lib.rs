@@ -20,7 +20,7 @@ use yt_core::fold::{FoldInput, SpanFields};
 use yt_core::ids::WalLsn;
 
 const BATCH_MAGIC_V2: u64 = 0x3254_4259_5741_4C59; // Versioned batch sentinel, distinct from realistic record counts.
-const SPAN_FIELDS_MAGIC_V2: u64 = 0x3244_4C46_5459_5954; // Versioned SpanFields sentinel for standalone upgrade payloads.
+const SPAN_FIELDS_MAGIC: u64 = 0x3244_4C46_5459_5954; // Versioned SpanFields sentinel for standalone upgrade payloads.
 const WAL_STATE_MAGIC: u64 = 0x3154_5357_5459_5954; // "TYYTWST1"
 const WAL_STATE_VERSION: u32 = 1;
 const WAL_STATE_LEN: usize = 40;
@@ -514,8 +514,8 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
 fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
-    put_u64(b, SPAN_FIELDS_MAGIC_V2);
-    put_u64(b, 2);
+    put_u64(b, SPAN_FIELDS_MAGIC);
+    put_u64(b, 3);
     put_opt_u8(b, f.status);
     put_opt_u64(b, f.duration_ns);
     put_opt_u64(b, f.parent_span_id);
@@ -527,6 +527,8 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_opt_str(b, &f.external_span_id);
     put_opt_str(b, &f.external_parent_span_id);
     put_opt_str(b, &f.external_session_id);
+    put_opt_str(b, &f.span_name);
+    put_opt_str(b, &f.display_name);
     put_opt_str(b, &f.agent_name);
     put_opt_str(b, &f.tool_name);
     put_opt_str(b, &f.model);
@@ -545,11 +547,64 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     }
 }
 
-fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
-    let ver = c.u64()?;
-    if ver != 2 {
-        return None;
+fn decode_span_fields_v3_from(c: &mut Cur) -> Option<SpanFields> {
+    let status = c.opt_u8()?;
+    let duration_ns = c.opt_u64()?;
+    let parent_span_id = c.opt_u64()?;
+    let input_tokens = c.opt_u64()?;
+    let output_tokens = c.opt_u64()?;
+    let session_id = c.opt_u64()?;
+    let tenant_id = c.opt_u64()?;
+    let external_trace_id = c.opt_str()?;
+    let external_span_id = c.opt_str()?;
+    let external_parent_span_id = c.opt_str()?;
+    let external_session_id = c.opt_str()?;
+    let span_name = c.opt_str()?;
+    let display_name = c.opt_str()?;
+    let agent_name = c.opt_str()?;
+    let tool_name = c.opt_str()?;
+    let model = c.opt_str()?;
+    let input_text = c.opt_str()?;
+    let output_text = c.opt_str()?;
+    let eval_score = c.opt_u64()?.map(|v| v as u32);
+    let eval_label = c.opt_str()?;
+    let log_n = c.u64()? as usize;
+    let mut logs = Vec::with_capacity(log_n);
+    for _ in 0..log_n {
+        logs.push(c.string()?);
     }
+    let attr_n = c.u64()? as usize;
+    let mut attrs = std::collections::BTreeMap::new();
+    for _ in 0..attr_n {
+        attrs.insert(c.string()?, c.string()?);
+    }
+    Some(SpanFields {
+        status,
+        duration_ns,
+        parent_span_id,
+        input_tokens,
+        output_tokens,
+        session_id,
+        tenant_id,
+        external_trace_id,
+        external_span_id,
+        external_parent_span_id,
+        external_session_id,
+        span_name,
+        display_name,
+        agent_name,
+        tool_name,
+        model,
+        input_text,
+        output_text,
+        eval_score,
+        eval_label,
+        logs,
+        attrs,
+    })
+}
+
+fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
     let status = c.opt_u8()?;
     let duration_ns = c.opt_u64()?;
     let parent_span_id = c.opt_u64()?;
@@ -599,6 +654,7 @@ fn decode_span_fields_v2_from(c: &mut Cur) -> Option<SpanFields> {
         eval_label,
         logs,
         attrs,
+        ..Default::default()
     })
 }
 
@@ -652,9 +708,13 @@ pub fn encode_span_fields(f: &SpanFields) -> Vec<u8> {
 /// `encode_span_fields` 的逆。
 pub fn decode_span_fields(bytes: &[u8]) -> Option<SpanFields> {
     let mut c = Cur { b: bytes, i: 0 };
-    if c.peek_u64() == Some(SPAN_FIELDS_MAGIC_V2) {
+    if c.peek_u64() == Some(SPAN_FIELDS_MAGIC) {
         c.u64()?;
-        decode_span_fields_v2_from(&mut c)
+        match c.u64()? {
+            2 => decode_span_fields_v2_from(&mut c),
+            3 => decode_span_fields_v3_from(&mut c),
+            _ => None,
+        }
     } else {
         decode_span_fields_legacy_from(&mut c)
     }
@@ -1008,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn span_fields_v2_roundtrips_external_ids_and_attrs() {
+    fn span_fields_v3_roundtrips_names_external_ids_and_attrs() {
         let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("project_id".to_string(), "\"agentic-data\"".to_string());
         attrs.insert("retry".to_string(), "true".to_string());
@@ -1016,6 +1076,8 @@ mod tests {
             external_trace_id: Some("run-uuid".into()),
             external_span_id: Some("span-uuid".into()),
             external_session_id: Some("session-uuid".into()),
+            span_name: Some("risk.review".into()),
+            display_name: Some("风险审核".into()),
             attrs,
             logs: vec!["ok".into()],
             ..Default::default()
@@ -1024,12 +1086,51 @@ mod tests {
         assert_eq!(decoded.external_trace_id.as_deref(), Some("run-uuid"));
         assert_eq!(decoded.external_span_id.as_deref(), Some("span-uuid"));
         assert_eq!(decoded.external_session_id.as_deref(), Some("session-uuid"));
+        assert_eq!(decoded.span_name.as_deref(), Some("risk.review"));
+        assert_eq!(decoded.display_name.as_deref(), Some("风险审核"));
         assert_eq!(
             decoded.attrs.get("project_id").map(String::as_str),
             Some("\"agentic-data\"")
         );
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
+    }
+
+    #[test]
+    fn span_fields_v2_decodes_with_empty_names() {
+        // 固定写出旧版 v2 布局，保证升级后仍能读取历史 WAL/segment 字段块。
+        let mut bytes = Vec::new();
+        put_u64(&mut bytes, SPAN_FIELDS_MAGIC);
+        put_u64(&mut bytes, 2);
+        put_opt_u8(&mut bytes, Some(0));
+        put_opt_u64(&mut bytes, Some(10));
+        put_opt_u64(&mut bytes, None);
+        put_opt_u64(&mut bytes, None);
+        put_opt_u64(&mut bytes, None);
+        put_opt_u64(&mut bytes, None);
+        put_opt_u64(&mut bytes, Some(1));
+        put_opt_str(&mut bytes, &Some("run-old".into()));
+        put_opt_str(&mut bytes, &Some("span-old".into()));
+        put_opt_str(&mut bytes, &None);
+        put_opt_str(&mut bytes, &None);
+        put_opt_str(&mut bytes, &Some("旧 Agent".into()));
+        put_opt_str(&mut bytes, &Some("lookup".into()));
+        put_opt_str(&mut bytes, &None);
+        put_opt_str(&mut bytes, &None);
+        put_opt_str(&mut bytes, &None);
+        put_opt_u64(&mut bytes, None);
+        put_opt_str(&mut bytes, &None);
+        put_u64(&mut bytes, 1);
+        put_str(&mut bytes, "旧日志");
+        put_u64(&mut bytes, 0);
+
+        let decoded = decode_span_fields(&bytes).expect("v2 fields should decode");
+        assert_eq!(decoded.external_trace_id.as_deref(), Some("run-old"));
+        assert_eq!(decoded.agent_name.as_deref(), Some("旧 Agent"));
+        assert_eq!(decoded.tool_name.as_deref(), Some("lookup"));
+        assert_eq!(decoded.logs, vec!["旧日志"]);
+        assert_eq!(decoded.span_name, None);
+        assert_eq!(decoded.display_name, None);
     }
 
     #[test]

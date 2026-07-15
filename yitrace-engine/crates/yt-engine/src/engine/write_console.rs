@@ -248,14 +248,19 @@ impl WriteCoordinator {
         spans
             .into_iter()
             .map(|s| {
-                let (kind, name) = if let Some(a) = &s.agent_name {
-                    ("agent", a.clone())
-                } else if let Some(t) = &s.tool_name {
-                    ("tool", t.clone())
+                // tool 优先：agent 上下文会被子 span 继承，工具 span 可能同时带 agent_name/tool_name。
+                let (kind, name, actor_id) = if let Some(t) = &s.tool_name {
+                    ("tool", t.clone(), format!("tool:{t}"))
+                } else if let Some(a) = &s.agent_name {
+                    ("agent", a.clone(), format!("agent:{a}"))
                 } else if let Some(m) = &s.model {
-                    ("llm", m.clone())
+                    ("llm", m.clone(), format!("model:{m}"))
                 } else {
-                    ("other", format!("span {}", s.span_id))
+                    (
+                        "other",
+                        format!("span {}", s.span_id),
+                        format!("span:{}", s.span_id),
+                    )
                 };
                 let dur = s.duration_ns.unwrap_or(0);
                 let cs = ConsoleSpan {
@@ -267,6 +272,11 @@ impl WriteCoordinator {
                     external_session_id: s.external_session_id.clone(),
                     kind,
                     name,
+                    span_name: s.span_name.clone(),
+                    display_name: s.display_name.clone(),
+                    actor_id,
+                    agent_name: s.agent_name.clone(),
+                    tool_name: s.tool_name.clone(),
                     start_ns: start,
                     duration_ns: dur,
                     has_error: s.status.unwrap_or(0) != 0,

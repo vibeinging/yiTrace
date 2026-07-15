@@ -37,6 +37,17 @@ tracer.trace("反洗钱筛查", (t) => {
 
 嵌套 `span` 自动建父子（`parent_span_id` 进线格式 + 引擎），trace 还原成树。
 
+普通用户只传 `name`。需要区分技术名和用户看到的名字时，再传 `displayName`；`agentName` 可以在 tracer 上配置并由子 span 继承：
+
+```ts
+const tracer = new Tracer(new ConsoleExporter(), 1, "planner-agent");
+tracer.trace("处理请求", (t) => {
+  t.span("planner.route", { displayName: "规划下一步" }, () => {});
+});
+```
+
+`planner.route` 会写入内部 `span_name`，控制台优先显示“规划下一步”。`displayName` 只负责展示，不参与检索、过滤或节点合并；全空格按未设置处理。
+
 ## 关键保证：event_id 三方逐字节一致
 
 `event_id = FNV-1a(ext_span_id ++ seq(8字节小端) ++ [event_type_tag])`，与 **Rust 引擎** 和

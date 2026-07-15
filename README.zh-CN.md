@@ -58,6 +58,10 @@ with connect(path="./yitrace-data", tenant_id=1) as db:
     print(hits)
 ```
 
+上面的 `with connect(...)` 适合脚本和最小示例。长期运行的 FastAPI、ARQ、Celery 服务不要按请求或任务反复打开 DB。正确做法是每个进程启动时调用一次 `init_yitrace(...)`，进程内复用 `runtime.tracer` 和查询 handle，退出时调用一次 `shutdown_yitrace()`。同机多个 worker 可以共享一个本地 data dir；多台机器应改用 HTTP。
+
+完整的生命周期、FastAPI/ARQ 示例、buffered/spool/http 选择和查询写法见 [Python 服务端接入指南](docs/design/2026-07-14_python-service-integration.md)。
+
 如果只想把 trace 发到一个运行中的 yiTrace server，只装轻量 SDK：
 
 ```bash
@@ -143,9 +147,9 @@ tracer.trace("风控复核", (trace) => {
 await tracer.close();
 ```
 
-### 起一个本地 yiTrace server
+### 起一个 yiTrace server
 
-多个进程或多台机器要写到同一个 TraceDB 时，用 server 模式。
+多台机器、跨主机容器或不能共享本地磁盘时，用 server 模式。同一台机器上的多个进程也可以直接使用 embedded 模式，不需要仅因为 worker 多就改成 server。
 
 ```bash
 python -m pip install "yitrace-db[server]"
@@ -194,6 +198,8 @@ const db = await YiTraceDB.open({ dataDir: "./yitrace-data", tenantId: 1 });
 
 适合一个机器拥有这个 data dir 的场景。同一台机器上的多个 worker 进程可以同时打开；
 yiTrace 会用 data-dir 锁串行化 open/write，并用 reader pin 保护快照清理。
+
+服务端应让每个 worker 进程启动时打开一次、退出时关闭一次。不要在每个请求、任务或查询中反复 open/close。buffered 模式下刚写完就要查询时，先等待 exporter flush，不要重新打开 DB。
 
 **server 模式**是跑一个 yiTrace 进程，其他客户端通过 HTTP 写入：
 

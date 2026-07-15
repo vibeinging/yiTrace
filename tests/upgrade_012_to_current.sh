@@ -165,7 +165,7 @@ assert load("current-custom-search-before-retry.json") == load("current-custom-s
 expected = {
     "bm25.dat": 4,
     "filter_attrs.dat": 3,
-    "trace_rollup.dat": 2,
+    "trace_rollup.dat": 3,
     "segment_bloom.dat": 1,
 }
 for name, version in expected.items():
@@ -187,7 +187,7 @@ if ! rg -q 'event="segment_scan_indexes_ready".*cache_loaded=false' "$WORK_DIR/c
   exit 1
 fi
 
-echo "==> 再次重启并直接加载 0.1.3 派生索引"
+echo "==> 再次重启并直接加载当前版本派生索引"
 start_server "$CURRENT_BIN" "$WORK_DIR/current-second.log"
 request POST /v1/search '{"text":"盗刷","k":20}' >/dev/null
 request POST /v1/search '{"text":"盗刷","k":20,"filter":{"attrs":{"project_id":"scale-a"}}}' >/dev/null

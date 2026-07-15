@@ -62,6 +62,7 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_string();
+    let span_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
     let ts_start = get2(sp, "startTimeUnixNano", "start_time_unix_nano")
         .and_then(Json::as_i64)
         .unwrap_or(0);
@@ -107,6 +108,9 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
     );
     let agent_name = first_str(attrs, &["gen_ai.agent.name", "agent.name"]);
     let tool_name = first_str(attrs, &["gen_ai.tool.name", "tool.name"]);
+    let display_name = first_str(attrs, &["yitrace.display_name"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     // 大文本：OTel GenAI 的 gen_ai.prompt/completion 常是 **JSON 消息数组串**（[{role,content}]），
     // 不是人读的纯文本——直接存会把 eval 的输入/输出污染成 JSON。这里拍平成纯文本；OpenInference 的
     // input.value/output.value 是扁平串，flatten_messages 原样返回。再不行就从 span events 里捞
@@ -166,16 +170,14 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
                 "session_id",
             ],
         ),
+        span_name,
+        display_name,
         agent_name,
         tool_name,
         model,
         input_text,
         output_text,
-        logs: if name.is_empty() {
-            Vec::new()
-        } else {
-            vec![name]
-        },
+        logs: Vec::new(),
         attrs: Default::default(),
     });
     // SpanEnd：状态 + 耗时。
@@ -201,6 +203,8 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
             Some(parent_hex.to_string())
         },
         external_session_id: None,
+        span_name: None,
+        display_name: None,
         agent_name: None,
         tool_name: None,
         model: None,
@@ -387,6 +391,7 @@ mod tests {
               {"key":"gen_ai.usage.input_tokens","value":{"intValue":"1200"}},
               {"key":"gen_ai.usage.output_tokens","value":{"intValue":"340"}},
               {"key":"gen_ai.agent.name","value":{"stringValue":"风控研判"}},
+              {"key":"yitrace.display_name","value":{"stringValue":"  风控助手研判  "}},
               {"key":"session.id","value":{"stringValue":"会话-7"}}
             ]
           }]
@@ -423,8 +428,12 @@ mod tests {
         assert_eq!(start.input_tokens, Some(1200));
         assert_eq!(start.output_tokens, Some(340));
         assert_eq!(start.agent_name.as_deref(), Some("风控研判"));
+        assert_eq!(start.display_name.as_deref(), Some("风控助手研判"));
         assert!(start.session_id.is_some(), "字符串会话 id 哈希成 u64");
-        assert_eq!(start.logs, vec!["chat qwen3"], "span 名进 logs");
+        assert_eq!(start.span_name.as_deref(), Some("chat qwen3"));
+        assert!(start.logs.is_empty(), "span 名不能混进 logs");
+        assert_eq!(end.span_name, None, "名称只写入 SpanStart");
+        assert_eq!(end.display_name, None, "名称只写入 SpanStart");
         // 状态/耗时在 end 上
         assert_eq!(end.status, Some(1), "OTLP Error(2) → 本引擎 status=1");
         assert_eq!(end.duration_ns, Some(500_000_000), "end-start 纳秒");

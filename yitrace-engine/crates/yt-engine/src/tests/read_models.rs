@@ -107,6 +107,7 @@ fn agent_graph_collapses_tree_into_caller_callee() {
     s1.fields.agent_name = Some("规划".into());
     let mut s2 = ev(1, 2, 1, Some(0), Some(50), &[]);
     s2.fields.tool_name = Some("kb_lookup".into());
+    s2.fields.agent_name = Some("规划".into()); // agent 上下文会继承，tool 身份仍优先
     s2.fields.parent_span_id = Some(1);
     let mut s3 = ev(1, 3, 1, Some(0), Some(200), &[]);
     s3.fields.agent_name = Some("执行".into());
@@ -118,6 +119,7 @@ fn agent_graph_collapses_tree_into_caller_callee() {
     s4.fields.input_tokens = Some(20);
     let mut s5 = ev(1, 5, 1, Some(0), Some(30), &[]);
     s5.fields.tool_name = Some("calc".into());
+    s5.fields.agent_name = Some("执行".into());
     s5.fields.parent_span_id = Some(3);
     wc.ingest(vec![s1, s2, s3, s4, s5]);
 

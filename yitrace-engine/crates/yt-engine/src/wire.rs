@@ -206,6 +206,10 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             external_span_id: opt_str("external_span_id").or(span_ext_from_id),
             external_parent_span_id: opt_str("external_parent_span_id").or(parent_ext_from_id),
             external_session_id: opt_str("external_session_id").or(session_ext_from_id),
+            span_name: opt_str("span_name"),
+            display_name: opt_str("display_name")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             agent_name: opt_str("agent_name"),
             tool_name: opt_str("tool_name"),
             model: opt_str("model"),
@@ -438,6 +442,19 @@ mod tests {
             r.attrs.get("nested").map(String::as_str),
             Some("{\"ok\":true}")
         );
+    }
+
+    #[test]
+    fn parses_span_and_optional_display_names() {
+        let body = r#"[
+          {"trace_id":1,"span_id":1,"ts":1,"seq":1,"event_type":1,"ext_span_id":"1","span_name":"risk.review","display_name":"  风险审核  "},
+          {"trace_id":1,"span_id":2,"ts":1,"seq":1,"event_type":1,"ext_span_id":"2","span_name":"risk.lookup","display_name":"   "}
+        ]"#;
+        let recs = parse_wire_batch(body).unwrap();
+        assert_eq!(recs[0].span_name.as_deref(), Some("risk.review"));
+        assert_eq!(recs[0].display_name.as_deref(), Some("风险审核"));
+        assert_eq!(recs[1].span_name.as_deref(), Some("risk.lookup"));
+        assert_eq!(recs[1].display_name, None, "空展示名按未设置处理");
     }
 
     #[test]

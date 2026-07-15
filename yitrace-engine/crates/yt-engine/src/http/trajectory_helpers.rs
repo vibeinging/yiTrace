@@ -249,13 +249,15 @@ fn trajectory_steps_json(spans: &[FoldedSpan]) -> String {
         .enumerate()
         .map(|(index, span)| {
             format!(
-                r#"{{"index":{},"spanId":"{}","externalSpanId":{},"parentSpanId":{},"kind":"{}","name":"{}","agentName":{},"toolName":{},"model":{},"status":{},"durationNs":{},"key":"{}"}}"#,
+                r#"{{"index":{},"spanId":"{}","externalSpanId":{},"parentSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"agentName":{},"toolName":{},"model":{},"status":{},"durationNs":{},"key":"{}"}}"#,
                 index,
                 span.span_id,
                 json_opt_str(span.external_span_id.as_deref()),
                 span.parent_span_id.map_or("null".to_string(), |v| json_string_value(&v.to_string())),
                 folded_kind(span),
                 json_escape(&folded_name(span)),
+                json_opt_str(span.span_name.as_deref()),
+                json_opt_str(span.display_name.as_deref()),
                 json_opt_str(span.agent_name.as_deref()),
                 json_opt_str(span.tool_name.as_deref()),
                 json_opt_str(span.model.as_deref()),

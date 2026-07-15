@@ -63,6 +63,8 @@ export interface SpanEvent {
   outputTokens: bigint | null;
   sessionId: bigint | null; // 会话 id（多轮对话/agent 会话，串起多条 trace）
   tenantId: bigint | null; // 租户 id（逻辑隔离维度；多租户共享索引、查询强制按 tenant 过滤）
+  spanName: string | null; // span(name) 的技术操作名，只在 SpanStart 上报
+  displayName: string | null; // 可选前端展示名，只在 SpanStart 上报
   agentName: string | null; // agent 名（成本/可观测按 agent 下钻）
   toolName: string | null; // 工具名（tool/function call span）
   model: string | null; // 模型名（成本按模型归因）
@@ -88,6 +90,8 @@ export function toWire(e: SpanEvent): Record<string, unknown> {
     output_tokens: e.outputTokens === null ? null : e.outputTokens.toString(),
     session_id: e.sessionId === null ? null : e.sessionId.toString(),
     tenant_id: e.tenantId === null ? null : e.tenantId.toString(),
+    span_name: e.spanName,
+    display_name: e.displayName,
     agent_name: e.agentName,
     tool_name: e.toolName,
     model: e.model,

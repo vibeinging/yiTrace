@@ -42,8 +42,8 @@ or an internal package registry, then depend on exact `file:` tarballs:
 ```json
 {
   "dependencies": {
-    "@yitrace/db": "file:vendor/yitrace-db-0.1.3-g1a2b3c4d5e6f.tgz",
-    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.1.3-g1a2b3c4d5e6f.tgz"
+    "@yitrace/db": "file:vendor/yitrace-db-0.1.4-g1a2b3c4d5e6f.tgz",
+    "@yitrace/db-darwin-x64": "file:vendor/yitrace-db-darwin-x64-0.1.4-g1a2b3c4d5e6f.tgz"
   }
 }
 ```
@@ -85,6 +85,7 @@ const db = await YiTraceDB.open({ dataDir: "./data", tenantId: 1 });
 const builder = createSpanEventBuilder({
   traceId: "run-uuid",
   sessionId: "session-uuid",
+  agentName: "risk-agent",
   attrs: {
     project_id: "agentic-data",
     skill: "review",
@@ -95,8 +96,8 @@ const builder = createSpanEventBuilder({
 
 builder.startSpan({
   spanId: "span-uuid",
-  name: "risk review",
-  agentName: "risk-agent",
+  name: "risk.review",
+  displayName: "风险审核",
   toolName: "card-risk",
   model: "gpt-5",
   inputText: "疑似盗刷订单",
@@ -136,6 +137,8 @@ console.log(page.readPlan?.source, page.readPlan?.candidateSpanKeys);
 
 await db.close();
 ```
+
+普通用户只需要给 `startSpan` 传 `name`。它会自动写成内部 `span_name`；只有技术名不适合直接展示时才额外传 `displayName`。`agentName` 建议放在 builder 默认上下文中，所有事件都会继承。`displayName` 只写在 SpanStart，只负责展示，不参与检索、过滤或节点合并；全空格按未设置处理。
 
 Semantic / hybrid search is opt-in. Pass an embedder when opening the DB, then
 explicitly choose `mode: "semantic"` or `mode: "hybrid"` for query-time
