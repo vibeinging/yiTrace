@@ -1,6 +1,6 @@
 {
   "name": "@yitrace/trace-sdk",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "yiTrace instrumentation SDK (TypeScript) — emit trace events with deterministic, engine-matching event_id",
   "type": "module",
   "license": "MIT",

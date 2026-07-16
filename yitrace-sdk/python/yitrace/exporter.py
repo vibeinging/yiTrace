@@ -116,7 +116,7 @@ class BufferedDbExporter(Exporter):
         drop_when_full: bool = True,
         max_retries: int = 3,
         retry_interval: float = 0.1,
-        on_error: Callable[[Exception, int], None] | None = None,
+        on_error: Callable[[BaseException, int], None] | None = None,
         register_atexit: bool = True,
     ) -> None:
         if max_batch <= 0:
@@ -225,9 +225,19 @@ class BufferedDbExporter(Exporter):
                     batch.append(self._queue.get_nowait())
                 except queue.Empty:
                     break
-            self._write_batch(batch)
-            for _ in batch:
-                self._queue.task_done()
+            try:
+                self._write_batch(batch)
+            except BaseException as err:
+                # native DB bindings can raise BaseException subclasses (for
+                # example a PyO3 panic). A single bad write must not kill the
+                # process-scoped writer and strand queue.join() forever.
+                self._record_write_error(err)
+                self._record_drop(len(batch))
+                self._report_error(err, len(batch))
+                self._closed.wait(self.retry_interval)
+            finally:
+                for _ in batch:
+                    self._queue.task_done()
 
     def _write_batch(self, batch: list[SpanEvent]) -> None:
         attempts = 0
@@ -237,17 +247,27 @@ class BufferedDbExporter(Exporter):
                 with self._lock:
                     self._sent += len(batch)
                 return
-            except Exception as err:
+            except BaseException as err:
                 attempts += 1
-                with self._lock:
-                    self._write_errors += 1
-                    self._last_error = str(err)
+                self._record_write_error(err)
                 if attempts > self.max_retries:
                     self._record_drop(len(batch))
-                    self.on_error(err, len(batch))
+                    self._report_error(err, len(batch))
                     return
-                self.on_error(err, 0)
-                time.sleep(self.retry_interval)
+                self._report_error(err, 0)
+                backoff = self.retry_interval * (2 ** min(attempts - 1, 6))
+                self._closed.wait(backoff)
+
+    def _record_write_error(self, err: BaseException) -> None:
+        with self._lock:
+            self._write_errors += 1
+            self._last_error = str(err)
+
+    def _report_error(self, err: BaseException, dropped: int) -> None:
+        try:
+            self.on_error(err, dropped)
+        except BaseException as callback_err:
+            print(f"[yitrace] 写入错误回调失败: {callback_err}", file=sys.stderr)
 
     def _record_drop(self, n: int) -> None:
         if n <= 0:
@@ -256,7 +276,7 @@ class BufferedDbExporter(Exporter):
             self._dropped += n
 
     @staticmethod
-    def _default_on_error(err: Exception, dropped: int) -> None:
+    def _default_on_error(err: BaseException, dropped: int) -> None:
         msg = f"[yitrace] embedded 写入失败: {err}"
         if dropped:
             msg += f" (dropped={dropped})"

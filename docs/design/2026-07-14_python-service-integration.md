@@ -1,4 +1,4 @@
-# Python 服务端接入 yiTrace（v0.1.4）
+# Python 服务端接入 yiTrace（v0.1.5）
 
 这篇面向 FastAPI、ARQ、Celery 一类长期运行的 Python 服务。核心规则只有一条：
 
@@ -9,10 +9,10 @@
 建议先锁定已经验证过的版本：
 
 ```bash
-python -m pip install "yitrace==0.1.4" "yitrace-db==0.1.4"
+python -m pip install "yitrace==0.1.5" "yitrace-db==0.1.5"
 ```
 
-如果进程只通过 HTTP 向独立 yiTrace server 上报，不需要本地查询，可以只安装 `yitrace==0.1.4`。
+如果进程只通过 HTTP 向独立 yiTrace server 上报，不需要本地查询，可以只安装 `yitrace==0.1.5`。
 
 ## 2. 先选运行模式
 
@@ -135,7 +135,7 @@ def find_run(run_id: str):
     return result
 ```
 
-`externalTraceId` 在 v0.1.4 会走过滤索引，适合按业务 `runId` 查存在性或下钻详情。判断查询是否走了预期路径时看 `readPlan`：
+`externalTraceId` 在 v0.1.5 会走过滤索引，适合按业务 `runId` 查存在性或下钻详情。判断查询是否走了预期路径时看 `readPlan`：
 
 - `usedFilterIndex`：是否使用过滤索引。
 - `candidateSpanKeys`：索引给出的候选数量；负查通常是 `0`。
@@ -196,6 +196,8 @@ health = runtime.health()
 - `enabled`、`last_error`：初始化是否成功。`fail_open=True` 时，失败会退化成 no-op，不阻塞主服务启动。
 - `queue.queued`、`dropped`、`write_errors`：后台写队列是否积压或丢数据。
 - `lock.active_wait_count`、`lock.wait_count`、`lock.wait_ms`：embedded 多进程是否在等待 DB 锁。
+
+从 v0.1.5 开始，数据库写入或错误回调抛出的异常不会让 buffered writer 线程退出。writer 会记录错误、按退避间隔重试，并继续消费后面的数据；重试用尽的批次会计入 `dropped`。
 
 如果锁等待长期偏高，再从 buffered 切到 spool；不要一开始就把单机多进程全部改成独立 server。
 

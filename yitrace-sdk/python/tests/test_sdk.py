@@ -366,6 +366,94 @@ def test_buffered_db_exporter_drops_after_retry_budget():
     assert errors[-1] == ("db down", 1)
 
 
+def test_buffered_db_exporter_survives_native_base_exception_and_keeps_consuming():
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecoveringDb:
+        def __init__(self):
+            self.calls = 0
+            self.written = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise SystemExit("native write exit")
+            self.written.extend(events)
+            return {"ingested": len(events)}
+
+    db = RecoveringDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=1,
+        flush_interval=0.01,
+        retry_interval=0.01,
+        max_retries=1,
+        register_atexit=False,
+    )
+    events = [
+        SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i)
+        for i in range(2)
+    ]
+
+    exporter.export_batch(events)
+    assert exporter.flush(timeout=2.0)
+    health = exporter.health()
+    exporter.close()
+
+    assert health["thread_alive"] is True
+    assert exporter.sent_count() == 2
+    assert exporter.dropped_count() == 0
+    assert exporter.write_error_count() == 1
+    assert len(db.written) == 2
+
+
+def test_buffered_db_exporter_keeps_consuming_after_drop_and_callback_error():
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecoveringDb:
+        def __init__(self):
+            self.calls = 0
+            self.written = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("db down")
+            self.written.extend(events)
+            return {"ingested": len(events)}
+
+    def failing_error_callback(_err, _dropped):
+        raise SystemExit("callback exit")
+
+    db = RecoveringDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=1,
+        flush_interval=0.01,
+        retry_interval=0.01,
+        max_retries=1,
+        on_error=failing_error_callback,
+        register_atexit=False,
+    )
+    events = [
+        SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i)
+        for i in range(2)
+    ]
+
+    exporter.export_batch(events)
+    assert exporter.flush(timeout=2.0)
+    health = exporter.health()
+    exporter.close()
+
+    assert health["thread_alive"] is True
+    assert exporter.sent_count() == 1
+    assert exporter.dropped_count() == 1
+    assert exporter.write_error_count() == 2
+    assert len(db.written) == 1
+
+
 def test_spool_exporter_writes_files_and_consumer_ingests_once():
     from pathlib import Path  # noqa: E402
     from yitrace.event import SpanEvent  # noqa: E402
