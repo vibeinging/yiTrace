@@ -56,6 +56,8 @@ class SpanEvent:
     duration_ns: int | None = None
     input_tokens: int | None = None  # LLM 输入 token（成本核心）
     output_tokens: int | None = None
+    cache_read_tokens: int | None = None  # input_tokens 中由供应商缓存读取的部分
+    cache_write_tokens: int | None = None  # input_tokens 中新写入供应商缓存的部分
     session_id: int | None = None  # 会话 id（多轮对话/agent 会话，串起多条 trace）
     tenant_id: int | None = None  # 租户 id（逻辑隔离维度；多租户共享索引、查询强制按 tenant 过滤）
     span_name: str | None = None  # SDK 的 span(name)，技术操作名；只在 SPAN_START 上报
@@ -66,6 +68,7 @@ class SpanEvent:
     input_text: str | None = None  # LLM 输入文本（prompt）—— eval 的评测上文
     output_text: str | None = None  # LLM 输出文本（答案）—— eval 打分对象
     logs: list[str] = field(default_factory=list)
+    attrs: dict[str, str | int | float | bool] = field(default_factory=dict)
 
     def event_id(self) -> int:
         return event_id(self.ext_span_id, self.seq, self.event_type)
@@ -85,6 +88,8 @@ class SpanEvent:
             "duration_ns": self.duration_ns,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "session_id": self.session_id,
             "tenant_id": self.tenant_id,
             "span_name": self.span_name,
@@ -95,4 +100,5 @@ class SpanEvent:
             "input_text": self.input_text,
             "output_text": self.output_text,
             "logs": list(self.logs),
+            "attrs": dict(self.attrs),
         }

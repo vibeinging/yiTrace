@@ -23,6 +23,15 @@ export interface SpanOptions {
   agentName?: string;
 }
 
+export interface TokenUsageOptions {
+  inputTokens?: bigint | number | null;
+  outputTokens?: bigint | number | null;
+  cacheReadTokens?: bigint | number | null;
+  cacheWriteTokens?: bigint | number | null;
+}
+
+type AttributeValue = string | number | boolean;
+
 export class Span {
   tracer: Tracer;
   traceId: bigint;
@@ -35,6 +44,8 @@ export class Span {
   private statusV: number | null = null;
   private inputTokensV: bigint | null = null;
   private outputTokensV: bigint | null = null;
+  private cacheReadTokensV: bigint | null = null;
+  private cacheWriteTokensV: bigint | null = null;
   private sessionIdV: bigint | null = null; // 会话 id：从 trace 透传下来
   private tenantIdV: bigint | null = null; // 租户 id：从 trace 透传下来（隔离维度）
   private agentNameV: string | null = null;
@@ -42,6 +53,7 @@ export class Span {
   private modelV: string | null = null;
   private inputTextV: string | null = null;
   private outputTextV: string | null = null;
+  private attrsV: Record<string, AttributeValue> = {};
   private startNs: bigint | null = null;
 
   constructor(
@@ -94,6 +106,7 @@ export class Span {
     eventType: EventType,
     opts: { status?: number | null; durationNs?: bigint | null; logs?: string[] } = {},
   ): void {
+    const isEnd = eventType === EventType.SpanEnd;
     this.tracer.emitEvent({
       traceId: this.traceId,
       spanId: this.spanId,
@@ -104,8 +117,10 @@ export class Span {
       parentSpanId: this.parentSpanId,
       status: opts.status ?? null,
       durationNs: opts.durationNs ?? null,
-      inputTokens: this.inputTokensV,
-      outputTokens: this.outputTokensV,
+      inputTokens: isEnd ? this.inputTokensV : null,
+      outputTokens: isEnd ? this.outputTokensV : null,
+      cacheReadTokens: isEnd ? this.cacheReadTokensV : null,
+      cacheWriteTokens: isEnd ? this.cacheWriteTokensV : null,
       sessionId: this.sessionIdV,
       tenantId: this.tenantIdV,
       spanName: eventType === EventType.SpanStart ? this.name : null,
@@ -116,6 +131,7 @@ export class Span {
       inputText: this.inputTextV,
       outputText: this.outputTextV,
       logs: opts.logs ?? [],
+      attrs: isEnd ? { ...this.attrsV } : {},
     });
   }
 
@@ -128,9 +144,71 @@ export class Span {
   }
 
   // 记 LLM token 用量（成本核心）。在后续事件上报，引擎按 trace 汇总。
-  setTokens(inputTokens?: bigint | number, outputTokens?: bigint | number): void {
-    if (inputTokens !== undefined) this.inputTokensV = BigInt(inputTokens);
-    if (outputTokens !== undefined) this.outputTokensV = BigInt(outputTokens);
+  setTokens(options: TokenUsageOptions): void;
+  setTokens(inputTokens?: bigint | number, outputTokens?: bigint | number): void;
+  setTokens(
+    optionsOrInput?: TokenUsageOptions | bigint | number,
+    outputTokens?: bigint | number,
+  ): void {
+    const options: TokenUsageOptions =
+      typeof optionsOrInput === "object" && optionsOrInput !== null
+        ? optionsOrInput
+        : { inputTokens: optionsOrInput, outputTokens };
+    const convert = (name: string, value: bigint | number | null | undefined): bigint | null | undefined => {
+      if (value === undefined || value === null) return value;
+      if (typeof value === "number" && (!Number.isSafeInteger(value) || value < 0)) {
+        throw new RangeError(`${name} must be a non-negative safe integer or bigint`);
+      }
+      const converted = BigInt(value);
+      if (converted < 0n) throw new RangeError(`${name} must be non-negative`);
+      return converted;
+    };
+    const input = convert("inputTokens", options.inputTokens);
+    const output = convert("outputTokens", options.outputTokens);
+    const cacheRead = convert("cacheReadTokens", options.cacheReadTokens);
+    const cacheWrite = convert("cacheWriteTokens", options.cacheWriteTokens);
+    if (input !== undefined && input !== null) this.inputTokensV = input;
+    if (output !== undefined && output !== null) this.outputTokensV = output;
+    if (cacheRead !== undefined && cacheRead !== null) this.cacheReadTokensV = cacheRead;
+    if (cacheWrite !== undefined && cacheWrite !== null) this.cacheWriteTokensV = cacheWrite;
+  }
+
+  setAttribute(key: string, value: AttributeValue | null): void {
+    if (value === null) return;
+    if (typeof key !== "string" || key.trim().length === 0) {
+      throw new TypeError("attribute key must be a non-empty string");
+    }
+    if (new TextEncoder().encode(key).length > 128) {
+      throw new RangeError("attribute key must be at most 128 UTF-8 bytes");
+    }
+    if (!["string", "number", "boolean"].includes(typeof value)) {
+      throw new TypeError("attribute value must be a JSON scalar or null");
+    }
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      throw new RangeError("attribute number must be finite");
+    }
+    if (new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
+      throw new RangeError("attribute value must be at most 4096 UTF-8 bytes");
+    }
+    const next = { ...this.attrsV, [key]: value };
+    if (Object.keys(next).length > 64) throw new RangeError("a span can have at most 64 attributes");
+    if (new TextEncoder().encode(JSON.stringify(next)).length > 16384) {
+      throw new RangeError("span attributes must be at most 16384 UTF-8 bytes");
+    }
+    this.attrsV = next;
+  }
+
+  setAttributes(attrs: Record<string, AttributeValue | null>): void {
+    if (attrs === null || typeof attrs !== "object" || Array.isArray(attrs)) {
+      throw new TypeError("attrs must be an object");
+    }
+    const original = { ...this.attrsV };
+    try {
+      for (const [key, value] of Object.entries(attrs)) this.setAttribute(key, value);
+    } catch (error) {
+      this.attrsV = original;
+      throw error;
+    }
   }
 
   // 标记本 span 属于哪个 agent（成本/可观测按 agent 下钻）。

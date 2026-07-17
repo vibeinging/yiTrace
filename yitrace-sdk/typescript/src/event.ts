@@ -61,6 +61,8 @@ export interface SpanEvent {
   durationNs: bigint | null;
   inputTokens: bigint | null; // LLM 输入 token（成本核心）
   outputTokens: bigint | null;
+  cacheReadTokens?: bigint | null;
+  cacheWriteTokens?: bigint | null;
   sessionId: bigint | null; // 会话 id（多轮对话/agent 会话，串起多条 trace）
   tenantId: bigint | null; // 租户 id（逻辑隔离维度；多租户共享索引、查询强制按 tenant 过滤）
   spanName: string | null; // span(name) 的技术操作名，只在 SpanStart 上报
@@ -71,6 +73,7 @@ export interface SpanEvent {
   inputText: string | null; // LLM 输入文本（prompt）—— eval 的评测上文
   outputText: string | null; // LLM 输出文本（答案）—— eval 打分对象
   logs: string[];
+  attrs?: Record<string, string | number | boolean>;
 }
 
 // 灌进引擎摄入端的 JSON 载荷（BigInt 转字符串,避免精度丢失）。
@@ -88,6 +91,8 @@ export function toWire(e: SpanEvent): Record<string, unknown> {
     duration_ns: e.durationNs === null ? null : e.durationNs.toString(),
     input_tokens: e.inputTokens === null ? null : e.inputTokens.toString(),
     output_tokens: e.outputTokens === null ? null : e.outputTokens.toString(),
+    cache_read_tokens: e.cacheReadTokens == null ? null : e.cacheReadTokens.toString(),
+    cache_write_tokens: e.cacheWriteTokens == null ? null : e.cacheWriteTokens.toString(),
     session_id: e.sessionId === null ? null : e.sessionId.toString(),
     tenant_id: e.tenantId === null ? null : e.tenantId.toString(),
     span_name: e.spanName,
@@ -98,5 +103,6 @@ export function toWire(e: SpanEvent): Record<string, unknown> {
     input_text: e.inputText,
     output_text: e.outputText,
     logs: e.logs,
+    attrs: e.attrs ?? {},
   };
 }

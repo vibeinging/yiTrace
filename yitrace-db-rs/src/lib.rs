@@ -408,6 +408,8 @@ pub struct SpanEvent {
     duration_ns: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     agent_name: Option<String>,
     tool_name: Option<String>,
     model: Option<String>,
@@ -438,6 +440,8 @@ impl SpanEvent {
         push_opt_num(&mut fields, "duration_ns", self.duration_ns);
         push_opt_num(&mut fields, "input_tokens", self.input_tokens);
         push_opt_num(&mut fields, "output_tokens", self.output_tokens);
+        push_opt_num(&mut fields, "cache_read_tokens", self.cache_read_tokens);
+        push_opt_num(&mut fields, "cache_write_tokens", self.cache_write_tokens);
         push_opt_str(&mut fields, "agent_name", self.agent_name.as_deref());
         push_opt_str(&mut fields, "tool_name", self.tool_name.as_deref());
         push_opt_str(&mut fields, "model", self.model.as_deref());
@@ -566,6 +570,8 @@ impl SpanEventBuilder {
         event.duration_ns = options.duration_ns;
         event.input_tokens = options.input_tokens;
         event.output_tokens = options.output_tokens;
+        event.cache_read_tokens = options.cache_read_tokens;
+        event.cache_write_tokens = options.cache_write_tokens;
         event.output_text = options.output_text;
         event.attrs.extend(options.attrs);
         self.events.push(event);
@@ -606,6 +612,8 @@ impl SpanEventBuilder {
             duration_ns: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             agent_name: None,
             tool_name: None,
             model: None,
@@ -712,6 +720,8 @@ pub struct SpanEndOptions {
     duration_ns: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     output_text: Option<String>,
     attrs: Vec<(String, JsonValue)>,
 }
@@ -723,6 +733,8 @@ impl SpanEndOptions {
             duration_ns: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             output_text: None,
             attrs: Vec::new(),
         }
@@ -748,6 +760,16 @@ impl SpanEndOptions {
 
     pub fn output_tokens(mut self, value: u64) -> Self {
         self.output_tokens = Some(value);
+        self
+    }
+
+    pub fn cache_read_tokens(mut self, value: u64) -> Self {
+        self.cache_read_tokens = Some(value);
+        self
+    }
+
+    pub fn cache_write_tokens(mut self, value: u64) -> Self {
+        self.cache_write_tokens = Some(value);
         self
     }
 

@@ -5,6 +5,7 @@
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件。
 
 ```
+
 npm test     # 含与引擎逐字节一致的 event_id、失败缓冲、close flush 校验
 ```
 
@@ -68,10 +69,23 @@ Python 与 TS 的测试都据此断言一致。
 import { Tracer, HttpExporter } from "@yitrace/trace-sdk";
 const tr = new Tracer(new HttpExporter("http://127.0.0.1:7878/v1/ingest"), 2);
 tr.trace("盗刷拦截", (t) => {
-  t.span("调用LLM研判", (s) => s.setTokens(800, 150));
+  t.span("调用LLM研判", (s) => {
+    s.setTokens({
+      inputTokens: 800,
+      outputTokens: 150,
+      cacheReadTokens: 0,
+      cacheWriteTokens: null,
+    });
+    s.setAttributes({
+      "llm.call_site": "superagent.reasoning",
+      "llm.model_category": "chat",
+    });
+  });
 });
 await tr.close();  // flush → POST 到引擎摄入服务
 ```
+
+缓存 token 的 `null` 表示模型服务没有返回该指标，`0` 表示模型服务返回了指标、但本次没有缓存读写。`setTokens()` 和 `setAttributes()` 只更新 Span 内存状态，统一随 `SpanEnd` 上报，不会额外产生 `Log` 或 `Attr` 事件。
 
 ## 可靠上报语义
 

@@ -266,7 +266,7 @@ def _init_yitrace_strict(
             db,
             tenant_id=tenant_id,
             max_batch=options.pop("max_batch", 256),
-            flush_interval=options.pop("flush_interval", 0.25),
+            flush_interval=options.pop("flush_interval", 1.0),
             max_queue=options.pop("max_queue", 8192),
             drop_when_full=options.pop("drop_when_full", True),
             max_retries=options.pop("max_retries", 3),

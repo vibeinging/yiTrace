@@ -1,4 +1,4 @@
-# Python 服务端接入 yiTrace（v0.1.5）
+# Python 服务端接入 yiTrace
 
 这篇面向 FastAPI、ARQ、Celery 一类长期运行的 Python 服务。核心规则只有一条：
 
@@ -14,6 +14,8 @@ python -m pip install "yitrace==0.1.5" "yitrace-db==0.1.5"
 
 如果进程只通过 HTTP 向独立 yiTrace server 上报，不需要本地查询，可以只安装 `yitrace==0.1.5`。
 
+> 版本说明：0.1.5 已修复数据库异常导致 writer 线程退出。本文后面描述的“首条事件后最多收集 1 秒”和 flush 屏障是当前源码中的下一版行为，尚未发布到 0.1.5。
+
 ## 2. 先选运行模式
 
 | 场景 | 推荐模式 | 说明 |
@@ -23,6 +25,8 @@ python -m pip install "yitrace==0.1.5" "yitrace-db==0.1.5"
 | 多台机器、跨主机容器、网络文件系统 | `http` | 只运行一个 yiTrace server，业务进程通过 HTTP 上报和查询。不要跨机器共享 embedded data dir。 |
 
 `direct` 会让业务线程同步写 DB，适合短脚本和测试，不建议作为服务端默认方式。
+
+buffered 模式保持一个数据库 writer。第一条事件到达后默认继续收集最多 1 秒；达到 `max_batch=256`、根 Trace 结束、主动 flush 或进程退出时提前写。少于 256 条也一定会写，256 是单批上限，不是最低数量。
 
 ## 3. 为什么 API worker 和 ARQ worker 都要初始化
 
@@ -145,7 +149,7 @@ def find_run(run_id: str):
 
 `scannedSpans` 是兼容旧客户端的字段，新接入不要只看它。
 
-buffered 写入是异步的。如果同一条业务路径刚写完就必须立刻查到，先等待队列写完：
+buffered 写入是异步的。如果同一条业务路径刚写完就必须立刻查到，先等待调用前已经提交的事件处理完成：
 
 ```python
 runtime.exporter.flush(timeout=2.0)
@@ -156,6 +160,8 @@ result = runtime.db.trace_search({
 ```
 
 不要为了实现“写后立刻查”而重新 open DB。
+
+这里的 `flush()` 是提交序号屏障，不要求整个进程的队列永久归零。其他并发任务在调用之后继续产生 Trace，不会拖住这次查询。
 
 HTTP 模式在进程启动时创建并保存一个 `connect(url=...)` client，后续查询一直复用。spool 模式的 worker 本身没有 DB handle；需要查询时应访问持有 DB 的服务，或改用 HTTP 模式。
 
@@ -194,7 +200,7 @@ health = runtime.health()
 重点看：
 
 - `enabled`、`last_error`：初始化是否成功。`fail_open=True` 时，失败会退化成 no-op，不阻塞主服务启动。
-- `queue.queued`、`dropped`、`write_errors`：后台写队列是否积压或丢数据。
+- `queue.queued`、`max_batch`、`flush_interval`、`dropped`、`write_errors`：后台写队列、批量窗口是否符合预期，以及是否积压或丢数据。
 - `lock.active_wait_count`、`lock.wait_count`、`lock.wait_ms`：embedded 多进程是否在等待 DB 锁。
 
 从 v0.1.5 开始，数据库写入或错误回调抛出的异常不会让 buffered writer 线程退出。writer 会记录错误、按退避间隔重试，并继续消费后面的数据；重试用尽的批次会计入 `dropped`。

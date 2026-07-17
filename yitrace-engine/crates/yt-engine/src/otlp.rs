@@ -106,6 +106,8 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
             "llm.token_count.completion",
         ],
     );
+    let cache_read_tokens = first_u64(attrs, &["gen_ai.usage.cache_read.input_tokens"]);
+    let cache_write_tokens = first_u64(attrs, &["gen_ai.usage.cache_creation.input_tokens"]);
     let agent_name = first_str(attrs, &["gen_ai.agent.name", "agent.name"]);
     let tool_name = first_str(attrs, &["gen_ai.tool.name", "tool.name"]);
     let display_name = first_str(attrs, &["yitrace.display_name"])
@@ -152,6 +154,8 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         duration_ns: None,
         input_tokens,
         output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         session_id,
         tenant_id,
         external_trace_id: Some(trace_hex.to_string()),
@@ -193,6 +197,8 @@ fn map_span(sp: &Json, out: &mut Vec<WireRecord>) -> Result<(), String> {
         duration_ns: Some(duration_ns),
         input_tokens: None,
         output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
         session_id: None,
         tenant_id: None,
         external_trace_id: Some(trace_hex.to_string()),

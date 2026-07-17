@@ -47,13 +47,20 @@ impl EngineJsonApi {
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"sessionId":"{}","externalSessionId":{},"title":"{}","turnCount":{},"totalCost":{},"status":"{}","startedAt":{},"firstTraceId":"{}"}}"#,
+                    r#"{{"sessionId":"{}","externalSessionId":{},"title":"{}","turnCount":{},"totalCost":{},"inputTokens":{},"outputTokens":{},"totalCacheReadTokens":{},"totalCacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"status":"{}","startedAt":{},"firstTraceId":"{}"}}"#,
                     s.session_id,
                     json_opt_str(s.external_session_id.as_deref()),
                     json_escape(&s.title),
                     s.turn_count,
                     cost_num(s.input_tokens, s.output_tokens),
-                    if s.has_error { "error" } else { "ok" },
+                    s.input_tokens,
+                    s.output_tokens,
+                    s.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    s.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    s.cache_read_reported_spans,
+                    s.cache_write_reported_spans,
+                    s.total_llm_spans,
+                    if s.has_error { "error" } else if s.has_running { "run" } else { "ok" },
                     s.session_id,
                     s.first_trace_id,
                 )
@@ -88,9 +95,10 @@ impl EngineJsonApi {
                 // 真实耗时：对该轮 trace 求 span 时长之和（毫秒）。
                 let spans = self.coord.console_trace_spans_for_tenant(&snap, t.trace_id, tenant);
                 let dur_ms = spans.iter().map(|s| s.duration_ns).sum::<u64>() / 1_000_000;
+                let lifecycle_status = aggregate_span_status(&spans);
                 let name = t.user_input.as_deref().map(trunc).unwrap_or_else(|| format!("第{}轮", t.turn_index + 1));
                 format!(
-                    r#"{{"traceId":"{}","sessionId":"{}","turnIndex":{},"name":"{}","durMs":{},"cost":{},"inTok":{},"outTok":{},"spanCount":{},"status":"{}"}}"#,
+                    r#"{{"traceId":"{}","sessionId":"{}","turnIndex":{},"name":"{}","durMs":{},"cost":{},"inTok":{},"outTok":{},"cacheReadTokens":{},"cacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"spanCount":{},"status":"{}"}}"#,
                     t.trace_id,
                     sid,
                     t.turn_index,
@@ -99,8 +107,13 @@ impl EngineJsonApi {
                     cost_num(t.input_tokens, t.output_tokens),
                     t.input_tokens,
                     t.output_tokens,
+                    t.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    t.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    t.cache_read_reported_spans,
+                    t.cache_write_reported_spans,
+                    t.total_llm_spans,
                     t.span_count,
-                    if t.error_count > 0 { "error" } else { "ok" },
+                    if t.error_count > 0 { "error" } else { lifecycle_status },
                 )
             })
             .collect();
@@ -140,6 +153,17 @@ impl EngineJsonApi {
             (i + s.input_tokens, o + s.output_tokens)
         });
         let any_err = spans.iter().any(|s| s.has_error);
+        let mut cache = crate::CacheTokenCoverage::default();
+        for span in &spans {
+            cache.observe_values(
+                span.model.is_some(),
+                (span.input_tokens > 0).then_some(span.input_tokens),
+                (span.output_tokens > 0).then_some(span.output_tokens),
+                span.cache_read_tokens,
+                span.cache_write_tokens,
+            );
+        }
+        let lifecycle_status = aggregate_span_status(&spans);
         let name = spans
             .first()
             .map(|s| {
@@ -168,7 +192,7 @@ impl EngineJsonApi {
                     .map(|events| json_log_events(events))
                     .unwrap_or_else(|| "[]".to_string());
                 format!(
-                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"startMs":{},"durMs":{},"status":"{}","cost":{},"inTok":{},"outTok":{},"model":{},"depth":{},"attrs":{},"logEvents":{}}}"#,
+                    r#"{{"id":"{}","parentId":{},"externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"startMs":{},"durMs":{},"status":"{}","lifecycle":"{}","cost":{},"inTok":{},"outTok":{},"cacheReadTokens":{},"cacheWriteTokens":{},"model":{},"depth":{},"attrs":{},"logEvents":{}}}"#,
                     s.span_id,
                     s.parent_span_id.map_or("null".to_string(), |p| format!("\"{p}\"")),
                     json_opt_str(s.external_trace_id.as_deref()),
@@ -184,10 +208,13 @@ impl EngineJsonApi {
                     json_opt_str(s.tool_name.as_deref()),
                     s.start_ns / 1_000_000,
                     s.duration_ns / 1_000_000,
-                    if s.has_error { "error" } else { "ok" },
+                    s.status_label(),
+                    s.lifecycle(),
                     cost_num(s.input_tokens, s.output_tokens),
                     s.input_tokens,
                     s.output_tokens,
+                    s.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    s.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
                     s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
                     depth_of(s.span_id),
                     json_attrs(&s.attrs),
@@ -196,14 +223,19 @@ impl EngineJsonApi {
             })
             .collect();
         let summary = format!(
-            r#"{{"traceId":"{}","externalTraceId":{},"name":"{}","durMs":{},"cost":{},"spanCount":{},"status":"{}"}}"#,
+            r#"{{"traceId":"{}","externalTraceId":{},"name":"{}","durMs":{},"cost":{},"totalCacheReadTokens":{},"totalCacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"spanCount":{},"status":"{}"}}"#,
             tid,
             json_opt_str(spans.iter().find_map(|s| s.external_trace_id.as_deref())),
             json_escape(&name),
             total_dur_ms,
             cost_num(in_tok, out_tok),
+            cache.read_total().map_or("null".to_string(), |v| v.to_string()),
+            cache.write_total().map_or("null".to_string(), |v| v.to_string()),
+            cache.read_reported_spans,
+            cache.write_reported_spans,
+            cache.total_llm_spans,
             spans.len(),
-            if any_err { "error" } else { "ok" },
+            if any_err { "error" } else { lifecycle_status },
         );
         (
             200,
@@ -232,7 +264,7 @@ impl EngineJsonApi {
             .iter()
             .map(|s| {
                 format!(
-                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"status":"{}","durMs":{},"inTok":{},"outTok":{},"model":{},"input":{},"output":{},"attrs":{}}}"#,
+                    r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"status":"{}","lifecycle":"{}","durMs":{},"inTok":{},"outTok":{},"cacheReadTokens":{},"cacheWriteTokens":{},"model":{},"input":{},"output":{},"attrs":{}}}"#,
                     s.span_id,
                     json_opt_str(s.external_trace_id.as_deref()),
                     json_opt_str(s.external_span_id.as_deref()),
@@ -243,10 +275,13 @@ impl EngineJsonApi {
                     json_escape(&s.actor_id),
                     json_opt_str(s.agent_name.as_deref()),
                     json_opt_str(s.tool_name.as_deref()),
-                    if s.has_error { "error" } else { "ok" },
+                    s.status_label(),
+                    s.lifecycle(),
                     s.duration_ns / 1_000_000,
                     s.input_tokens,
                     s.output_tokens,
+                    s.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    s.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
                     s.model.as_ref().map_or("null".to_string(), |m| format!("\"{}\"", json_escape(m))),
                     s.input_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
                     s.output_text.as_ref().map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
@@ -278,7 +313,7 @@ impl EngineJsonApi {
                 (
                     200,
                     format!(
-                        r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"input":{},"output":{},"attrs":{},"logEvents":{}}}"#,
+                        r#"{{"id":"{}","externalTraceId":{},"externalSpanId":{},"externalParentSpanId":{},"externalSessionId":{},"name":"{}","spanName":{},"displayName":{},"actorId":"{}","agentName":{},"toolName":{},"inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"model":{},"input":{},"output":{},"attrs":{},"logEvents":{}}}"#,
                         sid,
                         json_opt_str(s.external_trace_id.as_deref()),
                         json_opt_str(s.external_span_id.as_deref()),
@@ -290,6 +325,11 @@ impl EngineJsonApi {
                         json_escape(&s.actor_id),
                         json_opt_str(s.agent_name.as_deref()),
                         json_opt_str(s.tool_name.as_deref()),
+                        s.input_tokens,
+                        s.output_tokens,
+                        s.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                        s.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
+                        json_opt_str(s.model.as_deref()),
                         s.input_text
                             .as_ref()
                             .map_or("null".to_string(), |t| format!("\"{}\"", json_escape(t))),
@@ -303,4 +343,18 @@ impl EngineJsonApi {
             }
             None => (404, r#"{"error":"span not found"}"#.to_string()),
         }
-    }}
+    }
+}
+
+/// trace/轮次摘要的状态优先级：错误 > 运行中 > 数据不完整 > 完成。
+fn aggregate_span_status(spans: &[crate::ConsoleSpan]) -> &'static str {
+    if spans.iter().any(|span| span.has_error) {
+        "error"
+    } else if spans.iter().any(|span| span.lifecycle() == "running") {
+        "run"
+    } else if spans.iter().any(|span| span.lifecycle() != "completed") {
+        "incomplete"
+    } else {
+        "ok"
+    }
+}

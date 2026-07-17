@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import abc
 import atexit
+from collections import deque
 import json
 import os
-import queue
 import sys
 import threading
 import time
@@ -25,6 +25,9 @@ class Exporter(abc.ABC):
         """一次收一批。默认逐条转 `export`；能真正批量的传输（HttpExporter）覆盖成单次请求。"""
         for e in events:
             self.export(e)
+
+    def request_flush(self) -> int | None:
+        """请求后台 exporter 尽快写出已有数据，但不阻塞调用线程。"""
 
     def close(self) -> None:
         pass
@@ -111,7 +114,7 @@ class BufferedDbExporter(Exporter):
         *,
         tenant_id: int | str | None = None,
         max_batch: int = 256,
-        flush_interval: float = 0.25,
+        flush_interval: float = 1.0,
         max_queue: int = 8192,
         drop_when_full: bool = True,
         max_retries: int = 3,
@@ -123,6 +126,8 @@ class BufferedDbExporter(Exporter):
             raise ValueError("max_batch must be > 0")
         if max_queue <= 0:
             raise ValueError("max_queue must be > 0")
+        if flush_interval < 0:
+            raise ValueError("flush_interval must be >= 0")
         self.db = db
         self.tenant_id = tenant_id
         self.max_batch = max_batch
@@ -131,9 +136,14 @@ class BufferedDbExporter(Exporter):
         self.retry_interval = retry_interval
         self.drop_when_full = drop_when_full
         self.on_error = on_error if on_error is not None else self._default_on_error
-        self._queue: queue.Queue[SpanEvent] = queue.Queue(maxsize=max_queue)
+        self._queue = deque()
+        self._max_queue = max_queue
+        self._queue_changed = threading.Condition()
         self._closed = threading.Event()
         self._lock = threading.Lock()
+        self._submitted_seq = 0
+        self._processed_seq = 0
+        self._flush_target = 0
         self._sent = 0
         self._dropped = 0
         self._write_errors = 0
@@ -149,36 +159,54 @@ class BufferedDbExporter(Exporter):
     def export_batch(self, events: list[SpanEvent]) -> None:
         if not events:
             return
-        for event in events:
-            if self._closed.is_set():
-                self._record_drop(1)
-                continue
-            try:
-                if self.drop_when_full:
-                    self._queue.put_nowait(event)
-                else:
-                    self._queue.put(event)
-            except queue.Full:
-                self._record_drop(1)
+        dropped = 0
+        with self._queue_changed:
+            for event in events:
+                while (
+                    not self.drop_when_full
+                    and not self._closed.is_set()
+                    and len(self._queue) >= self._max_queue
+                ):
+                    self._queue_changed.wait()
+                if self._closed.is_set() or len(self._queue) >= self._max_queue:
+                    dropped += 1
+                    continue
+                self._submitted_seq += 1
+                self._queue.append((self._submitted_seq, time.monotonic(), event))
+            self._queue_changed.notify_all()
+        self._record_drop(dropped)
+
+    def request_flush(self) -> int:
+        """让 writer 立即结束当前收集窗口；调用方不等待数据库写完。"""
+        with self._queue_changed:
+            target = self._submitted_seq
+            if target > self._flush_target:
+                self._flush_target = target
+            self._queue_changed.notify_all()
+            return target
 
     def flush(self, timeout: float | None = None) -> bool:
-        """等待当前队列写完。返回 False 表示超时。"""
-        if timeout is None:
-            self._queue.join()
-            return True
-        deadline = time.monotonic() + timeout
-        with self._queue.all_tasks_done:
-            while self._queue.unfinished_tasks:
+        """等待调用前已提交的事件处理完；之后的新事件不影响本次等待。"""
+        target = self.request_flush()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._queue_changed:
+            while self._processed_seq < target:
+                if deadline is None:
+                    self._queue_changed.wait()
+                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._queue.all_tasks_done.wait(remaining)
-        return True
+                self._queue_changed.wait(remaining)
+            return True
 
     def close(self, timeout: float | None = 5.0) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
+        with self._queue_changed:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self._flush_target = max(self._flush_target, self._submitted_seq)
+            self._queue_changed.notify_all()
         self.flush(timeout=timeout)
         self._thread.join(timeout=timeout)
 
@@ -199,12 +227,15 @@ class BufferedDbExporter(Exporter):
             return self._last_error
 
     def queued_count(self) -> int:
-        return self._queue.qsize()
+        with self._queue_changed:
+            return len(self._queue)
 
     def health(self) -> dict:
         return {
             "type": "buffered_db",
-            "queue": {"queued": self.queued_count(), "max": self._queue.maxsize},
+            "queue": {"queued": self.queued_count(), "max": self._max_queue},
+            "max_batch": self.max_batch,
+            "flush_interval": self.flush_interval,
             "sent": self.sent_count(),
             "dropped": self.dropped_count(),
             "write_errors": self.write_error_count(),
@@ -214,30 +245,49 @@ class BufferedDbExporter(Exporter):
         }
 
     def _run(self) -> None:
-        while not self._closed.is_set() or not self._queue.empty():
-            batch: list[SpanEvent] = []
-            try:
-                batch.append(self._queue.get(timeout=self.flush_interval))
-            except queue.Empty:
-                continue
-            while len(batch) < self.max_batch:
-                try:
-                    batch.append(self._queue.get_nowait())
-                except queue.Empty:
-                    break
+        while True:
+            queued_batch = self._take_batch()
+            if not queued_batch:
+                return
+            batch = [item[2] for item in queued_batch]
+            processed_through = queued_batch[-1][0]
             try:
                 self._write_batch(batch)
             except BaseException as err:
                 # native DB bindings can raise BaseException subclasses (for
                 # example a PyO3 panic). A single bad write must not kill the
-                # process-scoped writer and strand queue.join() forever.
+                # process-scoped writer and strand a flush barrier forever.
                 self._record_write_error(err)
                 self._record_drop(len(batch))
                 self._report_error(err, len(batch))
                 self._closed.wait(self.retry_interval)
             finally:
-                for _ in batch:
-                    self._queue.task_done()
+                with self._queue_changed:
+                    self._processed_seq = processed_through
+                    self._queue_changed.notify_all()
+
+    def _take_batch(self) -> list[tuple[int, float, SpanEvent]]:
+        with self._queue_changed:
+            while not self._queue:
+                if self._closed.is_set():
+                    return []
+                self._queue_changed.wait()
+
+            deadline = self._queue[0][1] + self.flush_interval
+            while (
+                len(self._queue) < self.max_batch
+                and not self._closed.is_set()
+                and self._flush_target <= self._processed_seq
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._queue_changed.wait(remaining)
+
+            batch_size = min(self.max_batch, len(self._queue))
+            batch = [self._queue.popleft() for _ in range(batch_size)]
+            self._queue_changed.notify_all()
+            return batch
 
     def _write_batch(self, batch: list[SpanEvent]) -> None:
         attempts = 0

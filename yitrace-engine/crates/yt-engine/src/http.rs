@@ -489,7 +489,7 @@ impl EngineJsonApi {
             .iter()
             .map(|t| {
                 format!(
-                    r#"{{"trace_id":{},"external_trace_id":{},"span_count":{},"total_duration_ns":{},"max_duration_ns":{},"error_count":{},"total_input_tokens":{},"total_output_tokens":{}}}"#,
+                    r#"{{"trace_id":{},"external_trace_id":{},"span_count":{},"total_duration_ns":{},"max_duration_ns":{},"error_count":{},"total_input_tokens":{},"total_output_tokens":{},"total_cache_read_tokens":{},"total_cache_write_tokens":{},"cache_read_reported_spans":{},"cache_write_reported_spans":{},"total_llm_spans":{}}}"#,
                     t.trace_id,
                     json_opt_str(t.external_trace_id.as_deref()),
                     t.span_count,
@@ -497,7 +497,12 @@ impl EngineJsonApi {
                     t.max_duration_ns,
                     t.error_count,
                     t.total_input_tokens,
-                    t.total_output_tokens
+                    t.total_output_tokens,
+                    t.total_cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    t.total_cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
+                    t.cache_read_reported_spans,
+                    t.cache_write_reported_spans,
+                    t.total_llm_spans,
                 )
             })
             .collect();

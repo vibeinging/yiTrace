@@ -142,6 +142,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
     "duration_ns": null,
     "input_tokens": 900,
     "output_tokens": null,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": null,
     "session_id": "session-uuid",
     "tenant_id": null,
     "span_name": "risk.review",
@@ -174,7 +176,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `parent_span_id` | u64 或 string? | 父 span（建树）；字符串原文保存在 `external_parent_span_id` |
 | `status` | u8? | 0=ok，非 0=error（SpanEnd 时给） |
 | `duration_ns` | u64? | 耗时纳秒（SpanEnd 时给） |
-| `input_tokens`/`output_tokens` | u64? | token 计数 |
+| `input_tokens`/`output_tokens` | u64? | 输入/输出 token 计数 |
+| `cache_read_tokens`/`cache_write_tokens` | u64? | 缓存读取/新写入 token；`null` 表示上游未返回，`0` 表示已返回但本次为零 |
 | `session_id` | u64 或 string? | 会话归属；字符串原文保存在 `external_session_id` |
 | `tenant_id` | u64? | 租户归属；HTTP 服务会被 `X-Tenant-Id` 覆盖 |
 | `span_name` | string? | 技术操作名；SDK 的 `span(name)` 自动写入，进入 BM25 |
@@ -207,6 +210,8 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
 | `gen_ai.request.model` / `gen_ai.response.model` / `llm.model_name` | `model` |
 | `gen_ai.usage.input_tokens` / `gen_ai.usage.prompt_tokens` / `llm.token_count.prompt` | `input_tokens` |
 | `gen_ai.usage.output_tokens` / `gen_ai.usage.completion_tokens` / `llm.token_count.completion` | `output_tokens` |
+| `gen_ai.usage.cache_read.input_tokens` | `cache_read_tokens` |
+| `gen_ai.usage.cache_creation.input_tokens` | `cache_write_tokens` |
 | `gen_ai.agent.name` / `agent.name` | `agent_name` |
 | `gen_ai.tool.name` / `tool.name` | `tool_name` |
 | OTLP span 的 `name` | `span_name` |
@@ -236,7 +241,12 @@ yiTrace 有**两类端点**，JSON 字段命名风格不同，别混用：
   "max_duration_ns": 3000000,
   "error_count": 0,
   "total_input_tokens": 900,
-  "total_output_tokens": 120
+  "total_output_tokens": 120,
+  "total_cache_read_tokens": 0,
+  "total_cache_write_tokens": null,
+  "cache_read_reported_spans": 1,
+  "cache_write_reported_spans": 0,
+  "total_llm_spans": 1
 }
 ```
 
@@ -918,7 +928,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `title` | string | 会话标题（取首轮 trace 名） |
 | `turnCount` | u32 | 轮数（多轮会话 > 1） |
 | `totalCost` | f64 | 会话合计成本（美元） |
-| `status` | string | `"ok"` / `"error"` |
+| `status` | string | `"ok"` / `"error"` / `"run"`；存在只收到 start 的 span 时为 `run` |
 | `startedAt` | i64 | 起始（排序/游标用） |
 | `firstTraceId` | string | 首轮 trace id（单轮直接选它） |
 | `nextCursor` | string? | 下一页游标，`null`=到底 |
@@ -952,7 +962,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `cost` | f64 | 该轮成本 |
 | `inTok`/`outTok` | u64 | 输入/输出 token |
 | `spanCount` | u32 | span 数 |
-| `status` | string | `"ok"` / `"error"` |
+| `status` | string | `"ok"` / `"error"` / `"run"` / `"incomplete"` |
 
 ### GET /v1/traces/:id  —— 一条 trace 的折叠 span（瀑布）
 
@@ -982,6 +992,7 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
       "startMs": 0,
       "durMs": 6,
       "status": "ok",
+      "lifecycle": "completed",
       "cost": 0.001,
       "inTok": null,
       "outTok": null,
@@ -1018,7 +1029,8 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `agentName`/`toolName` | string? | “谁在做”与工具身份；不等同于 span 名 |
 | `startMs` | i64 | 起点（瀑布定位用） |
 | `durMs` | i64 | 耗时 |
-| `status` | string | `"ok"`/`error`/`run` |
+| `status` | string | `"ok"` / `"error"` / `"run"` / `"incomplete"` |
+| `lifecycle` | string | `completed` / `running` / `orphan_end` / `incomplete`；严格依据实际收到的 start/end 事件 |
 | `cost` | f64 | 成本 |
 | `inTok`/`outTok` | u64? | token（仅 llm） |
 | `model` | string? | 模型名（仅 llm） |
@@ -1026,6 +1038,8 @@ attrs 语义：会话内至少一个 span 命中所有 supplied attrs 时返回�
 | `logEvents` | object[] | span 内携带 `logs` 的原始事件，按 `ts, seq, eventId` 排序 |
 
 > **晚物化**：本端点**不含** input/output 大文本（瀑布图不需要）。要大文本见下面的 span 详情。`startMs` 是逻辑瀑布（按 span 顺序累加，不保留真实起始时刻）。
+
+只有 `SPAN_START` 时，span 会立即返回，`status="run"`、`lifecycle="running"`，耗时不再被页面解释成真实的 0ms 成功。收到对应 `SPAN_END` 后，同一 span 变为 `lifecycle="completed"`。`SPAN_END` 可以不带 `duration_ns` 或 `status`，生命周期仍以事件类型为准。成功率和耗时排名应只统计 `completed`。
 
 **`logEvents[]` 字段**：
 

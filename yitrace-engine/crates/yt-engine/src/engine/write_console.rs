@@ -8,10 +8,14 @@ impl WriteCoordinator {
                 | Projection::DURATION_NS
                 | Projection::INPUT_TOKENS
                 | Projection::OUTPUT_TOKENS
+                | Projection::CACHE_READ_TOKENS
+                | Projection::CACHE_WRITE_TOKENS
+                | Projection::MODEL
                 | Projection::EXTERNAL_IDS,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         let mut by_trace: BTreeMap<u64, TraceSummary> = BTreeMap::new();
+        let mut coverage: BTreeMap<u64, CacheTokenCoverage> = BTreeMap::new();
         for s in spans {
             let e = by_trace.entry(s.trace_id).or_insert(TraceSummary {
                 trace_id: s.trace_id,
@@ -22,6 +26,11 @@ impl WriteCoordinator {
                 error_count: 0,
                 total_input_tokens: 0,
                 total_output_tokens: 0,
+                total_cache_read_tokens: None,
+                total_cache_write_tokens: None,
+                cache_read_reported_spans: 0,
+                cache_write_reported_spans: 0,
+                total_llm_spans: 0,
             });
             if e.external_trace_id.is_none() {
                 e.external_trace_id = s.external_trace_id.clone();
@@ -36,6 +45,16 @@ impl WriteCoordinator {
             }
             e.total_input_tokens += s.input_tokens.unwrap_or(0);
             e.total_output_tokens += s.output_tokens.unwrap_or(0);
+            coverage.entry(s.trace_id).or_default().observe(&s);
+        }
+        for (trace_id, c) in coverage {
+            if let Some(summary) = by_trace.get_mut(&trace_id) {
+                summary.total_cache_read_tokens = c.read_total();
+                summary.total_cache_write_tokens = c.write_total();
+                summary.cache_read_reported_spans = c.read_reported_spans;
+                summary.cache_write_reported_spans = c.write_reported_spans;
+                summary.total_llm_spans = c.total_llm_spans;
+            }
         }
         by_trace.into_values().collect()
     }
@@ -44,12 +63,19 @@ impl WriteCoordinator {
     pub fn list_sessions(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<SessionSummary> {
         // 按 session 聚合 token —— 只读 session_id + token,跳过文本。
         let proj = Projection::of(
-            Projection::SESSION_ID | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+            Projection::SESSION_ID
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::CACHE_READ_TOKENS
+                | Projection::CACHE_WRITE_TOKENS
+                | Projection::MODEL,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
         // session_id -> (distinct traces, span_count, in_tok, out_tok)
-        let mut acc: BTreeMap<u64, (std::collections::HashSet<u64>, usize, u64, u64)> =
-            BTreeMap::new();
+        let mut acc: BTreeMap<
+            u64,
+            (std::collections::HashSet<u64>, usize, u64, u64, CacheTokenCoverage),
+        > = BTreeMap::new();
         for s in spans {
             if let Some(sid) = s.session_id {
                 let e = acc.entry(sid).or_default();
@@ -57,15 +83,21 @@ impl WriteCoordinator {
                 e.1 += 1;
                 e.2 += s.input_tokens.unwrap_or(0);
                 e.3 += s.output_tokens.unwrap_or(0);
+                e.4.observe(&s);
             }
         }
         acc.into_iter()
-            .map(|(session_id, (traces, span_count, i, o))| SessionSummary {
+            .map(|(session_id, (traces, span_count, i, o, c))| SessionSummary {
                 session_id,
                 trace_count: traces.len(),
                 span_count,
                 total_input_tokens: i,
                 total_output_tokens: o,
+                total_cache_read_tokens: c.read_total(),
+                total_cache_write_tokens: c.write_total(),
+                cache_read_reported_spans: c.read_reported_spans,
+                cache_write_reported_spans: c.write_reported_spans,
+                total_llm_spans: c.total_llm_spans,
             })
             .collect()
     }
@@ -97,6 +129,7 @@ impl WriteCoordinator {
         let mut turns = Vec::with_capacity(by_trace.len());
         let mut total_in = 0u64;
         let mut total_out = 0u64;
+        let mut total_coverage = CacheTokenCoverage::default();
         for (turn_index, (trace_id, mut sps)) in by_trace.into_iter().enumerate() {
             sps.sort_by_key(|s| s.span_id);
             // 输入取最早（span_id 最小）带 input_text 的；答复取最末带 output_text 的。
@@ -113,6 +146,10 @@ impl WriteCoordinator {
             let input_tokens: u64 = sps.iter().map(|s| s.input_tokens.unwrap_or(0)).sum();
             let output_tokens: u64 = sps.iter().map(|s| s.output_tokens.unwrap_or(0)).sum();
             let error_count = sps.iter().filter(|s| s.status.unwrap_or(0) != 0).count();
+            let mut turn_coverage = CacheTokenCoverage::default();
+            for span in &sps {
+                turn_coverage.observe(span);
+            }
             total_in += input_tokens;
             total_out += output_tokens;
             turns.push(SessionTurn {
@@ -124,15 +161,26 @@ impl WriteCoordinator {
                 span_count: sps.len(),
                 input_tokens,
                 output_tokens,
+                cache_read_tokens: turn_coverage.read_total(),
+                cache_write_tokens: turn_coverage.write_total(),
+                cache_read_reported_spans: turn_coverage.read_reported_spans,
+                cache_write_reported_spans: turn_coverage.write_reported_spans,
+                total_llm_spans: turn_coverage.total_llm_spans,
                 error_count,
                 eval_score,
             });
+            total_coverage.merge(&turn_coverage);
         }
         SessionTimeline {
             session_id,
             turns,
             total_input_tokens: total_in,
             total_output_tokens: total_out,
+            total_cache_read_tokens: total_coverage.read_total(),
+            total_cache_write_tokens: total_coverage.write_total(),
+            cache_read_reported_spans: total_coverage.read_reported_spans,
+            cache_write_reported_spans: total_coverage.write_reported_spans,
+            total_llm_spans: total_coverage.total_llm_spans,
         }
     }
 
@@ -280,8 +328,12 @@ impl WriteCoordinator {
                     start_ns: start,
                     duration_ns: dur,
                     has_error: s.status.unwrap_or(0) != 0,
+                    has_start: s.has_start,
+                    has_end: s.has_end,
                     input_tokens: s.input_tokens.unwrap_or(0),
                     output_tokens: s.output_tokens.unwrap_or(0),
+                    cache_read_tokens: s.cache_read_tokens,
+                    cache_write_tokens: s.cache_write_tokens,
                     model: s.model.clone(),
                     input_text: s.input_text.clone(),
                     output_text: s.output_text.clone(),
@@ -379,25 +431,36 @@ impl WriteCoordinator {
     pub fn cost_by_agent(&self, snap: &Snapshot, q: &TraceQuery) -> Vec<AgentCost> {
         // 按 agent 归因 token —— 只读 agent_name + token,跳过文本（成本下钻是典型的"只数不读原文"）。
         let proj = Projection::of(
-            Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+            Projection::AGENT_NAME
+                | Projection::INPUT_TOKENS
+                | Projection::OUTPUT_TOKENS
+                | Projection::CACHE_READ_TOKENS
+                | Projection::CACHE_WRITE_TOKENS
+                | Projection::MODEL,
         );
         let (spans, _) = self.fold_query(snap, q, None, proj);
-        let mut acc: BTreeMap<String, (usize, u64, u64)> = BTreeMap::new();
+        let mut acc: BTreeMap<String, (usize, u64, u64, CacheTokenCoverage)> = BTreeMap::new();
         for s in spans {
             if let Some(a) = &s.agent_name {
                 let e = acc.entry(a.clone()).or_default();
                 e.0 += 1;
                 e.1 += s.input_tokens.unwrap_or(0);
                 e.2 += s.output_tokens.unwrap_or(0);
+                e.3.observe(&s);
             }
         }
         acc.into_iter()
             .map(
-                |(agent_name, (span_count, input_tokens, output_tokens))| AgentCost {
+                |(agent_name, (span_count, input_tokens, output_tokens, c))| AgentCost {
                     agent_name,
                     span_count,
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens: c.read_total(),
+                    cache_write_tokens: c.write_total(),
+                    cache_read_reported_spans: c.read_reported_spans,
+                    cache_write_reported_spans: c.write_reported_spans,
+                    total_llm_spans: c.total_llm_spans,
                 },
             )
             .collect()

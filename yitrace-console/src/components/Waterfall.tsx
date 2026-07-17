@@ -9,6 +9,7 @@ import { TurnTimeline } from './TurnTimeline'
 type View = 'wf' | 'steps' | 'graph'
 
 const fmtDur = (ms: number) => (ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms')
+const spanDur = (s: Span) => s.status === 'run' ? '进行中' : s.status === 'incomplete' ? '不完整' : fmtDur(s.durMs)
 const KIND_LABEL: Record<string, string> = { llm: 'LLM', tool: 'TOOL', chain: 'CHAIN', retriever: 'RETR', agent: 'AGENT', other: 'SPAN' }
 
 export function Waterfall({
@@ -112,7 +113,8 @@ export function Waterfall({
 
 // 本 trace 洞察：耗时 / 成本 Top5（从内存里全部 span 算，与虚拟化渲染无关）。点行选中。
 function Insight({ spans, onSelect }: { spans: Span[]; onSelect: (id: string) => void }) {
-  const byDur = [...spans].sort((a, b) => b.durMs - a.durMs).slice(0, 5)
+  const completed = spans.filter((s) => s.lifecycle === 'completed' || (s.lifecycle == null && s.status !== 'run' && s.status !== 'incomplete'))
+  const byDur = [...completed].sort((a, b) => b.durMs - a.durMs).slice(0, 5)
   const byCost = [...spans].sort((a, b) => b.cost - a.cost).slice(0, 5)
   const maxDur = Math.max(1, ...byDur.map((s) => s.durMs))
   const maxCost = Math.max(1e-6, ...byCost.map((s) => s.cost))
@@ -141,17 +143,17 @@ function Insight({ spans, onSelect }: { spans: Span[]; onSelect: (id: string) =>
 function SpanRow({ s, maxEnd, sel, onClick }: { s: Span; maxEnd: number; sel: boolean; onClick: (id: string) => void }) {
   const left = (s.startMs / maxEnd) * 100
   const w = Math.max((s.durMs / maxEnd) * 100, 0.4)
-  const barcls = s.status === 'error' ? 'b-err' : 'b-' + s.kind
+  const barcls = s.status === 'error' ? 'b-err' : s.status === 'run' ? 'b-run' : s.status === 'incomplete' ? 'b-incomplete' : 'b-' + s.kind
   const tot = (s.inTok ?? 0) + (s.outTok ?? 0)
   return (
     <div className={'srow' + (sel ? ' sel' : '')} onClick={() => onClick(s.id)}>
       <div className="sname" style={{ paddingLeft: 14 + s.depth * 12 }}>
         <span className={'kind k-' + s.kind}>{KIND_LABEL[s.kind]}</span>
-        <span className="slabel">{spanDisplayName(s)}{s.status === 'error' && <span className="errchip"> ERR</span>}</span>
+        <span className="slabel">{spanDisplayName(s)}{s.status === 'error' && <span className="errchip"> ERR</span>}{s.status === 'run' && <span className="runchip"> RUN</span>}{s.status === 'incomplete' && <span className="incompletechip"> INCOMPLETE</span>}</span>
       </div>
       <div className="wf"><div className={'bar ' + barcls} style={{ left: left + '%', width: w + '%' }} /></div>
       <div className="scost">{tot ? (tot / 1000 >= 1 ? (tot / 1000).toFixed(1) + 'k' : tot) : '·'}</div>
-      <div className="sdur">{fmtDur(s.durMs)}</div>
+      <div className="sdur">{spanDur(s)}</div>
     </div>
   )
 }

@@ -97,7 +97,7 @@ fn sort_trace_search_spans(spans: &mut [FoldedSpan], sort_by: &str) {
 
 fn trace_search_item_json(s: &FoldedSpan) -> String {
     format!(
-        r#"{{"traceId":"{}","spanId":"{}","externalTraceId":{},"externalSpanId":{},"externalSessionId":{},"sessionId":{},"spanName":{},"displayName":{},"status":{},"durationNs":{},"inputTokens":{},"outputTokens":{},"agentName":{},"toolName":{},"model":{},"inputText":{},"outputText":{},"logs":[{}],"attrs":{}}}"#,
+        r#"{{"traceId":"{}","spanId":"{}","externalTraceId":{},"externalSpanId":{},"externalSessionId":{},"sessionId":{},"spanName":{},"displayName":{},"status":{},"lifecycle":"{}","durationNs":{},"inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"agentName":{},"toolName":{},"model":{},"inputText":{},"outputText":{},"logs":[{}],"attrs":{}}}"#,
         s.trace_id,
         s.span_id,
         json_opt_str(s.external_trace_id.as_deref()),
@@ -107,9 +107,14 @@ fn trace_search_item_json(s: &FoldedSpan) -> String {
         json_opt_str(s.span_name.as_deref()),
         json_opt_str(s.display_name.as_deref()),
         s.status.map_or("null".to_string(), |v| v.to_string()),
+        s.lifecycle(),
         s.duration_ns.map_or("null".to_string(), |v| v.to_string()),
         s.input_tokens.map_or("null".to_string(), |v| v.to_string()),
         s.output_tokens
+            .map_or("null".to_string(), |v| v.to_string()),
+        s.cache_read_tokens
+            .map_or("null".to_string(), |v| v.to_string()),
+        s.cache_write_tokens
             .map_or("null".to_string(), |v| v.to_string()),
         json_opt_str(s.agent_name.as_deref()),
         json_opt_str(s.tool_name.as_deref()),
@@ -225,6 +230,7 @@ struct TraceAggregateBucket {
     duration_max_ns: u64,
     input_tokens: u64,
     output_tokens: u64,
+    cache: crate::CacheTokenCoverage,
 }
 
 impl TraceAggregateBucket {
@@ -238,6 +244,7 @@ impl TraceAggregateBucket {
             duration_max_ns: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache: crate::CacheTokenCoverage::default(),
         }
     }
 
@@ -253,6 +260,7 @@ impl TraceAggregateBucket {
         }
         self.input_tokens += span.input_tokens.unwrap_or(0);
         self.output_tokens += span.output_tokens.unwrap_or(0);
+        self.cache.observe(span);
     }
 
     fn to_json(self, group_by: &[String]) -> String {
@@ -263,7 +271,7 @@ impl TraceAggregateBucket {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"key":{{{}}},"spanCount":{},"traceCount":{},"errorCount":{},"durationSumNs":"{}","durationMaxNs":{},"inputTokens":{},"outputTokens":{}}}"#,
+            r#"{{"key":{{{}}},"spanCount":{},"traceCount":{},"errorCount":{},"durationSumNs":"{}","durationMaxNs":{},"inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{}}}"#,
             key,
             self.span_count,
             self.trace_ids.len(),
@@ -272,6 +280,11 @@ impl TraceAggregateBucket {
             self.duration_max_ns,
             self.input_tokens,
             self.output_tokens,
+            self.cache.read_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.write_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.read_reported_spans,
+            self.cache.write_reported_spans,
+            self.cache.total_llm_spans,
         )
     }
 }

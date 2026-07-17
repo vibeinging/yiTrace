@@ -1,7 +1,8 @@
 // 控制台数据模型。字段对齐引擎已有的输出（SessionSummary / TraceSummary / FoldedSpan）。
 
 export type SpanKind = 'llm' | 'tool' | 'chain' | 'retriever' | 'agent' | 'other'
-export type Status = 'ok' | 'error' | 'run'
+export type Status = 'ok' | 'error' | 'run' | 'incomplete'
+export type SpanLifecycle = 'completed' | 'running' | 'orphan_end' | 'incomplete'
 
 /** 会话摘要 = 引擎 list_sessions 的一行（多轮串起的一组 trace）。 */
 export interface SessionSummary {
@@ -9,6 +10,13 @@ export interface SessionSummary {
   title: string // 会话标题（取首轮 trace 名）
   turnCount: number // 几轮 = 几条 trace
   totalCost: number
+  inputTokens?: number
+  outputTokens?: number
+  totalCacheReadTokens?: number | null
+  totalCacheWriteTokens?: number | null
+  cacheReadReportedSpans?: number
+  cacheWriteReportedSpans?: number
+  totalLlmSpans?: number
   status: Status
   startedAt: number // 排序/游标用
   firstTraceId: string // 单轮会话直接选它；多轮展开再拉全部轮次
@@ -24,6 +32,11 @@ export interface TraceSummary {
   cost: number
   inTok?: number // 该轮输入 token（时间线节点用，后端已吐）
   outTok?: number // 该轮输出 token
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
+  cacheReadReportedSpans?: number
+  cacheWriteReportedSpans?: number
+  totalLlmSpans?: number
   spanCount: number
   status: Status
 }
@@ -42,9 +55,12 @@ export interface Span {
   startMs: number
   durMs: number
   status: Status
+  lifecycle?: SpanLifecycle
   cost: number
   inTok?: number
   outTok?: number
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
   model?: string
   depth: number
 }
@@ -58,6 +74,11 @@ export interface SpanDetail {
   actorId?: string
   agentName?: string
   toolName?: string
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
+  model?: string
   input?: string
   output?: string
   error?: string
@@ -84,9 +105,12 @@ export interface Step {
   agentName?: string
   toolName?: string
   status: Status
+  lifecycle?: SpanLifecycle
   durMs: number
   inTok: number
   outTok: number
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
   model?: string
   input?: string
   output?: string

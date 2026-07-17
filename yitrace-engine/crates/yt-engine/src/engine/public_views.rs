@@ -20,6 +20,70 @@ pub struct ReadPlanStats {
     pub rollup_pages_total: Option<usize>,
 }
 
+/// 缓存 token 聚合必须同时保留覆盖率：没有上报和真实的 0 不是一回事。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CacheTokenCoverage {
+    pub read_tokens: u64,
+    pub write_tokens: u64,
+    pub read_reported_spans: usize,
+    pub write_reported_spans: usize,
+    pub total_llm_spans: usize,
+}
+
+impl CacheTokenCoverage {
+    pub fn observe(&mut self, span: &FoldedSpan) {
+        self.observe_values(
+            span.model.is_some(),
+            span.input_tokens,
+            span.output_tokens,
+            span.cache_read_tokens,
+            span.cache_write_tokens,
+        );
+    }
+
+    pub fn observe_values(
+        &mut self,
+        has_model: bool,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) {
+        if has_model
+            || input_tokens.is_some()
+            || output_tokens.is_some()
+            || cache_read_tokens.is_some()
+            || cache_write_tokens.is_some()
+        {
+            self.total_llm_spans += 1;
+        }
+        if let Some(tokens) = cache_read_tokens {
+            self.read_tokens += tokens;
+            self.read_reported_spans += 1;
+        }
+        if let Some(tokens) = cache_write_tokens {
+            self.write_tokens += tokens;
+            self.write_reported_spans += 1;
+        }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.read_tokens += other.read_tokens;
+        self.write_tokens += other.write_tokens;
+        self.read_reported_spans += other.read_reported_spans;
+        self.write_reported_spans += other.write_reported_spans;
+        self.total_llm_spans += other.total_llm_spans;
+    }
+
+    pub fn read_total(&self) -> Option<u64> {
+        (self.read_reported_spans > 0).then_some(self.read_tokens)
+    }
+
+    pub fn write_total(&self) -> Option<u64> {
+        (self.write_reported_spans > 0).then_some(self.write_tokens)
+    }
+}
+
 /// 一条 trace 的摘要（web 控制台列表视图用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceSummary {
@@ -33,6 +97,11 @@ pub struct TraceSummary {
     /// 全 trace 输入/输出 token 汇总（成本指标）。
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cache_read_tokens: Option<u64>,
+    pub total_cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
 }
 
 /// retention apply 的物理删除结果。
@@ -117,6 +186,8 @@ pub struct AgentGraphNode {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// agent 执行图的一条边 = 父 span 的角色"调用/移交给"子 span 的角色（聚合次数）。
@@ -154,6 +225,11 @@ pub struct SessionTurn {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
     /// 该轮 status≠0 的 span 数（这一轮有没有出错）。
     pub error_count: usize,
     /// 该轮答复 span 的评测分（若已 eval 写回）。
@@ -168,6 +244,11 @@ pub struct SessionTimeline {
     pub turns: Vec<SessionTurn>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cache_read_tokens: Option<u64>,
+    pub total_cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
 }
 
 /// 控制台会话行（一次扫描聚合）。比 `SessionSummary` 多了标题/状态/首 trace，给前端列表直接用。
@@ -179,7 +260,14 @@ pub struct ConsoleSession {
     pub turn_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
     pub has_error: bool,
+    /// 会话中是否存在只见过 SPAN_START、还没见到 SPAN_END 的 span。
+    pub has_running: bool,
     pub first_trace_id: u64,
 }
 
@@ -206,12 +294,41 @@ pub struct ConsoleSpan {
     pub start_ns: u64,
     pub duration_ns: u64,
     pub has_error: bool,
+    pub has_start: bool,
+    pub has_end: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub model: Option<String>,
     pub input_text: Option<String>,
     pub output_text: Option<String>,
     pub attrs: BTreeMap<String, String>,
+}
+
+impl ConsoleSpan {
+    /// 生命周期只看真正到达的事件类型，不用 duration/status 等可选字段猜。
+    pub fn lifecycle(&self) -> &'static str {
+        match (self.has_start, self.has_end) {
+            (true, true) => "completed",
+            (true, false) => "running",
+            (false, true) => "orphan_end",
+            (false, false) => "incomplete",
+        }
+    }
+
+    /// 保留前端原有 ok/error/run 口径；断头 end 和只有日志的数据明确标成 incomplete。
+    pub fn status_label(&self) -> &'static str {
+        if self.has_error {
+            "error"
+        } else {
+            match self.lifecycle() {
+                "completed" => "ok",
+                "running" => "run",
+                _ => "incomplete",
+            }
+        }
+    }
 }
 
 /// span 内的原始日志事件视图。它不是折叠后的 `logs` 字符串并集，而是保留事件顺序与 attrs 的明细，
@@ -234,6 +351,11 @@ pub struct SessionSummary {
     pub span_count: usize,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_cache_read_tokens: Option<u64>,
+    pub total_cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
 }
 
 /// 按 agent 的成本归因（per-agent 成本下钻）。
@@ -243,4 +365,9 @@ pub struct AgentCost {
     pub span_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub cache_read_reported_spans: usize,
+    pub cache_write_reported_spans: usize,
+    pub total_llm_spans: usize,
 }

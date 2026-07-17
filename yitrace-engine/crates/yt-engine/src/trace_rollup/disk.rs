@@ -14,7 +14,7 @@ use crate::{SearchFilter, TraceQuery};
 use super::{CacheCursor, TraceAggregateRollupRow};
 
 const MAGIC: u32 = 0x5954_524f; // "YTRO"
-const VERSION: u32 = 3;
+const VERSION: u32 = 5;
 const MIN_READ_VERSION: u32 = 2;
 const HEADER_LEN: u64 = 64;
 const PAGE_ROWS: usize = 4096;
@@ -563,5 +563,37 @@ mod tests {
 
         let _ = std::fs::remove_file(v3_path);
         let _ = std::fs::remove_file(v2_path);
+    }
+
+    #[test]
+    fn v5_persists_span_lifecycle_and_v4_uses_safe_fallback() {
+        let base = std::env::temp_dir().join(format!(
+            "yt_rollup_lifecycle_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let v5_path = base.with_extension("v5");
+        let v4_path = base.with_extension("v4");
+        let mut running = row(12, 7, "lifecycle");
+        running.has_start = true;
+        running.has_end = false;
+
+        write_atomic(&v5_path, 4, 9, &mut [running.clone()]).unwrap();
+        let mut v5 = DiskTraceRollup::open(&v5_path, 4, 9).unwrap();
+        let v5_rows = v5.all_rows().unwrap();
+        assert!(v5_rows[0].has_start);
+        assert!(!v5_rows[0].has_end);
+
+        write_atomic_version(&v4_path, 4, 9, &mut [running], 4).unwrap();
+        let mut v4 = DiskTraceRollup::open(&v4_path, 4, 9).unwrap();
+        let v4_rows = v4.all_rows().unwrap();
+        assert!(v4_rows[0].has_start);
+        assert!(!v4_rows[0].has_end, "旧记录没耗时时不能猜成已完成");
+
+        let _ = std::fs::remove_file(v5_path);
+        let _ = std::fs::remove_file(v4_path);
     }
 }

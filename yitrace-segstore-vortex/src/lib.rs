@@ -97,6 +97,8 @@ fn projected_field_names(proj: Projection) -> Option<Vec<&'static str>> {
         (Projection::PARENT_SPAN_ID, "parent_span_id"),
         (Projection::INPUT_TOKENS, "input_tokens"),
         (Projection::OUTPUT_TOKENS, "output_tokens"),
+        (Projection::CACHE_READ_TOKENS, "cache_read_tokens"),
+        (Projection::CACHE_WRITE_TOKENS, "cache_write_tokens"),
         (Projection::SESSION_ID, "session_id"),
         (Projection::TENANT_ID, "tenant_id"),
         (Projection::SPAN_NAME, "span_name"),
@@ -161,6 +163,8 @@ impl VortexSegmentStore {
         let parent_span_id = u64col!(|r: &WalRecord| r.fields.parent_span_id);
         let input_tokens = u64col!(|r: &WalRecord| r.fields.input_tokens);
         let output_tokens = u64col!(|r: &WalRecord| r.fields.output_tokens);
+        let cache_read_tokens = u64col!(|r: &WalRecord| r.fields.cache_read_tokens);
+        let cache_write_tokens = u64col!(|r: &WalRecord| r.fields.cache_write_tokens);
         let session_id = u64col!(|r: &WalRecord| r.fields.session_id);
         let tenant_id = u64col!(|r: &WalRecord| r.fields.tenant_id);
         let eval_score = PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.eval_score)).into_array();
@@ -190,6 +194,8 @@ impl VortexSegmentStore {
             ("parent_span_id", parent_span_id),
             ("input_tokens", input_tokens),
             ("output_tokens", output_tokens),
+            ("cache_read_tokens", cache_read_tokens),
+            ("cache_write_tokens", cache_write_tokens),
             ("session_id", session_id),
             ("tenant_id", tenant_id),
             ("eval_score", eval_score),
@@ -226,6 +232,8 @@ impl VortexSegmentStore {
         let parent_span_id = optu64("parent_span_id");
         let input_tokens = optu64("input_tokens");
         let output_tokens = optu64("output_tokens");
+        let cache_read_tokens = optu64("cache_read_tokens");
+        let cache_write_tokens = optu64("cache_write_tokens");
         let session_id = optu64("session_id");
         let tenant_id = optu64("tenant_id");
         let status = st.column_by_name("status").map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
@@ -263,6 +271,8 @@ impl VortexSegmentStore {
                     parent_span_id: gu64(&parent_span_id, i),
                     input_tokens: gu64(&input_tokens, i),
                     output_tokens: gu64(&output_tokens, i),
+                    cache_read_tokens: gu64(&cache_read_tokens, i),
+                    cache_write_tokens: gu64(&cache_write_tokens, i),
                     session_id: gu64(&session_id, i),
                     tenant_id: gu64(&tenant_id, i),
                     eval_score: gu32(&eval_score, i),

@@ -28,6 +28,8 @@ fn rust_embedded_db_ingests_searches_and_reads_details() {
                 .duration_ns(12_000_000)
                 .input_tokens(80)
                 .output_tokens(20)
+                .cache_read_tokens(0)
+                .cache_write_tokens(7)
                 .output_text("需要人工复核"),
         );
 
@@ -53,6 +55,8 @@ fn rust_embedded_db_ingests_searches_and_reads_details() {
 
     let span = db.span("run-rs-uuid", "span-rs-uuid").unwrap();
     assert!(span.contains("\"logEvents\""), "{span}");
+    assert!(span.contains("\"cacheReadTokens\":0"), "{span}");
+    assert!(span.contains("\"cacheWriteTokens\":7"), "{span}");
     assert!(span.contains("疑似盗刷"), "{span}");
 }
 

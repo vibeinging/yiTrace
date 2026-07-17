@@ -77,6 +77,8 @@ fn main() {
                 duration_ns: Some(100),
                 input_tokens: Some(10),
                 output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 session_id: None,
                 tenant_id: None,
                 external_trace_id: None,

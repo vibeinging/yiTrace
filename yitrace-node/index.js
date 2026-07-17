@@ -346,6 +346,8 @@ export class SpanEventBuilder {
     setIfDefined(event, "output_text", optionValue(options, "output_text", "outputText"));
     setIfDefined(event, "input_tokens", optionValue(options, "input_tokens", "inputTokens"));
     setIfDefined(event, "output_tokens", optionValue(options, "output_tokens", "outputTokens"));
+    setIfDefined(event, "cache_read_tokens", optionValue(options, "cache_read_tokens", "cacheReadTokens"));
+    setIfDefined(event, "cache_write_tokens", optionValue(options, "cache_write_tokens", "cacheWriteTokens"));
   }
 
   #nextSeq(key) {

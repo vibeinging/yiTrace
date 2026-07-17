@@ -63,7 +63,7 @@ button{font:inherit}
 .thsingle{color:var(--dim);font-family:var(--mono)}
 
 .dot{width:7px;height:7px;border-radius:50%;flex:none}
-.dot.ok{background:var(--ok)}.dot.error{background:var(--err)}.dot.run{background:var(--run)}
+.dot.ok{background:var(--ok)}.dot.error{background:var(--err)}.dot.run{background:var(--run)}.dot.incomplete{background:var(--muted)}
 .rowloading{padding:9px 14px;color:var(--dim);font-size:11px;font-family:var(--mono)}
 .endcap{padding:14px;text-align:center;color:var(--dim);font-size:11px}
 
@@ -142,9 +142,14 @@ button{font:inherit}
 .bar.b-retriever{background:var(--retr)}.bar.b-agent{background:var(--agent)}
 .bar.b-other{background:#7180a0}
 .bar.b-err{background:var(--err)!important}
+.bar.b-run{background:var(--run)!important;animation:pulse 1.4s ease-in-out infinite}
+.bar.b-incomplete{background:var(--muted)!important}
 .scost{width:60px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .sdur{width:60px;flex:none;text-align:right;font-family:var(--mono);font-size:11px;color:var(--muted)}
 .errchip{font-size:9px;color:var(--err);border:1px solid rgba(240,88,75,.4);padding:0 4px;border-radius:4px}
+.runchip{font-size:9px;color:var(--run);border:1px solid color-mix(in srgb,var(--run) 45%,transparent);padding:0 4px;border-radius:4px}
+.incompletechip{font-size:9px;color:var(--muted);border:1px solid var(--border);padding:0 4px;border-radius:4px}
+@keyframes pulse{50%{opacity:.45}}
 
 /* detail */
 .dwrap{flex:1;overflow:auto}

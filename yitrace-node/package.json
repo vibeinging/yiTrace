@@ -1,6 +1,6 @@
 {
   "name": "@yitrace/db",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Embedded yiTrace database for Node.js and Electron",
   "type": "module",
   "license": "MIT",
@@ -72,10 +72,10 @@
     "@napi-rs/cli": "^3.7.2"
   },
   "optionalDependencies": {
-    "@yitrace/db-darwin-arm64": "0.1.5",
-    "@yitrace/db-darwin-x64": "0.1.5",
-    "@yitrace/db-linux-arm64-gnu": "0.1.5",
-    "@yitrace/db-linux-x64-gnu": "0.1.5",
-    "@yitrace/db-win32-x64-msvc": "0.1.5"
+    "@yitrace/db-darwin-arm64": "0.1.6",
+    "@yitrace/db-darwin-x64": "0.1.6",
+    "@yitrace/db-linux-arm64-gnu": "0.1.6",
+    "@yitrace/db-linux-x64-gnu": "0.1.6",
+    "@yitrace/db-win32-x64-msvc": "0.1.6"
   }
 }

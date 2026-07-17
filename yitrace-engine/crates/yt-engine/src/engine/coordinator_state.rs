@@ -212,7 +212,12 @@ struct SpanAgg {
     external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    is_llm: bool,
     error: bool,
+    has_start: bool,
+    has_end: bool,
     agent: Option<String>,
     trace: u64,
 }
@@ -224,7 +229,13 @@ struct SessionAgg {
     external_session: Option<String>,
     in_tok: u64,
     out_tok: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cache_read_reported: usize,
+    cache_write_reported: usize,
+    total_llm: usize,
     error_spans: usize,
+    running_spans: usize,
     title: String,
     first_trace: u64,
     first_trace_set: bool,
@@ -261,8 +272,30 @@ impl SessionIndex {
             }
             e.in_tok = (e.in_tok as i64 + new.in_tok as i64 - old.in_tok as i64).max(0) as u64;
             e.out_tok = (e.out_tok as i64 + new.out_tok as i64 - old.out_tok as i64).max(0) as u64;
+            e.cache_read = (e.cache_read as i128
+                + new.cache_read.unwrap_or(0) as i128
+                - old.cache_read.unwrap_or(0) as i128)
+                .max(0) as u64;
+            e.cache_write = (e.cache_write as i128
+                + new.cache_write.unwrap_or(0) as i128
+                - old.cache_write.unwrap_or(0) as i128)
+                .max(0) as u64;
+            e.cache_read_reported = (e.cache_read_reported as i64
+                + new.cache_read.is_some() as i64
+                - old.cache_read.is_some() as i64)
+                .max(0) as usize;
+            e.cache_write_reported = (e.cache_write_reported as i64
+                + new.cache_write.is_some() as i64
+                - old.cache_write.is_some() as i64)
+                .max(0) as usize;
+            e.total_llm =
+                (e.total_llm as i64 + new.is_llm as i64 - old.is_llm as i64).max(0) as usize;
             e.error_spans =
                 (e.error_spans as i64 + new.error as i64 - old.error as i64).max(0) as usize;
+            e.running_spans = (e.running_spans as i64
+                + (new.has_start && !new.has_end) as i64
+                - (old.has_start && !old.has_end) as i64)
+                .max(0) as usize;
             if e.title.is_empty() {
                 if let Some(a) = &new.agent {
                     e.title = a.clone();
@@ -278,7 +311,13 @@ impl SessionIndex {
         let e = self.sess.entry(sid).or_default();
         e.in_tok += s.in_tok;
         e.out_tok += s.out_tok;
+        e.cache_read += s.cache_read.unwrap_or(0);
+        e.cache_write += s.cache_write.unwrap_or(0);
+        e.cache_read_reported += s.cache_read.is_some() as usize;
+        e.cache_write_reported += s.cache_write.is_some() as usize;
+        e.total_llm += s.is_llm as usize;
         e.error_spans += s.error as usize;
+        e.running_spans += (s.has_start && !s.has_end) as usize;
         e.traces.insert(s.trace);
         if e.external_session.is_none() {
             e.external_session = s.external_session.clone();
@@ -298,7 +337,19 @@ impl SessionIndex {
         if let Some(e) = self.sess.get_mut(&sid) {
             e.in_tok = e.in_tok.saturating_sub(s.in_tok);
             e.out_tok = e.out_tok.saturating_sub(s.out_tok);
+            e.cache_read = e.cache_read.saturating_sub(s.cache_read.unwrap_or(0));
+            e.cache_write = e.cache_write.saturating_sub(s.cache_write.unwrap_or(0));
+            e.cache_read_reported = e
+                .cache_read_reported
+                .saturating_sub(s.cache_read.is_some() as usize);
+            e.cache_write_reported = e
+                .cache_write_reported
+                .saturating_sub(s.cache_write.is_some() as usize);
+            e.total_llm = e.total_llm.saturating_sub(s.is_llm as usize);
             e.error_spans = e.error_spans.saturating_sub(s.error as usize);
+            e.running_spans = e
+                .running_spans
+                .saturating_sub((s.has_start && !s.has_end) as usize);
             // traces / first_trace 不在此精确回收（会话切换极罕见）；delete/upgrade 走标脏重建纠正。
         }
     }
@@ -313,7 +364,16 @@ impl SessionIndex {
                 external_session: s.external_session_id.clone(),
                 in_tok: s.input_tokens.unwrap_or(0),
                 out_tok: s.output_tokens.unwrap_or(0),
+                cache_read: s.cache_read_tokens,
+                cache_write: s.cache_write_tokens,
+                is_llm: s.model.is_some()
+                    || s.input_tokens.is_some()
+                    || s.output_tokens.is_some()
+                    || s.cache_read_tokens.is_some()
+                    || s.cache_write_tokens.is_some(),
                 error: s.status.unwrap_or(0) != 0,
+                has_start: s.has_start,
+                has_end: s.has_end,
                 agent: s.agent_name.clone(),
                 trace: s.trace_id,
             };
@@ -348,7 +408,13 @@ impl SessionIndex {
                 turn_count: a.traces.len(),
                 input_tokens: a.in_tok,
                 output_tokens: a.out_tok,
+                cache_read_tokens: (a.cache_read_reported > 0).then_some(a.cache_read),
+                cache_write_tokens: (a.cache_write_reported > 0).then_some(a.cache_write),
+                cache_read_reported_spans: a.cache_read_reported,
+                cache_write_reported_spans: a.cache_write_reported,
+                total_llm_spans: a.total_llm,
                 has_error: a.error_spans > 0,
+                has_running: a.running_spans > 0,
                 first_trace_id: a.first_trace,
             })
             .collect();

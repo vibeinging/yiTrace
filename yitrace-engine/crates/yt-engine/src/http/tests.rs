@@ -26,6 +26,79 @@ fn route_ingest_then_query() {
 }
 
 #[test]
+fn structured_cache_usage_round_trips_and_aggregates_without_double_counting() {
+    let s = server();
+    let events = r#"[
+      {"trace_id":702,"span_id":1,"session_id":9002,"ts":1,"seq":1,"event_type":1,"ext_span_id":"702-1","span_name":"llm:chat","model":"qwen"},
+      {"trace_id":702,"span_id":1,"session_id":9002,"ts":2,"seq":2,"event_type":2,"ext_span_id":"702-1","input_tokens":100,"output_tokens":20,"cacheReadTokens":0,"cacheWriteTokens":30,"attrs":{"llm.call_site":"superagent.reasoning"}}
+    ]"#;
+    let (status, body) = s.route("POST", "/v1/ingest", events);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, trace) = s.route("GET", "/v1/traces/702", "");
+    assert_eq!(status, 200, "{trace}");
+    assert!(trace.contains(r#""cacheReadTokens":0"#), "{trace}");
+    assert!(trace.contains(r#""cacheWriteTokens":30"#), "{trace}");
+    assert!(trace.contains(r#""totalCacheReadTokens":0"#), "{trace}");
+    assert!(trace.contains(r#""cacheReadReportedSpans":1"#), "{trace}");
+    assert!(trace.contains(r#""totalLlmSpans":1"#), "{trace}");
+
+    let (status, aggregate) = s.route("POST", "/v1/trace-aggregate", r#"{"groupBy":["model"]}"#);
+    assert_eq!(status, 200, "{aggregate}");
+    assert!(aggregate.contains(r#""cacheReadTokens":0"#), "{aggregate}");
+    assert!(
+        aggregate.contains(r#""cacheWriteTokens":30"#),
+        "{aggregate}"
+    );
+    assert!(aggregate.contains(r#""spanCount":1"#), "{aggregate}");
+
+    let (status, trajectory) = s.route("POST", "/v1/trace-trajectories", r#"{"limit":10}"#);
+    assert_eq!(status, 200, "{trajectory}");
+    assert!(
+        trajectory.contains(r#""cacheReadTokens":0"#),
+        "{trajectory}"
+    );
+    assert!(
+        trajectory.contains(r#""cacheWriteTokens":30"#),
+        "{trajectory}"
+    );
+}
+
+#[test]
+fn start_only_span_is_running_until_end_arrives() {
+    let s = server();
+    let start = r#"[{
+      "trace_id":701,"span_id":1,"session_id":9001,"ts":100,"seq":1,
+      "event_type":1,"ext_span_id":"701-1","span_name":"长时任务"
+    }]"#;
+    let (status, body) = s.route("POST", "/v1/ingest", start);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, trace) = s.route("GET", "/v1/traces/701", "");
+    assert_eq!(status, 200, "{trace}");
+    assert!(trace.contains(r#""status":"run""#), "{trace}");
+    assert!(trace.contains(r#""lifecycle":"running""#), "{trace}");
+    assert!(!trace.contains(r#""status":"ok""#), "{trace}");
+
+    let (status, sessions) = s.route("GET", "/v1/sessions?limit=10", "");
+    assert_eq!(status, 200, "{sessions}");
+    assert!(sessions.contains(r#""status":"run""#), "{sessions}");
+
+    // end 不带 duration/status 也必须依据事件类型变成 completed。
+    let end = r#"[{
+      "trace_id":701,"span_id":1,"session_id":9001,"ts":200,"seq":2,
+      "event_type":2,"ext_span_id":"701-1"
+    }]"#;
+    let (status, body) = s.route("POST", "/v1/ingest", end);
+    assert_eq!(status, 200, "{body}");
+
+    let (status, trace) = s.route("GET", "/v1/traces/701", "");
+    assert_eq!(status, 200, "{trace}");
+    assert!(trace.contains(r#""status":"ok""#), "{trace}");
+    assert!(trace.contains(r#""lifecycle":"completed""#), "{trace}");
+}
+
+#[test]
 fn names_are_exposed_without_changing_search_or_actor_identity() {
     let s = server();
     let batch = r#"[

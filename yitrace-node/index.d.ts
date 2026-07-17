@@ -97,6 +97,8 @@ export interface SpanEvent {
   duration_ns?: WireNumber | null;
   input_tokens?: WireNumber | null;
   output_tokens?: WireNumber | null;
+  cache_read_tokens?: WireNumber | null;
+  cache_write_tokens?: WireNumber | null;
   cost_usd?: number | null;
   status?: number | null;
   messages?: unknown[];
@@ -606,6 +608,10 @@ export interface SpanBuilderEventOptions extends SpanBuilderDefaults {
   input_tokens?: WireNumber | null;
   outputTokens?: WireNumber | null;
   output_tokens?: WireNumber | null;
+  cacheReadTokens?: WireNumber | null;
+  cache_read_tokens?: WireNumber | null;
+  cacheWriteTokens?: WireNumber | null;
+  cache_write_tokens?: WireNumber | null;
   attrs?: Record<string, unknown>;
 }
 

@@ -239,7 +239,14 @@ try {
     inputText: "builder 输入",
   });
   builder.log({ spanId: "builder-span", message: "builder 处理中" });
-  builder.endSpan({ spanId: "builder-span", status: 0, durationNs: 10, outputText: "builder 输出" });
+  builder.endSpan({
+    spanId: "builder-span",
+    status: 0,
+    durationNs: 10,
+    outputText: "builder 输出",
+    cacheReadTokens: 0,
+    cacheWriteTokens: 7,
+  });
   const builtEvents = builder.events();
   assert.deepEqual(
     builtEvents.map((event) => event.event_type),
@@ -257,6 +264,8 @@ try {
   assert.equal(builtEvents[0].agent_name, "builder-agent");
   assert.equal(builtEvents[0].logs, undefined, "name 不再混进 logs");
   assert.equal(builtEvents[1].span_name, undefined, "名字只在 start 上报");
+  assert.equal(builtEvents[2].cache_read_tokens, 0);
+  assert.equal(builtEvents[2].cache_write_tokens, 7);
   await builder.ingest(db);
 
   const attrHits = await db.search({

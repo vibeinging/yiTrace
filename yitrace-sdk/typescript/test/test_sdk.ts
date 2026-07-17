@@ -88,6 +88,38 @@ test("setTokens 上报并进线格式", () => {
   check(toWire(end).input_tokens === "1200", "token 进线格式(字符串避免精度丢失)");
 });
 
+test("结构化 usage 和 attrs 只在 SpanEnd 上报", () => {
+  const exp = new CollectingExporter();
+  const tr = new Tracer(exp, 1);
+  tr.trace("x", (t) => {
+    t.span("llm", (s) => {
+      s.setModel("qwen3.6-plus");
+      s.setTokens({ inputTokens: 12400, outputTokens: 240, cacheReadTokens: 0, cacheWriteTokens: 300 });
+      s.setAttribute("llm.call_site", "superagent.reasoning");
+      s.setAttributes({ "llm.model_category": "chat", retry: 1, stream: true, skip: null });
+    });
+  });
+  check(exp.events.map((e) => e.eventType).join(",") === `${EventType.SpanStart},${EventType.SpanEnd}`, "只有 start/end");
+  const [start, end] = exp.events;
+  check(start.cacheReadTokens === null && Object.keys(start.attrs ?? {}).length === 0, "start 不重复 usage/attrs");
+  check(end.cacheReadTokens === 0n && end.cacheWriteTokens === 300n, "缓存 token 保留 0");
+  const wire = toWire(end);
+  check(wire.cache_read_tokens === "0" && wire.cache_write_tokens === "300", "缓存 token 进 wire");
+  check(wire.attrs?.["llm.call_site"] === "superagent.reasoning" && wire.attrs?.stream === true, "标量 attrs 进 wire");
+  check(!("skip" in (wire.attrs ?? {})), "null 属性不写入");
+});
+
+test("缓存 token 缺失和 0 可区分", () => {
+  const exp = new CollectingExporter();
+  const tr = new Tracer(exp, 1);
+  tr.trace("x", (t) => {
+    t.span("missing", (s) => s.setTokens({ inputTokens: 1, outputTokens: 2 }));
+    t.span("zero", (s) => s.setTokens({ inputTokens: 1, outputTokens: 2, cacheReadTokens: 0 }));
+  });
+  const ends = exp.events.filter((e) => e.eventType === EventType.SpanEnd).map(toWire);
+  check(ends[0].cache_read_tokens === null && ends[1].cache_read_tokens === "0", "missing 与 0 不同");
+});
+
 test("会话/agent/eval 文本字段透传并进线格式", () => {
   const exp = new CollectingExporter();
   const tr = new Tracer(exp, 1);
@@ -137,6 +169,7 @@ async function asyncTests(): Promise<void> {
   const ev: SpanEvent = {
     traceId: 1n, spanId: 1n, ts: 1n, seq: 1n, eventType: EventType.SpanEnd, extSpanId: "s1",
     parentSpanId: null, status: 0, durationNs: null, inputTokens: null, outputTokens: null,
+    cacheReadTokens: null, cacheWriteTokens: null, attrs: {},
     sessionId: null, tenantId: null, spanName: null, displayName: null,
     agentName: null, toolName: null, model: null, inputText: null, outputText: null, logs: [],
   };

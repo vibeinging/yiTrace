@@ -515,12 +515,14 @@ pub fn crc32(data: &[u8]) -> u32 {
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
 fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
     put_u64(b, SPAN_FIELDS_MAGIC);
-    put_u64(b, 3);
+    put_u64(b, 4);
     put_opt_u8(b, f.status);
     put_opt_u64(b, f.duration_ns);
     put_opt_u64(b, f.parent_span_id);
     put_opt_u64(b, f.input_tokens);
     put_opt_u64(b, f.output_tokens);
+    put_opt_u64(b, f.cache_read_tokens);
+    put_opt_u64(b, f.cache_write_tokens);
     put_opt_u64(b, f.session_id);
     put_opt_u64(b, f.tenant_id);
     put_opt_str(b, &f.external_trace_id);
@@ -545,6 +547,67 @@ fn encode_span_fields_into(b: &mut Vec<u8>, f: &SpanFields) {
         put_str(b, k);
         put_str(b, v);
     }
+}
+
+fn decode_span_fields_v4_from(c: &mut Cur) -> Option<SpanFields> {
+    let status = c.opt_u8()?;
+    let duration_ns = c.opt_u64()?;
+    let parent_span_id = c.opt_u64()?;
+    let input_tokens = c.opt_u64()?;
+    let output_tokens = c.opt_u64()?;
+    let cache_read_tokens = c.opt_u64()?;
+    let cache_write_tokens = c.opt_u64()?;
+    let session_id = c.opt_u64()?;
+    let tenant_id = c.opt_u64()?;
+    let external_trace_id = c.opt_str()?;
+    let external_span_id = c.opt_str()?;
+    let external_parent_span_id = c.opt_str()?;
+    let external_session_id = c.opt_str()?;
+    let span_name = c.opt_str()?;
+    let display_name = c.opt_str()?;
+    let agent_name = c.opt_str()?;
+    let tool_name = c.opt_str()?;
+    let model = c.opt_str()?;
+    let input_text = c.opt_str()?;
+    let output_text = c.opt_str()?;
+    let eval_score = c.opt_u64()?.map(|v| v as u32);
+    let eval_label = c.opt_str()?;
+    let log_n = c.u64()? as usize;
+    let mut logs = Vec::with_capacity(log_n);
+    for _ in 0..log_n {
+        logs.push(c.string()?);
+    }
+    let attr_n = c.u64()? as usize;
+    let mut attrs = std::collections::BTreeMap::new();
+    for _ in 0..attr_n {
+        attrs.insert(c.string()?, c.string()?);
+    }
+    Some(SpanFields {
+        status,
+        duration_ns,
+        parent_span_id,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        session_id,
+        tenant_id,
+        external_trace_id,
+        external_span_id,
+        external_parent_span_id,
+        external_session_id,
+        span_name,
+        display_name,
+        agent_name,
+        tool_name,
+        model,
+        input_text,
+        output_text,
+        eval_score,
+        eval_label,
+        logs,
+        attrs,
+    })
 }
 
 fn decode_span_fields_v3_from(c: &mut Cur) -> Option<SpanFields> {
@@ -601,6 +664,7 @@ fn decode_span_fields_v3_from(c: &mut Cur) -> Option<SpanFields> {
         eval_label,
         logs,
         attrs,
+        ..Default::default()
     })
 }
 
@@ -713,6 +777,7 @@ pub fn decode_span_fields(bytes: &[u8]) -> Option<SpanFields> {
         match c.u64()? {
             2 => decode_span_fields_v2_from(&mut c),
             3 => decode_span_fields_v3_from(&mut c),
+            4 => decode_span_fields_v4_from(&mut c),
             _ => None,
         }
     } else {
@@ -1068,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn span_fields_v3_roundtrips_names_external_ids_and_attrs() {
+    fn span_fields_v4_roundtrips_names_attrs_and_cache_tokens() {
         let mut attrs = std::collections::BTreeMap::new();
         attrs.insert("project_id".to_string(), "\"agentic-data\"".to_string());
         attrs.insert("retry".to_string(), "true".to_string());
@@ -1079,6 +1144,8 @@ mod tests {
             span_name: Some("risk.review".into()),
             display_name: Some("风险审核".into()),
             attrs,
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(300),
             logs: vec!["ok".into()],
             ..Default::default()
         };
@@ -1094,6 +1161,8 @@ mod tests {
         );
         assert_eq!(decoded.attrs.get("retry").map(String::as_str), Some("true"));
         assert_eq!(decoded.logs, vec!["ok"]);
+        assert_eq!(decoded.cache_read_tokens, Some(0));
+        assert_eq!(decoded.cache_write_tokens, Some(300));
     }
 
     #[test]

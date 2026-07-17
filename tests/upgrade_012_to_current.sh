@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 用真实 v0.1.2 引擎生成数据，再由当前引擎打开并检查数据、去重和派生索引。
+# 用上一正式版引擎生成数据，再由当前引擎打开并检查数据、去重和派生索引。
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BASE_TAG="${YT_UPGRADE_BASE_TAG:-v0.1.2}"
+BASE_TAG="${YT_UPGRADE_BASE_TAG:-v0.1.5}"
 SPANS="${YT_UPGRADE_SPANS:-2000}"
 WORK_DIR="$(mktemp -d)"
 OLD_ROOT="$WORK_DIR/old"
@@ -49,16 +49,16 @@ import sys
 
 root = Path(sys.argv[1])
 expected = {
-    "bm25.dat": 1,
-    "filter_attrs.dat": 2,
-    "trace_rollup.dat": 1,
+    "bm25.dat": 4,
+    "filter_attrs.dat": 3,
+    "trace_rollup.dat": 3,
     "segment_bloom.dat": 1,
 }
 for name, version in expected.items():
     data = (root / name).read_bytes()
     actual = struct.unpack_from("<I", data, 4)[0]
     assert actual == version, f"{name}: expected v{version}, got v{actual}"
-print("v0.1.2 sidecar versions verified")
+print("upgrade baseline sidecar versions verified")
 PY
 
 start_server() {
@@ -151,10 +151,10 @@ after = load("current-traces-after-retry.json")
 assert len(old_traces) == len(before) == len(after), (
     len(old_traces), len(before), len(after)
 )
-assert load("old-search.json"), "v0.1.2 search baseline is empty"
-assert load("current-search.json"), "current search lost v0.1.2 results"
-assert load("current-filter-search.json"), "attrs search lost v0.1.2 results"
-assert load("current-rollup.json")["items"], "rollup lost v0.1.2 results"
+assert load("old-search.json"), "baseline search is empty"
+assert load("current-search.json"), "current search lost baseline results"
+assert load("current-filter-search.json"), "attrs search lost baseline results"
+assert load("current-rollup.json")["items"], "rollup lost baseline results"
 
 trace = load("current-custom-trace-after-retry.json")
 spans = trace.get("spans", [])
@@ -165,6 +165,7 @@ assert load("current-custom-search-before-retry.json") == load("current-custom-s
 expected = {
     "bm25.dat": 4,
     "filter_attrs.dat": 3,
+    # v3 仍受当前引擎支持；只读升级不应为了格式升级强制重写整份 rollup。
     "trace_rollup.dat": 3,
     "segment_bloom.dat": 1,
 }
@@ -181,8 +182,8 @@ assert len(index_files) == len(segment_files), (len(segment_files), len(index_fi
 print(f"upgrade preserved {len(after)} traces and rebuilt {len(index_files)} segment indexes")
 PY
 
-if ! rg -q 'event="segment_scan_indexes_ready".*cache_loaded=false' "$WORK_DIR/current-first.log"; then
-  echo "第一次打开没有记录旧全文索引重建" >&2
+if ! rg -q 'event="segment_scan_indexes_ready".*cache_loaded=true' "$WORK_DIR/current-first.log"; then
+  echo "第一次打开没有直接加载兼容的 v0.1.5 索引缓存" >&2
   cat "$WORK_DIR/current-first.log" >&2
   exit 1
 fi

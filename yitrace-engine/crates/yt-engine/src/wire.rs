@@ -180,6 +180,11 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
                 .ok_or_else(|| format!("第{i}条缺/坏字段 {k}"))
         };
         let opt_u64 = |k: &str| field(obj, k).and_then(Json::as_u64);
+        let opt_u64_alias = |snake: &str, camel: &str| {
+            field(obj, snake)
+                .or_else(|| field(obj, camel))
+                .and_then(Json::as_u64)
+        };
         let opt_str = |k: &str| field(obj, k).and_then(Json::as_str).map(|s| s.to_string());
         let (trace_id, trace_ext_from_id) = parse_req_id(obj, "trace_id", i)?;
         let (span_id, span_ext_from_id) = parse_req_id(obj, "span_id", i)?;
@@ -200,6 +205,8 @@ pub fn parse_wire_batch(s: &str) -> Result<Vec<WireRecord>, String> {
             duration_ns: opt_u64("duration_ns"),
             input_tokens: opt_u64("input_tokens"),
             output_tokens: opt_u64("output_tokens"),
+            cache_read_tokens: opt_u64_alias("cache_read_tokens", "cacheReadTokens"),
+            cache_write_tokens: opt_u64_alias("cache_write_tokens", "cacheWriteTokens"),
             session_id,
             tenant_id: opt_u64("tenant_id"),
             external_trace_id: opt_str("external_trace_id").or(trace_ext_from_id),

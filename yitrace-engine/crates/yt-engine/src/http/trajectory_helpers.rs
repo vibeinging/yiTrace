@@ -175,6 +175,7 @@ struct TraceMetrics {
     duration_ns: u128,
     input_tokens: u64,
     output_tokens: u64,
+    cache: crate::CacheTokenCoverage,
     has_error: bool,
 }
 
@@ -186,6 +187,7 @@ fn trace_metrics(spans: &[FoldedSpan]) -> TraceMetrics {
         metrics.duration_ns += span.duration_ns.unwrap_or(0) as u128;
         metrics.input_tokens += span.input_tokens.unwrap_or(0);
         metrics.output_tokens += span.output_tokens.unwrap_or(0);
+        metrics.cache.observe(span);
         if span.status.unwrap_or(0) != 0 {
             metrics.has_error = true;
         }
@@ -249,7 +251,7 @@ fn trajectory_steps_json(spans: &[FoldedSpan]) -> String {
         .enumerate()
         .map(|(index, span)| {
             format!(
-                r#"{{"index":{},"spanId":"{}","externalSpanId":{},"parentSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"agentName":{},"toolName":{},"model":{},"status":{},"durationNs":{},"key":"{}"}}"#,
+                r#"{{"index":{},"spanId":"{}","externalSpanId":{},"parentSpanId":{},"kind":"{}","name":"{}","spanName":{},"displayName":{},"agentName":{},"toolName":{},"model":{},"status":{},"durationNs":{},"inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"key":"{}"}}"#,
                 index,
                 span.span_id,
                 json_opt_str(span.external_span_id.as_deref()),
@@ -263,6 +265,10 @@ fn trajectory_steps_json(spans: &[FoldedSpan]) -> String {
                 json_opt_str(span.model.as_deref()),
                 span.status.map_or("null".to_string(), |v| v.to_string()),
                 span.duration_ns.map_or("null".to_string(), |v| v.to_string()),
+                span.input_tokens.map_or("null".to_string(), |v| v.to_string()),
+                span.output_tokens.map_or("null".to_string(), |v| v.to_string()),
+                span.cache_read_tokens.map_or("null".to_string(), |v| v.to_string()),
+                span.cache_write_tokens.map_or("null".to_string(), |v| v.to_string()),
                 json_escape(&trajectory_step_key(span)),
             )
         })
@@ -277,7 +283,7 @@ fn trace_trajectory_summary_json(spans: &[FoldedSpan]) -> String {
     let metrics = trace_metrics(spans);
     let first = &spans[0];
     format!(
-        r#"{{"traceId":"{}","externalTraceId":{},"sessionId":{},"externalSessionId":{},"status":"{}","spanCount":{},"eventCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"projectId":{},"taskFingerprint":{},"loopId":{},"skill":{},"mode":{},"validationStatus":{},"signature":"{}"}}"#,
+        r#"{{"traceId":"{}","externalTraceId":{},"sessionId":{},"externalSessionId":{},"status":"{}","spanCount":{},"eventCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"projectId":{},"taskFingerprint":{},"loopId":{},"skill":{},"mode":{},"validationStatus":{},"signature":"{}"}}"#,
         first.trace_id,
         json_opt_str(spans.iter().find_map(|s| s.external_trace_id.as_deref())),
         spans
@@ -291,6 +297,11 @@ fn trace_trajectory_summary_json(spans: &[FoldedSpan]) -> String {
         metrics.duration_ns,
         metrics.input_tokens,
         metrics.output_tokens,
+        metrics.cache.read_total().map_or("null".to_string(), |v| v.to_string()),
+        metrics.cache.write_total().map_or("null".to_string(), |v| v.to_string()),
+        metrics.cache.read_reported_spans,
+        metrics.cache.write_reported_spans,
+        metrics.cache.total_llm_spans,
         attr_json_or_null(spans, "project_id"),
         attr_json_or_null(spans, "task_fingerprint"),
         attr_json_or_null(spans, "loop_id"),
@@ -319,6 +330,7 @@ struct TrajectoryGroupBucket {
     duration_ns: u128,
     input_tokens: u64,
     output_tokens: u64,
+    cache: crate::CacheTokenCoverage,
     examples: Vec<String>,
 }
 
@@ -334,6 +346,7 @@ impl TrajectoryGroupBucket {
             duration_ns: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache: crate::CacheTokenCoverage::default(),
             examples: Vec::new(),
         }
     }
@@ -351,6 +364,7 @@ impl TrajectoryGroupBucket {
         self.duration_ns += metrics.duration_ns;
         self.input_tokens += metrics.input_tokens;
         self.output_tokens += metrics.output_tokens;
+        self.cache.merge(&metrics.cache);
         if self.examples.len() < 3 {
             self.examples.push(trace_trajectory_summary_json(spans));
         }
@@ -358,7 +372,7 @@ impl TrajectoryGroupBucket {
 
     fn to_json(self) -> String {
         format!(
-            r#"{{"signature":"{}","traceCount":{},"spanCount":{},"successCount":{},"errorCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"steps":{},"examples":[{}]}}"#,
+            r#"{{"signature":"{}","traceCount":{},"spanCount":{},"successCount":{},"errorCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"steps":{},"examples":[{}]}}"#,
             json_escape(&self.signature),
             self.trace_count,
             self.span_count,
@@ -367,6 +381,11 @@ impl TrajectoryGroupBucket {
             self.duration_ns,
             self.input_tokens,
             self.output_tokens,
+            self.cache.read_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.write_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.read_reported_spans,
+            self.cache.write_reported_spans,
+            self.cache.total_llm_spans,
             self.steps_json,
             self.examples.join(","),
         )
@@ -410,7 +429,7 @@ fn trace_diff_result_json(
         trace_trajectory_summary_json(right)
     };
     format!(
-        r#"{{"sameSignature":{},"commonPrefix":{},"left":{},"right":{},"delta":{{"durationNs":"{}","inputTokens":{},"outputTokens":{},"spanCount":{}}},"missingSteps":[{}],"extraSteps":[{}]}}"#,
+        r#"{{"sameSignature":{},"commonPrefix":{},"left":{},"right":{},"delta":{{"durationNs":"{}","inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"spanCount":{}}},"missingSteps":[{}],"extraSteps":[{}]}}"#,
         trajectory_signature(left) == trajectory_signature(right),
         common_prefix,
         left_json,
@@ -418,6 +437,8 @@ fn trace_diff_result_json(
         (right_metrics.duration_ns as i128) - (left_metrics.duration_ns as i128),
         (right_metrics.input_tokens as i128) - (left_metrics.input_tokens as i128),
         (right_metrics.output_tokens as i128) - (left_metrics.output_tokens as i128),
+        (right_metrics.cache.read_tokens as i128) - (left_metrics.cache.read_tokens as i128),
+        (right_metrics.cache.write_tokens as i128) - (left_metrics.cache.write_tokens as i128),
         (right_metrics.span_count as i128) - (left_metrics.span_count as i128),
         missing.join(","),
         extra.join(","),
@@ -432,6 +453,7 @@ struct LoopBucket {
     duration_ns: u128,
     input_tokens: u64,
     output_tokens: u64,
+    cache: crate::CacheTokenCoverage,
     project_id: String,
     task_fingerprint: String,
     validation_status: String,
@@ -447,6 +469,7 @@ impl LoopBucket {
             duration_ns: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache: crate::CacheTokenCoverage::default(),
             project_id: "null".to_string(),
             task_fingerprint: "null".to_string(),
             validation_status: "null".to_string(),
@@ -462,6 +485,7 @@ impl LoopBucket {
         self.duration_ns += span.duration_ns.unwrap_or(0) as u128;
         self.input_tokens += span.input_tokens.unwrap_or(0);
         self.output_tokens += span.output_tokens.unwrap_or(0);
+        self.cache.observe(span);
         if self.project_id == "null" {
             self.project_id = span
                 .attrs
@@ -487,7 +511,7 @@ impl LoopBucket {
 
     fn to_json(self) -> String {
         format!(
-            r#"{{"loopId":"{}","traceCount":{},"spanCount":{},"errorCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"projectId":{},"taskFingerprint":{},"validationStatus":{}}}"#,
+            r#"{{"loopId":"{}","traceCount":{},"spanCount":{},"errorCount":{},"durationNs":"{}","inputTokens":{},"outputTokens":{},"cacheReadTokens":{},"cacheWriteTokens":{},"cacheReadReportedSpans":{},"cacheWriteReportedSpans":{},"totalLlmSpans":{},"projectId":{},"taskFingerprint":{},"validationStatus":{}}}"#,
             json_escape(&self.loop_id),
             self.trace_ids.len(),
             self.span_count,
@@ -495,6 +519,11 @@ impl LoopBucket {
             self.duration_ns,
             self.input_tokens,
             self.output_tokens,
+            self.cache.read_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.write_total().map_or("null".to_string(), |v| v.to_string()),
+            self.cache.read_reported_spans,
+            self.cache.write_reported_spans,
+            self.cache.total_llm_spans,
             self.project_id,
             self.task_fingerprint,
             self.validation_status,

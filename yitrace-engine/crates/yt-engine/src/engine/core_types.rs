@@ -68,8 +68,10 @@ impl Projection {
     pub const ATTRS: u32 = 1 << 16;
     pub const SPAN_NAME: u32 = 1 << 17;
     pub const DISPLAY_NAME: u32 = 1 << 18;
+    pub const CACHE_READ_TOKENS: u32 = 1 << 19;
+    pub const CACHE_WRITE_TOKENS: u32 = 1 << 20;
 
-    const MASK: u32 = (1 << 19) - 1;
+    const MASK: u32 = (1 << 21) - 1;
 
     /// 全列（含两个大文本列）。普通读 / trace 详情 / eval 打分 / 数据集采集要原文，用这个。
     pub const ALL: Projection = Projection(Self::MASK);

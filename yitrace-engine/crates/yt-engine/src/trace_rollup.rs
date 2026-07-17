@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use crate::{ConsoleSession, ReadPlanStats, SearchFilter, TraceQuery};
+use crate::{CacheTokenCoverage, ConsoleSession, ReadPlanStats, SearchFilter, TraceQuery};
+use yt_core::event::EventType;
 use yt_core::fold::{FoldedSpan, SpanFields};
 use yt_wal::WalRecord;
 
@@ -245,7 +246,9 @@ impl TraceAggregateRollupIndex {
             external_session: Option<String>,
             input_tokens: u64,
             output_tokens: u64,
+            coverage: CacheTokenCoverage,
             error_count: usize,
+            running_count: usize,
             title: String,
             first_trace: u64,
         }
@@ -278,7 +281,15 @@ impl TraceAggregateRollupIndex {
             acc.traces.insert(row.trace_id);
             acc.input_tokens += row.input_tokens.unwrap_or(0);
             acc.output_tokens += row.output_tokens.unwrap_or(0);
+            acc.coverage.observe_values(
+                row.model.is_some(),
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+            );
             acc.error_count += usize::from(row.status.unwrap_or(0) != 0);
+            acc.running_count += usize::from(row.has_start && !row.has_end);
             if acc.external_session.is_none() {
                 acc.external_session = row.external_session_id.clone();
             }
@@ -305,7 +316,13 @@ impl TraceAggregateRollupIndex {
                 turn_count: acc.traces.len(),
                 input_tokens: acc.input_tokens,
                 output_tokens: acc.output_tokens,
+                cache_read_tokens: acc.coverage.read_total(),
+                cache_write_tokens: acc.coverage.write_total(),
+                cache_read_reported_spans: acc.coverage.read_reported_spans,
+                cache_write_reported_spans: acc.coverage.write_reported_spans,
+                total_llm_spans: acc.coverage.total_llm_spans,
                 has_error: acc.error_count > 0,
+                has_running: acc.running_count > 0,
                 first_trace_id: acc.first_trace,
             })
             .collect();
@@ -341,6 +358,8 @@ impl TraceAggregateRollupIndex {
 struct TraceAggregateRollupRow {
     trace_id: u64,
     span_id: u64,
+    has_start: bool,
+    has_end: bool,
     parent_span_id: Option<u64>,
     session_id: Option<u64>,
     tenant_id: Option<u64>,
@@ -354,6 +373,8 @@ struct TraceAggregateRollupRow {
     duration_ns: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     agent_name: Option<String>,
     tool_name: Option<String>,
     model: Option<String>,
@@ -373,6 +394,8 @@ impl TraceAggregateRollupRow {
         Self {
             trace_id,
             span_id,
+            has_start: false,
+            has_end: false,
             parent_span_id: None,
             session_id: None,
             tenant_id: None,
@@ -386,6 +409,8 @@ impl TraceAggregateRollupRow {
             duration_ns: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             agent_name: None,
             tool_name: None,
             model: None,
@@ -400,6 +425,11 @@ impl TraceAggregateRollupRow {
         self.min_ts = self.min_ts.min(record.ts);
         self.max_ts = self.max_ts.max(record.ts);
         self.event_count = self.event_count.saturating_add(1);
+        match record.identity.event_type {
+            EventType::SpanStart => self.has_start = true,
+            EventType::SpanEnd => self.has_end = true,
+            _ => {}
+        }
         self.apply_fields(&record.fields);
     }
 
@@ -442,6 +472,12 @@ impl TraceAggregateRollupRow {
         }
         if fields.output_tokens.is_some() {
             self.output_tokens = fields.output_tokens;
+        }
+        if fields.cache_read_tokens.is_some() {
+            self.cache_read_tokens = fields.cache_read_tokens;
+        }
+        if fields.cache_write_tokens.is_some() {
+            self.cache_write_tokens = fields.cache_write_tokens;
         }
         if fields.agent_name.is_some() {
             self.agent_name = fields.agent_name.clone();
@@ -531,11 +567,15 @@ impl TraceAggregateRollupRow {
         FoldedSpan {
             trace_id: self.trace_id,
             span_id: self.span_id,
+            has_start: self.has_start,
+            has_end: self.has_end,
             parent_span_id: self.parent_span_id,
             status: self.status,
             duration_ns: self.duration_ns,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             session_id: self.session_id,
             tenant_id: self.tenant_id,
             external_trace_id: self.external_trace_id.clone(),
@@ -587,6 +627,14 @@ impl TraceAggregateRollupRow {
             put_opt_string(out, self.span_name.as_deref());
             put_opt_string(out, self.display_name.as_deref());
         }
+        if version >= 4 {
+            put_opt_u64(out, self.cache_read_tokens);
+            put_opt_u64(out, self.cache_write_tokens);
+        }
+        if version >= 5 {
+            out.push(u8::from(self.has_start));
+            out.push(u8::from(self.has_end));
+        }
     }
 
     fn decode(cur: &mut CacheCursor<'_>, version: u32) -> Option<Self> {
@@ -619,9 +667,23 @@ impl TraceAggregateRollupRow {
         } else {
             (None, None)
         };
+        let (cache_read_tokens, cache_write_tokens) = if version >= 4 {
+            (cur.opt_u64()?, cur.opt_u64()?)
+        } else {
+            (None, None)
+        };
+        let (has_start, has_end) = if version >= 5 {
+            (cur.u8()? != 0, cur.u8()? != 0)
+        } else {
+            // 旧 rollup 没有保存事件类型。旧记录有耗时时按已结束兼容；
+            // 否则保守当作未结束，避免继续误报成 0ms 成功。
+            (true, duration_ns.is_some())
+        };
         Some(Self {
             trace_id,
             span_id,
+            has_start,
+            has_end,
             parent_span_id,
             session_id,
             tenant_id,
@@ -635,6 +697,8 @@ impl TraceAggregateRollupRow {
             duration_ns,
             input_tokens,
             output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             agent_name,
             tool_name,
             model,

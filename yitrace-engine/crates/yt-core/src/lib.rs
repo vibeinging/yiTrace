@@ -386,7 +386,7 @@ pub mod manifest {
 /// 这里只实现「算法」。把四个源（MemTable 行、段行、deletion、upgrade）解码成 `FoldInput`
 /// 喂进来，是上层 `MergeOnReadExec` 的事（仍是 TODO，需要给行解码出结构化字段）。
 pub mod fold {
-    use super::event::{EventId, EventIdentity};
+    use super::event::{EventId, EventIdentity, EventType};
     use std::collections::{BTreeMap, HashSet};
 
     /// 一个事件携带的可折叠字段（按 span 维度）。真实实现字段更多。
@@ -402,6 +402,10 @@ pub mod fold {
         pub input_tokens: Option<u64>,
         /// LLM 输出 token（last-non-null）。
         pub output_tokens: Option<u64>,
+        /// 输入 token 中由供应商缓存读取的部分（last-non-null）。None 表示供应商未返回。
+        pub cache_read_tokens: Option<u64>,
+        /// 输入 token 中新写入供应商缓存的部分（last-non-null）。None 表示供应商未返回。
+        pub cache_write_tokens: Option<u64>,
         /// 会话 id（多轮对话/agent 会话；同一 session 串起多条 trace）。last-non-null。
         pub session_id: Option<u64>,
         /// 租户 id（**逻辑隔离维度**）：多租户共享一套索引，靠每个查询强制带 tenant 过滤隔离。
@@ -459,6 +463,12 @@ pub mod fold {
             }
             if other.output_tokens.is_some() {
                 self.output_tokens = other.output_tokens;
+            }
+            if other.cache_read_tokens.is_some() {
+                self.cache_read_tokens = other.cache_read_tokens;
+            }
+            if other.cache_write_tokens.is_some() {
+                self.cache_write_tokens = other.cache_write_tokens;
             }
             if other.session_id.is_some() {
                 self.session_id = other.session_id;
@@ -531,11 +541,17 @@ pub mod fold {
     pub struct FoldedSpan {
         pub trace_id: u64,
         pub span_id: u64,
+        /// 去重后的事件中是否真正出现过 SPAN_START，不能用名称等可选字段代替判断。
+        pub has_start: bool,
+        /// 去重后的事件中是否真正出现过 SPAN_END，不能用 duration/status 等可选字段代替判断。
+        pub has_end: bool,
         pub parent_span_id: Option<u64>,
         pub status: Option<u8>,
         pub duration_ns: Option<u64>,
         pub input_tokens: Option<u64>,
         pub output_tokens: Option<u64>,
+        pub cache_read_tokens: Option<u64>,
+        pub cache_write_tokens: Option<u64>,
         pub session_id: Option<u64>,
         pub tenant_id: Option<u64>,
         pub external_trace_id: Option<String>,
@@ -558,6 +574,16 @@ pub mod fold {
     }
 
     impl FoldedSpan {
+        /// 只根据到达的原始事件类型返回生命周期，不依赖可选的耗时和状态字段。
+        pub fn lifecycle(&self) -> &'static str {
+            match (self.has_start, self.has_end) {
+                (true, true) => "completed",
+                (true, false) => "running",
+                (false, true) => "orphan_end",
+                (false, false) => "incomplete",
+            }
+        }
+
         /// 把一份 upgrade 补写（`SpanFields`）叠到已折叠出的 span 上：last-non-null-wins + logs 并集。
         /// 与 `SpanFields::merge_from` 同口径；`FoldedSpan` 是字段被摊平的同一组字段，故单独一份。
         pub fn apply_patch(&mut self, p: &SpanFields) {
@@ -575,6 +601,12 @@ pub mod fold {
             }
             if p.output_tokens.is_some() {
                 self.output_tokens = p.output_tokens;
+            }
+            if p.cache_read_tokens.is_some() {
+                self.cache_read_tokens = p.cache_read_tokens;
+            }
+            if p.cache_write_tokens.is_some() {
+                self.cache_write_tokens = p.cache_write_tokens;
             }
             if p.session_id.is_some() {
                 self.session_id = p.session_id;
@@ -651,11 +683,15 @@ pub mod fold {
         for ((trace_id, span_id), mut evs) in groups {
             evs.sort_by_key(|e| e.identity.seq);
             let event_count = evs.len();
+            let mut has_start = false;
+            let mut has_end = false;
             let mut status = None;
             let mut duration_ns = None;
             let mut parent_span_id = None;
             let mut input_tokens = None;
             let mut output_tokens = None;
+            let mut cache_read_tokens = None;
+            let mut cache_write_tokens = None;
             let mut session_id = None;
             let mut tenant_id = None;
             let mut external_trace_id: Option<String> = None;
@@ -675,6 +711,11 @@ pub mod fold {
             let mut logset: HashSet<&str> = HashSet::new();
             let mut attrs: BTreeMap<String, String> = BTreeMap::new();
             for e in &evs {
+                match e.identity.event_type {
+                    EventType::SpanStart => has_start = true,
+                    EventType::SpanEnd => has_end = true,
+                    _ => {}
+                }
                 if e.fields.status.is_some() {
                     status = e.fields.status; // 非空才覆盖 → 后到的非空值胜出，null 不抹掉已有值
                 }
@@ -689,6 +730,12 @@ pub mod fold {
                 }
                 if e.fields.output_tokens.is_some() {
                     output_tokens = e.fields.output_tokens;
+                }
+                if e.fields.cache_read_tokens.is_some() {
+                    cache_read_tokens = e.fields.cache_read_tokens;
+                }
+                if e.fields.cache_write_tokens.is_some() {
+                    cache_write_tokens = e.fields.cache_write_tokens;
                 }
                 if e.fields.session_id.is_some() {
                     session_id = e.fields.session_id;
@@ -747,11 +794,15 @@ pub mod fold {
             out.push(FoldedSpan {
                 trace_id,
                 span_id,
+                has_start,
+                has_end,
                 parent_span_id,
                 status,
                 duration_ns,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
                 session_id,
                 tenant_id,
                 external_trace_id,
@@ -817,6 +868,23 @@ pub mod fold {
             assert_eq!(folded[0].duration_ns, Some(500));
             assert_eq!(folded[0].logs, vec!["开始", "结束"]);
             assert_eq!(folded[0].event_count, 2);
+        }
+
+        #[test]
+        fn lifecycle_comes_from_event_types_not_optional_fields() {
+            let mut start = ev(1, 10, 1, None, None, &[]);
+            start.identity.event_type = EventType::SpanStart;
+            let only_start = fold_events([start.clone()]);
+            assert!(only_start[0].has_start);
+            assert!(!only_start[0].has_end);
+
+            // end 故意不带 duration/status：生命周期不能靠这些可选字段猜。
+            let mut end = ev(1, 10, 2, None, None, &[]);
+            end.identity.event_type = EventType::SpanEnd;
+            let completed = fold_events([start, end]);
+            assert!(completed[0].has_start);
+            assert!(completed[0].has_end);
+            assert_eq!(completed[0].duration_ns, None);
         }
 
         #[test]

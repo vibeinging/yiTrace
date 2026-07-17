@@ -5,6 +5,7 @@
 给 Agent 打点，产出与 yiTrace 引擎一致的 trace 事件。
 
 ```
+
 python3 tests/test_sdk.py     # 含与引擎逐字节一致的 event_id、失败缓冲、HTTP header 校验
 ```
 
@@ -57,9 +58,20 @@ from yitrace import Tracer, HttpExporter
 tr = Tracer(exporter=HttpExporter("http://127.0.0.1:7878/v1/ingest"), node_id=1)
 with tr.trace("反洗钱筛查") as t:
     with t.span("调用LLM研判") as s:
-        s.set_tokens(1200, 340)
+        s.set_tokens(
+            input_tokens=1200,
+            output_tokens=340,
+            cache_read_tokens=0,
+            cache_write_tokens=None,
+        )
+        s.set_attributes({
+            "llm.call_site": "superagent.reasoning",
+            "llm.model_category": "chat",
+        })
 tr.close()  # flush → POST 到引擎摄入服务
 ```
+
+缓存 token 的 `None` 表示模型服务没有返回该指标，`0` 表示模型服务返回了指标、但本次没有缓存读写。`set_tokens()` 和 `set_attributes()` 只更新 Span 内存状态，统一随 `SPAN_END` 上报，不会额外产生 `LOG` 或 `ATTR` 事件。
 
 也可以用统一 client 查数据：
 
@@ -143,7 +155,7 @@ result = runtime.db.trace_search({
 print(result["readPlan"])
 ```
 
-`externalTraceId` 会走过滤索引，适合按业务 runId 查存在性或下钻。新代码看 `readPlan`，不要只看兼容字段 `scannedSpans`。buffered 写入是异步的；同一条业务路径刚写完就必须查到时，先调用 `runtime.exporter.flush(timeout=2.0)`，不要重新 open DB。
+`externalTraceId` 会走过滤索引，适合按业务 runId 查存在性或下钻。新代码看 `readPlan`，不要只看兼容字段 `scannedSpans`。buffered 写入是异步的；第一条事件到达后默认收集最多 1 秒，达到 `max_batch=256` 会提前写。根 Trace 结束会请求 writer 尽快写出当前批次；同一条业务路径刚写完就必须查到时，先调用 `runtime.exporter.flush(timeout=2.0)`，不要重新 open DB。
 
 不要让多台机器、网络文件系统或跨主机容器共享同一个 embedded data dir；这些场景用 yiTrace server 或外部队列。
 
@@ -205,9 +217,9 @@ yitrace consume-spool --data-dir ./data/yitrace --spool-dir ./data/yitrace-spool
 - `HttpExporter` 失败时把整批退回缓冲队首，下次 `flush/close` 重试；`on_error(err, dropped)` 会暴露错误和超上限丢弃数。
 - `buffered_count()` / `sent_count()` / `dropped_count()` 可接监控。
 - 语义是 at-least-once：网络“已送达但响应丢失”会重发，同一事件由引擎按确定性 `event_id` 去重，token/成本不会翻倍。
-- `BufferedDbExporter` 用一个后台线程独占 `YiTraceDB`，请求线程只入队；`sent_count()` / `dropped_count()` / `write_error_count()` 可接监控。
+- `BufferedDbExporter` 用一个后台线程独占 `YiTraceDB`，请求线程只入队。第一条事件开启 `flush_interval` 收集窗口，满 `max_batch`、根 Trace 结束、主动 `flush()` 或 `close()` 时提前写；`sent_count()` / `dropped_count()` / `write_error_count()` 可接监控。
 - `SpoolDbExporter` 把事件写入本地 `spool/ready` 文件；`SpoolConsumer` 是唯一 DB 写者，失败时文件留在 ready 供下次重试。
-- 当前 `flush/close` 会等待队列或本地 spool 写完；进程退出前调用 `tr.close()`。
+- `BufferedDbExporter.flush()` 只等待调用前已经提交的事件，不会被调用后持续进入的新事件拖住；`close()` 会立即结束当前收集窗口。进程退出前调用 `tr.close()`。
 
 ## 还没做
 

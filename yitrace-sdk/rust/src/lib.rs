@@ -83,6 +83,8 @@ pub struct SpanEvent {
     pub duration_ns: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub session_id: Option<u64>,
     pub tenant_id: Option<u64>,
     pub span_name: Option<String>,
@@ -115,6 +117,8 @@ impl SpanEvent {
         push_opt_num(&mut fields, "duration_ns", self.duration_ns);
         push_opt_num(&mut fields, "input_tokens", self.input_tokens);
         push_opt_num(&mut fields, "output_tokens", self.output_tokens);
+        push_opt_num(&mut fields, "cache_read_tokens", self.cache_read_tokens);
+        push_opt_num(&mut fields, "cache_write_tokens", self.cache_write_tokens);
         push_opt_num(&mut fields, "session_id", self.session_id);
         push_opt_num(&mut fields, "tenant_id", self.tenant_id);
         push_opt_str(&mut fields, "span_name", self.span_name.as_deref());
@@ -636,6 +640,8 @@ pub struct Span<'a, E> {
     status: Option<u8>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     session_id: Option<u64>,
     tenant_id: Option<u64>,
     display_name: Option<String>,
@@ -670,6 +676,8 @@ impl<'a, E: Exporter> Span<'a, E> {
             status: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             session_id,
             tenant_id,
             display_name: display_name
@@ -803,6 +811,19 @@ impl<'a, E: Exporter> Span<'a, E> {
         }
     }
 
+    pub fn set_cache_tokens(
+        &mut self,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+    ) {
+        if let Some(value) = cache_read_tokens {
+            self.cache_read_tokens = Some(value);
+        }
+        if let Some(value) = cache_write_tokens {
+            self.cache_write_tokens = Some(value);
+        }
+    }
+
     pub fn set_agent(&mut self, value: impl Into<String>) {
         self.agent_name = Some(value.into());
     }
@@ -857,6 +878,7 @@ impl<'a, E: Exporter> Span<'a, E> {
         duration_ns: Option<u64>,
         logs: Vec<String>,
     ) -> Result<()> {
+        let is_end = event_type == EventType::SpanEnd;
         let event = SpanEvent {
             trace_id: self.trace_id,
             span_id: self.span_id,
@@ -867,8 +889,10 @@ impl<'a, E: Exporter> Span<'a, E> {
             parent_span_id: self.parent_span_id,
             status,
             duration_ns,
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
+            input_tokens: is_end.then_some(self.input_tokens).flatten(),
+            output_tokens: is_end.then_some(self.output_tokens).flatten(),
+            cache_read_tokens: is_end.then_some(self.cache_read_tokens).flatten(),
+            cache_write_tokens: is_end.then_some(self.cache_write_tokens).flatten(),
             session_id: self.session_id,
             tenant_id: self.tenant_id,
             span_name: (event_type == EventType::SpanStart).then(|| self.name.clone()),

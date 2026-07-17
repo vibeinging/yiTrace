@@ -76,8 +76,27 @@ impl WriteCoordinator {
         if let Some(t) = r.fields.output_tokens {
             new.out_tok = t;
         }
+        if let Some(t) = r.fields.cache_read_tokens {
+            new.cache_read = Some(t);
+        }
+        if let Some(t) = r.fields.cache_write_tokens {
+            new.cache_write = Some(t);
+        }
+        if r.fields.model.is_some()
+            || r.fields.input_tokens.is_some()
+            || r.fields.output_tokens.is_some()
+            || r.fields.cache_read_tokens.is_some()
+            || r.fields.cache_write_tokens.is_some()
+        {
+            new.is_llm = true;
+        }
         if let Some(st) = r.fields.status {
             new.error = st != 0;
+        }
+        match r.identity.event_type {
+            yt_core::event::EventType::SpanStart => new.has_start = true,
+            yt_core::event::EventType::SpanEnd => new.has_end = true,
+            _ => {}
         }
         if new.agent.is_none() {
             if let Some(a) = &r.fields.agent_name {

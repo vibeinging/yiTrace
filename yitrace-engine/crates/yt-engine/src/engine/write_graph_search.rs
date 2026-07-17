@@ -57,7 +57,9 @@ impl WriteCoordinator {
                 | Projection::TOOL_NAME
                 | Projection::PARENT_SPAN_ID
                 | Projection::INPUT_TOKENS
-                | Projection::OUTPUT_TOKENS,
+                | Projection::OUTPUT_TOKENS
+                | Projection::CACHE_READ_TOKENS
+                | Projection::CACHE_WRITE_TOKENS,
         );
         let (spans, _) = self.fold_query(
             snap,
@@ -80,14 +82,23 @@ impl WriteCoordinator {
         // span_id → 角色名，供连边时查父角色。
         let mut span_actor: HashMap<u64, String> = HashMap::new();
         // 节点聚合：actor → (kind, span_count, in_tok, out_tok)。
-        let mut nodes: BTreeMap<String, (ActorKind, usize, u64, u64)> = BTreeMap::new();
+        let mut nodes: BTreeMap<String, (ActorKind, usize, u64, u64, u64, u64, usize, usize)> =
+            BTreeMap::new();
         for s in &spans {
             let (name, kind) = actor_of(s);
             span_actor.insert(s.span_id, name.clone());
-            let e = nodes.entry(name).or_insert((kind, 0, 0, 0));
+            let e = nodes.entry(name).or_insert((kind, 0, 0, 0, 0, 0, 0, 0));
             e.1 += 1;
             e.2 += s.input_tokens.unwrap_or(0);
             e.3 += s.output_tokens.unwrap_or(0);
+            if let Some(tokens) = s.cache_read_tokens {
+                e.4 += tokens;
+                e.6 += 1;
+            }
+            if let Some(tokens) = s.cache_write_tokens {
+                e.5 += tokens;
+                e.7 += 1;
+            }
         }
 
         // 边聚合：父角色 → 子角色（跳过父不在本 trace 内 / 同角色自环）。
@@ -111,12 +122,14 @@ impl WriteCoordinator {
             nodes: nodes
                 .into_iter()
                 .map(
-                    |(actor, (kind, span_count, input_tokens, output_tokens))| AgentGraphNode {
+                    |(actor, (kind, span_count, input_tokens, output_tokens, read, write, read_n, write_n))| AgentGraphNode {
                         actor,
                         kind,
                         span_count,
                         input_tokens,
                         output_tokens,
+                        cache_read_tokens: (read_n > 0).then_some(read),
+                        cache_write_tokens: (write_n > 0).then_some(write),
                     },
                 )
                 .collect(),

@@ -30,15 +30,25 @@ fn list_traces_rolls_up_tokens() {
     let mut s1 = ev(1, 1, 1, Some(0), Some(100), &[]);
     s1.fields.input_tokens = Some(120);
     s1.fields.output_tokens = Some(45);
+    s1.fields.cache_read_tokens = Some(0);
+    s1.fields.cache_write_tokens = Some(12);
+    s1.fields.model = Some("qwen".into());
     let mut s2 = ev(1, 2, 1, Some(0), Some(50), &[]);
     s2.fields.input_tokens = Some(80);
     s2.fields.output_tokens = Some(30);
+    s2.fields.cache_write_tokens = Some(8);
+    s2.fields.model = Some("qwen".into());
     wc.ingest(vec![s1, s2]);
 
     let snap = wc.pin_snapshot();
     let t = wc.list_traces(&snap, &TraceQuery::all());
     assert_eq!(t[0].total_input_tokens, 200, "输入 token 汇总 = 120+80");
     assert_eq!(t[0].total_output_tokens, 75, "输出 token 汇总 = 45+30");
+    assert_eq!(t[0].total_cache_read_tokens, Some(0), "上报的 0 不能变成空值");
+    assert_eq!(t[0].total_cache_write_tokens, Some(20));
+    assert_eq!(t[0].cache_read_reported_spans, 1);
+    assert_eq!(t[0].cache_write_reported_spans, 2);
+    assert_eq!(t[0].total_llm_spans, 2);
 }
 
 #[test]
@@ -732,9 +742,12 @@ fn console_sidecar_token_delta_no_double_count() {
     start.fields.session_id = Some(100);
     start.fields.agent_name = Some("风控研判".into());
     start.fields.input_tokens = Some(500);
+    start.fields.cache_read_tokens = Some(100);
     let mut end = ev(1, 1, 2, Some(0), Some(10), &[]);
     end.fields.session_id = Some(100);
     end.fields.output_tokens = Some(120);
+    end.fields.cache_read_tokens = Some(150); // last-non-null 覆盖，不应变成 250
+    end.fields.cache_write_tokens = Some(0);
     // 再来一条同会话的 trace（第 2 轮）。
     let mut t2 = ev(2, 1, 1, Some(0), Some(10), &[]);
     t2.fields.session_id = Some(100);
@@ -749,6 +762,11 @@ fn console_sidecar_token_delta_no_double_count() {
         "500(span1) + 300(span2)，end 不重复加 in"
     );
     assert_eq!(r[0].output_tokens, 120, "只 end 的 out");
+    assert_eq!(r[0].cache_read_tokens, Some(150));
+    assert_eq!(r[0].cache_write_tokens, Some(0));
+    assert_eq!(r[0].cache_read_reported_spans, 1);
+    assert_eq!(r[0].cache_write_reported_spans, 1);
+    assert_eq!(r[0].total_llm_spans, 2);
     assert_eq!(r[0].turn_count, 2, "两条 trace = 两轮");
     assert_eq!(r[0].title, "风控研判");
 

@@ -69,6 +69,8 @@ def test_python_embedded_db_ingests_searches_and_reads_span_detail():
                 duration_ns=12_000,
                 output_text="needs review",
                 output_tokens=20,
+                cache_read_tokens=0,
+                cache_write_tokens=7,
             )
             result = builder.ingest(db)
             assert result["ingested"] == 3
@@ -83,6 +85,8 @@ def test_python_embedded_db_ingests_searches_and_reads_span_detail():
 
             span = db.span("run-python", "span-python")
             assert span["externalSpanId"] == "span-python"
+            assert span["cacheReadTokens"] == 0
+            assert span["cacheWriteTokens"] == 7
             messages = [message for event in span["logEvents"] for message in event["messages"]]
             assert "疑似盗刷" in messages
 

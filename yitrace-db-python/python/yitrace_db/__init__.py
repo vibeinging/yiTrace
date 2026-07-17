@@ -77,6 +77,8 @@ _FIELD_ALIASES = {
     "durationNs": "duration_ns",
     "inputTokens": "input_tokens",
     "outputTokens": "output_tokens",
+    "cacheReadTokens": "cache_read_tokens",
+    "cacheWriteTokens": "cache_write_tokens",
     "datasetId": "dataset_id",
     "itemId": "item_id",
     "datasetItemId": "dataset_item_id",
@@ -270,6 +272,8 @@ class SpanEventBuilder:
             ("output_text", "outputText"),
             ("input_tokens", "inputTokens"),
             ("output_tokens", "outputTokens"),
+            ("cache_read_tokens", "cacheReadTokens"),
+            ("cache_write_tokens", "cacheWriteTokens"),
         ]:
             _set_if_defined(event, snake, _option(options, snake, camel))
 

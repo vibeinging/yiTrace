@@ -92,6 +92,49 @@ def test_set_tokens_emits_and_wires():
     assert end.to_wire()["input_tokens"] == 1200, "token 进线格式"
 
 
+def test_structured_llm_usage_and_attrs_only_emit_on_span_end():
+    exp = CollectingExporter()
+    tr = Tracer(exporter=exp, node_id=1)
+    with tr.trace("x") as t:
+        with t.span("llm") as s:
+            s.set_model("qwen3.6-plus")
+            s.set_tokens(
+                input_tokens=12400,
+                output_tokens=240,
+                cache_read_tokens=0,
+                cache_write_tokens=300,
+            )
+            s.set_attribute("llm.call_site", "superagent.reasoning")
+            s.set_attributes({"llm.model_category": "chat", "retry": 1, "stream": True, "skip": None})
+
+    assert [e.event_type for e in exp.events] == [EventType.SPAN_START, EventType.SPAN_END]
+    start, end = exp.events
+    assert start.cache_read_tokens is None and start.attrs == {}
+    assert end.cache_read_tokens == 0 and end.cache_write_tokens == 300
+    wire = end.to_wire()
+    assert wire["cache_read_tokens"] == 0
+    assert wire["cache_write_tokens"] == 300
+    assert wire["attrs"] == {
+        "llm.call_site": "superagent.reasoning",
+        "llm.model_category": "chat",
+        "retry": 1,
+        "stream": True,
+    }
+
+
+def test_structured_usage_keeps_missing_cache_tokens_distinct_from_zero():
+    exp = CollectingExporter()
+    tr = Tracer(exporter=exp, node_id=1)
+    with tr.trace("x") as t:
+        with t.span("missing") as s:
+            s.set_tokens(input_tokens=1, output_tokens=2)
+        with t.span("zero") as s:
+            s.set_tokens(input_tokens=1, output_tokens=2, cache_read_tokens=0)
+    ends = [e.to_wire() for e in exp.events if e.event_type == EventType.SPAN_END]
+    assert ends[0]["cache_read_tokens"] is None
+    assert ends[1]["cache_read_tokens"] == 0
+
+
 def test_session_agent_and_eval_io_fields_wire_through():
     # 会话 id 从 trace 透传到所有 span；agent/tool/model + eval 输入输出文本都进线格式。
     exp = CollectingExporter()
@@ -334,6 +377,305 @@ def test_buffered_db_exporter_writes_from_background_thread():
     assert all(tenant == 7 for _batch, tenant in db.calls)
     assert exporter.sent_count() == 3
     assert exporter.dropped_count() == 0
+
+
+def test_buffered_db_exporter_collects_staggered_events_until_batch_window():
+    import threading  # noqa: E402
+    import time  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecordingDb:
+        def __init__(self):
+            self.calls = []
+            self.written = threading.Event()
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            self.written.set()
+            return {"ingested": len(events)}
+
+    db = RecordingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=10,
+        flush_interval=0.12,
+        register_atexit=False,
+    )
+    event = lambda i: SpanEvent(  # noqa: E731
+        trace_id=1, span_id=i, parent_span_id=None, seq=1,
+        event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i,
+    )
+
+    started = time.monotonic()
+    exporter.export(event(1))
+    time.sleep(0.04)
+    exporter.export(event(2))
+
+    assert not db.written.wait(0.04), "第一条到达后不应立刻写小批次"
+    assert db.written.wait(0.15), "少量事件到达批量窗口后必须写入"
+    exporter.close()
+
+    assert time.monotonic() - started >= 0.10
+    assert [len(batch) for batch in db.calls] == [2]
+
+
+def test_buffered_db_exporter_writes_immediately_when_batch_is_full():
+    import threading  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecordingDb:
+        def __init__(self):
+            self.calls = []
+            self.written = threading.Event()
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            self.written.set()
+            return {"ingested": len(events)}
+
+    db = RecordingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=2,
+        flush_interval=1.0,
+        register_atexit=False,
+    )
+    exporter.export_batch([
+        SpanEvent(trace_id=1, span_id=i, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i)
+        for i in range(2)
+    ])
+
+    assert db.written.wait(0.25), "达到 max_batch 后不应继续等待窗口"
+    exporter.close()
+    assert [len(batch) for batch in db.calls] == [2]
+
+
+def test_buffered_db_exporter_flush_is_a_barrier_not_global_queue_join():
+    import threading  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class BlockingDb:
+        def __init__(self):
+            self.calls = []
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            if len(self.calls) == 1:
+                self.started.set()
+                assert self.release.wait(2.0)
+            return {"ingested": len(events)}
+
+    db = BlockingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=10,
+        flush_interval=1.0,
+        register_atexit=False,
+    )
+    event = lambda i: SpanEvent(  # noqa: E731
+        trace_id=1, span_id=i, parent_span_id=None, seq=1,
+        event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i,
+    )
+    exporter.export(event(1))
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(exporter.flush(timeout=1.0)))
+    waiter.start()
+    assert db.started.wait(0.25), "flush 应立即结束当前收集窗口"
+
+    exporter.export(event(2))
+    db.release.set()
+    waiter.join(0.5)
+
+    assert result == [True], "flush 不应等待调用之后提交的事件"
+    assert [len(batch) for batch in db.calls] == [1]
+    exporter.close()
+    assert [len(batch) for batch in db.calls] == [1, 1]
+
+
+def test_buffered_db_exporter_batches_concurrent_producers_with_one_writer():
+    import threading  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecordingDb:
+        def __init__(self):
+            self.calls = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            return {"ingested": len(events)}
+
+    db = RecordingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=64,
+        flush_interval=0.2,
+        max_queue=1000,
+        register_atexit=False,
+    )
+
+    def produce(worker):
+        exporter.export_batch([
+            SpanEvent(trace_id=worker, span_id=i, parent_span_id=None, seq=1,
+                      event_type=EventType.SPAN_START,
+                      ext_span_id=f"s{worker}-{i}", ts=i)
+            for i in range(100)
+        ])
+
+    producers = [threading.Thread(target=produce, args=(worker,)) for worker in range(4)]
+    for producer in producers:
+        producer.start()
+    for producer in producers:
+        producer.join()
+
+    assert exporter.flush(timeout=2.0)
+    exporter.close()
+
+    assert exporter.sent_count() == 400
+    assert exporter.dropped_count() == 0
+    assert sum(len(batch) for batch in db.calls) == 400
+    assert len(db.calls) <= 8
+    assert all(len(batch) <= 64 for batch in db.calls)
+
+
+def test_buffered_db_exporter_close_ends_long_batch_window_immediately():
+    import time  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class RecordingDb:
+        def __init__(self):
+            self.calls = []
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            return {"ingested": len(events)}
+
+    db = RecordingDb()
+    exporter = BufferedDbExporter(
+        db,
+        flush_interval=5.0,
+        register_atexit=False,
+    )
+    exporter.export(
+        SpanEvent(trace_id=1, span_id=1, parent_span_id=None, seq=1,
+                  event_type=EventType.SPAN_START, ext_span_id="s1", ts=1)
+    )
+
+    started = time.monotonic()
+    exporter.close(timeout=1.0)
+
+    assert time.monotonic() - started < 0.5
+    assert [len(batch) for batch in db.calls] == [1]
+
+
+def test_buffered_db_exporter_drops_new_event_when_queue_is_full():
+    import threading  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class BlockingDb:
+        def __init__(self):
+            self.calls = []
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            if len(self.calls) == 1:
+                self.started.set()
+                assert self.release.wait(2.0)
+            return {"ingested": len(events)}
+
+    event = lambda i: SpanEvent(  # noqa: E731
+        trace_id=1, span_id=i, parent_span_id=None, seq=1,
+        event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i,
+    )
+    db = BlockingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=1,
+        max_queue=1,
+        register_atexit=False,
+    )
+    exporter.export(event(1))
+    assert db.started.wait(0.25)
+    exporter.export_batch([event(2), event(3)])
+
+    assert exporter.queued_count() == 1
+    assert exporter.dropped_count() == 1
+    db.release.set()
+    assert exporter.flush(timeout=2.0)
+    exporter.close()
+    assert exporter.sent_count() == 2
+
+
+def test_buffered_db_exporter_blocks_instead_of_dropping_when_configured():
+    import threading  # noqa: E402
+    from yitrace.event import SpanEvent  # noqa: E402
+
+    class BlockingDb:
+        def __init__(self):
+            self.calls = []
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def ingest(self, events, tenant_id=None):
+            self.calls.append(events)
+            if len(self.calls) == 1:
+                self.started.set()
+                assert self.release.wait(2.0)
+            return {"ingested": len(events)}
+
+    event = lambda i: SpanEvent(  # noqa: E731
+        trace_id=1, span_id=i, parent_span_id=None, seq=1,
+        event_type=EventType.SPAN_START, ext_span_id=f"s{i}", ts=i,
+    )
+    db = BlockingDb()
+    exporter = BufferedDbExporter(
+        db,
+        max_batch=1,
+        max_queue=1,
+        drop_when_full=False,
+        register_atexit=False,
+    )
+    exporter.export(event(1))
+    assert db.started.wait(0.25)
+    exporter.export(event(2))
+    producer = threading.Thread(target=lambda: exporter.export(event(3)))
+    producer.start()
+    producer.join(0.05)
+    assert producer.is_alive(), "队列满时生产者应等待 writer 释放空间"
+
+    db.release.set()
+    producer.join(1.0)
+    assert not producer.is_alive()
+    assert exporter.flush(timeout=2.0)
+    exporter.close()
+    assert exporter.sent_count() == 3
+    assert exporter.dropped_count() == 0
+
+
+def test_trace_completion_requests_non_blocking_flush_even_on_error():
+    class FlushAwareExporter(CollectingExporter):
+        def __init__(self):
+            super().__init__()
+            self.flush_requests = 0
+
+        def request_flush(self):
+            self.flush_requests += 1
+
+    exporter = FlushAwareExporter()
+    tracer = Tracer(exporter=exporter, node_id=1)
+
+    try:
+        with tracer.trace("failed") as trace:
+            with trace.span("root"):
+                raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+
+    assert exporter.flush_requests == 1
 
 
 def test_buffered_db_exporter_drops_after_retry_budget():

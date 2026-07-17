@@ -20,7 +20,7 @@ export function StepStream({ traceId, active }: { traceId: string | null; active
               <div className="shd">
                 <span className={'kind k-' + s.kind}>{KIND_LABEL[s.kind] ?? s.kind}</span>
                 <span className="snm">{spanDisplayName(s)}</span>
-                <span className="smeta">{fmtDur(s.durMs)}{tot ? ` · ${tot} tok` : ''}{s.model ? ` · ${s.model}` : ''}{s.status === 'error' ? ' · 出错' : ''}</span>
+                <span className="smeta">{s.status === 'run' ? '进行中' : s.status === 'incomplete' ? '数据不完整' : fmtDur(s.durMs)}{tot ? ` · ${tot} tok` : ''}{s.model ? ` · ${s.model}` : ''}{s.status === 'error' ? ' · 出错' : ''}</span>
               </div>
               <div className="iorow">
                 <div className="iobox in">
@@ -29,7 +29,7 @@ export function StepStream({ traceId, active }: { traceId: string | null; active
                 </div>
                 <div className="ioarrow">→</div>
                 <div className={'iobox ' + (s.status === 'error' ? 'err' : 'out')}>
-                  <div className="cap">{s.status === 'error' ? '错误' : '输出'}</div>
+                  <div className="cap">{s.status === 'error' ? '错误' : s.status === 'run' ? '执行中' : s.status === 'incomplete' ? '数据不完整' : '输出'}</div>
                   {s.output ?? '—'}
                 </div>
               </div>
