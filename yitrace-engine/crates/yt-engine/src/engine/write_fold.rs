@@ -148,19 +148,31 @@ impl WriteCoordinator {
         // MemTable 源：半开区间 (retained_watermark, live_lsn]，再按时间窗 + trace_id 行级过滤。
         {
             let mt = self.memtable.lock().unwrap();
-            for r in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+            let mut collect = |r: &MemRow| {
                 if r.ts < q.time_from || r.ts > q.time_to {
-                    continue;
+                    return;
                 }
                 if let Some(tid) = q.trace_id {
                     if r.trace_id != tid {
-                        continue;
+                        return;
                     }
                 }
                 if !in_keys(r.trace_id, r.span_id) {
-                    continue;
+                    return;
                 }
                 inputs.push(r.to_fold_input());
+            };
+            if let Some(keys) = keys {
+                let rows = mt.read_keys_range(keys, snap.retained_watermark, snap.live_lsn);
+                stats.decoded_memtable_rows += rows.len();
+                for r in rows {
+                    collect(r);
+                }
+            } else {
+                for r in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+                    stats.decoded_memtable_rows += 1;
+                    collect(r);
+                }
             }
         }
 

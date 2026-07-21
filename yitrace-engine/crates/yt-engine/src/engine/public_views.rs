@@ -6,6 +6,8 @@ pub struct ReadPlanStats {
     pub scanned_segments: usize,
     pub point_lookup_segments: usize,
     pub decoded_segment_rows: usize,
+    /// 本次从活 MemTable 取出的事件数。点读时它应只等于目标 Span 的活事件数。
+    pub decoded_memtable_rows: usize,
     pub index_bytes_read: u64,
     pub data_bytes_read: u64,
     pub indexes_validated: usize,

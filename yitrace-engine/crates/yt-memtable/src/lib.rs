@@ -16,7 +16,7 @@
 //! 不可变 ring + 并发安全发布。
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use yt_core::event::EventIdentity;
 use yt_core::fold::{FoldInput, SpanFields};
@@ -47,14 +47,17 @@ impl MemRow {
 /// 活内存表骨架。单写者 append、N 读者按区间读、回收受 gate。
 #[derive(Default)]
 pub struct MemTable {
-    /// 按 commit_lsn 递增；队头是最老的、最先被 evict 的。
-    rows: VecDeque<MemRow>,
+    /// 按 commit_lsn 排序；首项是最老的、最先被 evict 的。
+    rows: BTreeMap<u64, MemRow>,
+    /// 单 Span 点读目录。这里只保存 LSN，不复制 SpanFields 里的大文本。
+    by_key: HashMap<(u64, u64), BTreeSet<u64>>,
 }
 
 impl MemTable {
     pub fn new() -> Self {
         Self {
-            rows: VecDeque::new(),
+            rows: BTreeMap::new(),
+            by_key: HashMap::new(),
         }
     }
 
@@ -62,11 +65,16 @@ impl MemTable {
     pub fn append(&mut self, row: MemRow) {
         debug_assert!(
             self.rows
-                .back()
-                .map_or(true, |b| b.commit_lsn < row.commit_lsn),
+                .last_key_value()
+                .map_or(true, |(&lsn, _)| lsn < row.commit_lsn),
             "commit_lsn 必须严格递增"
         );
-        self.rows.push_back(row);
+        let lsn = row.commit_lsn;
+        self.by_key
+            .entry((row.trace_id, row.span_id))
+            .or_default()
+            .insert(lsn);
+        self.rows.insert(lsn, row);
     }
 
     /// 读某快照的半开区间 `(retained_watermark, live_lsn]`，与段源不重叠。
@@ -78,8 +86,34 @@ impl MemTable {
         let lo = retained_watermark.get();
         let hi = live_lsn.get();
         self.rows
-            .iter()
-            .filter(move |r| r.commit_lsn > lo && r.commit_lsn <= hi)
+            .range((std::ops::Bound::Excluded(lo), std::ops::Bound::Included(hi)))
+            .map(|(_, row)| row)
+    }
+
+    /// 按 `(trace_id, span_id)` 读取快照区间内的活事件，避免单 Span 详情扫描整个 MemTable。
+    pub fn read_keys_range(
+        &self,
+        keys: &HashSet<(u64, u64)>,
+        retained_watermark: WalLsn,
+        live_lsn: WalLsn,
+    ) -> Vec<&MemRow> {
+        let lo = retained_watermark.get();
+        let hi = live_lsn.get();
+        let mut lsns = Vec::new();
+        for key in keys {
+            let Some(key_lsns) = self.by_key.get(key) else {
+                continue;
+            };
+            lsns.extend(
+                key_lsns
+                    .range((std::ops::Bound::Excluded(lo), std::ops::Bound::Included(hi)))
+                    .copied(),
+            );
+        }
+        lsns.sort_unstable();
+        lsns.into_iter()
+            .filter_map(|lsn| self.rows.get(&lsn))
+            .collect()
     }
 
     /// 物理回收：丢掉 `commit_lsn ≤ gate` 的队头行。
@@ -88,13 +122,22 @@ impl MemTable {
     pub fn evict_up_to(&mut self, gate: WalLsn) -> usize {
         let gate = gate.get();
         let mut n = 0;
-        while let Some(front) = self.rows.front() {
-            if front.commit_lsn <= gate {
-                self.rows.pop_front();
-                n += 1;
-            } else {
+        while let Some((&lsn, _)) = self.rows.first_key_value() {
+            if lsn > gate {
                 break;
             }
+            let row = self.rows.remove(&lsn).expect("first row exists");
+            let key = (row.trace_id, row.span_id);
+            let remove_key = if let Some(key_lsns) = self.by_key.get_mut(&key) {
+                key_lsns.remove(&lsn);
+                key_lsns.is_empty()
+            } else {
+                false
+            };
+            if remove_key {
+                self.by_key.remove(&key);
+            }
+            n += 1;
         }
         n
     }
@@ -109,17 +152,17 @@ impl MemTable {
 
     /// 当前内存里最老的 LSN（可观测 / 测试用）。
     pub fn oldest_lsn(&self) -> Option<u64> {
-        self.rows.front().map(|r| r.commit_lsn)
+        self.rows.first_key_value().map(|(&lsn, _)| lsn)
     }
 
     /// 当前内存里最新的 LSN（自动刷盘时作 watermark）。
     pub fn newest_lsn(&self) -> Option<u64> {
-        self.rows.back().map(|r| r.commit_lsn)
+        self.rows.last_key_value().map(|(&lsn, _)| lsn)
     }
 
     /// 遍历所有行（自动刷盘时把内存表内容封段用）。
     pub fn iter(&self) -> impl Iterator<Item = &MemRow> {
-        self.rows.iter()
+        self.rows.values()
     }
 }
 
@@ -158,6 +201,21 @@ mod tests {
         assert_eq!(seqs(&mt, 0, 3), vec![1, 2, 3]);
         assert_eq!(seqs(&mt, 1, 3), vec![2, 3]);
         assert_eq!(seqs(&mt, 0, 2), vec![1, 2]);
+    }
+
+    #[test]
+    fn keyed_read_returns_only_requested_rows_in_snapshot_range() {
+        let mut mt = MemTable::new();
+        for l in 1..=1_000 {
+            mt.append(row(l));
+        }
+        let keys = HashSet::from([(1, 777)]);
+        let rows = mt.read_keys_range(&keys, WalLsn::new(0), WalLsn::new(1_000));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].span_id, 777);
+
+        let hidden = mt.read_keys_range(&keys, WalLsn::new(777), WalLsn::new(1_000));
+        assert!(hidden.is_empty(), "下界仍然是半开区间");
     }
 
     #[test]

@@ -24,7 +24,7 @@ use yt_core::fold::FoldInput;
 use yt_core::ids::SegmentId;
 use yt_wal::WalRecord;
 
-use crate::{KeyedSegmentScan, SegmentStore};
+use crate::{KeyedRecordScan, KeyedSegmentScan, SegmentStore};
 
 const INDEX_MAGIC: u64 = 0x5954_5345_4749_4458; // "YTSEGIDX"
 const INDEX_VERSION: u32 = 1;
@@ -86,6 +86,65 @@ impl FileSegmentStore {
         Ok(Self {
             dir,
             validated_indexes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// 用同一份磁盘 key 目录读取原始记录。折叠点读和日志点读都走这里，避免两套索引逻辑漂移。
+    fn point_records(&self, seg: SegmentId, keys: &HashSet<(u64, u64)>) -> Option<KeyedRecordScan> {
+        // 大候选集做大量随机 seek 会比顺序扫描更慢；返回 None 让引擎走整段回退。
+        if keys.len() > MAX_POINT_LOOKUP_KEYS {
+            return None;
+        }
+        if keys.is_empty() {
+            return Some(KeyedRecordScan {
+                used_point_index: true,
+                ..KeyedRecordScan::default()
+            });
+        }
+        let mut access = self.index_header(seg)?;
+        let header = access.header;
+        let mut index = File::open(self.index_path(seg)).ok()?;
+        let mut entries = Vec::new();
+        for &key in keys {
+            entries.extend(Self::find_entries(
+                &mut index,
+                header.entry_count,
+                key,
+                &mut access.io.index_bytes_read,
+            )?);
+        }
+        entries.sort_unstable_by_key(|entry| entry.row);
+        entries.dedup_by_key(|entry| entry.row);
+
+        let mut data = File::open(self.seg_path(seg)).ok()?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let end = entry.offset.checked_add(entry.len as u64)?;
+            if entry.offset < 4 || end > header.data_len {
+                return None;
+            }
+            data.seek(SeekFrom::Start(entry.offset)).ok()?;
+            let mut bytes = vec![0u8; entry.len as usize];
+            data.read_exact(&mut bytes).ok()?;
+            access.io.data_bytes_read = access.io.data_bytes_read.saturating_add(entry.len as u64);
+            if yt_wal::crc32(&bytes) != entry.record_crc {
+                return None;
+            }
+            let record = yt_wal::decode_record(&bytes)?;
+            if record.trace_id != entry.trace_id || record.span_id != entry.span_id {
+                return None;
+            }
+            rows.push((entry.row, record));
+        }
+        let decoded_rows = rows.len();
+        Some(KeyedRecordScan {
+            rows,
+            used_point_index: true,
+            decoded_rows,
+            index_bytes_read: access.io.index_bytes_read,
+            data_bytes_read: access.io.data_bytes_read,
+            indexes_validated: access.io.indexes_validated,
+            indexes_rebuilt: access.io.indexes_rebuilt,
         })
     }
 
@@ -456,63 +515,28 @@ impl SegmentStore for FileSegmentStore {
         seg: SegmentId,
         keys: &HashSet<(u64, u64)>,
     ) -> Option<KeyedSegmentScan> {
-        // 大候选集做大量随机 seek 会比顺序扫描更慢；返回 None 让引擎走现有整段回退。
-        if keys.len() > MAX_POINT_LOOKUP_KEYS {
-            return None;
-        }
-        if keys.is_empty() {
-            return Some(KeyedSegmentScan {
-                rows: Vec::new(),
-                used_point_index: true,
-                decoded_rows: 0,
-                ..KeyedSegmentScan::default()
-            });
-        }
-        let mut access = self.index_header(seg)?;
-        let header = access.header;
-        let mut index = File::open(self.index_path(seg)).ok()?;
-        let mut entries = Vec::new();
-        for &key in keys {
-            entries.extend(Self::find_entries(
-                &mut index,
-                header.entry_count,
-                key,
-                &mut access.io.index_bytes_read,
-            )?);
-        }
-        entries.sort_unstable_by_key(|entry| entry.row);
-        entries.dedup_by_key(|entry| entry.row);
-
-        let mut data = File::open(self.seg_path(seg)).ok()?;
-        let mut rows = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let end = entry.offset.checked_add(entry.len as u64)?;
-            if entry.offset < 4 || end > header.data_len {
-                return None;
-            }
-            data.seek(SeekFrom::Start(entry.offset)).ok()?;
-            let mut bytes = vec![0u8; entry.len as usize];
-            data.read_exact(&mut bytes).ok()?;
-            access.io.data_bytes_read = access.io.data_bytes_read.saturating_add(entry.len as u64);
-            if yt_wal::crc32(&bytes) != entry.record_crc {
-                return None;
-            }
-            let record = yt_wal::decode_record(&bytes)?;
-            if record.trace_id != entry.trace_id || record.span_id != entry.span_id {
-                return None;
-            }
-            rows.push((entry.row, record.to_fold_input()));
-        }
-        let decoded_rows = rows.len();
+        let scan = self.point_records(seg, keys)?;
         Some(KeyedSegmentScan {
-            rows,
-            used_point_index: true,
-            decoded_rows,
-            index_bytes_read: access.io.index_bytes_read,
-            data_bytes_read: access.io.data_bytes_read,
-            indexes_validated: access.io.indexes_validated,
-            indexes_rebuilt: access.io.indexes_rebuilt,
+            rows: scan
+                .rows
+                .into_iter()
+                .map(|(row, record)| (row, record.to_fold_input()))
+                .collect(),
+            used_point_index: scan.used_point_index,
+            decoded_rows: scan.decoded_rows,
+            index_bytes_read: scan.index_bytes_read,
+            data_bytes_read: scan.data_bytes_read,
+            indexes_validated: scan.indexes_validated,
+            indexes_rebuilt: scan.indexes_rebuilt,
         })
+    }
+
+    fn scan_records_for_keys(
+        &self,
+        seg: SegmentId,
+        keys: &HashSet<(u64, u64)>,
+    ) -> Option<KeyedRecordScan> {
+        self.point_records(seg, keys)
     }
 
     fn unlink_segment(&self, seg: SegmentId) {
@@ -620,6 +644,14 @@ mod tests {
         assert!(scan.data_bytes_read > 0);
         assert_eq!(scan.indexes_validated, 0, "刚写入的索引已经在本进程校验过");
         assert!(store.index_path(seg).exists());
+
+        let raw = store.scan_records_for_keys(seg, &keys).unwrap();
+        assert!(raw.used_point_index);
+        assert_eq!(raw.decoded_rows, 1, "原始日志点读也只能解码目标事件");
+        assert_eq!(raw.rows.len(), 1);
+        assert_eq!(raw.rows[0].0, 1);
+        assert_eq!(raw.rows[0].1.span_id, 2);
+        assert_eq!(raw.rows[0].1.fields.logs, vec!["second"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

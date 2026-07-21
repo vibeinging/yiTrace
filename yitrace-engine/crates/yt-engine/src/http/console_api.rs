@@ -298,10 +298,10 @@ impl EngineJsonApi {
             return (400, r#"{"error":"bad id"}"#.to_string());
         };
         let snap = self.coord.pin_snapshot();
-        let spans = self
+        let (span, _) = self
             .coord
-            .console_trace_spans_for_tenant(&snap, tid, tenant);
-        match spans.into_iter().find(|s| s.span_id == sid) {
+            .console_span_for_tenant(&snap, tid, sid, tenant);
+        match span {
             Some(s) => {
                 let mut keys = std::collections::HashSet::new();
                 keys.insert((tid, sid));

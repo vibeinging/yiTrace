@@ -101,6 +101,7 @@ impl WriteCoordinator {
             stats.scanned_segments = scan.scanned_segments;
             stats.point_lookup_segments = scan.point_lookup_segments;
             stats.decoded_segment_rows = scan.decoded_segment_rows;
+            stats.decoded_memtable_rows = scan.decoded_memtable_rows;
             stats.matched_spans = spans.len();
             return (spans, stats);
         }
@@ -114,6 +115,7 @@ impl WriteCoordinator {
         stats.scanned_segments = scan.scanned_segments;
         stats.point_lookup_segments = scan.point_lookup_segments;
         stats.decoded_segment_rows = scan.decoded_segment_rows;
+        stats.decoded_memtable_rows = scan.decoded_memtable_rows;
         stats.matched_spans = spans.len();
         (spans, stats)
     }

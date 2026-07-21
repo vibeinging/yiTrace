@@ -298,6 +298,64 @@ fn flush_then_restart_survives_via_durable_segments_and_manifest() {
 }
 
 #[test]
+fn single_span_detail_point_read_does_not_decode_the_full_trace() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_single_span_point_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    let records = (1..=1_000)
+        .map(|span_id| ev(77, span_id, 1, Some(0), Some(1), &["detail-log"]))
+        .collect::<Vec<_>>();
+    wc.ingest(records);
+
+    let live_snap = wc.pin_snapshot();
+    let (live_span, live_stats) = wc.console_span_for_tenant(&live_snap, 77, 777, None);
+    assert_eq!(live_span.as_ref().map(|s| s.span_id), Some(777));
+    assert_eq!(live_stats.decoded_segment_rows, 0);
+    assert_eq!(
+        live_stats.decoded_memtable_rows, 1,
+        "未 flush 的单 Span 详情也只能读取目标活事件"
+    );
+    let keys = HashSet::from([(77, 777)]);
+    let (live_logs, live_log_stats) =
+        wc.log_events_for_trace_keys_with_stats(&live_snap, 77, &keys);
+    assert_eq!(live_logs.get(&777).map(Vec::len), Some(1));
+    assert_eq!(live_log_stats.decoded_segment_rows, 0);
+    assert_eq!(live_log_stats.decoded_memtable_rows, 1);
+    drop(live_snap);
+
+    wc.flush_memtable();
+
+    let snap = wc.pin_snapshot();
+    let (span, stats) = wc.console_span_for_tenant(&snap, 77, 777, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(777));
+    assert_eq!(stats.candidate_span_keys, Some(1));
+    assert_eq!(stats.point_lookup_segments, 1);
+    assert_eq!(
+        stats.decoded_segment_rows, 1,
+        "单 Span 详情不能随同 Trace 的 span 数量解码更多物理记录"
+    );
+
+    let (logs, log_stats) = wc.log_events_for_trace_keys_with_stats(&snap, 77, &keys);
+    assert_eq!(logs.get(&777).map(Vec::len), Some(1));
+    assert_eq!(logs.get(&777).unwrap()[0].messages, vec!["detail-log"]);
+    assert_eq!(log_stats.point_lookup_segments, 1);
+    assert_eq!(log_stats.decoded_segment_rows, 1);
+    assert_eq!(log_stats.decoded_memtable_rows, 0);
+    assert!(log_stats.fallback_reason.is_none());
+
+    drop(snap);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn search_indexes_rebuilt_after_restart() {
     // 检索索引(BM25/向量/属性边车)重启后从持久段 + 向量文件重建 —— 不再是"重启后搜啥都空"。
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -116,11 +116,27 @@ pub struct KeyedSegmentScan {
     pub indexes_rebuilt: usize,
 }
 
+/// 按 `(trace_id, span_id)` 点读出来的原始事件。
+///
+/// `FoldInput` 不保留事件时间和原始日志，单 Span 详情需要这份原始记录来返回 `logEvents`，
+/// 因此不能复用 `KeyedSegmentScan` 后再猜回原始事件。
+#[derive(Default)]
+pub struct KeyedRecordScan {
+    pub rows: Vec<(u32, WalRecord)>,
+    pub used_point_index: bool,
+    pub decoded_rows: usize,
+    pub index_bytes_read: u64,
+    pub data_bytes_read: u64,
+    pub indexes_validated: usize,
+    pub indexes_rebuilt: usize,
+}
+
 #[derive(Default)]
 struct FoldQueryStats {
     scanned_segments: usize,
     point_lookup_segments: usize,
     decoded_segment_rows: usize,
+    decoded_memtable_rows: usize,
     index_bytes_read: u64,
     data_bytes_read: u64,
     indexes_validated: usize,
@@ -146,6 +162,16 @@ pub trait SegmentStore: Send + Sync {
         _seg: SegmentId,
         _keys: &HashSet<(u64, u64)>,
     ) -> Option<KeyedSegmentScan> {
+        None
+    }
+
+    /// 可选：只读取命中 key 的原始事件。单 Span 日志详情使用它，避免为一条日志解码整个段。
+    /// 返回的物理行号必须和段 deletion vector 使用的行号一致。
+    fn scan_records_for_keys(
+        &self,
+        _seg: SegmentId,
+        _keys: &HashSet<(u64, u64)>,
+    ) -> Option<KeyedRecordScan> {
         None
     }
 

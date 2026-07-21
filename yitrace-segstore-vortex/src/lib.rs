@@ -9,21 +9,23 @@
 //! BtrBlocks 压缩策略（字符串列走 FSST/dict），大文本列在盘上是压缩态。
 //! 决策与计划见 `docs/design/2026-06-22_列式段存储-vortex-选型与落地计划.md`。
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
-use vortex::VortexSessionDefault;
-use vortex::buffer::{ByteBuffer, ByteBufferMut};
-use vortex::error::{VortexError, VortexResult};
 use vortex::array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
 use vortex::array::arrow::IntoArrowArray;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::array::{ArrayRef, IntoArray};
-use vortex::expr::{and, col, gt_eq, lit, lt_eq, root, select, Expression};
+use vortex::buffer::ByteBufferMut;
+use vortex::error::{VortexError, VortexResult};
+use vortex::expr::{and, col, eq, gt_eq, lit, lt_eq, or, root, select, Expression};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
 use arrow::array::{
     Array, AsArray, Int64Array, StringViewArray, UInt32Array, UInt64Array, UInt8Array,
@@ -32,7 +34,7 @@ use arrow::array::{
 use yt_core::event::{EventIdentity, EventType};
 use yt_core::fold::{FoldInput, SpanFields};
 use yt_core::ids::SegmentId;
-use yt_engine::{Projection, SegmentStore};
+use yt_engine::{KeyedRecordScan, KeyedSegmentScan, Projection, SegmentStore};
 use yt_wal::WalRecord;
 
 /// logs（Vec<String>）压成单列：转义后用记录分隔符 `\u{1e}` 连接。**对任意内容可逆**——金融系统日志
@@ -41,6 +43,8 @@ use yt_wal::WalRecord;
 /// （比真正的 list<utf8> 列省事，且对当前一段一文件的布局够用；要列内按元素下推再升级 list。）
 const LOG_SEP: char = '\u{1e}';
 const LOG_ESC: char = '\\';
+const KEY_INDEX_MAGIC: u64 = 0x5954_564B_4559_4931; // "YTVKEYI1"
+const MAX_POINT_LOOKUP_KEYS: usize = 4096;
 
 /// 把一条 span 的 logs 编码成单列字符串；空 → None。
 fn encode_logs(logs: &[String]) -> Option<String> {
@@ -90,7 +94,14 @@ fn projected_field_names(proj: Projection) -> Option<Vec<&'static str>> {
     if proj.is_all() {
         return None;
     }
-    let mut cols = vec!["trace_id", "span_id", "ts", "seq", "event_type", "ext_span_id"];
+    let mut cols = vec![
+        "trace_id",
+        "span_id",
+        "ts",
+        "seq",
+        "event_type",
+        "ext_span_id",
+    ];
     for (bit, name) in [
         (Projection::STATUS, "status"),
         (Projection::DURATION_NS, "duration_ns"),
@@ -124,23 +135,179 @@ pub struct VortexSegmentStore {
     dir: PathBuf,
     session: VortexSession,
     rt: Runtime,
+    key_indexes: Mutex<HashMap<u64, Arc<KeyIndex>>>,
+}
+
+struct KeyIndex {
+    by_key: HashMap<(u64, u64), Vec<u32>>,
 }
 
 impl VortexSegmentStore {
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         // with_tokio 抓当前 tokio 运行时句柄,必须在运行时上下文里调 → 进 rt.enter() 再配。
         let session = {
             let _enter = rt.enter();
             VortexSession::default().with_tokio()
         };
-        Ok(Self { dir, session, rt })
+        Ok(Self {
+            dir,
+            session,
+            rt,
+            key_indexes: Mutex::new(HashMap::new()),
+        })
     }
 
     fn seg_path(&self, seg: SegmentId) -> PathBuf {
         self.dir.join(format!("seg-{}.vortex", seg.get()))
+    }
+
+    fn key_index_path(&self, seg: SegmentId) -> PathBuf {
+        self.dir.join(format!("seg-{}.keys", seg.get()))
+    }
+
+    fn write_key_index(
+        &self,
+        seg: SegmentId,
+        records: &[WalRecord],
+        data_len: u64,
+        data_crc: u32,
+    ) -> std::io::Result<Arc<KeyIndex>> {
+        let mut bytes = Vec::with_capacity(28 + records.len() * 16 + 4);
+        bytes.extend_from_slice(&KEY_INDEX_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&(records.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.extend_from_slice(&data_crc.to_le_bytes());
+        let mut by_key: HashMap<(u64, u64), Vec<u32>> = HashMap::new();
+        for (row, record) in records.iter().enumerate() {
+            bytes.extend_from_slice(&record.trace_id.to_le_bytes());
+            bytes.extend_from_slice(&record.span_id.to_le_bytes());
+            by_key
+                .entry((record.trace_id, record.span_id))
+                .or_default()
+                .push(row as u32);
+        }
+        let crc = yt_wal::crc32(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        let path = self.key_index_path(seg);
+        let tmp = path.with_extension("keys.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(tmp, path)?;
+        let index = Arc::new(KeyIndex { by_key });
+        self.key_indexes
+            .lock()
+            .unwrap()
+            .insert(seg.get(), Arc::clone(&index));
+        Ok(index)
+    }
+
+    fn read_key_index(&self, seg: SegmentId) -> Option<(Arc<KeyIndex>, u64)> {
+        let bytes = std::fs::read(self.key_index_path(seg)).ok()?;
+        if bytes.len() < 32 {
+            return None;
+        }
+        let payload_len = bytes.len() - 4;
+        let stored_crc = u32::from_le_bytes(bytes[payload_len..].try_into().ok()?);
+        if yt_wal::crc32(&bytes[..payload_len]) != stored_crc {
+            return None;
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let count = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let data_len = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        let data_crc = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+        if magic != KEY_INDEX_MAGIC || payload_len != 28usize.checked_add(count.checked_mul(16)?)? {
+            return None;
+        }
+        // 首次加载必须把目录绑定到实际 Vortex 文件。有效但错配的 sidecar 不能参与 deletion vector 行号判断。
+        let data = std::fs::read(self.seg_path(seg)).ok()?;
+        if data.len() as u64 != data_len || yt_wal::crc32(&data) != data_crc {
+            return None;
+        }
+        let mut by_key: HashMap<(u64, u64), Vec<u32>> = HashMap::new();
+        for row in 0..count {
+            let offset = 28 + row * 16;
+            let trace_id = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let span_id = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().ok()?);
+            by_key
+                .entry((trace_id, span_id))
+                .or_default()
+                .push(row as u32);
+        }
+        let index = Arc::new(KeyIndex { by_key });
+        self.key_indexes
+            .lock()
+            .unwrap()
+            .insert(seg.get(), Arc::clone(&index));
+        Some((index, bytes.len() as u64))
+    }
+
+    fn key_index(&self, seg: SegmentId) -> Option<(Arc<KeyIndex>, u64, usize)> {
+        if let Some(index) = self.key_indexes.lock().unwrap().get(&seg.get()).cloned() {
+            return Some((index, 0, 0));
+        }
+        if let Some((index, bytes)) = self.read_key_index(seg) {
+            return Some((index, bytes, 0));
+        }
+        // 旧段首次点读只读取身份列，补建小型 key 目录；后续查询不再扫描所有身份行。
+        let data = std::fs::read(self.seg_path(seg)).ok()?;
+        let records = self.read_filtered(seg, None, Projection::of(0));
+        let index = self
+            .write_key_index(seg, &records, data.len() as u64, yt_wal::crc32(&data))
+            .ok()?;
+        Some((index, 0, 1))
+    }
+
+    fn point_records(&self, seg: SegmentId, keys: &HashSet<(u64, u64)>) -> Option<KeyedRecordScan> {
+        if keys.len() > MAX_POINT_LOOKUP_KEYS {
+            return None;
+        }
+        let (index, index_bytes_read, indexes_rebuilt) = self.key_index(seg)?;
+        let mut rows_by_key = keys
+            .iter()
+            .filter_map(|key| {
+                index
+                    .by_key
+                    .get(key)
+                    .map(|rows| (*key, VecDeque::from(rows.clone())))
+            })
+            .collect::<HashMap<_, _>>();
+        let filter = keys
+            .iter()
+            .copied()
+            .map(|(trace_id, span_id)| {
+                and(
+                    eq(col("trace_id"), lit(trace_id)),
+                    eq(col("span_id"), lit(span_id)),
+                )
+            })
+            .reduce(or);
+        let records = match filter {
+            Some(filter) => self.read_filtered(seg, Some(filter), Projection::ALL),
+            None => Vec::new(),
+        };
+        let mut rows = Vec::with_capacity(records.len());
+        for record in records {
+            let row = rows_by_key
+                .get_mut(&(record.trace_id, record.span_id))?
+                .pop_front()?;
+            rows.push((row, record));
+        }
+        let decoded_rows = rows.len();
+        Some(KeyedRecordScan {
+            rows,
+            used_point_index: true,
+            decoded_rows,
+            index_bytes_read,
+            data_bytes_read: std::fs::metadata(self.seg_path(seg))
+                .map(|meta| meta.len())
+                .unwrap_or(0),
+            indexes_validated: usize::from(indexes_rebuilt == 0),
+            indexes_rebuilt,
+        })
     }
 
     /// 把一批记录建成列式 StructArray（每字段一列）。
@@ -151,14 +318,23 @@ impl VortexSegmentStore {
                 PrimitiveArray::from_option_iter(records.iter().map(|r| $f(r))).into_array()
             };
         }
-        let trace_id = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.trace_id))).into_array();
-        let span_id = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.span_id))).into_array();
+        let trace_id =
+            PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.trace_id))).into_array();
+        let span_id =
+            PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.span_id))).into_array();
         let ts = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.ts))).into_array();
-        let seq = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.identity.seq))).into_array();
-        let event_type = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.identity.event_type.tag()))).into_array();
-        let ext_span_id = VarBinViewArray::from_iter_str(records.iter().map(|r| r.identity.ext_span_id.clone())).into_array();
+        let seq = PrimitiveArray::from_option_iter(records.iter().map(|r| Some(r.identity.seq)))
+            .into_array();
+        let event_type = PrimitiveArray::from_option_iter(
+            records.iter().map(|r| Some(r.identity.event_type.tag())),
+        )
+        .into_array();
+        let ext_span_id =
+            VarBinViewArray::from_iter_str(records.iter().map(|r| r.identity.ext_span_id.clone()))
+                .into_array();
 
-        let status = PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.status)).into_array();
+        let status =
+            PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.status)).into_array();
         let duration_ns = u64col!(|r: &WalRecord| r.fields.duration_ns);
         let parent_span_id = u64col!(|r: &WalRecord| r.fields.parent_span_id);
         let input_tokens = u64col!(|r: &WalRecord| r.fields.input_tokens);
@@ -167,7 +343,9 @@ impl VortexSegmentStore {
         let cache_write_tokens = u64col!(|r: &WalRecord| r.fields.cache_write_tokens);
         let session_id = u64col!(|r: &WalRecord| r.fields.session_id);
         let tenant_id = u64col!(|r: &WalRecord| r.fields.tenant_id);
-        let eval_score = PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.eval_score)).into_array();
+        let eval_score =
+            PrimitiveArray::from_option_iter(records.iter().map(|r| r.fields.eval_score))
+                .into_array();
 
         let strcol = |f: &dyn Fn(&WalRecord) -> Option<String>| {
             VarBinViewArray::from_iter_nullable_str(records.iter().map(f)).into_array()
@@ -218,16 +396,42 @@ impl VortexSegmentStore {
     fn rows_from_arrow(st: &arrow::array::StructArray) -> Vec<WalRecord> {
         let n = st.len();
         // 身份/分组列：任何投影都选了它们，恒在 → 直接取。
-        let u64req = |name: &str| st.column_by_name(name).unwrap().as_any().downcast_ref::<UInt64Array>().unwrap().clone();
+        let u64req = |name: &str| {
+            st.column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .clone()
+        };
         let trace_id = u64req("trace_id");
         let span_id = u64req("span_id");
-        let ts = st.column_by_name("ts").unwrap().as_any().downcast_ref::<Int64Array>().unwrap().clone();
+        let ts = st
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
         let seq = u64req("seq");
-        let event_type = st.column_by_name("event_type").unwrap().as_any().downcast_ref::<UInt8Array>().unwrap().clone();
-        let ext_span_id = st.column_by_name("ext_span_id").unwrap().as_string_view().clone();
+        let event_type = st
+            .column_by_name("event_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .clone();
+        let ext_span_id = st
+            .column_by_name("ext_span_id")
+            .unwrap()
+            .as_string_view()
+            .clone();
 
         // 可折叠值列：可能被投影裁掉 → Option<列>，缺列即全行 None。
-        let optu64 = |name: &str| st.column_by_name(name).map(|c| c.as_any().downcast_ref::<UInt64Array>().unwrap().clone());
+        let optu64 = |name: &str| {
+            st.column_by_name(name)
+                .map(|c| c.as_any().downcast_ref::<UInt64Array>().unwrap().clone())
+        };
         let duration_ns = optu64("duration_ns");
         let parent_span_id = optu64("parent_span_id");
         let input_tokens = optu64("input_tokens");
@@ -236,8 +440,12 @@ impl VortexSegmentStore {
         let cache_write_tokens = optu64("cache_write_tokens");
         let session_id = optu64("session_id");
         let tenant_id = optu64("tenant_id");
-        let status = st.column_by_name("status").map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
-        let eval_score = st.column_by_name("eval_score").map(|c| c.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
+        let status = st
+            .column_by_name("status")
+            .map(|c| c.as_any().downcast_ref::<UInt8Array>().unwrap().clone());
+        let eval_score = st
+            .column_by_name("eval_score")
+            .map(|c| c.as_any().downcast_ref::<UInt32Array>().unwrap().clone());
         let optsv = |name: &str| st.column_by_name(name).map(|c| c.as_string_view().clone());
         let span_name = optsv("span_name");
         let display_name = optsv("display_name");
@@ -250,10 +458,20 @@ impl VortexSegmentStore {
         let logs = optsv("logs");
 
         // 缺列 → None；在列但该行为 null → None；否则取值。
-        let gu64 = |a: &Option<UInt64Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
-        let gu8 = |a: &Option<UInt8Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
-        let gu32 = |a: &Option<UInt32Array>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i));
-        let gstr = |a: &Option<StringViewArray>, i: usize| a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i).to_string());
+        let gu64 = |a: &Option<UInt64Array>, i: usize| {
+            a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i))
+        };
+        let gu8 = |a: &Option<UInt8Array>, i: usize| {
+            a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i))
+        };
+        let gu32 = |a: &Option<UInt32Array>, i: usize| {
+            a.as_ref().filter(|x| !x.is_null(i)).map(|x| x.value(i))
+        };
+        let gstr = |a: &Option<StringViewArray>, i: usize| {
+            a.as_ref()
+                .filter(|x| !x.is_null(i))
+                .map(|x| x.value(i).to_string())
+        };
 
         (0..n)
             .map(|i| WalRecord {
@@ -297,16 +515,20 @@ impl VortexSegmentStore {
     /// 读段（可选谓词下推 + 投影下推）。`filter=Some(expr)` 把过滤**推进 Vortex 文件扫描**
     /// （`scan().with_filter`），只解码命中行/块；`proj` 非全列时再 `with_projection(select(...))` 把列也裁掉，
     /// 不读的列（尤其大文本列）连解码都不做。都不在 Rust 后置全读再筛。
-    fn read_filtered(&self, seg: SegmentId, filter: Option<Expression>, proj: Projection) -> Vec<WalRecord> {
+    fn read_filtered(
+        &self,
+        seg: SegmentId,
+        filter: Option<Expression>,
+        proj: Projection,
+    ) -> Vec<WalRecord> {
         let path = self.seg_path(seg);
-        let bytes = std::fs::read(&path).unwrap_or_default();
-        if bytes.is_empty() {
+        if !path.exists() {
             return Vec::new();
         }
         let fallback_filter = filter.clone();
         let arr: VortexResult<ArrayRef> = self.rt.block_on(async {
-            let buf = ByteBuffer::copy_from(bytes.as_slice());
-            let scan = self.session.open_options().open_buffer(buf)?.scan()?;
+            // open_path 通过 VortexReadAt 按需读取页；谓词点查不再先把整个段复制进内存。
+            let scan = self.session.open_options().open_path(&path).await?.scan()?;
             let scan = match filter {
                 Some(f) => scan.with_filter(f),
                 None => scan,
@@ -330,13 +552,22 @@ impl VortexSegmentStore {
             }
         };
         let arrow = arr.into_arrow_preferred().expect("vortex→arrow");
-        let st = arrow.as_any().downcast_ref::<arrow::array::StructArray>().expect("struct array");
+        let st = arrow
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("struct array");
         Self::rows_from_arrow(st)
     }
 
     /// **按 ts 范围下推过滤**（谓词进文件扫描）+ 可选投影：只返回 `ts ∈ [from, to]` 的行、只解码 `proj` 的列。
     /// 这是列式剪枝的主路 —— 读路径按时间窗只碰相关行/块、按投影只碰相关列，大段里查一小段时间不全扫、不全解。
-    pub fn scan_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Vec<WalRecord> {
+    pub fn scan_in_time(
+        &self,
+        seg: SegmentId,
+        from: i64,
+        to: i64,
+        proj: Projection,
+    ) -> Vec<WalRecord> {
         let filter = and(gt_eq(col("ts"), lit(from)), lt_eq(col("ts"), lit(to)));
         self.read_filtered(seg, Some(filter), proj)
     }
@@ -362,7 +593,14 @@ impl SegmentStore for VortexSegmentStore {
             Ok(buf) => {
                 let tmp = path.with_extension("tmp");
                 if std::fs::write(&tmp, buf.as_slice()).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path); // 原子替换
+                    if std::fs::rename(&tmp, &path).is_ok() {
+                        let _ = self.write_key_index(
+                            seg,
+                            records,
+                            buf.len() as u64,
+                            yt_wal::crc32(buf.as_slice()),
+                        );
+                    }
                 }
             }
             Err(e) => eprintln!("[vortex-segstore] flush seg {} 失败: {e}", seg.get()),
@@ -382,13 +620,48 @@ impl SegmentStore for VortexSegmentStore {
             .collect()
     }
 
+    fn scan_fold_inputs_for_keys(
+        &self,
+        seg: SegmentId,
+        keys: &HashSet<(u64, u64)>,
+    ) -> Option<KeyedSegmentScan> {
+        let scan = self.point_records(seg, keys)?;
+        Some(KeyedSegmentScan {
+            rows: scan
+                .rows
+                .into_iter()
+                .map(|(row, record)| (row, record.to_fold_input()))
+                .collect(),
+            used_point_index: scan.used_point_index,
+            decoded_rows: scan.decoded_rows,
+            index_bytes_read: scan.index_bytes_read,
+            data_bytes_read: scan.data_bytes_read,
+            indexes_validated: scan.indexes_validated,
+            indexes_rebuilt: scan.indexes_rebuilt,
+        })
+    }
+
+    fn scan_records_for_keys(
+        &self,
+        seg: SegmentId,
+        keys: &HashSet<(u64, u64)>,
+    ) -> Option<KeyedRecordScan> {
+        self.point_records(seg, keys)
+    }
+
     fn unlink_segment(&self, seg: SegmentId) {
         let _ = std::fs::remove_file(self.seg_path(seg));
+        let _ = std::fs::remove_file(self.key_index_path(seg));
+        self.key_indexes.lock().unwrap().remove(&seg.get());
     }
 
     /// 覆盖默认（None）：**投影下推**——只解码 `proj` 的列，不丢行 → 带物理行号返回（删除位图照常生效）。
     /// 行号 = 段内顺序；投影只裁列、行顺序不变，所以 enumerate 出来的行号与全列读一致。
-    fn scan_fold_inputs_projected(&self, seg: SegmentId, proj: Projection) -> Option<Vec<(u32, FoldInput)>> {
+    fn scan_fold_inputs_projected(
+        &self,
+        seg: SegmentId,
+        proj: Projection,
+    ) -> Option<Vec<(u32, FoldInput)>> {
         Some(
             self.read_filtered(seg, None, proj)
                 .iter()
@@ -400,8 +673,19 @@ impl SegmentStore for VortexSegmentStore {
 
     /// 覆盖默认（None）：把时间过滤 + 投影**真下推**进 Vortex 文件扫描，返回命中行的 FoldInput。
     /// 引擎只在「段无删除」时调它（见 trait 文档），故这里不管删除位图。
-    fn scan_fold_inputs_in_time(&self, seg: SegmentId, from: i64, to: i64, proj: Projection) -> Option<Vec<FoldInput>> {
-        Some(self.scan_in_time(seg, from, to, proj).iter().map(|r| r.to_fold_input()).collect())
+    fn scan_fold_inputs_in_time(
+        &self,
+        seg: SegmentId,
+        from: i64,
+        to: i64,
+        proj: Projection,
+    ) -> Option<Vec<FoldInput>> {
+        Some(
+            self.scan_in_time(seg, from, to, proj)
+                .iter()
+                .map(|r| r.to_fold_input())
+                .collect(),
+        )
     }
 }
 
@@ -413,7 +697,11 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!("yt_vortex_{}_{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let p = std::env::temp_dir().join(format!(
+            "yt_vortex_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&p);
         p
     }
@@ -423,7 +711,11 @@ mod tests {
             trace_id: trace,
             span_id: span,
             ts: seq as i64 * 100,
-            identity: EventIdentity { ext_span_id: format!("{trace}-{span}"), seq, event_type: EventType::SpanEnd },
+            identity: EventIdentity {
+                ext_span_id: format!("{trace}-{span}"),
+                seq,
+                event_type: EventType::SpanEnd,
+            },
             fields: SpanFields::default(),
         }
     }
@@ -484,6 +776,82 @@ mod tests {
     }
 
     #[test]
+    fn keyed_scan_decodes_only_target_records_and_preserves_physical_rows() {
+        let dir = temp_dir();
+        let store = VortexSegmentStore::open(&dir).unwrap();
+        let seg = SegmentId::new(9);
+        let mut first = rec(1, 7, 1);
+        first.fields.logs = vec!["first".into()];
+        let mut second = rec(1, 7, 2);
+        second.fields.logs = vec!["second".into()];
+        store.flush_to_segment(seg, &[rec(1, 1, 1), first, second, rec(2, 7, 1)]);
+
+        let keys = HashSet::from([(1, 7)]);
+        let raw = store.scan_records_for_keys(seg, &keys).unwrap();
+        assert!(raw.used_point_index);
+        assert_eq!(raw.decoded_rows, 2);
+        assert_eq!(
+            raw.rows.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(raw.rows[0].1.fields.logs, vec!["first"]);
+        assert_eq!(raw.rows[1].1.fields.logs, vec!["second"]);
+
+        std::fs::remove_file(store.key_index_path(seg)).unwrap();
+        drop(store);
+        let reopened = VortexSegmentStore::open(&dir).unwrap();
+        let rebuilt = reopened.scan_fold_inputs_for_keys(seg, &keys).unwrap();
+        assert_eq!(rebuilt.decoded_rows, 2);
+        assert_eq!(rebuilt.indexes_rebuilt, 1);
+        assert!(reopened.key_index_path(seg).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyed_scan_rebuilds_corrupt_or_mismatched_sidecar() {
+        let dir = temp_dir();
+        let first = SegmentId::new(10);
+        let second = SegmentId::new(11);
+        let store = VortexSegmentStore::open(&dir).unwrap();
+        store.flush_to_segment(first, &[rec(1, 1, 1), rec(1, 2, 2)]);
+        store.flush_to_segment(second, &[rec(2, 1, 1), rec(2, 2, 2)]);
+
+        let mut corrupt = std::fs::read(store.key_index_path(first)).unwrap();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        std::fs::write(store.key_index_path(first), corrupt).unwrap();
+        std::fs::copy(store.key_index_path(first), store.key_index_path(second)).unwrap();
+        drop(store);
+
+        let reopened = VortexSegmentStore::open(&dir).unwrap();
+        let first_scan = reopened
+            .scan_records_for_keys(first, &HashSet::from([(1, 2)]))
+            .unwrap();
+        assert_eq!(first_scan.indexes_rebuilt, 1);
+        assert_eq!(first_scan.rows[0].0, 1);
+
+        // 把 first 的有效目录错配给 second；自身 CRC 正确，但数据 fingerprint 不同，仍必须重建。
+        std::fs::copy(
+            reopened.key_index_path(first),
+            reopened.key_index_path(second),
+        )
+        .unwrap();
+        let reopened_again = VortexSegmentStore::open(&dir).unwrap();
+        let second_scan = reopened_again
+            .scan_records_for_keys(second, &HashSet::from([(2, 2)]))
+            .unwrap();
+        assert_eq!(second_scan.indexes_rebuilt, 1);
+        assert_eq!(second_scan.rows[0].0, 1);
+
+        let cached = reopened_again
+            .scan_records_for_keys(second, &HashSet::from([(2, 1)]))
+            .unwrap();
+        assert_eq!(cached.index_bytes_read, 0, "后续点读复用已校验内存目录");
+        assert_eq!(cached.decoded_rows, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn predicate_pushdown_filters_by_time_range() {
         // 谓词下推:按 ts 范围过滤,只读命中行(过滤进 Vortex 扫描,不在 Rust 后置)。
         let dir = temp_dir();
@@ -502,7 +870,9 @@ mod tests {
         assert_eq!(ts, vec![200, 300, 400], "下推过滤只返回时间窗内的行");
 
         // 窗口外 → 空
-        assert!(store.scan_in_time(seg, 1000, 2000, Projection::ALL).is_empty());
+        assert!(store
+            .scan_in_time(seg, 1000, 2000, Projection::ALL)
+            .is_empty());
         // 单点窗口
         let one = store.scan_in_time(seg, 300, 300, Projection::ALL);
         assert_eq!(one.len(), 1);
@@ -542,7 +912,11 @@ mod tests {
         a.fields.logs = vec!["帧\u{0}头".into(), "正常日志".into()];
         store.flush_to_segment(seg, &[a]);
         let back = store.scan_records(seg);
-        assert_eq!(back[0].fields.logs, vec!["帧\u{0}头", "正常日志"], "含 NUL 的 logs 过段不丢不错切");
+        assert_eq!(
+            back[0].fields.logs,
+            vec!["帧\u{0}头", "正常日志"],
+            "含 NUL 的 logs 过段不丢不错切"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -595,7 +969,9 @@ mod tests {
         store.flush_to_segment(seg, &[a]);
 
         // 窄投影:只要 agent + token(成本下钻的列)。
-        let proj = Projection::of(Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS);
+        let proj = Projection::of(
+            Projection::AGENT_NAME | Projection::INPUT_TOKENS | Projection::OUTPUT_TOKENS,
+        );
         let folds = store.scan_fold_inputs_projected(seg, proj).unwrap();
         assert_eq!(folds.len(), 1);
         assert_eq!(folds[0].0, 0, "投影不丢行 → 物理行号完整");
@@ -618,11 +994,17 @@ mod tests {
         let names = store.scan_fold_inputs_projected(seg, name_proj).unwrap();
         assert_eq!(names[0].1.fields.span_name.as_deref(), Some("risk.review"));
         assert_eq!(names[0].1.fields.display_name.as_deref(), Some("风险审核"));
-        assert_eq!(names[0].1.fields.agent_name, None, "名称投影不应读取 agent 列");
+        assert_eq!(
+            names[0].1.fields.agent_name, None,
+            "名称投影不应读取 agent 列"
+        );
 
         // 对照:全列读回原文都在。
         let all = store.scan_records(seg);
-        assert_eq!(all[0].fields.output_text.as_deref(), Some("很长的回答正文……"));
+        assert_eq!(
+            all[0].fields.output_text.as_deref(),
+            Some("很长的回答正文……")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -631,8 +1013,8 @@ mod tests {
     fn engine_uses_vortex_pushdown_end_to_end() {
         // 端到端:用 VortexSegmentStore 起引擎,灌数据 flush 进列式段,带时间窗读 → 引擎走真 Vortex 下推。
         use std::sync::Arc;
-        use yt_engine::{TraceQuery, WriteCoordinator};
         use yt_core::ids::WalLsn;
+        use yt_engine::{TraceQuery, WriteCoordinator};
 
         let dir = temp_dir();
         let store = Arc::new(VortexSegmentStore::open(&dir).unwrap());
@@ -646,10 +1028,48 @@ mod tests {
         // 全开窗:3 条都在(从列式段读回)
         assert_eq!(wc.read_spans_query(&snap, &TraceQuery::all()).0.len(), 3);
         // 时间窗 [150,250]:引擎走 Vortex 下推,只回 ts=200 的 span2
-        let (hit, _) = wc.read_spans_query(&snap, &TraceQuery { trace_id: None, time_from: 150, time_to: 250, tenant_id: None });
+        let (hit, _) = wc.read_spans_query(
+            &snap,
+            &TraceQuery {
+                trace_id: None,
+                time_from: 150,
+                time_to: 250,
+                tenant_id: None,
+            },
+        );
         assert_eq!(hit.len(), 1, "Vortex 下推穿过引擎读路径,行级时间过滤");
         assert_eq!(hit[0].span_id, 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn engine_applies_deletion_vector_to_vortex_point_rows() {
+        use std::sync::Arc;
+        use yt_core::ids::WalLsn;
+        use yt_engine::WriteCoordinator;
+
+        let dir = temp_dir();
+        let store = Arc::new(VortexSegmentStore::open(&dir).unwrap());
+        let wc = WriteCoordinator::new(store);
+        let mut deleted_log = rec(1, 7, 1);
+        deleted_log.fields.logs = vec!["must-not-leak".into()];
+        let rows = vec![rec(1, 1, 1), deleted_log, rec(1, 7, 2)];
+        wc.ingest(rows.clone());
+        wc.commit_flush(&rows, WalLsn::new(3));
+        wc.commit_delete(SegmentId::new(1), 1);
+
+        let snap = wc.pin_snapshot();
+        let (span, stats) = wc.console_span_for_tenant(&snap, 1, 7, None);
+        assert_eq!(span.as_ref().map(|span| span.span_id), Some(7));
+        assert_eq!(stats.point_lookup_segments, 1);
+        assert_eq!(stats.decoded_segment_rows, 2);
+
+        let keys = HashSet::from([(1, 7)]);
+        let (logs, log_stats) = wc.log_events_for_trace_keys_with_stats(&snap, 1, &keys);
+        assert!(logs.get(&7).is_none(), "被删除物理行的日志不能泄漏");
+        assert_eq!(log_stats.point_lookup_segments, 1);
+        assert_eq!(log_stats.decoded_segment_rows, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

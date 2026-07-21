@@ -296,53 +296,94 @@ impl WriteCoordinator {
         spans
             .into_iter()
             .map(|s| {
-                // tool 优先：agent 上下文会被子 span 继承，工具 span 可能同时带 agent_name/tool_name。
-                let (kind, name, actor_id) = if let Some(t) = &s.tool_name {
-                    ("tool", t.clone(), format!("tool:{t}"))
-                } else if let Some(a) = &s.agent_name {
-                    ("agent", a.clone(), format!("agent:{a}"))
-                } else if let Some(m) = &s.model {
-                    ("llm", m.clone(), format!("model:{m}"))
-                } else {
-                    (
-                        "other",
-                        format!("span {}", s.span_id),
-                        format!("span:{}", s.span_id),
-                    )
-                };
                 let dur = s.duration_ns.unwrap_or(0);
-                let cs = ConsoleSpan {
-                    span_id: s.span_id,
-                    parent_span_id: s.parent_span_id,
-                    external_trace_id: s.external_trace_id.clone(),
-                    external_span_id: s.external_span_id.clone(),
-                    external_parent_span_id: s.external_parent_span_id.clone(),
-                    external_session_id: s.external_session_id.clone(),
-                    kind,
-                    name,
-                    span_name: s.span_name.clone(),
-                    display_name: s.display_name.clone(),
-                    actor_id,
-                    agent_name: s.agent_name.clone(),
-                    tool_name: s.tool_name.clone(),
-                    start_ns: start,
-                    duration_ns: dur,
-                    has_error: s.status.unwrap_or(0) != 0,
-                    has_start: s.has_start,
-                    has_end: s.has_end,
-                    input_tokens: s.input_tokens.unwrap_or(0),
-                    output_tokens: s.output_tokens.unwrap_or(0),
-                    cache_read_tokens: s.cache_read_tokens,
-                    cache_write_tokens: s.cache_write_tokens,
-                    model: s.model.clone(),
-                    input_text: s.input_text.clone(),
-                    output_text: s.output_text.clone(),
-                    attrs: s.attrs.clone(),
-                };
+                let cs = Self::console_span_from_folded(s, start);
                 start += dur;
                 cs
             })
             .collect()
+    }
+
+    /// 单 Span 详情点读。候选 key 永远只有目标 `(trace_id, span_id)`，不会先取出同 Trace 的其它 span。
+    /// 返回读计划是为了让回归测试直接约束物理读放大，而不是依赖容易抖动的耗时断言。
+    pub fn console_span_for_tenant(
+        &self,
+        snap: &Snapshot,
+        trace_id: u64,
+        span_id: u64,
+        tenant: Option<u64>,
+    ) -> (Option<ConsoleSpan>, ReadPlanStats) {
+        let keys = HashSet::from([(trace_id, span_id)]);
+        let mut q = TraceQuery::trace(trace_id, i64::MIN, i64::MAX);
+        q.tenant_id = tenant;
+        let (mut spans, scan) = self.fold_query(snap, &q, Some(&keys), Projection::ALL);
+        let span = spans
+            .pop()
+            .filter(|span| span.span_id == span_id)
+            .map(|span| Self::console_span_from_folded(span, 0));
+        let matched_spans = usize::from(span.is_some());
+        (
+            span,
+            ReadPlanStats {
+                source: Some("span_point_lookup".to_string()),
+                candidate_span_keys: Some(1),
+                scanned_segments: scan.scanned_segments,
+                point_lookup_segments: scan.point_lookup_segments,
+                decoded_segment_rows: scan.decoded_segment_rows,
+                decoded_memtable_rows: scan.decoded_memtable_rows,
+                index_bytes_read: scan.index_bytes_read,
+                data_bytes_read: scan.data_bytes_read,
+                indexes_validated: scan.indexes_validated,
+                indexes_rebuilt: scan.indexes_rebuilt,
+                matched_spans,
+                ..ReadPlanStats::default()
+            },
+        )
+    }
+
+    fn console_span_from_folded(s: FoldedSpan, start_ns: u64) -> ConsoleSpan {
+        // tool 优先：agent 上下文会被子 span 继承，工具 span 可能同时带 agent_name/tool_name。
+        let (kind, name, actor_id) = if let Some(t) = &s.tool_name {
+            ("tool", t.clone(), format!("tool:{t}"))
+        } else if let Some(a) = &s.agent_name {
+            ("agent", a.clone(), format!("agent:{a}"))
+        } else if let Some(m) = &s.model {
+            ("llm", m.clone(), format!("model:{m}"))
+        } else {
+            (
+                "other",
+                format!("span {}", s.span_id),
+                format!("span:{}", s.span_id),
+            )
+        };
+        ConsoleSpan {
+            span_id: s.span_id,
+            parent_span_id: s.parent_span_id,
+            external_trace_id: s.external_trace_id,
+            external_span_id: s.external_span_id,
+            external_parent_span_id: s.external_parent_span_id,
+            external_session_id: s.external_session_id,
+            kind,
+            name,
+            span_name: s.span_name,
+            display_name: s.display_name,
+            actor_id,
+            agent_name: s.agent_name,
+            tool_name: s.tool_name,
+            start_ns,
+            duration_ns: s.duration_ns.unwrap_or(0),
+            has_error: s.status.unwrap_or(0) != 0,
+            has_start: s.has_start,
+            has_end: s.has_end,
+            input_tokens: s.input_tokens.unwrap_or(0),
+            output_tokens: s.output_tokens.unwrap_or(0),
+            cache_read_tokens: s.cache_read_tokens,
+            cache_write_tokens: s.cache_write_tokens,
+            model: s.model,
+            input_text: s.input_text,
+            output_text: s.output_text,
+            attrs: s.attrs,
+        }
     }
 
     /// 读取一条 trace 中可见 span 的原始日志事件。调用方传入已经过租户/删除过滤的 key 集，
@@ -353,7 +394,23 @@ impl WriteCoordinator {
         trace_id: u64,
         keys: &std::collections::HashSet<(u64, u64)>,
     ) -> BTreeMap<u64, Vec<SpanLogEvent>> {
+        self.log_events_for_trace_keys_with_stats(snap, trace_id, keys)
+            .0
+    }
+
+    /// 与 `log_events_for_trace_keys` 相同，但同时返回物理读取统计，供性能回归测试约束全段回退。
+    pub fn log_events_for_trace_keys_with_stats(
+        &self,
+        snap: &Snapshot,
+        trace_id: u64,
+        keys: &std::collections::HashSet<(u64, u64)>,
+    ) -> (BTreeMap<u64, Vec<SpanLogEvent>>, ReadPlanStats) {
         let mut by_event: BTreeMap<u64, (u64, SpanLogEvent)> = BTreeMap::new();
+        let mut stats = ReadPlanStats {
+            source: Some("log_event_point_lookup".to_string()),
+            candidate_span_keys: Some(keys.len()),
+            ..ReadPlanStats::default()
+        };
 
         for entry in snap.manifest.segments.values() {
             let bloom_skip = self
@@ -365,18 +422,40 @@ impl WriteCoordinator {
             if bloom_skip {
                 continue;
             }
-            let recs = self.segments.scan_records(entry.segment_id);
-            for (row, rec) in recs.iter().enumerate() {
-                if entry.deletion_vec.is_deleted(row as u32) {
-                    continue;
+            stats.scanned_segments += 1;
+            if let Some(scan) = self.segments.scan_records_for_keys(entry.segment_id, keys) {
+                stats.decoded_segment_rows += scan.decoded_rows;
+                stats.index_bytes_read = stats.index_bytes_read.saturating_add(scan.index_bytes_read);
+                stats.data_bytes_read = stats.data_bytes_read.saturating_add(scan.data_bytes_read);
+                stats.indexes_validated += scan.indexes_validated;
+                stats.indexes_rebuilt += scan.indexes_rebuilt;
+                if scan.used_point_index {
+                    stats.point_lookup_segments += 1;
                 }
-                self.collect_log_event(trace_id, keys, rec, &mut by_event);
+                for (row, rec) in scan.rows {
+                    if entry.deletion_vec.is_deleted(row) {
+                        continue;
+                    }
+                    self.collect_log_event(trace_id, keys, &rec, &mut by_event);
+                }
+            } else {
+                let recs = self.segments.scan_records(entry.segment_id);
+                stats.decoded_segment_rows += recs.len();
+                stats.fallback_reason = Some("segment_store_has_no_raw_point_lookup".to_string());
+                for (row, rec) in recs.iter().enumerate() {
+                    if entry.deletion_vec.is_deleted(row as u32) {
+                        continue;
+                    }
+                    self.collect_log_event(trace_id, keys, rec, &mut by_event);
+                }
             }
         }
 
         {
             let mt = self.memtable.lock().unwrap();
-            for row in mt.read_range(snap.retained_watermark, snap.live_lsn) {
+            let rows = mt.read_keys_range(keys, snap.retained_watermark, snap.live_lsn);
+            stats.decoded_memtable_rows += rows.len();
+            for row in rows {
                 let rec = WalRecord {
                     trace_id: row.trace_id,
                     span_id: row.span_id,
@@ -395,7 +474,8 @@ impl WriteCoordinator {
         for events in by_span.values_mut() {
             events.sort_by_key(|ev| (ev.ts, ev.seq, ev.event_id));
         }
-        by_span
+        stats.matched_spans = by_span.len();
+        (by_span, stats)
     }
 
     fn collect_log_event(
