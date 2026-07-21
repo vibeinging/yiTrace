@@ -336,6 +336,7 @@ impl WriteCoordinator {
                 indexes_validated: scan.indexes_validated,
                 indexes_rebuilt: scan.indexes_rebuilt,
                 matched_spans,
+                fallback_reason: scan.fallback_reason,
                 ..ReadPlanStats::default()
             },
         )
@@ -406,9 +407,19 @@ impl WriteCoordinator {
         keys: &std::collections::HashSet<(u64, u64)>,
     ) -> (BTreeMap<u64, Vec<SpanLogEvent>>, ReadPlanStats) {
         let mut by_event: BTreeMap<u64, (u64, SpanLogEvent)> = BTreeMap::new();
+        let bloom_stats = self.ensure_seg_key_bloom_for_manifest(&snap.manifest);
         let mut stats = ReadPlanStats {
             source: Some("log_event_point_lookup".to_string()),
             candidate_span_keys: Some(keys.len()),
+            scanned_segments: bloom_stats.scanned_segments,
+            point_lookup_segments: bloom_stats.point_lookup_segments,
+            decoded_segment_rows: bloom_stats.decoded_segment_rows,
+            decoded_memtable_rows: bloom_stats.decoded_memtable_rows,
+            index_bytes_read: bloom_stats.index_bytes_read,
+            data_bytes_read: bloom_stats.data_bytes_read,
+            indexes_validated: bloom_stats.indexes_validated,
+            indexes_rebuilt: bloom_stats.indexes_rebuilt,
+            fallback_reason: bloom_stats.fallback_reason,
             ..ReadPlanStats::default()
         };
 

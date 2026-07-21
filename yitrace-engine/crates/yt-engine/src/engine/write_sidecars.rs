@@ -1,5 +1,7 @@
 const SEG_BLOOM_CACHE_MAGIC: u32 = 0x5954_424c; // "YTBL"
-const SEG_BLOOM_CACHE_VERSION: u32 = 1;
+const SEG_BLOOM_CACHE_VERSION: u32 = 2;
+const SEG_BLOOM_HASH_COUNT: u32 = 7;
+const MAX_SEG_BLOOM_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 impl WriteCoordinator {
     pub fn trace_aggregate_rollup_spans(
@@ -310,6 +312,9 @@ impl WriteCoordinator {
     }
 
     fn load_seg_key_bloom_segments(&self, manifest: &Manifest) -> bool {
+        #[cfg(test)]
+        self.seg_key_bloom_load_count
+            .fetch_add(1, Ordering::Relaxed);
         let Some(path) = &self.seg_key_bloom_path else {
             return false;
         };
@@ -322,7 +327,9 @@ impl WriteCoordinator {
             return false;
         };
         let count = blooms.len();
-        *self.seg_key_bloom.lock().unwrap() = blooms;
+        // Segment 不可变且 id 永不复用。旧 Snapshot 的首查可能与新 flush/compaction 并发，
+        // 因此只能合并，不能整表替换，否则会删掉写路径刚加入的新 segment bloom。
+        self.seg_key_bloom.lock().unwrap().extend(blooms);
         olog::log(
             olog::Level::Info,
             "segment_bloom_cache_load",
@@ -344,18 +351,23 @@ impl WriteCoordinator {
         }
         let manifest = self.current.manifest();
         let blooms = self.seg_key_bloom.lock().unwrap();
-        if let Err(err) = save_seg_key_bloom_cache(
+        let result = save_seg_key_bloom_cache(
             path,
             manifest.version.get(),
             manifest.memtable_watermark.get(),
             &manifest,
             &blooms,
-        ) {
-            olog::log(
-                olog::Level::Warn,
-                "segment_bloom_cache_save_failed",
-                &[("error", &err.to_string())],
-            );
+        );
+        drop(blooms);
+        match result {
+            Ok(()) => *self.seg_key_bloom_load_failed_for.lock().unwrap() = None,
+            Err(err) => {
+                olog::log(
+                    olog::Level::Warn,
+                    "segment_bloom_cache_save_failed",
+                    &[("error", &err.to_string())],
+                );
+            }
         }
     }
 
@@ -483,6 +495,8 @@ fn save_seg_key_bloom_cache(
             sidecar_put_u64(&mut out, word);
         }
     }
+    let checksum = yt_wal::crc32(&out);
+    sidecar_put_u32(&mut out, checksum);
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)?;
@@ -499,28 +513,56 @@ fn load_seg_key_bloom_cache(
     memtable_watermark: u64,
     manifest: &Manifest,
 ) -> Option<HashMap<u64, Arc<KeyBloom>>> {
+    let file_len = std::fs::metadata(path).ok()?.len();
+    if file_len < 36 || file_len > MAX_SEG_BLOOM_CACHE_BYTES {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
-    let mut cur = SidecarCursor { bytes: &bytes, pos: 0 };
+    if bytes.len() < 36 || bytes.len() as u64 > MAX_SEG_BLOOM_CACHE_BYTES {
+        return None;
+    }
+    let payload_len = bytes.len().checked_sub(4)?;
+    let (payload, checksum_bytes) = bytes.split_at(payload_len);
+    let expected_checksum = u32::from_le_bytes(checksum_bytes.try_into().ok()?);
+    if yt_wal::crc32(payload) != expected_checksum {
+        return None;
+    }
+    let mut cur = SidecarCursor {
+        bytes: payload,
+        pos: 0,
+    };
     if cur.u32()? != SEG_BLOOM_CACHE_MAGIC || cur.u32()? != SEG_BLOOM_CACHE_VERSION {
         return None;
     }
     if cur.u64()? != manifest_version || cur.u64()? != memtable_watermark {
         return None;
     }
-    let count = cur.u64()? as usize;
-    let mut out = HashMap::with_capacity(count);
+    let count = usize::try_from(cur.u64()?).ok()?;
+    if count != manifest.segments.len() {
+        return None;
+    }
+    let mut out = HashMap::new();
+    out.try_reserve(count).ok()?;
     for _ in 0..count {
         let seg_id = cur.u64()?;
         let k = cur.u32()?;
-        let bit_words = cur.u64()? as usize;
-        let mut bits = Vec::with_capacity(bit_words);
+        if k != SEG_BLOOM_HASH_COUNT {
+            return None;
+        }
+        let bit_words = usize::try_from(cur.u64()?).ok()?;
+        let bit_bytes = bit_words.checked_mul(8)?;
+        if bit_words == 0 || !bit_words.is_power_of_two() || bit_bytes > cur.remaining() {
+            return None;
+        }
+        let mut bits = Vec::new();
+        bits.try_reserve_exact(bit_words).ok()?;
         for _ in 0..bit_words {
             bits.push(cur.u64()?);
         }
         let bloom = KeyBloom::from_bits(bits, k)?;
         out.insert(seg_id, Arc::new(bloom));
     }
-    if cur.pos != bytes.len() || out.len() != manifest.segments.len() {
+    if cur.pos != payload.len() || out.len() != manifest.segments.len() {
         return None;
     }
     if manifest
@@ -547,6 +589,10 @@ struct SidecarCursor<'a> {
 }
 
 impl<'a> SidecarCursor<'a> {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         if end > self.bytes.len() {

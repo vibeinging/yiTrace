@@ -18,13 +18,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use yt_core::fold::FoldInput;
 use yt_core::ids::SegmentId;
-use yt_wal::WalRecord;
+use yt_wal::{Crc32, WalRecord};
 
-use crate::{KeyedRecordScan, KeyedSegmentScan, SegmentStore};
+use crate::{FullRecordScan, KeyedRecordScan, KeyedSegmentScan, SegmentStore};
 
 const INDEX_MAGIC: u64 = 0x5954_5345_4749_4458; // "YTSEGIDX"
 const INDEX_VERSION: u32 = 1;
@@ -151,6 +151,29 @@ impl FileSegmentStore {
     fn seg_path(&self, seg: SegmentId) -> PathBuf {
         self.dir.join(format!("seg-{}.dat", seg.get()))
     }
+
+    fn full_record_scan(&self, seg: SegmentId) -> FullRecordScan {
+        let bytes = fs::read(self.seg_path(seg)).unwrap_or_default();
+        let data_bytes_read = bytes.len() as u64;
+        if bytes.len() < 4 {
+            return FullRecordScan {
+                data_bytes_read,
+                ..FullRecordScan::default()
+            };
+        }
+        let crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let payload = &bytes[4..];
+        if crc != yt_wal::crc32(payload) {
+            return FullRecordScan {
+                data_bytes_read,
+                ..FullRecordScan::default()
+            };
+        }
+        FullRecordScan {
+            rows: yt_wal::decode_records(payload).unwrap_or_default(),
+            data_bytes_read,
+        }
+    }
     fn tmp_path(&self, seg: SegmentId) -> PathBuf {
         self.dir.join(format!("seg-{}.tmp", seg.get()))
     }
@@ -222,7 +245,7 @@ impl FileSegmentStore {
             .open(&tmp)
             .ok()?;
         let mut writer = BufWriter::with_capacity(INDEX_IO_BUFFER, file);
-        let mut crc = StreamingCrc32::new();
+        let mut crc = Crc32::new();
         write_index_part(&mut writer, &mut crc, &INDEX_MAGIC.to_le_bytes()).ok()?;
         write_index_part(&mut writer, &mut crc, &INDEX_VERSION.to_le_bytes()).ok()?;
         write_index_part(
@@ -269,7 +292,7 @@ impl FileSegmentStore {
 
         file.seek(SeekFrom::Start(0)).ok()?;
         let mut reader = BufReader::with_capacity(INDEX_IO_BUFFER, file);
-        let mut crc = StreamingCrc32::new();
+        let mut crc = Crc32::new();
         let mut remaining = body_len;
         let mut chunk = vec![0u8; INDEX_IO_BUFFER];
         while remaining > 0 {
@@ -294,7 +317,7 @@ impl FileSegmentStore {
         if u32::from_le_bytes(crc_bytes) != header.data_crc {
             return None;
         }
-        let mut data_crc = StreamingCrc32::new();
+        let mut data_crc = Crc32::new();
         let mut remaining = header.data_len.checked_sub(4)?;
         while remaining > 0 {
             let take = usize::try_from(remaining.min(chunk.len() as u64)).ok()?;
@@ -426,52 +449,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn write_index_part(
-    writer: &mut impl Write,
-    crc: &mut StreamingCrc32,
-    bytes: &[u8],
-) -> std::io::Result<()> {
+fn write_index_part(writer: &mut impl Write, crc: &mut Crc32, bytes: &[u8]) -> std::io::Result<()> {
     writer.write_all(bytes)?;
     crc.update(bytes);
     Ok(())
-}
-
-struct StreamingCrc32(u32);
-
-impl StreamingCrc32 {
-    fn new() -> Self {
-        Self(0xffff_ffff)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        let table = crc32_table();
-        for &byte in bytes {
-            self.0 = table[((self.0 ^ byte as u32) & 0xff) as usize] ^ (self.0 >> 8);
-        }
-    }
-
-    fn finish(self) -> u32 {
-        !self.0
-    }
-}
-
-fn crc32_table() -> &'static [u32; 256] {
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for (i, slot) in table.iter_mut().enumerate() {
-            let mut value = i as u32;
-            for _ in 0..8 {
-                value = if value & 1 != 0 {
-                    0xedb8_8320 ^ (value >> 1)
-                } else {
-                    value >> 1
-                };
-            }
-            *slot = value;
-        }
-        table
-    })
 }
 
 impl SegmentStore for FileSegmentStore {
@@ -498,16 +479,11 @@ impl SegmentStore for FileSegmentStore {
     }
 
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord> {
-        let bytes = fs::read(self.seg_path(seg)).unwrap_or_default();
-        if bytes.len() < 4 {
-            return Vec::new(); // 缺文件 / 太短
-        }
-        let crc = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let payload = &bytes[4..];
-        if crc != yt_wal::crc32(payload) {
-            return Vec::new(); // 损坏/截断 → 当空段，绝不返回脏数据
-        }
-        yt_wal::decode_records(payload).unwrap_or_default()
+        self.full_record_scan(seg).rows
+    }
+
+    fn scan_records_with_stats(&self, seg: SegmentId) -> FullRecordScan {
+        self.full_record_scan(seg)
     }
 
     fn scan_fold_inputs_for_keys(
@@ -587,6 +563,23 @@ mod tests {
                 logs: vec![log.into()],
                 ..Default::default()
             },
+        }
+    }
+
+    #[test]
+    fn streaming_crc32_matches_wal_crc_across_chunk_boundaries() {
+        let bytes = (0..2_057)
+            .map(|i| ((i * 131 + i / 7) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        for len in 0..=bytes.len() {
+            let expected = yt_wal::crc32(&bytes[..len]);
+            for chunk_size in [1, 3, 7, 8, 9, 31, 128, 1_024] {
+                let mut crc = Crc32::new();
+                for chunk in bytes[..len].chunks(chunk_size) {
+                    crc.update(chunk);
+                }
+                assert_eq!(crc.finish(), expected, "len={len}, chunk_size={chunk_size}");
+            }
         }
     }
 

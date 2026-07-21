@@ -221,6 +221,10 @@ impl WriteCoordinator {
             session_idx: Mutex::new(SessionIndex::default()),
             seg_fold_cache: Mutex::new(SegFoldCache::new(2_000_000)), // 缓存上限 ~200 万行
             seg_key_bloom: Mutex::new(HashMap::new()),
+            seg_key_bloom_load_lock: Mutex::new(()),
+            seg_key_bloom_load_failed_for: Mutex::new(None),
+            #[cfg(test)]
+            seg_key_bloom_load_count: AtomicUsize::new(0),
             segment_scan_indexes_stale: Mutex::new(false),
             gc_log: Mutex::new(None), // open_durable 设成 Some；非持久模式保持 None
             dir,
@@ -400,6 +404,7 @@ impl WriteCoordinator {
         *self.session_idx.lock().unwrap() = SessionIndex::default();
         *self.seg_fold_cache.lock().unwrap() = SegFoldCache::new(2_000_000);
         self.seg_key_bloom.lock().unwrap().clear();
+        *self.seg_key_bloom_load_failed_for.lock().unwrap() = None;
     }
 
     fn rebuild_volatile_from_current_locked(&self) -> usize {
@@ -474,6 +479,115 @@ impl WriteCoordinator {
             return;
         }
         self.ensure_segment_scan_indexes_current_locked();
+    }
+
+    /// 单 Span 点查只需要知道目标 key 可能位于哪些 segment。
+    /// clean reopen 时先按当前快照加载小型 bloom sidecar，避免为了定位一个 Span 对所有段做完整 CRC；
+    /// BM25 仍保持 deferred，不把全文索引的冷启动成本带进详情读取。
+    fn ensure_seg_key_bloom_for_manifest(&self, manifest: &Manifest) -> FoldQueryStats {
+        let manifest_key = (
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+        );
+        let covers_manifest = || {
+            let blooms = self.seg_key_bloom.lock().unwrap();
+            manifest
+                .segments
+                .keys()
+                .all(|segment_id| blooms.contains_key(segment_id))
+        };
+        if covers_manifest() {
+            return FoldQueryStats::default();
+        }
+        if *self.seg_key_bloom_load_failed_for.lock().unwrap() == Some(manifest_key) {
+            return FoldQueryStats::default();
+        }
+
+        let _load = self.seg_key_bloom_load_lock.lock().unwrap();
+        if covers_manifest() {
+            return FoldQueryStats::default();
+        }
+        if *self.seg_key_bloom_load_failed_for.lock().unwrap() == Some(manifest_key) {
+            return FoldQueryStats::default();
+        }
+        // 缺失、旧版或损坏时不能信任派生 sidecar。这里从真实 segment 一次性重建并原子写成
+        // 当前格式；这样升级用户只承担一次迁移成本，之后即使进程重启也仍走冷读快路。
+        if self.load_seg_key_bloom_segments(manifest) {
+            *self.seg_key_bloom_load_failed_for.lock().unwrap() = None;
+        } else {
+            let (rebuilt, stats) = self.rebuild_and_persist_seg_key_bloom_current();
+            if rebuilt && covers_manifest() {
+                *self.seg_key_bloom_load_failed_for.lock().unwrap() = None;
+            } else {
+                *self.seg_key_bloom_load_failed_for.lock().unwrap() = Some(manifest_key);
+            }
+            return stats;
+        }
+        FoldQueryStats::default()
+    }
+
+    fn rebuild_and_persist_seg_key_bloom_current(&self) -> (bool, FoldQueryStats) {
+        let mut stats = FoldQueryStats {
+            fallback_reason: Some("segment_bloom_migrated".to_string()),
+            ..FoldQueryStats::default()
+        };
+        let Some(path) = &self.seg_key_bloom_path else {
+            return (false, stats);
+        };
+        let _process = self.acquire_process_lock("write");
+        let _local = self.write_lock.lock().unwrap();
+        self.refresh_from_disk_locked();
+        let manifest = self.current.manifest();
+        let mut rebuilt = HashMap::new();
+        if rebuilt.try_reserve(manifest.segments.len()).is_err() {
+            return (false, stats);
+        }
+        for entry in manifest.segments.values() {
+            let scan = self.segments.scan_records_with_stats(entry.segment_id);
+            stats.scanned_segments += 1;
+            stats.decoded_segment_rows += scan.rows.len();
+            stats.data_bytes_read = stats.data_bytes_read.saturating_add(scan.data_bytes_read);
+            // 已提交的 segment 不会为空；空结果说明数据段缺失或校验失败，此时不能生成会有
+            // 假阴性的 bloom，只能保留逐段点查回退。
+            if scan.rows.is_empty() {
+                return (false, stats);
+            }
+            rebuilt.insert(
+                entry.segment_id.get(),
+                Arc::new(KeyBloom::build(
+                    scan.rows
+                        .iter()
+                        .map(|record| (record.trace_id, record.span_id)),
+                    scan.rows.len(),
+                )),
+            );
+        }
+        let result = save_seg_key_bloom_cache(
+            path,
+            manifest.version.get(),
+            manifest.memtable_watermark.get(),
+            &manifest,
+            &rebuilt,
+        );
+        if let Err(err) = result {
+            olog::log(
+                olog::Level::Warn,
+                "segment_bloom_cache_migrate_failed",
+                &[("error", &err.to_string())],
+            );
+            return (false, stats);
+        }
+        self.seg_key_bloom.lock().unwrap().extend(rebuilt);
+        olog::log(
+            olog::Level::Info,
+            "segment_bloom_cache_migrated",
+            &[
+                ("segments", &manifest.segments.len()),
+                ("version", &manifest.version.get()),
+                ("watermark", &manifest.memtable_watermark.get()),
+            ],
+        );
+        (true, stats)
     }
 
     fn ensure_segment_scan_indexes_current_locked(&self) {

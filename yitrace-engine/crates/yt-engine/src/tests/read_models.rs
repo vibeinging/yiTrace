@@ -356,6 +356,423 @@ fn single_span_detail_point_read_does_not_decode_the_full_trace() {
 }
 
 #[test]
+fn reopened_single_span_detail_loads_bloom_before_validating_segments() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_reopen_single_span_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        for segment in 0..10u64 {
+            let trace_id = 1_000 + segment;
+            let records = (1..=100)
+                .map(|span_id| {
+                    ev(
+                        trace_id,
+                        span_id,
+                        1,
+                        Some(0),
+                        Some(1),
+                        &["cold-detail-log"],
+                    )
+                })
+                .collect::<Vec<_>>();
+            wc.ingest(records);
+            // 显式 flush 会同时持久化与当前 manifest 对应的 segment bloom sidecar。
+            wc.flush_memtable();
+        }
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let snap = wc.pin_snapshot();
+    let target_trace = 1_009;
+    let target_span = 77;
+    let (span, stats) = wc.console_span_for_tenant(&snap, target_trace, target_span, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(target_span));
+    assert_eq!(
+        stats.scanned_segments, 1,
+        "clean reopen 后首次点查应先加载 bloom，不能校验所有历史段"
+    );
+    assert_eq!(stats.point_lookup_segments, 1);
+    assert_eq!(stats.indexes_validated, 1, "冷读只校验命中的目标段");
+    assert_eq!(stats.decoded_segment_rows, 1);
+
+    let keys = HashSet::from([(target_trace, target_span)]);
+    let (logs, log_stats) =
+        wc.log_events_for_trace_keys_with_stats(&snap, target_trace, &keys);
+    assert_eq!(logs.get(&target_span).map(Vec::len), Some(1));
+    assert_eq!(log_stats.scanned_segments, 1);
+    assert_eq!(log_stats.indexes_validated, 0, "同一目标段只需冷校验一次");
+
+    drop(snap);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_bloom_sidecar_rebuilds_once_and_persists_recovery() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_invalid_point_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        for segment in 0..3u64 {
+            wc.ingest(vec![ev(
+                2_000 + segment,
+                20 + segment,
+                1,
+                Some(0),
+                Some(1),
+                &["cold-fallback"],
+            )]);
+            wc.flush_memtable();
+        }
+    }
+    std::fs::write(dir.join("segment_bloom.dat"), b"broken-sidecar").unwrap();
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let snap = wc.pin_snapshot();
+    let target = (2_002, 22);
+    let (span, stats) = wc.console_span_for_tenant(&snap, target.0, target.1, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(target.1));
+    assert_eq!(stats.scanned_segments, 4, "读计划应包含三段迁移和一次目标点查");
+    assert!(stats.data_bytes_read > 0, "迁移读取的 segment 字节必须计入读计划");
+    assert_eq!(stats.fallback_reason.as_deref(), Some("segment_bloom_migrated"));
+    assert_eq!(stats.indexes_validated, 1, "点查仍校验目标 segment 索引");
+    assert_eq!(wc.seg_key_bloom_load_count.load(Ordering::Relaxed), 1);
+    assert!(wc.seg_key_bloom_load_failed_for.lock().unwrap().is_none());
+
+    let keys = HashSet::from([target]);
+    let (logs, log_stats) = wc.log_events_for_trace_keys_with_stats(&snap, target.0, &keys);
+    assert_eq!(logs.get(&target.1).map(Vec::len), Some(1));
+    assert_eq!(log_stats.scanned_segments, 1);
+    assert_eq!(
+        wc.seg_key_bloom_load_count.load(Ordering::Relaxed),
+        1,
+        "同一 manifest 的坏 sidecar 只迁移一次"
+    );
+
+    drop(snap);
+    drop(wc);
+    let reopened = WriteCoordinator::open_durable(&dir).unwrap();
+    reopened.recover();
+    let reopened_snap = reopened.pin_snapshot();
+    let (span, reopened_stats) =
+        reopened.console_span_for_tenant(&reopened_snap, target.0, target.1, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(target.1));
+    assert_eq!(reopened_stats.scanned_segments, 1, "重启后应直接加载修复后的 v2 sidecar");
+    assert_eq!(reopened.seg_key_bloom_load_count.load(Ordering::Relaxed), 1);
+
+    drop(reopened_snap);
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v1_bloom_sidecar_is_migrated_once_and_reused_after_reopen() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_v1_point_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        for segment in 0..3u64 {
+            wc.ingest(vec![ev(
+                2_050 + segment,
+                25 + segment,
+                1,
+                Some(0),
+                Some(1),
+                &["v1-migrate"],
+            )]);
+            wc.flush_memtable();
+        }
+    }
+    let path = dir.join("segment_bloom.dat");
+    let mut v1 = std::fs::read(&path).unwrap();
+    v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+    v1.truncate(v1.len() - 4);
+    std::fs::write(&path, v1).unwrap();
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        wc.recover();
+        let snap = wc.pin_snapshot();
+        let (span, stats) = wc.console_span_for_tenant(&snap, 2_052, 27, None);
+        assert_eq!(span.as_ref().map(|s| s.span_id), Some(27));
+        assert_eq!(stats.scanned_segments, 4, "首次升级应报告三段迁移和一次点查");
+        assert!(stats.data_bytes_read > 0);
+        assert_eq!(stats.fallback_reason.as_deref(), Some("segment_bloom_migrated"));
+        let migrated = std::fs::read(&path).unwrap();
+        assert_eq!(&migrated[4..8], &SEG_BLOOM_CACHE_VERSION.to_le_bytes());
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let snap = wc.pin_snapshot();
+    let (span, stats) = wc.console_span_for_tenant(&snap, 2_052, 27, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(27));
+    assert_eq!(stats.scanned_segments, 1, "迁移后的 v2 sidecar 应在重启后复用");
+    assert_eq!(stats.indexes_validated, 1);
+
+    drop(snap);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bloom_sidecar_bit_corruption_falls_back_without_missing_span() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_corrupt_point_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        for segment in 0..2u64 {
+            wc.ingest(vec![ev(
+                2_100 + segment,
+                30 + segment,
+                1,
+                Some(0),
+                Some(1),
+                &["crc-fallback"],
+            )]);
+            wc.flush_memtable();
+        }
+    }
+    let path = dir.join("segment_bloom.dat");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let bloom_payload_byte = bytes.len() - 5;
+    bytes[bloom_payload_byte] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let snap = wc.pin_snapshot();
+    let (span, stats) = wc.console_span_for_tenant(&snap, 2_101, 31, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(31));
+    assert_eq!(stats.scanned_segments, 3, "读计划应包含两段重建和一次目标点查");
+    assert!(stats.data_bytes_read > 0);
+    assert_eq!(stats.fallback_reason.as_deref(), Some("segment_bloom_migrated"));
+    assert_eq!(wc.seg_key_bloom_load_count.load(Ordering::Relaxed), 1);
+
+    drop(snap);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bloom_sidecar_rejects_extreme_lengths_and_hash_count() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_oversized_point_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        wc.ingest(vec![ev(2_200, 40, 1, Some(0), Some(1), &["bounded"])]);
+        wc.flush_memtable();
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let snap = wc.pin_snapshot();
+    let path = dir.join("segment_bloom.dat");
+    let segment_id = *snap.manifest.segments.keys().next().unwrap();
+    let header = || {
+        let mut payload = Vec::new();
+        sidecar_put_u32(&mut payload, SEG_BLOOM_CACHE_MAGIC);
+        sidecar_put_u32(&mut payload, SEG_BLOOM_CACHE_VERSION);
+        sidecar_put_u64(&mut payload, snap.manifest.version.get());
+        sidecar_put_u64(&mut payload, snap.manifest.memtable_watermark.get());
+        payload
+    };
+    let write_and_reject = |mut payload: Vec<u8>| {
+        let checksum = yt_wal::crc32(&payload);
+        sidecar_put_u32(&mut payload, checksum);
+        std::fs::write(&path, payload).unwrap();
+        assert!(
+            load_seg_key_bloom_cache(
+                &path,
+                snap.manifest.version.get(),
+                snap.manifest.memtable_watermark.get(),
+                &snap.manifest,
+            )
+            .is_none()
+        );
+    };
+
+    let mut huge_count = header();
+    sidecar_put_u64(&mut huge_count, u64::MAX);
+    write_and_reject(huge_count);
+
+    let mut huge_k = header();
+    sidecar_put_u64(&mut huge_k, 1);
+    sidecar_put_u64(&mut huge_k, segment_id);
+    sidecar_put_u32(&mut huge_k, u32::MAX);
+    sidecar_put_u64(&mut huge_k, 1);
+    sidecar_put_u64(&mut huge_k, 0);
+    write_and_reject(huge_k);
+
+    let mut huge_words = header();
+    sidecar_put_u64(&mut huge_words, 1);
+    sidecar_put_u64(&mut huge_words, segment_id);
+    sidecar_put_u32(&mut huge_words, SEG_BLOOM_HASH_COUNT);
+    sidecar_put_u64(&mut huge_words, u64::MAX);
+    write_and_reject(huge_words);
+
+    let (span, stats) = wc.console_span_for_tenant(&snap, 2_200, 40, None);
+    assert_eq!(span.as_ref().map(|s| s.span_id), Some(40));
+    assert_eq!(stats.scanned_segments, 2, "极端字段回退后应报告重建和目标点查");
+    assert!(stats.data_bytes_read > 0);
+
+    drop(snap);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_reopened_point_reads_share_one_bloom_load() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_concurrent_point_bloom_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        for segment in 0..10u64 {
+            wc.ingest(vec![ev(
+                3_000 + segment,
+                30 + segment,
+                1,
+                Some(0),
+                Some(1),
+                &["concurrent-point"],
+            )]);
+            wc.flush_memtable();
+        }
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let barrier = Arc::new(Barrier::new(12));
+    let mut workers = Vec::new();
+    for _ in 0..12 {
+        let wc = Arc::clone(&wc);
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let snap = wc.pin_snapshot();
+            wc.console_span_for_tenant(&snap, 3_009, 39, None)
+        }));
+    }
+
+    let mut validated = 0;
+    for worker in workers {
+        let (span, stats) = worker.join().unwrap();
+        assert_eq!(span.as_ref().map(|s| s.span_id), Some(39));
+        assert_eq!(stats.scanned_segments, 1);
+        validated += stats.indexes_validated;
+    }
+    assert_eq!(validated, 1, "并发冷读只校验目标 segment 一次");
+    assert_eq!(
+        wc.seg_key_bloom_load_count.load(Ordering::Relaxed),
+        1,
+        "并发首查只加载一次 bloom sidecar"
+    );
+
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn loading_old_snapshot_bloom_does_not_remove_new_segment_blooms() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "yt_old_snapshot_bloom_merge_{}_{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+        let wc = WriteCoordinator::open_durable(&dir).unwrap();
+        wc.ingest(vec![ev(4_000, 40, 1, Some(0), Some(1), &["old"])]);
+        wc.flush_memtable();
+    }
+
+    let wc = WriteCoordinator::open_durable(&dir).unwrap();
+    wc.recover();
+    let old = wc.pin_snapshot();
+    let old_segment_id = *old.manifest.segments.keys().next().unwrap();
+    wc.commit_flush(
+        &[ev(4_001, 41, 1, Some(0), Some(1), &["new"])],
+        WalLsn::new(1),
+    );
+    let current = wc.pin_snapshot();
+    let new_segment_id = *current
+        .manifest
+        .segments
+        .keys()
+        .find(|segment_id| !old.manifest.segments.contains_key(segment_id))
+        .unwrap();
+    drop(current);
+    assert!(
+        wc.seg_key_bloom
+            .lock()
+            .unwrap()
+            .contains_key(&new_segment_id),
+        "新 flush 的 bloom 应先进入共享缓存"
+    );
+    assert!(wc.load_seg_key_bloom_segments(&old.manifest));
+    let blooms = wc.seg_key_bloom.lock().unwrap();
+    assert!(
+        blooms.contains_key(&old_segment_id),
+        "旧快照 bloom 应补进共享缓存"
+    );
+    assert!(
+        blooms.contains_key(&new_segment_id),
+        "新 flush 的 bloom 不能被旧快照加载覆盖"
+    );
+    drop(blooms);
+
+    drop(old);
+    drop(wc);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn search_indexes_rebuilt_after_restart() {
     // 检索索引(BM25/向量/属性边车)重启后从持久段 + 向量文件重建 —— 不再是"重启后搜啥都空"。
     use std::sync::atomic::{AtomicU64, Ordering};

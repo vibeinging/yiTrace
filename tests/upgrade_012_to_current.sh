@@ -167,7 +167,8 @@ expected = {
     "filter_attrs.dat": 3,
     # v3 仍受当前引擎支持；只读升级不应为了格式升级强制重写整份 rollup。
     "trace_rollup.dat": 3,
-    "segment_bloom.dat": 1,
+    # v1 没有整文件 CRC；当前引擎首次读取会从真实 segment 重建并升级为 v2。
+    "segment_bloom.dat": 2,
 }
 for name, version in expected.items():
     raw = (data_dir / name).read_bytes()
@@ -182,8 +183,8 @@ assert len(index_files) == len(segment_files), (len(segment_files), len(index_fi
 print(f"upgrade preserved {len(after)} traces and rebuilt {len(index_files)} segment indexes")
 PY
 
-if ! rg -q 'event="segment_scan_indexes_ready".*cache_loaded=true' "$WORK_DIR/current-first.log"; then
-  echo "第一次打开没有直接加载兼容的 v0.1.5 索引缓存" >&2
+if ! rg -q 'event="segment_scan_indexes_ready".*cache_loaded=false' "$WORK_DIR/current-first.log"; then
+  echo "第一次打开没有安全重建 v0.1.5 的无 CRC bloom sidecar" >&2
   cat "$WORK_DIR/current-first.log" >&2
   exit 1
 fi

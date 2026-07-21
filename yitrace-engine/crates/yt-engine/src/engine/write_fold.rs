@@ -19,6 +19,9 @@ impl WriteCoordinator {
         let mut inputs: Vec<FoldInput> = Vec::new();
         let mut stats = FoldQueryStats::default();
         let in_keys = |t: u64, s: u64| keys.map_or(true, |ks| ks.contains(&(t, s)));
+        if keys.is_some() {
+            stats = self.ensure_seg_key_bloom_for_manifest(&snap.manifest);
+        }
 
         // 段源：先用段 zone-map(min_ts/max_ts) 做时间窗剪枝 —— 不重叠的段整段跳过、不扫。
         let mut upgrades: std::collections::BTreeMap<(u64, u64), SpanFields> =

@@ -507,9 +507,15 @@ pub fn decode_records(payload: &[u8]) -> Option<Vec<WalRecord>> {
     decode_batch(payload)
 }
 
-/// 无表 CRC32（IEEE），段文件完整性校验复用 WAL 同一实现。
+/// CRC32（IEEE），段文件完整性校验复用 WAL 同一实现。
 pub fn crc32(data: &[u8]) -> u32 {
-    crc32_bytes(data)
+    let mut crc = Crc32::new();
+    crc.update(data);
+    crc.finish()
+}
+
+fn crc32_bytes(data: &[u8]) -> u32 {
+    crc32(data)
 }
 
 /// SpanFields 的二进制编码（唯一一份）—— WAL、段落盘、manifest 持久化都复用它，避免字段列表抄多份。
@@ -937,13 +943,12 @@ fn decode_batch_legacy(c: &mut Cur, n: usize) -> Option<Vec<WalRecord>> {
     Some(out)
 }
 
-/// CRC32（IEEE，反射多项式 0xEDB8_8320）查表实现：256 项表在首用时一次性算好（`OnceLock`，零外部依赖、
-/// 不破 std-only），之后每字节一次查表，去掉了原来每字节 8 次内层位运算。WAL fsync 前对每批都算一次，
-/// 大批量写是热点，查表是稳妥的常数级加速（保持零依赖，不引 crc32fast）。
-fn crc32_table() -> &'static [u32; 256] {
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
+/// CRC32（IEEE，反射多项式 0xEDB8_8320）slicing-by-8 查表实现。8 张表在首用时一次性算好，
+/// 每轮处理 8 字节；校验值和历史逐字节实现完全一致，保持 std-only 且不改变 WAL/segment 格式。
+fn crc32_tables() -> &'static [[u32; 256]; 8] {
+    static TABLES: std::sync::OnceLock<[[u32; 256]; 8]> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut tables = [[0u32; 256]; 8];
         let mut i = 0usize;
         while i < 256 {
             let mut crc = i as u32;
@@ -953,20 +958,61 @@ fn crc32_table() -> &'static [u32; 256] {
                 crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
                 j += 1;
             }
-            t[i] = crc;
+            tables[0][i] = crc;
             i += 1;
         }
-        t
+        let mut slice = 1usize;
+        while slice < 8 {
+            let mut i = 0usize;
+            while i < 256 {
+                let previous = tables[slice - 1][i];
+                tables[slice][i] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+                i += 1;
+            }
+            slice += 1;
+        }
+        tables
     })
 }
 
-fn crc32_bytes(data: &[u8]) -> u32 {
-    let table = crc32_table();
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc = (crc >> 8) ^ table[((crc ^ b as u32) & 0xFF) as usize];
+/// 可分块更新的 IEEE CRC32。WAL 一次性校验和 segment 流式校验共用这一份实现，
+/// 避免两套 slicing-by-8 表和循环以后发生漂移。
+pub struct Crc32(u32);
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self(0xffff_ffff)
     }
-    !crc
+
+    pub fn update(&mut self, mut bytes: &[u8]) {
+        let tables = crc32_tables();
+        while bytes.len() >= 8 {
+            let first = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let current = self.0 ^ first;
+            self.0 = tables[7][(current & 0xff) as usize]
+                ^ tables[6][((current >> 8) & 0xff) as usize]
+                ^ tables[5][((current >> 16) & 0xff) as usize]
+                ^ tables[4][(current >> 24) as usize]
+                ^ tables[3][bytes[4] as usize]
+                ^ tables[2][bytes[5] as usize]
+                ^ tables[1][bytes[6] as usize]
+                ^ tables[0][bytes[7] as usize];
+            bytes = &bytes[8..];
+        }
+        for &byte in bytes {
+            self.0 = (self.0 >> 8) ^ tables[0][((self.0 ^ byte as u32) & 0xff) as usize];
+        }
+    }
+
+    pub fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -1004,12 +1050,34 @@ mod tests {
     #[test]
     fn crc32_matches_ieee_known_vectors() {
         // 查表实现必须与 IEEE CRC32 标准逐字节一致（换实现不能改校验和,否则老 WAL/段 全部读不回）。
-        assert_eq!(crc32_bytes(b""), 0x0000_0000);
-        assert_eq!(crc32_bytes(b"123456789"), 0xCBF4_3926, "标准测试向量");
+        assert_eq!(crc32(b""), 0x0000_0000);
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "标准测试向量");
         assert_eq!(
-            crc32_bytes(b"The quick brown fox jumps over the lazy dog"),
+            crc32(b"The quick brown fox jumps over the lazy dog"),
             0x414F_A339
         );
+    }
+
+    #[test]
+    fn crc32_slicing_by_8_matches_slow_reference() {
+        fn slow(data: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffffu32;
+            for &byte in data {
+                crc ^= byte as u32;
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        let bytes = (0..4_097)
+            .map(|i| ((i * 197 + i / 11) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        for len in 0..=bytes.len() {
+            assert_eq!(crc32(&bytes[..len]), slow(&bytes[..len]), "len={len}");
+        }
     }
 
     #[test]

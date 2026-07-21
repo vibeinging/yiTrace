@@ -69,6 +69,13 @@ pub struct WriteCoordinator {
     /// 检索折叠定位时，bloom 判"这个段肯定没有任何候选 key" → 整段跳过，不碰折叠缓存。派生数据：flush
     /// 时建、recover 时优先从 `segment_bloom.dat` 恢复，坏了再从段重建。每段几 KB，常驻内存可控。
     seg_key_bloom: Mutex<HashMap<u64, Arc<KeyBloom>>>,
+    /// clean reopen 后第一次点查只需要加载小型 segment bloom，不应连带加载 BM25。
+    /// 独立锁把并发首查合并成一次 sidecar 读取，同时不占用写锁或跨进程写锁。
+    seg_key_bloom_load_lock: Mutex<()>,
+    /// 同一 manifest 的 sidecar 已确认不可用时不再每次点查重复读取；manifest 更新或缓存重建后重试。
+    seg_key_bloom_load_failed_for: Mutex<Option<(u64, u64)>>,
+    #[cfg(test)]
+    seg_key_bloom_load_count: AtomicUsize,
     /// 全文检索必需的段扫描派生索引（BM25 / seg_key_bloom）是否还没从历史 segment 补建。
     /// open/recover 命中 rollup/filter 但缺 `bm25.dat` 或 `segment_bloom.dat` 时，先快速可用；
     /// 需要全文检索时再补。控制台 session index 有独立 dirty 标记，不混在这里。
@@ -113,7 +120,7 @@ impl KeyBloom {
         let mut b = KeyBloom {
             bits: vec![0u64; m_bits / 64],
             mask: m_bits - 1,
-            k: 7,
+            k: SEG_BLOOM_HASH_COUNT,
         };
         for key in keys {
             b.insert(key);
@@ -140,7 +147,7 @@ impl KeyBloom {
         })
     }
     fn from_bits(bits: Vec<u64>, k: u32) -> Option<Self> {
-        if bits.is_empty() || !bits.len().is_power_of_two() {
+        if k != SEG_BLOOM_HASH_COUNT || bits.is_empty() || !bits.len().is_power_of_two() {
             return None;
         }
         let m_bits = bits.len().checked_mul(64)?;

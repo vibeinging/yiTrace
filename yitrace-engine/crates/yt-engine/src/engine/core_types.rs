@@ -131,6 +131,14 @@ pub struct KeyedRecordScan {
     pub indexes_rebuilt: usize,
 }
 
+/// 顺序读取完整 segment 时的物理读统计。派生 sidecar 迁移会走这条路径，查询计划必须把
+/// 一次性全段读取成本如实返回，不能伪装成只读了目标 Span。
+#[derive(Default)]
+pub struct FullRecordScan {
+    pub rows: Vec<WalRecord>,
+    pub data_bytes_read: u64,
+}
+
 #[derive(Default)]
 struct FoldQueryStats {
     scanned_segments: usize,
@@ -141,6 +149,7 @@ struct FoldQueryStats {
     data_bytes_read: u64,
     indexes_validated: usize,
     indexes_rebuilt: usize,
+    fallback_reason: Option<String>,
 }
 
 pub trait SegmentStore: Send + Sync {
@@ -152,6 +161,14 @@ pub trait SegmentStore: Send + Sync {
     fn scan_fold_inputs(&self, seg: SegmentId) -> Vec<(u32, FoldInput)>;
     /// 扫一个段的原始记录（compaction 重建新段用）。
     fn scan_records(&self, seg: SegmentId) -> Vec<WalRecord>;
+    /// 与 `scan_records` 相同，但返回真实物理读取量。默认存储只能报告解码结果；文件段覆盖它，
+    /// 精确报告读入并校验的 segment 字节数。
+    fn scan_records_with_stats(&self, seg: SegmentId) -> FullRecordScan {
+        FullRecordScan {
+            rows: self.scan_records(seg),
+            data_bytes_read: 0,
+        }
+    }
     /// 物理删除一个 dead 段文件（仅在 §D1.4 三条水位放行后调用）。
     fn unlink_segment(&self, seg: SegmentId);
 
