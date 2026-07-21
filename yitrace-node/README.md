@@ -199,9 +199,12 @@ replaying the WAL tail. The cache is disposable: deletes, retention apply, segme
 versions, or corrupt cache contents rebuild it from the current snapshot.
 Persistent data dirs also write `bm25.dat` and `segment_bloom.dat`. When all four caches
 (`trace_rollup.dat`, `filter_attrs.dat`, `bm25.dat`, `segment_bloom.dat`) match the manifest,
-reopen recovery does not scan historical segments, and the first text / hybrid search does not
-do a catch-up segment scan. If the BM25 or bloom cache is missing, only the first text / hybrid
-search rebuilds those derived indexes.
+reopen recovery does not scan historical segments. A point lookup loads the bloom cache lazily,
+then validates and reads only segments that may contain the requested span; it does not load BM25.
+The v2 bloom cache has a full-file CRC. A v1, missing, or corrupt bloom cache is rebuilt once from
+the real segments and written back atomically. That migration I/O is included in `readPlan` with
+`fallbackReason: "segment_bloom_migrated"`. A missing BM25 cache is rebuilt by the first text or
+hybrid search.
 Trajectory, loop, and task helpers can return `source: "trajectory_rollup"` for no-text path
 summaries and reuse the same `trace_rollup.dat` cache after reopen. When those helpers expand
 complete traces after finding candidates, `readPlan.traceFetchSource` shows whether that second

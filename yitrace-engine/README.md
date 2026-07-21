@@ -71,7 +71,7 @@ cargo run -p yt-engine --release --example bench_qps  # 真实 QPS 压测(摄入
 | 带属性过滤 | ✅ | 按 agent/status/time/trace 过滤(向量侧走进图、BM25 侧后置) |
 | 混合召回 | ✅ | BM25 + 向量用 RRF 融合成一路,双命中排更前 |
 | 时间窗 + trace 剪枝 | ✅ | 段级 zone-map 跳无关段;段折叠缓存(检索只取候选行) |
-| 段级 key Bloom | ✅ | 折叠定位时跳过"肯定没有"的段(ClickHouse 跳过索引同款) |
+| 段级 key Bloom | ✅ | 点查时跳过“肯定没有”的段；v2 边车带全文件 CRC，旧版或损坏边车会从真实段重建一次 |
 
 ### 评测与飞轮
 
